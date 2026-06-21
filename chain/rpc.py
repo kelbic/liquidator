@@ -15,6 +15,15 @@ class BaseRpc:
             self._w3 = Web3(Web3.HTTPProvider(self.rpc_url))
         return self._w3
 
+    def contract(self, address: str, abi: list):
+        """Bound contract for read calls. web3 stays lazy (loaded on first use)."""
+        w3 = self._web3()
+        return w3.eth.contract(address=w3.to_checksum_address(address), abi=abi)
+
+    def to_bytes32(self, hexstr: str):
+        from web3 import Web3
+        return Web3.to_bytes(hexstr=hexstr)
+
     def block_number(self) -> int:
         return self._web3().eth.block_number
 
