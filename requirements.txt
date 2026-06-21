@@ -1,0 +1,7 @@
+# --- bot runtime ---
+web3>=6.11
+eth-account>=0.10
+# --- analysis/ tools (model + Dune bridge) ---
+numpy>=1.26
+pandas>=2.0
+dune-client>=1.7

@@ -1,0 +1,30 @@
+# /etc/systemd/system/liquidator-bot.service
+# cgroup-лимиты не дают всплеску/утечке задеть twidgest. От root в /root.
+# ВАЖНО: НЕТ inline-комментариев после директив — только на своих строках.
+[Unit]
+Description=Base liquidation monitor/bot (Morpho Blue)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/root/liquidator
+EnvironmentFile=/root/liquidator/.env
+ExecStart=/root/liquidator/venv/bin/python -u main.py
+Restart=on-failure
+RestartSec=10
+CPUWeight=30
+CPUQuota=150%
+MemoryHigh=384M
+MemoryMax=512M
+IOWeight=30
+TasksMax=256
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/root/liquidator
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
