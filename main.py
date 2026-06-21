@@ -10,6 +10,7 @@ Two-tier scan (cheap -> precise):
      eth_calls/cycle regardless of how many markets/positions are in flight.
 """
 from __future__ import annotations
+import json
 import logging
 import time
 from collections import defaultdict
@@ -117,6 +118,39 @@ def scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) -> dict:
     return summary
 
 
+def rescan_markets(cfg, current_markets, ctx_cache, log):
+    """Re-fetch + re-select the covered set: catches new tail markets, drops out-of-band ones,
+    excludes configured SVR/OEV oracles. Hot-swaps, prunes ctx_cache, persists JSON, reloads.
+    Returns the new list, or the current one unchanged on any failure."""
+    try:
+        from analysis.build_covered_markets import fetch_markets, select_markets, to_json_records
+        exclude = {a.strip().lower() for a in (cfg.exclude_oracles or "").split(",") if a.strip()}
+        records = to_json_records(select_markets(fetch_markets(), exclude_oracles=exclude))
+        if not records:
+            log.warning("market rescan: empty selection — keeping current %d markets", len(current_markets))
+            return current_markets
+        old_ids = {m.market_id for m in current_markets}
+        new_ids = {r["market_id"] for r in records}
+        for mid in (old_ids - new_ids):
+            ctx_cache.pop(mid, None)
+        try:
+            with open(cfg.covered_markets_path, "w") as fh:
+                json.dump(records, fh, indent=2)
+        except OSError as e:
+            log.warning("market rescan: persist failed: %s", e)
+        new_markets = load_covered_markets(cfg.covered_markets_path)
+        added, removed = new_ids - old_ids, old_ids - new_ids
+        if added or removed:
+            log.info("market rescan: %d markets (+%d/-%d) added=%s removed=%s", len(new_markets),
+                     len(added), len(removed), sorted(a[:10] for a in added), sorted(r[:10] for r in removed))
+        else:
+            log.info("market rescan: %d markets (no change)", len(new_markets))
+        return new_markets
+    except Exception as e:
+        log.warning("market rescan failed (%s) — keeping current %d markets", type(e).__name__, len(current_markets))
+        return current_markets
+
+
 def main():
     cfg = Config.from_env()
     setup_logging(cfg.log_level)
@@ -138,8 +172,12 @@ def main():
                     cfg.max_daily_loss_usd, cfg.max_daily_gas_usd)
 
     last_hb = 0.0
+    last_rescan = time.time()
     while True:
         try:
+            if rpc and time.time() - last_rescan >= cfg.rescan_interval_sec:
+                markets = rescan_markets(cfg, markets, ctx_cache, log)
+                last_rescan = time.time()
             t0 = time.time()
             today = store.realized_today()
             st = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"], inflight=0)

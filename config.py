@@ -15,6 +15,8 @@ class Config:
     liquidator_address: str = ""         # deployed Liquidator contract
     mode: str = "monitor"
     covered_markets_path: str = "covered_markets.json"
+    rescan_interval_sec: float = 21600.0
+    exclude_oracles: str = ""
     min_profit_usd: float = 5.0
     max_daily_loss_usd: float = 50.0
     max_daily_gas_usd: float = 100.0
@@ -51,6 +53,8 @@ class Config:
             liquidator_address=s("LIQUIDATOR_ADDRESS"),
             mode=s("MODE", "monitor"),
             covered_markets_path=s("COVERED_MARKETS_PATH", "covered_markets.json"),
+            rescan_interval_sec=f("RESCAN_INTERVAL_SEC", 21600.0),
+            exclude_oracles=s("EXCLUDE_ORACLES"),
             min_profit_usd=f("MIN_PROFIT_USD", 5.0),
             max_daily_loss_usd=f("MAX_DAILY_LOSS_USD", 50.0),
             max_daily_gas_usd=f("MAX_DAILY_GAS_USD", 100.0),

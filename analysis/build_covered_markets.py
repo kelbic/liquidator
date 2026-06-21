@@ -28,6 +28,7 @@ query Markets($chains: [Int!], $first: Int!, $skip: Int!) {
           where: { chainId_in: $chains }) {
     items {
       marketId
+      oracleAddress
       lltv
       loanAsset { symbol decimals address }
       collateralAsset { symbol decimals address }
@@ -75,7 +76,7 @@ def _lltv_fraction(raw) -> float:
 
 
 def select_markets(items, min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD, max_markets=40,
-                   default_slippage=DEFAULT_SLIPPAGE, min_bonus=MIN_BONUS):
+                   default_slippage=DEFAULT_SLIPPAGE, min_bonus=MIN_BONUS, exclude_oracles=None):
     """Pure: filter (real borrow, valid collateral, bonus>slippage) + map -> records.
     Carries a private _borrow_usd for inspection/sort; stripped before JSON."""
     rows = []
@@ -89,6 +90,8 @@ def select_markets(items, min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD
         loan = it.get("loanAsset") or {}
         if not key or not col.get("symbol"):   # idle/unrecognized-collateral markets -> skip
             continue
+        if exclude_oracles and (it.get("oracleAddress") or "").lower() in exclude_oracles:
+            continue                            # SVR/OEV-recapture oracle -> bonus leaks to protocol
         lltv = _lltv_fraction(it.get("lltv"))
         bonus = _lif_bonus(lltv)
         if bonus <= min_bonus:                  # uneconomical (bonus <= slippage) -> skip
