@@ -11,6 +11,8 @@ class Config:
     chain: str = "base"
     chain_id: int = 8453
     wallet_address: str = ""
+    wallet_key: str = ""                 # private key; used ONLY when MODE=execute
+    liquidator_address: str = ""         # deployed Liquidator contract
     mode: str = "monitor"
     covered_markets_path: str = "covered_markets.json"
     min_profit_usd: float = 5.0
@@ -45,6 +47,8 @@ class Config:
             chain=s("CHAIN", "base"),
             chain_id=i("CHAIN_ID", 8453),
             wallet_address=s("WALLET_ADDRESS"),
+            wallet_key=s("WALLET_KEY"),
+            liquidator_address=s("LIQUIDATOR_ADDRESS"),
             mode=s("MODE", "monitor"),
             covered_markets_path=s("COVERED_MARKETS_PATH", "covered_markets.json"),
             min_profit_usd=f("MIN_PROFIT_USD", 5.0),

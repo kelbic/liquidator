@@ -24,6 +24,14 @@ class BaseRpc:
         from web3 import Web3
         return Web3.to_bytes(hexstr=hexstr)
 
+    def eth_call(self, tx: dict, block="latest", state_override=None):
+        """Low-level eth_call. state_override (optional) injects {addr: {code, stateDiff}} —
+        used to simulate the not-yet-deployed liquidator before a real deploy."""
+        w3 = self._web3()
+        if state_override is not None:
+            return w3.eth.call(tx, block, state_override)
+        return w3.eth.call(tx, block)
+
     def block_number(self) -> int:
         return self._web3().eth.block_number
 

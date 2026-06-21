@@ -15,6 +15,7 @@ import time
 from collections import defaultdict
 
 from config import Config
+from chain.execute import try_liquidate
 from store import Store
 from alerts import Alerter
 from strategy.scanner import load_covered_markets
@@ -59,9 +60,11 @@ def scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) -> dict:
 
     groups = defaultdict(list)
     debt_by = {}
+    debt_assets_by = {}
     for c in candidates:
         groups[c.market_id].append(c.borrower)
         debt_by[(c.market_id, c.borrower)] = c.debt_usd
+        debt_assets_by[(c.market_id, c.borrower)] = c.debt_assets
 
     # ONE aggregate3 (+ a cached-once idToMarketParams batch on first sight): market()+price()
     # per market and position() per candidate across ALL markets -> exact on-chain HF. This
@@ -91,10 +94,21 @@ def scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) -> dict:
         today = store.realized_today()
         gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"], inflight=0)
         blocked = guard.blocked_reason(gs)
+        tx_hash = None
         if cfg.mode == "execute" and not blocked:
-            pass  # TODO(execute): simulate_tx + submit; record tx_hash + status
-        status = "paper" if cfg.mode == "monitor" else (f"blocked:{blocked}" if blocked else "would_submit")
-        store.log_action(market_id=mid, borrower=borrower, mode=cfg.mode, tx_hash=None,
+            out = try_liquidate(rpc, cfg, mid, borrower,
+                                debt_by.get((mid, borrower), 0.0),
+                                debt_assets_by.get((mid, borrower), 0), log)
+            if out["sent"]:
+                tx_hash = out["hash"]
+                status = f"submitted:{out['status']} ${out.get('profit_usd', 0):.2f}"
+            else:
+                status = f"skip:{out['reason'][:50]}"
+        elif cfg.mode == "execute":
+            status = f"blocked:{blocked}"
+        else:
+            status = "paper"
+        store.log_action(market_id=mid, borrower=borrower, mode=cfg.mode, tx_hash=tx_hash,
                          net_usd=sr.net_usd, gas_usd=sr.gas_usd, status=status)
         log.info("ACTIONABLE %s/%s HF=%.4f net=$%.2f mode=%s status=%s",
                  mid[:10], borrower[:10], hr.hf, sr.net_usd, cfg.mode, status)

@@ -5,3 +5,9 @@ __pycache__/
 .env
 covered_markets.json
 *.bak
+
+# foundry build artifacts
+contracts/out/
+contracts/cache/
+contracts/lib/
+contracts/broadcast/

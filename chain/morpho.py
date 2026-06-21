@@ -13,6 +13,8 @@ API, so the position query only needs `marketId` to map a position back to its l
 from __future__ import annotations
 import json
 import urllib.request
+import urllib.error
+import time
 from dataclasses import dataclass
 
 from strategy.scanner import Market
@@ -101,17 +103,36 @@ def parse_positions(payload: dict, lltv_by_key: dict, hf_ceiling: float = 1.0) -
     return out
 
 
-def _query_page(keys: list[str], skip: int, first: int, api_url: str, timeout: int) -> list:
-    """One page of marketPositions (ordered by borrowShares desc). I/O."""
+_RETRYABLE_HTTP = (429, 500, 502, 503, 504)
+
+
+def _query_page(keys: list[str], skip: int, first: int, api_url: str, timeout: int,
+                retries: int = 3) -> list:
+    """One page of marketPositions (ordered by borrowShares desc). I/O with retry-on-transient
+    (timeout / URLError / 429 / 5xx) so a single API hiccup doesn't drop a whole scan cycle.
+    Non-transient (HTTP 4xx, GraphQL errors) propagate immediately."""
     body = json.dumps({"query": _POSITIONS_QUERY,
                        "variables": {"keys": keys, "first": first, "skip": skip}}).encode()
-    req = urllib.request.Request(api_url, data=body,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        payload = json.loads(r.read())
-    if payload.get("errors"):
-        raise RuntimeError(f"Morpho API errors: {payload['errors']}")
-    return (((payload.get("data") or {}).get("marketPositions") or {}).get("items")) or []
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(api_url, data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                payload = json.loads(r.read())
+            if payload.get("errors"):
+                raise RuntimeError(f"Morpho API errors: {payload['errors']}")
+            return (((payload.get("data") or {}).get("marketPositions") or {}).get("items")) or []
+        except urllib.error.HTTPError as e:
+            if e.code not in _RETRYABLE_HTTP or attempt == retries - 1:
+                raise
+            last_exc = e
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == retries - 1:
+                raise
+            last_exc = e
+        time.sleep(0.5 * (2 ** attempt))
+    raise last_exc
 
 
 def _fetch_borrower_positions(keys: list[str], api_url: str, page: int = 1000,
