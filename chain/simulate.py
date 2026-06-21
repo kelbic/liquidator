@@ -25,6 +25,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from chain.rpc import BaseRpc
+from chain.multicall import (aggregate3, encode_market_call, decode_market,
+    encode_id_to_market_params_call, decode_id_to_market_params,
+    encode_price_call, decode_price, encode_position_call, decode_position)
 from strategy.pnl import PnlInputs, net_profit, lif_from_lltv
 
 # Morpho Blue exact integer math (SharesMathLib + the health check in _liquidate).
@@ -185,6 +188,56 @@ def assess_position(rpc: BaseRpc, morpho_addr: str, market_id: str, borrower: st
     """Single-shot convenience: read_health + estimate. Loop uses the granular pieces."""
     return estimate(read_health(rpc, morpho_addr, market_id, borrower),
                     debt_usd, slippage, gas_usd, tip_usd, min_profit_usd)
+
+
+def refresh_market_params(rpc: BaseRpc, morpho_addr: str, market_ids: list, ctx_cache: dict) -> None:
+    """Cache IMMUTABLE per-market params (oracle, lltv_wad) for any uncached markets via one
+    aggregate3 of idToMarketParams. ctx_cache: {market_id_hex: (oracle_addr, lltv_wad)}."""
+    missing = [mid for mid in market_ids if mid not in ctx_cache]
+    if not missing:
+        return
+    calls = [(morpho_addr, encode_id_to_market_params_call(rpc.to_bytes32(mid))) for mid in missing]
+    for mid, (ok, data) in zip(missing, aggregate3(rpc, calls)):
+        if ok and data:
+            _loan, _coll, oracle, _irm, lltv_wad = decode_id_to_market_params(data)
+            ctx_cache[mid] = (oracle, lltv_wad)
+
+
+def assess_candidates_batched(rpc: BaseRpc, morpho_addr: str, groups: dict, ctx_cache: dict) -> list:
+    """groups: {market_id_hex: [borrower_addr]}. ONE aggregate3 reads market()+oracle.price()
+    for every market + position() for every candidate, across ALL markets at once. Immutable
+    oracle/lltv come from ctx_cache (refreshed first). -> [(market_id, borrower, HealthReport)].
+    This is what makes the scan ~1-2 eth_calls/cycle regardless of market/position count."""
+    refresh_market_params(rpc, morpho_addr, list(groups.keys()), ctx_cache)
+    mids = [mid for mid in groups if mid in ctx_cache]
+    if not mids:
+        return []
+    calls = [(morpho_addr, encode_market_call(rpc.to_bytes32(mid))) for mid in mids]
+    calls += [(ctx_cache[mid][0], encode_price_call()) for mid in mids]   # price() on the oracle addr
+    pos_index = []
+    for mid in mids:
+        b32 = rpc.to_bytes32(mid)
+        for b in groups[mid]:
+            calls.append((morpho_addr, encode_position_call(b32, b)))
+            pos_index.append((mid, b))
+    res = aggregate3(rpc, calls)
+    n = len(mids)
+    ctx_by = {}
+    for i, mid in enumerate(mids):
+        ok_m, d_m = res[i]
+        ok_p, d_p = res[n + i]
+        if ok_m and d_m and ok_p and d_p:
+            m = decode_market(d_m)
+            oracle, lltv_wad = ctx_cache[mid]
+            ctx_by[mid] = MarketContext(oracle=oracle, price=decode_price(d_p), lltv_wad=lltv_wad,
+                                        total_borrow_assets=m[2], total_borrow_shares=m[3])
+    out = []
+    for (mid, b), (ok, data) in zip(pos_index, res[2 * n:]):
+        ctx = ctx_by.get(mid)
+        if ctx is not None and ok and data:
+            bs, col = decode_position(data)
+            out.append((mid, b, health_from(ctx, bs, col)))
+    return out
 
 
 def simulate_tx(*args, **kwargs):

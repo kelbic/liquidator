@@ -28,12 +28,13 @@ MORPHO_API_URL = "https://api.morpho.org/graphql"
 # filter needed. `market { marketId }` is the position's market id (== the key we filter
 # by). TODO: paginate via skip if a market ever exceeds `first`.
 _POSITIONS_QUERY = """
-query Positions($keys: [String!]) {
-  marketPositions(first: 1000, where: { marketUniqueKey_in: $keys }) {
+query Positions($keys: [String!], $first: Int!, $skip: Int!) {
+  marketPositions(first: $first, skip: $skip, orderBy: BorrowShares, orderDirection: Desc,
+                  where: { marketUniqueKey_in: $keys }) {
     items {
       user { address }
       market { marketId }
-      state { collateral collateralUsd borrowAssets borrowAssetsUsd }
+      state { collateral collateralUsd borrowAssets borrowAssetsUsd borrowShares }
     }
   }
 }
@@ -82,7 +83,10 @@ def parse_positions(payload: dict, lltv_by_key: dict, hf_ceiling: float = 1.0) -
         borrow_usd = _num(st.get("borrowAssetsUsd"))
         if borrow_usd <= 0:
             continue  # нет долга -> не ликвидируемо
-        hf = health_factor(_num(st.get("collateralUsd")), borrow_usd, lltv)
+        collateral_usd = _num(st.get("collateralUsd"))
+        if collateral_usd < borrow_usd:
+            continue  # залог < долга -> безнадёжный долг (изъятие не покрывает погашение); не наш
+        hf = health_factor(collateral_usd, borrow_usd, lltv)
         if hf <= hf_ceiling:
             out.append(Position(
                 market_id=market_id,
@@ -97,13 +101,36 @@ def parse_positions(payload: dict, lltv_by_key: dict, hf_ceiling: float = 1.0) -
     return out
 
 
-def _query_market_positions(keys: list[str], api_url: str, timeout: int = 15) -> dict:
-    """POST the GraphQL query. I/O — dry-run on the VPS (sandbox can't reach the API)."""
-    body = json.dumps({"query": _POSITIONS_QUERY, "variables": {"keys": keys}}).encode()
+def _query_page(keys: list[str], skip: int, first: int, api_url: str, timeout: int) -> list:
+    """One page of marketPositions (ordered by borrowShares desc). I/O."""
+    body = json.dumps({"query": _POSITIONS_QUERY,
+                       "variables": {"keys": keys, "first": first, "skip": skip}}).encode()
     req = urllib.request.Request(api_url, data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+        payload = json.loads(r.read())
+    if payload.get("errors"):
+        raise RuntimeError(f"Morpho API errors: {payload['errors']}")
+    return (((payload.get("data") or {}).get("marketPositions") or {}).get("items")) or []
+
+
+def _fetch_borrower_positions(keys: list[str], api_url: str, page: int = 1000,
+                              max_pages: int = 20, timeout: int = 15) -> list:
+    """All BORROWER positions across markets, no truncation. Because positions are ordered
+    by borrowShares desc, suppliers (borrowShares==0) sort last -> stop at the first zero.
+    Single first:1000 would have capped at one big market; this paginates all of them."""
+    out: list = []
+    skip = 0
+    for _ in range(max_pages):
+        batch = _query_page(keys, skip, page, api_url, timeout)
+        for it in batch:
+            if _int((it.get("state") or {}).get("borrowShares")) == 0:
+                return out                      # reached the supplier tail -> done
+            out.append(it)
+        if len(batch) < page:
+            break
+        skip += page
+    return out
 
 
 def positions_at_risk(markets: list[Market], hf_ceiling: float = 1.0,
@@ -113,5 +140,5 @@ def positions_at_risk(markets: list[Market], hf_ceiling: float = 1.0,
     if not keys:
         return []
     lltv_by_key = {m.market_id: m.lltv for m in markets if m.market_id}
-    payload = _query_market_positions(keys, api_url)
-    return parse_positions(payload, lltv_by_key, hf_ceiling)
+    items = _fetch_borrower_positions(keys, api_url)
+    return parse_positions({"data": {"marketPositions": {"items": items}}}, lltv_by_key, hf_ceiling)
