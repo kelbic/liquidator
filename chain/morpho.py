@@ -47,6 +47,8 @@ class Position:
     health_factor: float
     debt_assets: int
     collateral_assets: int
+    debt_usd: float = 0.0
+    collateral_usd: float = 0.0
 
 
 def _num(x, default=0.0) -> float:
@@ -88,6 +90,8 @@ def parse_positions(payload: dict, lltv_by_key: dict, hf_ceiling: float = 1.0) -
                 health_factor=hf,
                 debt_assets=_int(st.get("borrowAssets")),
                 collateral_assets=_int(st.get("collateral")),
+                debt_usd=borrow_usd,
+                collateral_usd=_num(st.get("collateralUsd")),
             ))
     out.sort(key=lambda p: p.health_factor)
     return out
