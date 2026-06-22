@@ -133,24 +133,26 @@ def send_tx(rpc, key: str, tx: dict, wait: bool = True, timeout: int = 120,
 _MORPHO_BLUE = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
 
 
-def try_liquidate(rpc, cfg, market_id: str, borrower: str, debt_usd: float,
-                  debt_assets: int, log=None, slippage_bps: int = 100) -> dict:
-    """Execute ONE liquidation: re-read fresh state, size+fetch swap, gate with simulate_tx, and
-    only if it would succeed AND clears the USD floor, sign+send with a slippage floor (revert if
-    realized < 95% of simulated). Returns {sent, reason?/hash?/status?/profit_usd?}. Catches own
-    errors so a bad candidate never crashes the scan loop."""
+def prepare_liquidation(rpc, cfg, market_id: str, borrower: str, debt_usd: float,
+                        debt_assets: int, slippage_bps: int = 100) -> dict:
+    """Read fresh on-chain state, size the seize, fetch the swap, simulate, and gate on the NET
+    floor — everything UP TO sending. Returns {ok: True, calldata, net_usd, profit_usd, cost_usd}
+    ready to sign+send, or {ok: False, reason, net_usd?}. No send, so many candidates can be
+    prepared and then dispatched together (parallel). Catches its own errors."""
     try:
         from chain.multicall import (aggregate3, encode_id_to_market_params_call,
             decode_id_to_market_params, encode_market_call, decode_market,
             encode_price_call, decode_price, encode_position_call, decode_position)
         from chain.simulate import to_assets_up
         from strategy.pnl import lif_from_lltv
+
         liq = cfg.liquidator_address
         if not liq:
-            return {"sent": False, "reason": "LIQUIDATOR_ADDRESS unset"}
+            return {"ok": False, "reason": "LIQUIDATOR_ADDRESS unset"}
         w3 = rpc._web3()
         bot = w3.eth.account.from_key(cfg.wallet_key).address
         mid = rpc.to_bytes32(market_id)
+
         r1 = aggregate3(rpc, [(_MORPHO_BLUE, encode_id_to_market_params_call(mid)),
                               (_MORPHO_BLUE, encode_market_call(mid)),
                               (_MORPHO_BLUE, encode_position_call(mid, borrower))])
@@ -158,33 +160,57 @@ def try_liquidate(rpc, cfg, market_id: str, borrower: str, debt_usd: float,
         m = decode_market(r1[1][1]); tba, tbs = m[2], m[3]
         borrow_shares, _ = decode_position(r1[2][1])
         if borrow_shares == 0:
-            return {"sent": False, "reason": "no debt (cleared)"}
+            return {"ok": False, "reason": "no debt (cleared)"}
         price = decode_price(aggregate3(rpc, [(oracle, encode_price_call())])[0][1])
+
         repaid_shares = int(borrow_shares)
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)
         seized = expected_seized(repaid_assets, lif_from_lltv(lltv_wad / 10**18), price)
         if seized == 0:
-            return {"sent": False, "reason": "seized=0"}
+            return {"ok": False, "reason": "seized=0"}
+
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
         swap = kyber_swap(coll, loan, seized, liq, liq, slippage_bps=slippage_bps)
+
         cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0)
         sim = simulate_tx(rpc, liq, bot, cd0)
         if not sim["ok"]:
-            return {"sent": False, "reason": f"sim revert: {sim['error']}"}
+            return {"ok": False, "reason": f"sim revert: {sim['error']}"}
         profit_wei = sim["profit"]
         profit_usd = profit_wei * debt_usd / debt_assets if debt_assets else 0.0
-        cost_usd = cfg.gas_limit_est * cfg.tip_gwei * cfg.eth_price_usd / 1e9  # tip dominates (base fee ~0)
+        cost_usd = cfg.gas_limit_est * cfg.tip_gwei * cfg.eth_price_usd / 1e9
         net_usd = profit_usd - cost_usd
         if net_usd < cfg.min_profit_usd:
-            return {"sent": False, "net_usd": net_usd,
+            return {"ok": False, "net_usd": net_usd,
                     "reason": f"net ${net_usd:.2f} (profit ${profit_usd:.2f} - cost ${cost_usd:.2f}) < min ${cfg.min_profit_usd:.2f}"}
-        min_profit_final = profit_wei * 95 // 100
+
+        min_profit_final = profit_wei * 95 // 100   # revert if realized < 95% of simulated
         cd1 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit_final)
-        res = send_tx(rpc, cfg.wallet_key, {"to": liq, "data": cd1}, min_tip_wei=int(cfg.tip_gwei * 1e9))
-        if log:
-            log.info("LIQUIDATE sent %s/%s tx=%s status=%s net~$%.2f (profit $%.2f - cost $%.2f)",
-                     market_id[:10], borrower[:10], res["hash"], res["status"], net_usd, profit_usd, cost_usd)
-        return {"sent": True, "hash": res["hash"], "status": res["status"], "gas_used": res["gas_used"],
-                "profit_usd": profit_usd, "net_usd": net_usd}
+        return {"ok": True, "calldata": cd1, "net_usd": net_usd,
+                "profit_usd": profit_usd, "cost_usd": cost_usd}
     except Exception as e:
-        return {"sent": False, "reason": f"error: {type(e).__name__}: {str(e)[:120]}"}
+        return {"ok": False, "reason": f"error: {type(e).__name__}: {str(e)[:120]}"}
+
+
+def try_liquidate(rpc, cfg, market_id: str, borrower: str, debt_usd: float,
+                  debt_assets: int, log=None, slippage_bps: int = 100) -> dict:
+    """Prepare + send ONE liquidation (blocking) — the sequential path. Returns
+    {sent, reason?/hash?/status?/net_usd?/profit_usd?}. The batch path prepares many then sends
+    non-blocking with sequential nonces; this wrapper keeps the single-shot behavior identical."""
+    prep = prepare_liquidation(rpc, cfg, market_id, borrower, debt_usd, debt_assets, slippage_bps)
+    if not prep["ok"]:
+        out = {"sent": False, "reason": prep["reason"]}
+        if "net_usd" in prep:
+            out["net_usd"] = prep["net_usd"]
+        return out
+    try:
+        res = send_tx(rpc, cfg.wallet_key, {"to": cfg.liquidator_address, "data": prep["calldata"]},
+                      min_tip_wei=int(cfg.tip_gwei * 1e9))
+    except Exception as e:
+        return {"sent": False, "reason": f"send error: {type(e).__name__}: {str(e)[:120]}"}
+    if log:
+        log.info("LIQUIDATE sent %s/%s tx=%s status=%s net~$%.2f (profit $%.2f - cost $%.2f)",
+                 market_id[:10], borrower[:10], res["hash"], res["status"],
+                 prep["net_usd"], prep["profit_usd"], prep["cost_usd"])
+    return {"sent": True, "hash": res["hash"], "status": res["status"], "gas_used": res["gas_used"],
+            "profit_usd": prep["profit_usd"], "net_usd": prep["net_usd"]}
