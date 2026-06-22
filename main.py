@@ -11,6 +11,8 @@ Two-tier scan (cheap -> precise):
 """
 from __future__ import annotations
 import json
+import asyncio
+import threading
 import logging
 import time
 from collections import defaultdict
@@ -47,18 +49,11 @@ def _empty_summary(n_markets: int) -> dict:
             "liquidatable": 0, "profitable": 0, "min_hf": None}
 
 
-def scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) -> dict:
-    """One scan pass. Returns a summary dict for the heartbeat line."""
-    by_id = {m.market_id: m for m in markets}
-    candidates = positions_at_risk(markets, hf_ceiling=HF_API_CEILING)  # API, USD-approx
-    summary = _empty_summary(len(markets))
-    summary["api_candidates"] = len(candidates)
-    if not candidates:
-        return summary
-    if rpc is None:
-        log.warning("near-risk positions found but RPC_URL empty — on-chain confirm skipped")
-        return summary
-
+def fetch_candidates(markets):
+    """SLOW path (Morpho API): enumerate at-risk borrowers (HF <= HF_API_CEILING), grouped by
+    market + debt maps. Candidate SET drifts slowly; refresh periodically (~60s), NOT per block.
+    Returns (groups, debt_by, debt_assets_by, n)."""
+    candidates = positions_at_risk(markets, hf_ceiling=HF_API_CEILING)
     groups = defaultdict(list)
     debt_by = {}
     debt_assets_by = {}
@@ -66,10 +61,17 @@ def scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) -> dict:
         groups[c.market_id].append(c.borrower)
         debt_by[(c.market_id, c.borrower)] = c.debt_usd
         debt_assets_by[(c.market_id, c.borrower)] = c.debt_assets
+    return dict(groups), debt_by, debt_assets_by, len(candidates)
 
-    # ONE aggregate3 (+ a cached-once idToMarketParams batch on first sight): market()+price()
-    # per market and position() per candidate across ALL markets -> exact on-chain HF. This
-    # keeps on-chain cost ~1-2 eth_calls/cycle no matter how many markets/positions are live.
+
+def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, guard, alerter,
+                       log, ctx_cache, n_candidates=0):
+    """FAST path (on-chain): ONE aggregate3 over the candidate set -> exact HF; per
+    liquidatable+profitable+unblocked candidate, execute. ~1-2 eth_calls — cheap per block."""
+    summary = _empty_summary(len(by_id))
+    summary["api_candidates"] = n_candidates
+    if not groups:
+        return summary
     assessed = assess_candidates_batched(rpc, MORPHO_BLUE_ADDRESS, groups, ctx_cache)
 
     for mid, borrower, hr in assessed:
@@ -118,6 +120,17 @@ def scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) -> dict:
     return summary
 
 
+def scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) -> dict:
+    """One full scan pass (poll mode): fetch candidate set (API) then process it (on-chain)."""
+    by_id = {m.market_id: m for m in markets}
+    groups, debt_by, debt_assets_by, ncand = fetch_candidates(markets)
+    if ncand and rpc is None:
+        log.warning("near-risk positions found but RPC_URL empty — on-chain confirm skipped")
+        s = _empty_summary(len(markets)); s["api_candidates"] = ncand; return s
+    return process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, guard,
+                              alerter, log, ctx_cache, ncand)
+
+
 def rescan_markets(cfg, current_markets, ctx_cache, log):
     """Re-fetch + re-select the covered set: catches new tail markets, drops out-of-band ones,
     excludes configured SVR/OEV oracles. Hot-swaps, prunes ctx_cache, persists JSON, reloads.
@@ -151,6 +164,102 @@ def rescan_markets(cfg, current_markets, ctx_cache, log):
         return current_markets
 
 
+class _Shared:
+    """Candidate set shared between the API-refresh thread (writer) and the wss block loop (reader)."""
+    def __init__(self, markets):
+        self.lock = threading.Lock()
+        self.by_id = {m.market_id: m for m in markets}
+        self.groups, self.debt_by, self.debt_assets_by, self.n = {}, {}, {}, 0
+
+    def snapshot(self):
+        with self.lock:
+            return self.by_id, self.groups, self.debt_by, self.debt_assets_by, self.n
+
+
+def _refresh_worker(shared, markets, cfg, ctx_cache, log, stop):
+    """Background thread: periodically re-fetch the at-risk candidate set (slow API) + rescan
+    markets (6h). API-only (no web3) -> safe alongside the loop. Updates `shared` atomically."""
+    last_rescan = time.time()
+    while not stop.is_set():
+        try:
+            if time.time() - last_rescan >= cfg.rescan_interval_sec:
+                markets = rescan_markets(cfg, markets, ctx_cache, log)
+                last_rescan = time.time()
+            g, db, dab, n = fetch_candidates(markets)
+            with shared.lock:
+                shared.by_id = {m.market_id: m for m in markets}
+                shared.groups, shared.debt_by, shared.debt_assets_by, shared.n = g, db, dab, n
+        except Exception:
+            log.exception("candidate refresh error")
+        stop.wait(cfg.candidate_refresh_sec)
+
+
+async def _new_heads(ws):
+    """Subscribe to newHeads; yield the LATEST header each time, draining any buffered backlog so a
+    slow assess never makes us act on stale state (the loop self-aligns to the current block)."""
+    await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": ["newHeads"]}))
+    sub = json.loads(await asyncio.wait_for(ws.recv(), timeout=20))
+    if "error" in sub:
+        raise RuntimeError(f"wss subscribe rejected: {sub['error']}")
+    while True:
+        msg = json.loads(await ws.recv())                       # block for next head
+        head = (msg.get("params") or {}).get("result")
+        if not head:
+            continue
+        while True:                                             # drain backlog -> keep only latest
+            try:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), 0.01))
+            except asyncio.TimeoutError:
+                break
+            nh = (msg.get("params") or {}).get("result")
+            if nh:
+                head = nh
+        yield head
+
+
+async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_cache):
+    """wss newHeads -> fast on-chain assess+execute every block (~2s). Background thread refreshes
+    candidates+markets so the per-block path never blocks on the API. Reconnects on wss drop."""
+    import websockets
+    wss_url = cfg.rpc_url.replace("https://", "wss://").replace("http://", "ws://")
+    shared = _Shared(markets)
+    stop = threading.Event()
+    threading.Thread(target=_refresh_worker, args=(shared, markets, cfg, ctx_cache, log, stop),
+                     daemon=True).start()
+    last_hb = 0.0
+    while True:
+        try:
+            async with websockets.connect(wss_url, open_timeout=20, ping_interval=20) as ws:
+                log.info("wss connected — block-driven loop (mode=%s)", cfg.mode)
+                async for head in _new_heads(ws):
+                    blk = int(head.get("number", "0x0"), 16)
+                    by_id, groups, debt_by, debt_assets_by, ncand = shared.snapshot()
+                    today = store.realized_today()
+                    gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"], inflight=0)
+                    blocked = guard.blocked_reason(gs)
+                    if blocked and cfg.mode == "execute":
+                        if time.time() - last_hb >= HEARTBEAT_SEC:
+                            log.error("kill switch engaged: %s", blocked)
+                            alerter.send(f"\U0001F6D1 liquidator halted: {blocked}", key="killswitch")
+                            last_hb = time.time()
+                        continue
+                    if not groups:
+                        continue
+                    t0 = time.time()
+                    s = process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg,
+                                           guard, alerter, log, ctx_cache, ncand)
+                    if s["liquidatable"] or s["profitable"] or (time.time() - last_hb >= HEARTBEAT_SEC):
+                        last_hb = time.time()
+                        mh = f"{s['min_hf']:.4f}" if s["min_hf"] is not None else "n/a"
+                        log.info("block %d: markets=%d cand=%d confirmed=%d liq=%d profit=%d min_hf=%s in %.2fs",
+                                 blk, s["markets"], s["api_candidates"], s["confirmed"],
+                                 s["liquidatable"], s["profitable"], mh, time.time() - t0)
+        except Exception as e:
+            log.warning("wss loop error (%s) — reconnecting in 3s", type(e).__name__)
+            alerter.send("\U0001F6A8 wss loop reconnect — check journalctl", key="wsserr")
+            await asyncio.sleep(3)
+
+
 def main():
     cfg = Config.from_env()
     setup_logging(cfg.log_level)
@@ -170,6 +279,10 @@ def main():
     if cfg.mode == "execute":
         log.warning("EXECUTE mode — real txs. kill switch: loss<=$%.0f gas<=$%.0f",
                     cfg.max_daily_loss_usd, cfg.max_daily_gas_usd)
+
+    if cfg.loop_mode == "block" and rpc:
+        asyncio.run(block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_cache))
+        return
 
     last_hb = 0.0
     last_rescan = time.time()
