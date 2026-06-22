@@ -23,7 +23,7 @@ class Config:
     eth_price_usd: float = 1730.0        # ETH/USD to value gas/tip cost (keep ~current; tip dominates)
     max_daily_loss_usd: float = 50.0
     max_daily_gas_usd: float = 100.0
-    max_inflight: int = 1
+    max_inflight: int = 5            # cap on parallel sends per block (cascade)
     tg_bot_token: str = ""
     tg_admin_id: int = 0
     alert_antiflood_sec: int = 600
@@ -66,7 +66,7 @@ class Config:
             eth_price_usd=f("ETH_PRICE_USD", 1730.0),
             max_daily_loss_usd=f("MAX_DAILY_LOSS_USD", 50.0),
             max_daily_gas_usd=f("MAX_DAILY_GAS_USD", 100.0),
-            max_inflight=i("MAX_INFLIGHT", 1),
+            max_inflight=i("MAX_INFLIGHT", 5),
             tg_bot_token=s("TG_BOT_TOKEN"),
             tg_admin_id=i("TG_ADMIN_ID", 0),
             alert_antiflood_sec=i("ALERT_ANTIFLOOD_SEC", 600),

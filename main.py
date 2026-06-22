@@ -18,7 +18,7 @@ import time
 from collections import defaultdict
 
 from config import Config
-from chain.execute import try_liquidate
+from chain.execute import try_liquidate, prepare_liquidation, dispatch_liquidations
 from store import Store
 from alerts import Alerter
 from strategy.scanner import load_covered_markets
@@ -64,6 +64,60 @@ def fetch_candidates(markets):
     return dict(groups), debt_by, debt_assets_by, len(candidates)
 
 
+def _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, guard, alerter, log,
+                        prepare_fn=prepare_liquidation, dispatch_fn=dispatch_liquidations):
+    """Monitor: record paper. Execute: kill switch ONCE, prepare each (fresh reads+simulate+floor),
+    dispatch passers NON-BLOCKING with sequential nonces, record. Parallel so a cascade isn't
+    serialized on one blocking send. prepare_fn/dispatch_fn injectable for tests."""
+    def _record(mid, borrower, hr, sr, status, tx_hash=None):
+        store.log_action(market_id=mid, borrower=borrower, mode=cfg.mode, tx_hash=tx_hash,
+                         net_usd=sr.net_usd, gas_usd=sr.gas_usd, status=status)
+        log.info("ACTIONABLE %s/%s HF=%.4f net=$%.2f mode=%s status=%s",
+                 mid[:10], borrower[:10], hr.hf, sr.net_usd, cfg.mode, status)
+        alerter.send(f"\U0001F4B0 {cfg.mode} liquidation {borrower[:10]} "
+                     f"net ${sr.net_usd:.2f} HF={hr.hf:.4f}", key=f"act:{mid}:{borrower}")
+
+    if not actionable:
+        return
+    if cfg.mode != "execute":
+        for mid, borrower, hr, sr in actionable:
+            _record(mid, borrower, hr, sr, "paper")
+        return
+
+    today = store.realized_today()
+    blocked = guard.blocked_reason(GuardState(realized_net_today=today["net"],
+                                              gas_spent_today=today["gas"], inflight=0))
+    if blocked:
+        for mid, borrower, hr, sr in actionable:
+            _record(mid, borrower, hr, sr, f"blocked:{blocked}")
+        return
+
+    ready, meta = [], {}
+    for mid, borrower, hr, sr in actionable:
+        prep = prepare_fn(rpc, cfg, mid, borrower,
+                          debt_by.get((mid, borrower), 0.0),
+                          debt_assets_by.get((mid, borrower), 0))
+        if prep.get("ok"):
+            ready.append((mid, borrower, prep)); meta[(mid, borrower)] = (hr, sr)
+        else:
+            _record(mid, borrower, hr, sr, f"skip:{prep['reason'][:50]}")
+    if not ready:
+        return
+
+    results = dispatch_fn(rpc, cfg, ready, log=log, max_inflight=cfg.max_inflight)
+    done = set()
+    for r in results:
+        hr, sr = meta[(r["market_id"], r["borrower"])]
+        done.add((r["market_id"], r["borrower"]))
+        status = (f"submitted:{r.get('status')} net${r.get('net_usd', 0):.2f}" if r["sent"]
+                  else f"skip:{r['reason'][:50]}")
+        _record(r["market_id"], r["borrower"], hr, sr, status, tx_hash=r.get("hash"))
+    for mid, borrower, prep in ready:
+        if (mid, borrower) not in done:
+            hr, sr = meta[(mid, borrower)]
+            _record(mid, borrower, hr, sr, "skip:deferred (inflight cap/stop)")
+
+
 def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, guard, alerter,
                        log, ctx_cache, n_candidates=0, hf_cache=None):
     """FAST path (on-chain): ONE aggregate3 over the candidate set -> exact HF; per
@@ -73,6 +127,7 @@ def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, 
     if not groups:
         return summary
     assessed = assess_candidates_batched(rpc, MORPHO_BLUE_ADDRESS, groups, ctx_cache)
+    actionable = []
 
     for mid, borrower, hr in assessed:
         mkt = by_id.get(mid)
@@ -96,29 +151,8 @@ def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, 
         if not sr.profitable:
             continue
         summary["profitable"] += 1
-        today = store.realized_today()
-        gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"], inflight=0)
-        blocked = guard.blocked_reason(gs)
-        tx_hash = None
-        if cfg.mode == "execute" and not blocked:
-            out = try_liquidate(rpc, cfg, mid, borrower,
-                                debt_by.get((mid, borrower), 0.0),
-                                debt_assets_by.get((mid, borrower), 0), log)
-            if out["sent"]:
-                tx_hash = out["hash"]
-                status = f"submitted:{out['status']} ${out.get('profit_usd', 0):.2f}"
-            else:
-                status = f"skip:{out['reason'][:50]}"
-        elif cfg.mode == "execute":
-            status = f"blocked:{blocked}"
-        else:
-            status = "paper"
-        store.log_action(market_id=mid, borrower=borrower, mode=cfg.mode, tx_hash=tx_hash,
-                         net_usd=sr.net_usd, gas_usd=sr.gas_usd, status=status)
-        log.info("ACTIONABLE %s/%s HF=%.4f net=$%.2f mode=%s status=%s",
-                 mid[:10], borrower[:10], hr.hf, sr.net_usd, cfg.mode, status)
-        alerter.send(f"\U0001F4B0 {cfg.mode} liquidation {borrower[:10]} "
-                     f"net ${sr.net_usd:.2f} HF={hr.hf:.4f}", key=f"act:{mid}:{borrower}")
+        actionable.append((mid, borrower, hr, sr))   # collect -> batch-dispatch after the loop
+    _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, guard, alerter, log)
     return summary
 
 
