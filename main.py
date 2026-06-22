@@ -178,6 +178,23 @@ class _Shared:
             return self.by_id, self.groups, self.debt_by, self.debt_assets_by, self.n
 
 
+_WETH_BASE = "0x4200000000000000000000000000000000000006"
+
+
+def fetch_eth_price_usd(timeout=10):
+    """ETH/USD from the Morpho API (assetByAddress(WETH).price.usd) — same API the loop already
+    uses, reachable from the VPS. Returns float or None on failure (caller keeps last good value)."""
+    import json as _json, urllib.request as _u
+    q = ('query($a:String!,$c:Int!){ assetByAddress(address:$a,chainId:$c){ price { usd } } }')
+    body = _json.dumps({"query": q, "variables": {"a": _WETH_BASE, "c": 8453}}).encode()
+    req = _u.Request("https://api.morpho.org/graphql", data=body,
+                     headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+    with _u.urlopen(req, timeout=timeout) as r:
+        d = _json.loads(r.read())
+    usd = (((d.get("data") or {}).get("assetByAddress") or {}).get("price") or {}).get("usd")
+    return float(usd) if usd else None
+
+
 def _refresh_worker(shared, markets, cfg, ctx_cache, log, stop):
     """Background thread: periodically re-fetch the at-risk candidate set (slow API) + rescan
     markets (6h). API-only (no web3) -> safe alongside the loop. Updates `shared` atomically."""
@@ -187,6 +204,12 @@ def _refresh_worker(shared, markets, cfg, ctx_cache, log, stop):
             if time.time() - last_rescan >= cfg.rescan_interval_sec:
                 markets = rescan_markets(cfg, markets, ctx_cache, log)
                 last_rescan = time.time()
+            try:
+                px = fetch_eth_price_usd()
+                if px and px > 0:
+                    cfg.eth_price_usd = px            # live ETH/USD -> honest net-cost floor (no hardcode)
+            except Exception:
+                pass                                  # keep last good price
             g, db, dab, n = fetch_candidates(markets)
             with shared.lock:
                 shared.by_id = {m.market_id: m for m in markets}
