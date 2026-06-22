@@ -21,6 +21,9 @@ BASE_CHAIN_ID = 8453
 DEFAULT_SLIPPAGE = 0.01   # conservative placeholder; refined per-market by monitor/Dune later
 MIN_BONUS = 0.01          # drop markets whose LIF bonus <= this (uneconomical: bonus < slippage)
 MAX_BORROW_USD = 30_000_000   # exclude mega-cap markets: contested (we won't win) AND huge position counts
+# collateral our swap venue (KyberSwap) cannot exit -> liquidation would revert; don't waste a slot.
+# Pendle PT tokens trade on Pendle's own AMM, not the DEXs Kyber aggregates.
+EXIT_BLOCKED_COLLATERAL = ("PT-",)
 
 _MARKETS_QUERY = """
 query Markets($chains: [Int!], $first: Int!, $skip: Int!) {
@@ -76,7 +79,8 @@ def _lltv_fraction(raw) -> float:
 
 
 def select_markets(items, min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD, max_markets=40,
-                   default_slippage=DEFAULT_SLIPPAGE, min_bonus=MIN_BONUS, exclude_oracles=None):
+                   default_slippage=DEFAULT_SLIPPAGE, min_bonus=MIN_BONUS, exclude_oracles=None,
+                   exclude_collateral_prefixes=EXIT_BLOCKED_COLLATERAL):
     """Pure: filter (real borrow, valid collateral, bonus>slippage) + map -> records.
     Carries a private _borrow_usd for inspection/sort; stripped before JSON."""
     rows = []
@@ -90,6 +94,9 @@ def select_markets(items, min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD
         loan = it.get("loanAsset") or {}
         if not key or not col.get("symbol"):   # idle/unrecognized-collateral markets -> skip
             continue
+        csym = col.get("symbol") or ""
+        if any(csym.upper().startswith(pre.upper()) for pre in (exclude_collateral_prefixes or ())):
+            continue                            # collateral our swap can't exit (e.g. Pendle PT)
         if exclude_oracles and (it.get("oracleAddress") or "").lower() in exclude_oracles:
             continue                            # SVR/OEV-recapture oracle -> bonus leaks to protocol
         lltv = _lltv_fraction(it.get("lltv"))
