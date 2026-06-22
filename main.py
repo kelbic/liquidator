@@ -65,7 +65,7 @@ def fetch_candidates(markets):
 
 
 def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, guard, alerter,
-                       log, ctx_cache, n_candidates=0):
+                       log, ctx_cache, n_candidates=0, hf_cache=None):
     """FAST path (on-chain): ONE aggregate3 over the candidate set -> exact HF; per
     liquidatable+profitable+unblocked candidate, execute. ~1-2 eth_calls — cheap per block."""
     summary = _empty_summary(len(by_id))
@@ -78,6 +78,8 @@ def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, 
         mkt = by_id.get(mid)
         if mkt is None:
             continue
+        if hf_cache is not None:
+            hf_cache[(mid, borrower)] = hr.hf       # remember reading -> drives the hot set
         summary["confirmed"] += 1
         summary["min_hf"] = hr.hf if summary["min_hf"] is None else min(summary["min_hf"], hr.hf)
         store.upsert_position(mid, borrower, hr.hf)
@@ -217,6 +219,21 @@ async def _new_heads(ws):
         yield head
 
 
+HOT_HF_CEILING = 1.02          # block mode: per block, assess only candidates with last HF < this
+HOT_FULL_REFRESH_SEC = 30.0    # block mode: re-assess the FULL candidate set at least this often
+
+
+def _hot_subset(groups, hf_cache):
+    """Candidates whose last on-chain HF was below HOT_HF_CEILING (unseen -> included). Only these
+    can realistically liquidate within a block; assessing just them keeps per-block cost tiny."""
+    hot = {}
+    for mid, borrowers in groups.items():
+        sel = [b for b in borrowers if hf_cache.get((mid, b), 0.0) < HOT_HF_CEILING]
+        if sel:
+            hot[mid] = sel
+    return hot
+
+
 async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_cache):
     """wss newHeads -> fast on-chain assess+execute every block (~2s). Background thread refreshes
     candidates+markets so the per-block path never blocks on the API. Reconnects on wss drop."""
@@ -227,6 +244,8 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
     threading.Thread(target=_refresh_worker, args=(shared, markets, cfg, ctx_cache, log, stop),
                      daemon=True).start()
     last_hb = 0.0
+    last_full = 0.0
+    hf_cache = {}
     while True:
         try:
             async with websockets.connect(wss_url, open_timeout=20, ping_interval=20) as ws:
@@ -245,15 +264,24 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                         continue
                     if not groups:
                         continue
+                    do_full = time.time() - last_full >= HOT_FULL_REFRESH_SEC
+                    if do_full:
+                        last_full = time.time()
+                        live = {(m, b) for m, bs in groups.items() for b in bs}
+                        for k in [k for k in hf_cache if k not in live]:
+                            del hf_cache[k]                       # prune cache to current set
+                    else:
+                        groups = _hot_subset(groups, hf_cache)    # per block: only near-threshold
                     t0 = time.time()
                     s = process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg,
-                                           guard, alerter, log, ctx_cache, ncand)
+                                           guard, alerter, log, ctx_cache, ncand, hf_cache=hf_cache)
                     if s["liquidatable"] or s["profitable"] or (time.time() - last_hb >= HEARTBEAT_SEC):
                         last_hb = time.time()
+                        tag = "full" if do_full else "hot"
                         mh = f"{s['min_hf']:.4f}" if s["min_hf"] is not None else "n/a"
-                        log.info("block %d: markets=%d cand=%d confirmed=%d liq=%d profit=%d min_hf=%s in %.2fs",
-                                 blk, s["markets"], s["api_candidates"], s["confirmed"],
-                                 s["liquidatable"], s["profitable"], mh, time.time() - t0)
+                        log.info("block %d: assessed=%d/%d (%s) liq=%d profit=%d min_hf=%s in %.2fs",
+                                 blk, s["confirmed"], ncand, tag, s["liquidatable"],
+                                 s["profitable"], mh, time.time() - t0)
         except Exception as e:
             log.warning("wss loop error (%s) — reconnecting in 3s", type(e).__name__)
             alerter.send("\U0001F6A8 wss loop reconnect — check journalctl", key="wsserr")
