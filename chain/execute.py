@@ -173,15 +173,18 @@ def try_liquidate(rpc, cfg, market_id: str, borrower: str, debt_usd: float,
             return {"sent": False, "reason": f"sim revert: {sim['error']}"}
         profit_wei = sim["profit"]
         profit_usd = profit_wei * debt_usd / debt_assets if debt_assets else 0.0
-        if profit_usd < cfg.min_profit_usd:
-            return {"sent": False, "reason": f"profit ${profit_usd:.2f} < min ${cfg.min_profit_usd:.2f}"}
+        cost_usd = cfg.gas_limit_est * cfg.tip_gwei * cfg.eth_price_usd / 1e9  # tip dominates (base fee ~0)
+        net_usd = profit_usd - cost_usd
+        if net_usd < cfg.min_profit_usd:
+            return {"sent": False, "net_usd": net_usd,
+                    "reason": f"net ${net_usd:.2f} (profit ${profit_usd:.2f} - cost ${cost_usd:.2f}) < min ${cfg.min_profit_usd:.2f}"}
         min_profit_final = profit_wei * 95 // 100
         cd1 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit_final)
-        res = send_tx(rpc, cfg.wallet_key, {"to": liq, "data": cd1})
+        res = send_tx(rpc, cfg.wallet_key, {"to": liq, "data": cd1}, min_tip_wei=int(cfg.tip_gwei * 1e9))
         if log:
-            log.info("LIQUIDATE sent %s/%s tx=%s status=%s profit~$%.2f",
-                     market_id[:10], borrower[:10], res["hash"], res["status"], profit_usd)
-        return {"sent": True, "hash": res["hash"], "status": res["status"],
-                "gas_used": res["gas_used"], "profit_usd": profit_usd}
+            log.info("LIQUIDATE sent %s/%s tx=%s status=%s net~$%.2f (profit $%.2f - cost $%.2f)",
+                     market_id[:10], borrower[:10], res["hash"], res["status"], net_usd, profit_usd, cost_usd)
+        return {"sent": True, "hash": res["hash"], "status": res["status"], "gas_used": res["gas_used"],
+                "profit_usd": profit_usd, "net_usd": net_usd}
     except Exception as e:
         return {"sent": False, "reason": f"error: {type(e).__name__}: {str(e)[:120]}"}

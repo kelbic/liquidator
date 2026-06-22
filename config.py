@@ -17,7 +17,10 @@ class Config:
     covered_markets_path: str = "covered_markets.json"
     rescan_interval_sec: float = 21600.0
     exclude_oracles: str = ""
-    min_profit_usd: float = 5.0
+    min_profit_usd: float = 5.0          # floor on NET (profit - gas/tip cost) before sending
+    tip_gwei: float = 3.0                # competitive priority fee we bid (beats observed ~2.0 cap)
+    gas_limit_est: int = 500000          # ~gas used per liquidation, for the net-cost estimate
+    eth_price_usd: float = 1730.0        # ETH/USD to value gas/tip cost (keep ~current; tip dominates)
     max_daily_loss_usd: float = 50.0
     max_daily_gas_usd: float = 100.0
     max_inflight: int = 1
@@ -58,6 +61,9 @@ class Config:
             rescan_interval_sec=f("RESCAN_INTERVAL_SEC", 21600.0),
             exclude_oracles=s("EXCLUDE_ORACLES"),
             min_profit_usd=f("MIN_PROFIT_USD", 5.0),
+            tip_gwei=f("TIP_GWEI", 3.0),
+            gas_limit_est=i("GAS_LIMIT_EST", 500000),
+            eth_price_usd=f("ETH_PRICE_USD", 1730.0),
             max_daily_loss_usd=f("MAX_DAILY_LOSS_USD", 50.0),
             max_daily_gas_usd=f("MAX_DAILY_GAS_USD", 100.0),
             max_inflight=i("MAX_INFLIGHT", 1),
