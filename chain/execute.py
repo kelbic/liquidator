@@ -7,8 +7,11 @@ stdlib HTTP (urllib) like morpho.py — runs on `python3`; only the eth_call pat
 """
 from __future__ import annotations
 import json
+import threading
 import urllib.request
 from urllib.parse import urlencode
+
+_SEND_LOCK = threading.Lock()   # serialize dispatch nonce-fetch+send across the block loop and hot path
 
 ORACLE_PRICE_SCALE = 10 ** 36
 WAD = 10 ** 18
@@ -241,28 +244,29 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
         return results
     w3 = rpc._web3()
     bot = w3.eth.account.from_key(cfg.wallet_key).address
-    base_nonce = int(w3.eth.get_transaction_count(bot, "pending"))
-    tip = int(cfg.tip_gwei * 1e9)
-    batch = prepared[:max_inflight]
+    with _SEND_LOCK:                                         # serialize nonce-fetch+send across senders (block loop + hot path)
+        base_nonce = int(w3.eth.get_transaction_count(bot, "pending"))
+        tip = int(cfg.tip_gwei * 1e9)
+        batch = prepared[:max_inflight]
 
-    sent = []
-    for i, (mid, borrower, prep) in enumerate(batch):
-        try:
-            res = send(rpc, cfg.wallet_key,
-                       {"to": cfg.liquidator_address, "data": prep["calldata"], "nonce": base_nonce + i},
-                       wait=False, min_tip_wei=tip)
-            sent.append((mid, borrower, prep, res["hash"]))
-            if log:
-                log.info("dispatch: sent %s/%s nonce=%d tx=%s net~$%.2f",
-                         mid[:10], borrower[:10], base_nonce + i, res["hash"], prep["net_usd"])
-        except Exception as e:
-            if log:
-                log.warning("dispatch: send FAILED at nonce %d (%s/%s): %s — stopping batch to avoid gap",
-                            base_nonce + i, mid[:10], borrower[:10], type(e).__name__)
-            results.append({"market_id": mid, "borrower": borrower, "sent": False,
-                            "reason": f"send error: {type(e).__name__}: {str(e)[:80]}",
-                            "net_usd": prep["net_usd"]})
-            break   # nonce gap -> later txs would be stuck; next block re-derives the base nonce
+        sent = []
+        for i, (mid, borrower, prep) in enumerate(batch):
+            try:
+                res = send(rpc, cfg.wallet_key,
+                           {"to": cfg.liquidator_address, "data": prep["calldata"], "nonce": base_nonce + i},
+                           wait=False, min_tip_wei=tip)
+                sent.append((mid, borrower, prep, res["hash"]))
+                if log:
+                    log.info("dispatch: sent %s/%s nonce=%d tx=%s net~$%.2f",
+                             mid[:10], borrower[:10], base_nonce + i, res["hash"], prep["net_usd"])
+            except Exception as e:
+                if log:
+                    log.warning("dispatch: send FAILED at nonce %d (%s/%s): %s — stopping batch to avoid gap",
+                                base_nonce + i, mid[:10], borrower[:10], type(e).__name__)
+                results.append({"market_id": mid, "borrower": borrower, "sent": False,
+                                "reason": f"send error: {type(e).__name__}: {str(e)[:80]}",
+                                "net_usd": prep["net_usd"]})
+                break   # nonce gap -> later txs would be stuck; next block re-derives the base nonce
 
     if not wait_receipts:
         for mid, borrower, prep, h in sent:
