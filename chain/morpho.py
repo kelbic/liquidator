@@ -25,6 +25,11 @@ MORPHO_BLUE_ADDRESS = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
 
 MORPHO_API_URL = "https://api.morpho.org/graphql"
 
+# Floor: позиции с долгом в USD ниже этого — пыль: невыгодны всем (бонус < газ+флор) и
+# Morpho ревертит 0x81ceff30 на ~нулевом долге. Режем на стадии кандидата, чтобы они не
+# засоряли hot set / simulations. (Бэклог STATE; в Config не тянем — хватает дефолта модуля.)
+MIN_DEBT_USD = 1.0
+
 # marketUniqueKey is keccak(loanToken,collateralToken,oracle,irm,lltv); token/oracle
 # addresses differ per chain, so Base keys can't collide with other chains -> no chainId
 # filter needed. `market { marketId }` is the position's market id (== the key we filter
@@ -69,7 +74,7 @@ def health_factor(collateral_usd: float, borrow_usd: float, lltv: float) -> floa
     return collateral_usd * lltv / borrow_usd
 
 
-def parse_positions(payload: dict, lltv_by_key: dict, hf_ceiling: float = 1.0) -> list[Position]:
+def parse_positions(payload: dict, lltv_by_key: dict, hf_ceiling: float = 1.0, min_debt_usd: float = MIN_DEBT_USD) -> list[Position]:
     """marketPositions payload -> at-risk Positions (HF <= ceiling), most-at-risk first.
     lltv_by_key maps marketId -> lltv (fraction). Pure: unit-tested on synthetic data."""
     if payload.get("errors"):
@@ -83,8 +88,8 @@ def parse_positions(payload: dict, lltv_by_key: dict, hf_ceiling: float = 1.0) -
         if lltv <= 0:
             continue  # lltv не передан для этого рынка -> не оцениваем (безопасно)
         borrow_usd = _num(st.get("borrowAssetsUsd"))
-        if borrow_usd <= 0:
-            continue  # нет долга -> не ликвидируемо
+        if borrow_usd < min_debt_usd:
+            continue  # пыль/нулевой долг (< MIN_DEBT_USD): невыгодно + ревертит 0x81ceff30; не тащим
         collateral_usd = _num(st.get("collateralUsd"))
         if collateral_usd < borrow_usd:
             continue  # залог < долга -> безнадёжный долг (изъятие не покрывает погашение); не наш
@@ -154,7 +159,7 @@ def _fetch_borrower_positions(keys: list[str], api_url: str, page: int = 1000,
     return out
 
 
-def positions_at_risk(markets: list[Market], hf_ceiling: float = 1.0,
+def positions_at_risk(markets: list[Market], hf_ceiling: float = 1.0, min_debt_usd: float = MIN_DEBT_USD,
                       api_url: str = MORPHO_API_URL) -> list[Position]:
     """At-risk positions across covered markets, via the Morpho API."""
     keys = [m.market_id for m in markets if m.market_id]
@@ -162,4 +167,4 @@ def positions_at_risk(markets: list[Market], hf_ceiling: float = 1.0,
         return []
     lltv_by_key = {m.market_id: m.lltv for m in markets if m.market_id}
     items = _fetch_borrower_positions(keys, api_url)
-    return parse_positions({"data": {"marketPositions": {"items": items}}}, lltv_by_key, hf_ceiling)
+    return parse_positions({"data": {"marketPositions": {"items": items}}}, lltv_by_key, hf_ceiling, min_debt_usd)
