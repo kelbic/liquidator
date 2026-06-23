@@ -276,6 +276,39 @@ async def _new_heads(ws):
         yield head
 
 
+async def _flashblock_heads(ws):
+    """Subscribe to the public Base Flashblocks feed; yield each block's number ONCE, on the FIRST
+    Flashblock seen for it — ~2.1s earlier than newHeads (measured). Messages are brotli-compressed
+    JSON; the block number is base/block_number on the initial sub-block (index 0) and
+    metadata/block_number on the rest. Flashblocks are ordered, so we yield on a strictly increasing
+    number and dedup the ~10 sub-blocks per block. Per-message decode errors are skipped (the feed is
+    public/best-effort) so one bad frame can't kill the stream."""
+    import brotli  # lazy: keeps `import main` clean without the dep
+    last = 0
+    while True:
+        raw = await ws.recv()
+        try:
+            txt = brotli.decompress(raw).decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+            d = json.loads(txt)
+        except Exception:
+            continue
+        bn = None
+        base = d.get("base")
+        if isinstance(base, dict):
+            bn = base.get("block_number")
+        if bn is None:
+            meta = d.get("metadata")
+            if isinstance(meta, dict):
+                bn = meta.get("block_number")
+        if bn is None:
+            continue
+        bn = int(bn, 16) if isinstance(bn, str) and bn.startswith("0x") else int(bn)
+        if bn <= last:
+            continue                                  # dedup sub-blocks / stale frames (monotonic)
+        last = bn
+        yield bn
+
+
 HOT_HF_CEILING = 1.02          # block mode: per block, assess only candidates with last HF < this
 HOT_FULL_REFRESH_SEC = 30.0    # block mode: re-assess the FULL candidate set at least this often
 

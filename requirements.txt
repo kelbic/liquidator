@@ -5,3 +5,4 @@ eth-account>=0.10
 numpy>=1.26
 pandas>=2.0
 dune-client>=1.7
+brotli

@@ -29,6 +29,7 @@ class Config:
     alert_antiflood_sec: int = 600
     poll_interval_sec: float = 2.0
     loop_mode: str = "poll"
+    block_source: str = "flashblocks"   # block trigger: flashblocks (~2s earlier) | newheads (fallback)
     candidate_refresh_sec: float = 60.0
     db_path: str = "liquidator.db"
     log_level: str = "INFO"
@@ -72,6 +73,7 @@ class Config:
             alert_antiflood_sec=i("ALERT_ANTIFLOOD_SEC", 600),
             poll_interval_sec=f("POLL_INTERVAL_SEC", 2.0),
             loop_mode=s("LOOP_MODE", "poll"),
+            block_source=s("BLOCK_SOURCE", "flashblocks"),
             candidate_refresh_sec=f("CANDIDATE_REFRESH_SEC", 60.0),
             db_path=s("DB_PATH", "liquidator.db"),
             log_level=s("LOG_LEVEL", "INFO"),
