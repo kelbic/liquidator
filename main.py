@@ -273,7 +273,8 @@ async def _new_heads(ws):
             nh = (msg.get("params") or {}).get("result")
             if nh:
                 head = nh
-        yield head
+        if head.get("number"):
+            yield int(head["number"], 16)
 
 
 async def _flashblock_heads(ws):
@@ -324,11 +325,25 @@ def _hot_subset(groups, hf_cache):
     return hot
 
 
+_FLASHBLOCK_URL = "wss://mainnet.flashblocks.base.org/ws"
+_FLASHBLOCK_FALLBACK_AFTER = 3   # consecutive flashblocks failures (no blocks) -> fall back to newHeads
+
+
+def _source_params(cfg, active):
+    """(url, connect_kwargs, generator) for the active block source. flashblocks = the public feed
+    (~2.1s earlier, brotli, large frames -> max_size=None); newheads = the RPC wss (fallback)."""
+    if active == "flashblocks":
+        return (_FLASHBLOCK_URL,
+                {"open_timeout": 20, "ping_interval": 20, "max_size": None},
+                _flashblock_heads)
+    wss = cfg.rpc_url.replace("https://", "wss://").replace("http://", "ws://")
+    return (wss, {"open_timeout": 20, "ping_interval": 20}, _new_heads)
+
+
 async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_cache):
     """wss newHeads -> fast on-chain assess+execute every block (~2s). Background thread refreshes
     candidates+markets so the per-block path never blocks on the API. Reconnects on wss drop."""
     import websockets
-    wss_url = cfg.rpc_url.replace("https://", "wss://").replace("http://", "ws://")
     shared = _Shared(markets)
     stop = threading.Event()
     threading.Thread(target=_refresh_worker, args=(shared, markets, cfg, ctx_cache, log, stop),
@@ -336,12 +351,15 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
     last_hb = 0.0
     last_full = 0.0
     hf_cache = {}
+    active = cfg.block_source if cfg.block_source in ("flashblocks", "newheads") else "newheads"
+    fails = 0
     while True:
+        url, conn_kw, gen = _source_params(cfg, active)
         try:
-            async with websockets.connect(wss_url, open_timeout=20, ping_interval=20) as ws:
-                log.info("wss connected — block-driven loop (mode=%s)", cfg.mode)
-                async for head in _new_heads(ws):
-                    blk = int(head.get("number", "0x0"), 16)
+            async with websockets.connect(url, **conn_kw) as ws:
+                log.info("block source=%s connected — loop (mode=%s)", active, cfg.mode)
+                async for blk in gen(ws):
+                    fails = 0   # blocks are flowing on this source
                     by_id, groups, debt_by, debt_assets_by, ncand = shared.snapshot()
                     today = store.realized_today()
                     gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"], inflight=0)
@@ -373,8 +391,14 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                  blk, s["confirmed"], ncand, tag, s["liquidatable"],
                                  s["profitable"], mh, time.time() - t0)
         except Exception as e:
-            log.warning("wss loop error (%s) — reconnecting in 3s", type(e).__name__)
-            alerter.send("\U0001F6A8 wss loop reconnect — check journalctl", key="wsserr")
+            log.warning("block source=%s error (%s) — reconnecting in 3s", active, type(e).__name__)
+            alerter.send("\U0001F6A8 block-loop reconnect — check journalctl", key="wsserr")
+            if active == "flashblocks":
+                fails += 1
+                if fails >= _FLASHBLOCK_FALLBACK_AFTER:
+                    active = "newheads"; fails = 0
+                    log.error("flashblocks feed unstable — FALLING BACK to newHeads")
+                    alerter.send("\U0001F504 flashblocks -> newHeads fallback", key="fbfallback")
             await asyncio.sleep(3)
 
 
