@@ -348,6 +348,16 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
     stop = threading.Event()
     threading.Thread(target=_refresh_worker, args=(shared, markets, cfg, ctx_cache, log, stop),
                      daemon=True).start()
+    if getattr(cfg, "hot_path", False):                      # preconf-triggered hot path (OFF until ARM)
+        from chain.hotpath import hot_loop
+        preconf_rpc = BaseRpc(cfg.preconf_rpc or "https://mainnet-preconf.base.org", cfg.chain_id)
+
+        def _run_hot():
+            import asyncio as _a
+            _a.run(hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, stop, markets))
+        threading.Thread(target=_run_hot, daemon=True).start()
+        log.warning("HOT PATH ENABLED — preconf trigger live (tip=%.1f gwei, daily-loss<=$%.0f, repaid>=$%.0f)",
+                    cfg.tip_gwei, cfg.max_daily_loss_usd, getattr(cfg, "hot_min_repaid_usd", 2000.0))
     last_hb = 0.0
     last_full = 0.0
     hf_cache = {}

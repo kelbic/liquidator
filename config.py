@@ -31,6 +31,9 @@ class Config:
     loop_mode: str = "poll"
     block_source: str = "flashblocks"   # block trigger: flashblocks (~2s earlier) | newheads (fallback)
     candidate_refresh_sec: float = 60.0
+    hot_path: bool = False                # preconf-triggered hot path ON/OFF (OFF until ARM)
+    hot_min_repaid_usd: float = 2000.0    # hot path fires only on reaction prizes >= this (repaid USD)
+    preconf_rpc: str = "https://mainnet-preconf.base.org"   # pre-confirmed price source for the hot path
     db_path: str = "liquidator.db"
     log_level: str = "INFO"
 
@@ -75,6 +78,9 @@ class Config:
             loop_mode=s("LOOP_MODE", "poll"),
             block_source=s("BLOCK_SOURCE", "flashblocks"),
             candidate_refresh_sec=f("CANDIDATE_REFRESH_SEC", 60.0),
+            hot_path=(s("HOT_PATH", "").lower() in ("1", "true", "yes", "on")),
+            hot_min_repaid_usd=f("HOT_MIN_REPAID_USD", 2000.0),
+            preconf_rpc=s("PRECONF_RPC", "https://mainnet-preconf.base.org"),
             db_path=s("DB_PATH", "liquidator.db"),
             log_level=s("LOG_LEVEL", "INFO"),
         )
