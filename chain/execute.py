@@ -88,11 +88,13 @@ def encode_liquidate(mp: dict, borrower: str, repaid_shares: int, swap_target: s
 
 
 def simulate_tx(rpc, liquidator_addr: str, from_addr: str, calldata: str,
-                state_override: dict | None = None) -> dict:
-    """eth_call the liquidate bundle against live state (no send). {ok, profit, error}."""
+                state_override: dict | None = None, block: str = "latest") -> dict:
+    """eth_call the liquidate bundle (no send). {ok, profit, error}. `block` defaults to 'latest' (the
+    confirmed-state gate the block loop uses); the hot path passes a preconf RPC + block='pending' to
+    gate on the pre-confirmed price, where a just-transmitted price has already moved the position."""
     tx = {"to": liquidator_addr, "from": from_addr, "data": calldata}
     try:
-        ret = bytes(rpc.eth_call(tx, "latest", state_override))
+        ret = bytes(rpc.eth_call(tx, block, state_override))
         profit = int.from_bytes(ret[:32], "big") if len(ret) >= 32 else 0
         return {"ok": True, "profit": profit, "error": None}
     except Exception as e:
