@@ -91,6 +91,61 @@ def read_positions(rpc, mid, borrowers):
     return tba, tbs, pos
 
 
+def read_preconf_prices(preconf_rpc, oracles):
+    """ONE aggregate3 at block='pending' on the preconf RPC -> {oracle: price|None}. Reads ALL our
+    oracles each block; covers markets whose aggregator never surfaces in the tx stream (the money
+    markets cbXRP/cbDOGE/cbADA), which the bare match structurally misses."""
+    from chain.multicall import aggregate3, encode_price_call, decode_price
+    if not oracles:
+        return {}
+    calls = [(o, encode_price_call()) for o in oracles]
+    try:
+        res = aggregate3(preconf_rpc, calls, block_identifier="pending")
+    except Exception:
+        return {o: None for o in oracles}
+    out = {}
+    for o, (ok, data) in zip(oracles, res):
+        out[o] = decode_price(data) if (ok and data) else None
+    return out
+
+
+def _poll_changed(prices, poll_seen, oracle2agg):
+    """PURE: given {oracle: price|None}, update poll_seen (baseline on first sighting) and return the
+    set of aggregators whose oracle price MOVED. First sighting -> no spawn; None price -> skipped."""
+    changed = set()
+    for o, px in prices.items():
+        if px is None:
+            continue
+        prev = poll_seen.get(o)
+        poll_seen[o] = px
+        if prev is not None and px != prev:
+            changed.add(oracle2agg.get(o))
+    changed.discard(None)
+    return changed
+
+
+def _poll_prices(*, preconf_rpc, feeds, meta, poll_seen, stats, spawn_kwargs, bn, log):
+    """Per-block trigger: batch-read all oracle preconf prices; spawn a (gated) _process_transmit for
+    each aggregator whose price moved. The agg-level gate dedups vs any bare-match spawn. This is what
+    gives cbXRP/cbDOGE/cbADA a detection trigger at all (they never surface in the flashblock stream)."""
+    oracle2agg = {}
+    for agg, mids in feeds.items():
+        for mid in mids:
+            om = meta.get(mid)
+            if om:
+                oracle2agg[om[0]] = agg
+    prices = read_preconf_prices(preconf_rpc, list(oracle2agg))
+    if stats is not None:
+        stats["poll"] += 1
+        stats["poll_none"] += sum(1 for v in prices.values() if v is None)
+    changed = _poll_changed(prices, poll_seen, oracle2agg)
+    if stats is not None:
+        stats["pspawn"] += len(changed)
+    for agg in changed:
+        threading.Thread(target=_process_transmit, args=(agg, bn, "poll", time.time()),
+                         kwargs=spawn_kwargs, daemon=True).start()
+
+
 def resolve_meta(rpc, markets):
     """{mid: (oracle, lltv_wad)} via ONE aggregate3 of idToMarketParams (immutable)."""
     from chain.multicall import aggregate3, encode_id_to_market_params_call, decode_id_to_market_params
@@ -273,8 +328,11 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
 
     last_spawn: dict = {}        # agg -> last spawn time.time() (throttle; survives ws reconnects)
     last_price: dict = {}        # agg -> last preconf price of representative oracle (change-gate)
-    stats = {"spawn": 0, "skip": 0, "proceed": 0, "none": 0}   # hot-path health; emitted every HOT_STATS_SEC
+    stats = {"spawn": 0, "skip": 0, "proceed": 0, "none": 0,    # hot-path health; emitted every HOT_STATS_SEC
+             "poll": 0, "pspawn": 0, "poll_none": 0}            # poll=cycles, pspawn=poll-triggered spawns
     last_stats = time.monotonic()
+    poll_seen: dict = {}         # oracle -> last preconf price (poll-local; baseline -> spawn only on move)
+    last_poll_block = None       # one preconf-price poll per block
     while not stop.is_set():
         try:
             async with ws_factory() as ws:
@@ -286,10 +344,11 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         except Exception:
                             pass
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
-                        log.info("hot stats %ds: spawn=%d | gate proceed=%d skip=%d none=%d",
-                                 int(time.monotonic() - last_stats), stats["spawn"],
-                                 stats["proceed"], stats["skip"], stats["none"])
-                        stats["spawn"] = stats["skip"] = stats["proceed"] = stats["none"] = 0
+                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d | gate proceed=%d skip=%d none=%d poll_none=%d",
+                                 int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
+                                 stats["proceed"], stats["skip"], stats["none"], stats["poll_none"])
+                        for _k in list(stats):
+                            stats[_k] = 0
                         last_stats = time.monotonic()
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
@@ -303,6 +362,15 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                     bn = block_number_of(d)
                     if bn is None:
                         continue
+                    if bn != last_poll_block:                 # one preconf-price poll per block (money markets)
+                        last_poll_block = bn
+                        threading.Thread(target=_poll_prices, daemon=True,
+                                         kwargs=dict(preconf_rpc=preconf_rpc, feeds=feeds, meta=meta,
+                                                     poll_seen=poll_seen, stats=stats, bn=bn, log=log,
+                                                     spawn_kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,
+                                                                       feeds=feeds, meta=meta, shared=shared,
+                                                                       store=store, guard=guard, alerter=alerter,
+                                                                       log=log, last_price=last_price, stats=stats))).start()
                     idx = d.get("index"); txs = extract_txs(d); now = time.time()
                     for agg in agg_set:                          # BARE match: ANY mention of the aggregator
                         if now - last_spawn.get(agg, 0.0) < HOT_THROTTLE_SEC:

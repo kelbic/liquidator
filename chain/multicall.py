@@ -85,16 +85,19 @@ def decode_price(data: bytes) -> int:
     return decode(["uint256"], data)[0]
 
 
-def aggregate3(rpc: BaseRpc, calls: list, chunk: int = 500) -> list:
+def aggregate3(rpc: BaseRpc, calls: list, chunk: int = 500, block_identifier=None) -> list:
     """Generic Multicall3: calls = [(target_addr, calldata_bytes)]. allowFailure=True.
     Returns [(success: bool, return_bytes: bytes)] aligned with `calls`. Chunked so each
-    eth_call stays a reasonable size; a handful of chunks still cost ~chunks eth_calls."""
+    eth_call stays a reasonable size; a handful of chunks still cost ~chunks eth_calls.
+    block_identifier='pending' reads against the pre-confirmed state (preconf RPC)."""
     from web3 import Web3
     mc = rpc.contract(MULTICALL3_ADDRESS, MULTICALL3_ABI)
     out = []
     for i in range(0, len(calls), chunk):
         agg = [(Web3.to_checksum_address(t), True, cd) for (t, cd) in calls[i:i + chunk]]
-        for success, data in mc.functions.aggregate3(agg).call():
+        fn = mc.functions.aggregate3(agg)
+        rows = fn.call(block_identifier=block_identifier) if block_identifier else fn.call()
+        for success, data in rows:
             out.append((bool(success), bytes(data)))
     return out
 
