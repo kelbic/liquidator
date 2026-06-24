@@ -230,6 +230,40 @@ def realized_econ(profit_usd: float, gas_used: int, eff_gas_price: int, status, 
     return net_usd, gas_usd
 
 
+def _revert_bucket(err_str: str) -> str:
+    """Map a revert error string to a short diagnostic bucket. Pure -> unit-testable. The buckets we
+    care about: 'position healthy' (lost the race / position recovered -> latency lever) vs structural
+    (no-route / slippage / Morpho param error -> a different fix). Falls back to the raw msg/selector."""
+    import re
+    low = err_str.lower()
+    if "healthy" in low:
+        return "position healthy (lost race / recovered)"
+    if "0x81ceff30" in low:
+        return "Morpho 0x81ceff30"
+    m = re.search(r"reverted:?\s*(.+)", err_str)        # Error(string): 'execution reverted: <msg>'
+    if m:
+        return m.group(1).strip()[:80]
+    sel = re.search(r"0x[0-9a-fA-F]{8}", err_str)        # custom-error selector
+    if sel:
+        return "selector " + sel.group(0)
+    return err_str[:80]
+
+
+def _revert_reason(rpc, tx_hash, block_number):
+    """Best-effort revert reason for a mined-but-reverted tx: replay it as eth_call at the mined block
+    and surface the revert string/selector via _revert_bucket. DIAGNOSTIC ONLY (block end-state may
+    differ from what the tx saw mid-block) -> use as a bucket, not proof. Two RPC calls; reverts are
+    infrequent so the cost is negligible. Never raises -> failure to diagnose returns a tag, not an error."""
+    try:
+        w3 = rpc._web3()
+        tx = w3.eth.get_transaction(tx_hash)
+        rpc.eth_call({"to": tx["to"], "from": tx["from"], "data": tx["input"]},
+                     block=block_number if block_number is not None else "latest")
+        return "clean-on-replay (state moved / lost race)"
+    except Exception as e:
+        return _revert_bucket(str(e))
+
+
 def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int = 3,
                           send_fn=None, wait_receipts: bool = True, timeout: int = 120) -> list:
     """Send up to `max_inflight` already-prepared liquidations NON-BLOCKING with SEQUENTIAL nonces,
@@ -289,9 +323,16 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
             status = rcpt.get("status")
             net_usd, gas_usd = realized_econ(prep["profit_usd"], int(rcpt.get("gasUsed") or 0),
                                              int(rcpt.get("effectiveGasPrice") or 0), status, cfg.eth_price_usd)
-            results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
-                            "status": status, "gas_used": rcpt.get("gasUsed"),
-                            "net_usd": net_usd, "gas_usd": gas_usd})
+            row = {"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
+                   "status": status, "gas_used": rcpt.get("gasUsed"),
+                   "net_usd": net_usd, "gas_usd": gas_usd}
+            if status != 1:                                  # diagnose the revert (lost race vs structural)
+                reason = _revert_reason(rpc, h, rcpt.get("blockNumber"))
+                row["revert_reason"] = reason
+                if log:
+                    log.warning("liquidate revert %s/%s reason=%s tx=%s",
+                                mid[:10], borrower[:10], reason, h)
+            results.append(row)
         except Exception as e:
             # outcome unknown -> conservatively book estimated cost as a LOSS, never a phantom profit
             results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
