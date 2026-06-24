@@ -22,6 +22,8 @@ HOT_THROTTLE_SEC = 0.25   # min seconds between hot-path spawns PER aggregator. 
                           # frequent price-READ txs; this bounds preconf-RPC reads + thread spawns.
                           # Transmit cadence is minutes, so 0.25s loses no real update; raise if the
                           # public preconf endpoint rate-limits (a throttled/None read simply skips).
+HOT_STATS_SEC = 120       # emit hot-path counters (spawn + gate outcomes) every N seconds. Lets us see
+                          # detection is ALIVE without waiting for a flip (the gate is silent on readers).
 
 
 # ---- pure helpers (unit-tested) ----
@@ -168,7 +170,7 @@ def hot_min_repaid(cfg):
 
 
 def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, meta, shared,
-                      store, guard, alerter, log, last_price=None,
+                      store, guard, alerter, log, last_price=None, stats=None,
                       price_fn=read_preconf_price, reads_fn=read_positions,
                       prepare_fn=prepare_hot, dispatch_fn=None):
     """For one detected transmit: per affected market, read the preconf price, recompute flips, keep only
@@ -184,7 +186,13 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     # the 340-call multicall + flips. This is what makes the bare match viable on the hot path.
     if last_price is not None:
         rep = next((meta[m][0] for m in feeds.get(agg, []) if meta.get(m)), None)
-        if rep is None or not _price_moved(agg, price_fn(preconf_rpc, rep), last_price):
+        if rep is None:
+            return []
+        px = price_fn(preconf_rpc, rep)
+        moved = _price_moved(agg, px, last_price)
+        if stats is not None:                                # health buckets (none=preconf unreadable)
+            stats["none" if px is None else ("proceed" if moved else "skip")] += 1
+        if not moved:
             return []
     with shared.lock:
         groups = dict(shared.groups); debt_by = dict(shared.debt_by); debt_assets_by = dict(shared.debt_assets_by)
@@ -265,6 +273,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
 
     last_spawn: dict = {}        # agg -> last spawn time.time() (throttle; survives ws reconnects)
     last_price: dict = {}        # agg -> last preconf price of representative oracle (change-gate)
+    stats = {"spawn": 0, "skip": 0, "proceed": 0, "none": 0}   # hot-path health; emitted every HOT_STATS_SEC
+    last_stats = time.monotonic()
     while not stop.is_set():
         try:
             async with ws_factory() as ws:
@@ -275,6 +285,12 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             agg_set = set(feeds); last_resolve = time.monotonic()
                         except Exception:
                             pass
+                    if time.monotonic() - last_stats >= HOT_STATS_SEC:
+                        log.info("hot stats %ds: spawn=%d | gate proceed=%d skip=%d none=%d",
+                                 int(time.monotonic() - last_stats), stats["spawn"],
+                                 stats["proceed"], stats["skip"], stats["none"])
+                        stats["spawn"] = stats["skip"] = stats["proceed"] = stats["none"] = 0
+                        last_stats = time.monotonic()
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     except asyncio.TimeoutError:
@@ -293,11 +309,12 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             continue                             # per-agg throttle: bound preconf reads/spawns
                         if any(raw_ and (agg[2:] in raw_) for raw_, _ in txs):
                             last_spawn[agg] = now
+                            stats["spawn"] += 1
                             threading.Thread(target=_process_transmit, args=(agg, bn, idx, now),
                                              kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,
                                                          feeds=feeds, meta=meta, shared=shared, store=store,
                                                          guard=guard, alerter=alerter, log=log,
-                                                         last_price=last_price),
+                                                         last_price=last_price, stats=stats),
                                              daemon=True).start()
         except Exception as e:
             log.warning("hot path ws error (%s) — reconnecting in 3s", type(e).__name__)
