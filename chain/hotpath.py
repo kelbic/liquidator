@@ -204,7 +204,7 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
                               (MORPHO_BLUE, encode_position_call(mid, borrower))])
         loan, coll, oracle, irm, lltv_wad = decode_id_to_market_params(r1[0][1])
         m = decode_market(r1[1][1]); tba, tbs = m[2], m[3]
-        borrow_shares, _ = decode_position(r1[2][1])
+        borrow_shares, collateral_dbg = decode_position(r1[2][1])
         if borrow_shares == 0:
             return {"ok": False, "reason": "no debt (cleared)"}
 
@@ -212,6 +212,8 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)
         seized = expected_seized(repaid_assets, lif_from_lltv(lltv_wad / 10**18), int(price))   # (1) preconf price
         if seized == 0:
+            log.info("DIAG seized=0 %s/%s repaid_shares=%d repaid_assets=%d collateral=%d tba=%d tbs=%d price=%d lltv=%d",
+                     market_id[:10], borrower[:10], repaid_shares, repaid_assets, collateral_dbg, tba, tbs, int(price), lltv_wad)
             return {"ok": False, "reason": "seized=0"}
 
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
@@ -220,6 +222,10 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0)
         sim = simulate_tx(preconf_rpc, liq, bot, cd0, block="pending")        # (2) preconf-pending gate
         if not sim["ok"]:
+            if "0x11" in str(sim.get("error", "")) or "seized" in str(sim.get("error", "")):
+                log.info("DIAG sim-revert %s/%s err=%s | repaid_shares=%d repaid_assets=%d seized=%d collateral=%d tba=%d tbs=%d price=%d lltv=%d lif=%.4f",
+                         market_id[:10], borrower[:10], str(sim["error"])[:40], repaid_shares, repaid_assets, seized,
+                         collateral_dbg, tba, tbs, int(price), lltv_wad, lif_from_lltv(lltv_wad / 10**18))
             return {"ok": False, "reason": f"preconf sim revert: {sim['error']}"}
         profit_wei = sim["profit"]
         profit_usd, cost_usd, net_usd = _net_gate(profit_wei, debt_usd, debt_assets, cfg)
