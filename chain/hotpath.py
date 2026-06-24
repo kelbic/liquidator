@@ -210,7 +210,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         status = (f"submitted:{r.get('status')} net${r.get('net_usd',0):.2f}" if r["sent"]
                   else f"skip:{str(r.get('reason'))[:50]}")
         store.log_action(market_id=r["market_id"], borrower=r["borrower"], mode=cfg.mode,
-                         tx_hash=r.get("hash"), net_usd=r.get("net_usd", 0.0), gas_usd=0.0, status=status)
+                         tx_hash=r.get("hash"), net_usd=r.get("net_usd", 0.0), gas_usd=r.get("gas_usd", 0.0), status=status)
         log.info("HOT ACTIONABLE %s/%s status=%s tx=%s", r["market_id"][:10], r["borrower"][:10], status, r.get("hash"))
         alerter.send(f"\U0001F525 HOT {cfg.mode} {r['borrower'][:10]} {status}", key=f"hot:{r['market_id']}:{r['borrower']}")
     return results

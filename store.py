@@ -76,5 +76,5 @@ class Store:
         with closing(self._conn()) as c:
             row = c.execute(
                 """SELECT COALESCE(SUM(net_usd),0) net, COALESCE(SUM(gas_usd),0) gas
-                   FROM actions WHERE ts>=? AND mode='execute'""", (since,)).fetchone()
+                   FROM actions WHERE ts>=? AND mode='execute' AND status LIKE 'submitted:%'""", (since,)).fetchone()
             return {"net": row["net"], "gas": row["gas"]}

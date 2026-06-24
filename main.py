@@ -69,13 +69,15 @@ def _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, gu
     """Monitor: record paper. Execute: kill switch ONCE, prepare each (fresh reads+simulate+floor),
     dispatch passers NON-BLOCKING with sequential nonces, record. Parallel so a cascade isn't
     serialized on one blocking send. prepare_fn/dispatch_fn injectable for tests."""
-    def _record(mid, borrower, hr, sr, status, tx_hash=None):
+    def _record(mid, borrower, hr, sr, status, tx_hash=None, net_usd=None, gas_usd=None):
+        net = sr.net_usd if net_usd is None else net_usd       # realized (receipt) when sent, else expected (sim)
+        gas = sr.gas_usd if gas_usd is None else gas_usd
         store.log_action(market_id=mid, borrower=borrower, mode=cfg.mode, tx_hash=tx_hash,
-                         net_usd=sr.net_usd, gas_usd=sr.gas_usd, status=status)
+                         net_usd=net, gas_usd=gas, status=status)
         log.info("ACTIONABLE %s/%s HF=%.4f net=$%.2f mode=%s status=%s",
-                 mid[:10], borrower[:10], hr.hf, sr.net_usd, cfg.mode, status)
+                 mid[:10], borrower[:10], hr.hf, net, cfg.mode, status)
         alerter.send(f"\U0001F4B0 {cfg.mode} liquidation {borrower[:10]} "
-                     f"net ${sr.net_usd:.2f} HF={hr.hf:.4f}", key=f"act:{mid}:{borrower}")
+                     f"net ${net:.2f} HF={hr.hf:.4f}", key=f"act:{mid}:{borrower}")
 
     if not actionable:
         return
@@ -111,7 +113,9 @@ def _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, gu
         done.add((r["market_id"], r["borrower"]))
         status = (f"submitted:{r.get('status')} net${r.get('net_usd', 0):.2f}" if r["sent"]
                   else f"skip:{r['reason'][:50]}")
-        _record(r["market_id"], r["borrower"], hr, sr, status, tx_hash=r.get("hash"))
+        _record(r["market_id"], r["borrower"], hr, sr, status, tx_hash=r.get("hash"),
+                net_usd=(r.get("net_usd") if r["sent"] else None),
+                gas_usd=(r.get("gas_usd") if r["sent"] else None))
     for mid, borrower, prep in ready:
         if (mid, borrower) not in done:
             hr, sr = meta[(mid, borrower)]

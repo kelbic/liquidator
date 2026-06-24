@@ -221,6 +221,15 @@ def try_liquidate(rpc, cfg, market_id: str, borrower: str, debt_usd: float,
             "profit_usd": prep["profit_usd"], "net_usd": prep["net_usd"]}
 
 
+def realized_econ(profit_usd: float, gas_used: int, eff_gas_price: int, status, eth_price_usd: float):
+    """Realized (net_usd, gas_usd) from a mined receipt. A revert still burns gas, so gas is ALWAYS a
+    cost; net = profit - gas on success (status==1), else just -gas. Pure -> the kill-switch math is
+    unit-testable: the loss gate must see a revert as a LOSS, not the simulated expected profit."""
+    gas_usd = gas_used * eff_gas_price * eth_price_usd / 1e18
+    net_usd = (profit_usd - gas_usd) if status == 1 else -gas_usd
+    return net_usd, gas_usd
+
+
 def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int = 3,
                           send_fn=None, wait_receipts: bool = True, timeout: int = 120) -> list:
     """Send up to `max_inflight` already-prepared liquidations NON-BLOCKING with SEQUENTIAL nonces,
@@ -277,11 +286,16 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
     for mid, borrower, prep, h in sent:
         try:
             rcpt = w3.eth.wait_for_transaction_receipt(h, timeout=timeout)
+            status = rcpt.get("status")
+            net_usd, gas_usd = realized_econ(prep["profit_usd"], int(rcpt.get("gasUsed") or 0),
+                                             int(rcpt.get("effectiveGasPrice") or 0), status, cfg.eth_price_usd)
             results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
-                            "status": rcpt.get("status"), "gas_used": rcpt.get("gasUsed"),
-                            "net_usd": prep["net_usd"]})
+                            "status": status, "gas_used": rcpt.get("gasUsed"),
+                            "net_usd": net_usd, "gas_usd": gas_usd})
         except Exception as e:
+            # outcome unknown -> conservatively book estimated cost as a LOSS, never a phantom profit
             results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
-                            "status": None, "gas_used": None, "net_usd": prep["net_usd"],
+                            "status": None, "gas_used": None,
+                            "net_usd": -prep["cost_usd"], "gas_usd": prep["cost_usd"],
                             "reason": f"receipt timeout: {type(e).__name__}"})
     return results
