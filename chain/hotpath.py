@@ -18,9 +18,25 @@ import time
 MORPHO_BLUE = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
 FB_URL = "wss://mainnet.flashblocks.base.org/ws"
 PRECONF_RPC_DEFAULT = "https://mainnet-preconf.base.org"
+HOT_THROTTLE_SEC = 0.25   # min seconds between hot-path spawns PER aggregator. The bare match fires on
+                          # frequent price-READ txs; this bounds preconf-RPC reads + thread spawns.
+                          # Transmit cadence is minutes, so 0.25s loses no real update; raise if the
+                          # public preconf endpoint rate-limits (a throttled/None read simply skips).
 
 
 # ---- pure helpers (unit-tested) ----
+
+def _price_moved(agg, px, last_price):
+    """True if px differs from the last preconf price seen for agg (or first sighting); updates
+    last_price. The bare aggregator match also fires on price-READ txs, so this gates the heavy
+    multicall to REAL transmits: a reader AFTER a transmit returns the new price (delta -> proceed);
+    a reader with no transmit returns the same price (skip). px is None (unreadable) -> skip."""
+    if px is None:
+        return False
+    prev = last_price.get(agg)
+    last_price[agg] = px
+    return prev is None or px != prev
+
 
 def _flips(price, lltv_wad, tba, tbs, positions):
     """PURE flip recompute on the preconf price — identical to the armed assess (chain.simulate.health_from).
@@ -152,7 +168,7 @@ def hot_min_repaid(cfg):
 
 
 def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, meta, shared,
-                      store, guard, alerter, log,
+                      store, guard, alerter, log, last_price=None,
                       price_fn=read_preconf_price, reads_fn=read_positions,
                       prepare_fn=prepare_hot, dispatch_fn=None):
     """For one detected transmit: per affected market, read the preconf price, recompute flips, keep only
@@ -163,6 +179,13 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     if dispatch_fn is None:
         from chain.execute import dispatch_liquidations as dispatch_fn  # noqa: F811
     floor = hot_min_repaid(cfg)
+    # price-change gate: the bare match also fires on price-READ txs. Read ONE representative oracle
+    # preconf price; if it has not moved since last sighting this was a reader, not a transmit -> skip
+    # the 340-call multicall + flips. This is what makes the bare match viable on the hot path.
+    if last_price is not None:
+        rep = next((meta[m][0] for m in feeds.get(agg, []) if meta.get(m)), None)
+        if rep is None or not _price_moved(agg, price_fn(preconf_rpc, rep), last_price):
+            return []
     with shared.lock:
         groups = dict(shared.groups); debt_by = dict(shared.debt_by); debt_assets_by = dict(shared.debt_assets_by)
 
@@ -240,6 +263,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     log.info("hot path: %d aggregators / %d markets (preconf=%s, tip=%.1f gwei, floor repaid $%.0f)",
              len(agg_set), len(meta), preconf_rpc.rpc_url, cfg.tip_gwei, hot_min_repaid(cfg))
 
+    last_spawn: dict = {}        # agg -> last spawn time.time() (throttle; survives ws reconnects)
+    last_price: dict = {}        # agg -> last preconf price of representative oracle (change-gate)
     while not stop.is_set():
         try:
             async with ws_factory() as ws:
@@ -263,13 +288,16 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                     if bn is None:
                         continue
                     idx = d.get("index"); txs = extract_txs(d); now = time.time()
-                    for agg in agg_set:                          # PRECISE 94-form match (no over-count)
-                        pf = "94" + agg[2:]
-                        if any((to_ == agg) or (raw_ and pf in raw_) for raw_, to_ in txs):
+                    for agg in agg_set:                          # BARE match: ANY mention of the aggregator
+                        if now - last_spawn.get(agg, 0.0) < HOT_THROTTLE_SEC:
+                            continue                             # per-agg throttle: bound preconf reads/spawns
+                        if any(raw_ and (agg[2:] in raw_) for raw_, _ in txs):
+                            last_spawn[agg] = now
                             threading.Thread(target=_process_transmit, args=(agg, bn, idx, now),
                                              kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,
                                                          feeds=feeds, meta=meta, shared=shared, store=store,
-                                                         guard=guard, alerter=alerter, log=log),
+                                                         guard=guard, alerter=alerter, log=log,
+                                                         last_price=last_price),
                                              daemon=True).start()
         except Exception as e:
             log.warning("hot path ws error (%s) — reconnecting in 3s", type(e).__name__)
