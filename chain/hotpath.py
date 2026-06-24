@@ -91,22 +91,37 @@ def read_positions(rpc, mid, borrowers):
     return tba, tbs, pos
 
 
-def read_preconf_prices(preconf_rpc, oracles):
-    """ONE aggregate3 at block='pending' on the preconf RPC -> {oracle: price|None}. Reads ALL our
-    oracles each block; covers markets whose aggregator never surfaces in the tx stream (the money
-    markets cbXRP/cbDOGE/cbADA), which the bare match structurally misses."""
+def read_preconf_prices(preconf_rpc, oracles, rpc_fallback=None):
+    """ONE aggregate3 at block='pending' on the preconf RPC -> ({oracle: price|None}, n_fallback). Reads
+    ALL our oracles each block; covers markets whose aggregator never surfaces in the tx stream (the money
+    markets cbXRP/cbDOGE/cbADA), which the bare match structurally misses. If rpc_fallback is given, any
+    oracle that came back None (preconf degraded/rate-limited) is re-read on `latest` in ONE extra batch
+    (latest is as fast and identical between transmits -> fills holes losing only the ~1.8s preconf lead).
+    n_fallback = how many oracles were filled from latest (0 = preconf healthy)."""
     from chain.multicall import aggregate3, encode_price_call, decode_price
     if not oracles:
-        return {}
+        return {}, 0
     calls = [(o, encode_price_call()) for o in oracles]
     try:
         res = aggregate3(preconf_rpc, calls, block_identifier="pending")
+        out = {o: (decode_price(data) if (ok and data) else None) for o, (ok, data) in zip(oracles, res)}
     except Exception:
-        return {o: None for o in oracles}
-    out = {}
-    for o, (ok, data) in zip(oracles, res):
-        out[o] = decode_price(data) if (ok and data) else None
-    return out
+        out = {o: None for o in oracles}
+    n_fb = 0
+    if rpc_fallback is not None:
+        missing = [o for o, v in out.items() if v is None]
+        if missing:
+            try:
+                fb = aggregate3(rpc_fallback, [(o, encode_price_call()) for o in missing])
+                for o, (ok, data) in zip(missing, fb):
+                    if ok and data:
+                        px = decode_price(data)
+                        if px is not None:
+                            out[o] = px
+                            n_fb += 1
+            except Exception:
+                pass
+    return out, n_fb
 
 
 def _poll_changed(prices, poll_seen, oracle2agg):
@@ -124,7 +139,7 @@ def _poll_changed(prices, poll_seen, oracle2agg):
     return changed
 
 
-def _poll_prices(*, preconf_rpc, feeds, meta, poll_seen, stats, spawn_kwargs, bn, log):
+def _poll_prices(*, preconf_rpc, rpc_fallback, feeds, meta, poll_seen, stats, spawn_kwargs, bn, log):
     """Per-block trigger: batch-read all oracle preconf prices; spawn a (gated) _process_transmit for
     each aggregator whose price moved. The agg-level gate dedups vs any bare-match spawn. This is what
     gives cbXRP/cbDOGE/cbADA a detection trigger at all (they never surface in the flashblock stream)."""
@@ -134,10 +149,11 @@ def _poll_prices(*, preconf_rpc, feeds, meta, poll_seen, stats, spawn_kwargs, bn
             om = meta.get(mid)
             if om:
                 oracle2agg[om[0]] = agg
-    prices = read_preconf_prices(preconf_rpc, list(oracle2agg))
+    prices, n_fb = read_preconf_prices(preconf_rpc, list(oracle2agg), rpc_fallback=rpc_fallback)
     if stats is not None:
         stats["poll"] += 1
         stats["poll_none"] += sum(1 for v in prices.values() if v is None)
+        stats["poll_fb"] += n_fb
     changed = _poll_changed(prices, poll_seen, oracle2agg)
     if stats is not None:
         stats["pspawn"] += len(changed)
@@ -329,10 +345,12 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     last_spawn: dict = {}        # agg -> last spawn time.time() (throttle; survives ws reconnects)
     last_price: dict = {}        # agg -> last preconf price of representative oracle (change-gate)
     stats = {"spawn": 0, "skip": 0, "proceed": 0, "none": 0,    # hot-path health; emitted every HOT_STATS_SEC
-             "poll": 0, "pspawn": 0, "poll_none": 0}            # poll=cycles, pspawn=poll-triggered spawns
+             "poll": 0, "pspawn": 0, "poll_none": 0, "poll_fb": 0}  # poll_fb=oracles filled from latest fallback
     last_stats = time.monotonic()
     poll_seen: dict = {}         # oracle -> last preconf price (poll-local; baseline -> spawn only on move)
     last_poll_block = None       # one preconf-price poll per block
+    fb_windows = 0               # consecutive stats windows with poll_fb>0 (preconf degradation streak)
+    last_fb_alert = 0.0          # monotonic of last degradation alert (anti-flood)
     while not stop.is_set():
         try:
             async with ws_factory() as ws:
@@ -344,9 +362,17 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         except Exception:
                             pass
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
-                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d | gate proceed=%d skip=%d none=%d poll_none=%d",
+                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d",
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
-                                 stats["proceed"], stats["skip"], stats["none"], stats["poll_none"])
+                                 stats["proceed"], stats["skip"], stats["none"], stats["poll_none"], stats["poll_fb"])
+                        fb_windows = fb_windows + 1 if stats["poll_fb"] > 0 else 0
+                        if fb_windows >= 3 and time.monotonic() - last_fb_alert > 1800:
+                            last_fb_alert = time.monotonic()
+                            try:
+                                alerter.send("preconf degraded %dx windows: polling on LATEST (detection alive, "
+                                             "but WITHOUT the ~1.8s lead -> contested races lost). check preconf RPC." % fb_windows)
+                            except Exception:
+                                pass
                         for _k in list(stats):
                             stats[_k] = 0
                         last_stats = time.monotonic()
@@ -365,7 +391,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                     if bn != last_poll_block:                 # one preconf-price poll per block (money markets)
                         last_poll_block = bn
                         threading.Thread(target=_poll_prices, daemon=True,
-                                         kwargs=dict(preconf_rpc=preconf_rpc, feeds=feeds, meta=meta,
+                                         kwargs=dict(preconf_rpc=preconf_rpc, rpc_fallback=rpc, feeds=feeds, meta=meta,
                                                      poll_seen=poll_seen, stats=stats, bn=bn, log=log,
                                                      spawn_kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,
                                                                        feeds=feeds, meta=meta, shared=shared,
