@@ -115,8 +115,8 @@ def _loan_price(addr: str, chain_id: int, cache: dict) -> float:
     return cache[key]
 
 
-_Q = """query($first:Int!,$skip:Int!,$where:MarketTransactionFilters!){
-  marketTransactions(first:$first,skip:$skip,orderBy:Timestamp,orderDirection:Desc,where:$where){
+_Q = """query($first:Int!,$skip:Int!,$cid:[Int!]){
+  marketTransactions(first:$first,skip:$skip,orderBy:Timestamp,orderDirection:Desc,where:{type_in:[Liquidation],chainId_in:$cid}){
     items{ timestamp
       market{ marketId collateralAsset{symbol} loanAsset{symbol address decimals} }
       data{ ... on MarketTransactionLiquidationData{ liquidator repaidAssets } } } } }"""
@@ -130,10 +130,9 @@ def run(cfg, days: int = 30, min_repaid_usd: float = 10_000.0) -> None:
     since = int(time.time()) - days * 86400
     price_cache: dict = {}
 
-    where = {"type_in": ["Liquidation"], "chainId_in": [cfg.chain_id]}
     rows, skip = [], 0
     while skip <= 4000:
-        r = _gql(_Q, {"first": 100, "skip": skip, "where": where})
+        r = _gql(_Q, {"first": 100, "skip": skip, "cid": [cfg.chain_id]})
         if r.get("errors"):
             print("API errors:", r["errors"]); return
         batch = (((r.get("data") or {}).get("marketTransactions") or {}).get("items")) or []

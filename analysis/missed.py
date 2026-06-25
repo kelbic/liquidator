@@ -26,9 +26,8 @@ try:
     HOT = cfg.hot_min_repaid_usd  # флор СКОРОСТИ хот-пути — читаем из конфига (не хардкод!)
     cut = time.time() - BLOCK1_HOURS * 3600   # блок [1]: своё окно
     price_cache, rows, skip = {}, [], 0
-    where = {"type_in": ["Liquidation"], "chainId_in": [cfg.chain_id]}
     while skip <= 2000:
-        r = _gql(_LIQ_QUERY, {"first": 100, "skip": skip, "where": where})
+        r = _gql(_LIQ_QUERY, {"first": 100, "skip": skip, "cid": [cfg.chain_id]})
         batch = (((r.get("data") or {}).get("marketTransactions") or {}).get("items")) or []
         if not batch:
             break
