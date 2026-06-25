@@ -177,6 +177,20 @@ def resolve_meta(rpc, markets):
 
 # ---- preconf-sourced prepare (mirror of execute.prepare_liquidation; 2 diffs only) ----
 
+def _diag_revert_bucket(err: str) -> str:
+    """Классифицирует sim-revert в бакет для DIAG. Чистая (под юнит)."""
+    e = (err or "").lower()
+    if "0x11" in e or "panic" in e:
+        return "panic-underflow"
+    if "0x81ceff30" in e:
+        return "swapfailed"
+    if "healthy" in e or "position is heal" in e:
+        return "healthy-race"
+    if "0x08c379a0" in e:
+        return "error-string"
+    return "other"
+
+
 def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_assets, price, slippage_bps=100):
     """Mirror of execute.prepare_liquidation, PRECONF-sourced. Two and only two differences:
       (1) the seize is sized on the PRE-CONFIRMED `price` (passed in, read once by the caller), not a
@@ -222,10 +236,15 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0)
         sim = simulate_tx(preconf_rpc, liq, bot, cd0, block="pending")        # (2) preconf-pending gate
         if not sim["ok"]:
-            if "0x11" in str(sim.get("error", "")) or "seized" in str(sim.get("error", "")):
-                log.info("DIAG sim-revert %s/%s err=%s | repaid_shares=%d repaid_assets=%d seized=%d collateral=%d tba=%d tbs=%d price=%d lltv=%d lif=%.4f",
-                         market_id[:10], borrower[:10], str(sim["error"])[:40], repaid_shares, repaid_assets, seized,
-                         collateral_dbg, tba, tbs, int(price), lltv_wad, lif_from_lltv(lltv_wad / 10**18))
+            # DIAG: логируем ВСЕ sim-revert'ы (не только Panic/seized) с бакетом причины + calldata+блок для форка.
+            try:
+                _diag_blk = rpc._web3().eth.block_number
+            except Exception:
+                _diag_blk = 0
+            _diag_bucket = _diag_revert_bucket(str(sim.get("error", "")))
+            log.info("DIAG sim-revert %s/%s bucket=%s err=%s | repaid_shares=%d repaid_assets=%d seized=%d collateral=%d tba=%d tbs=%d price=%d lltv=%d lif=%.4f block=%d cd=%s",
+                     market_id[:10], borrower[:10], _diag_bucket, str(sim["error"])[:40], repaid_shares, repaid_assets, seized,
+                     collateral_dbg, tba, tbs, int(price), lltv_wad, lif_from_lltv(lltv_wad / 10**18), _diag_blk, cd0.hex() if isinstance(cd0, (bytes, bytearray)) else str(cd0))
             return {"ok": False, "reason": f"preconf sim revert: {sim['error']}"}
         profit_wei = sim["profit"]
         profit_usd, cost_usd, net_usd = _net_gate(profit_wei, debt_usd, debt_assets, cfg)
