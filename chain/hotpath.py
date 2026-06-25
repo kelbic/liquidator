@@ -213,14 +213,40 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         bot = w3.eth.account.from_key(cfg.wallet_key).address
         mid = rpc.to_bytes32(market_id)
 
-        r1 = aggregate3(rpc, [(MORPHO_BLUE, encode_id_to_market_params_call(mid)),
-                              (MORPHO_BLUE, encode_market_call(mid)),
-                              (MORPHO_BLUE, encode_position_call(mid, borrower))])
-        loan, coll, oracle, irm, lltv_wad = decode_id_to_market_params(r1[0][1])
-        m = decode_market(r1[1][1]); tba, tbs = m[2], m[3]
-        borrow_shares, collateral_dbg = decode_position(r1[2][1])
+        # market-PARAMS (статичные адреса рынка) — из подтверждённого rpc (не меняются):
+        rp_params = aggregate3(rpc, [(MORPHO_BLUE, encode_id_to_market_params_call(mid))])
+        loan, coll, oracle, irm, lltv_wad = decode_id_to_market_params(rp_params[0][1])
+        # market(tba/tbs)+position(borrow_shares) — из PRECONF pending (ТОТ ЖЕ источник, что sim) для консистентности.
+        # fallback на rpc-latest при degraded preconf (теряем 1.8с lead, но не падаем).
+        try:
+            rp_state = aggregate3(preconf_rpc, [(MORPHO_BLUE, encode_market_call(mid)),
+                                                (MORPHO_BLUE, encode_position_call(mid, borrower))],
+                                  block_identifier="pending")
+            _preconf_ok = rp_state[0][0] and rp_state[1][0]
+        except Exception:
+            _preconf_ok = False
+        if _preconf_ok:
+            m = decode_market(rp_state[0][1]); tba, tbs = m[2], m[3]
+            borrow_shares, collateral_dbg = decode_position(rp_state[1][1])
+            _snap_src = "preconf"
+        else:
+            rp_fb = aggregate3(rpc, [(MORPHO_BLUE, encode_market_call(mid)),
+                                     (MORPHO_BLUE, encode_position_call(mid, borrower))])
+            m = decode_market(rp_fb[0][1]); tba, tbs = m[2], m[3]
+            borrow_shares, collateral_dbg = decode_position(rp_fb[1][1])
+            _snap_src = "rpc-fallback"
         if borrow_shares == 0:
             return {"ok": False, "reason": "no debt (cleared)"}
+        # ДИАГНОСТИКА расхождения: confirmed borrow_shares vs preconf — подтверждает рассогласование на флипе.
+        try:
+            _rp_conf = aggregate3(rpc, [(MORPHO_BLUE, encode_position_call(mid, borrower))])
+            _bs_conf, _ = decode_position(_rp_conf[0][1])
+            if _bs_conf != borrow_shares:
+                log.info("DIAG divergence %s/%s src=%s preconf_bs=%d confirmed_bs=%d ratio=%.2f",
+                         market_id[:10], borrower[:10], _snap_src, borrow_shares, _bs_conf,
+                         (_bs_conf / borrow_shares if borrow_shares else 0))
+        except Exception:
+            pass
 
         repaid_shares = int(borrow_shares)
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)
@@ -232,6 +258,21 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
 
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
         swap = kyber_swap(coll, loan, seized, liq, liq, slippage_bps=slippage_bps)
+
+        # GUARD свежести (skip-only): повторный preconf-read borrow_shares макс. близко к send.
+        # Если долг УПАЛ ниже planned repaid -> SKIP (underflow неизбежен). НЕ капаем (seized/swap уже
+        # посчитаны от repaid_shares -> кап = swap-mismatch -> SwapFailed). Либо planned как есть, либо skip.
+        try:
+            _rg = aggregate3(preconf_rpc, [(MORPHO_BLUE, encode_position_call(mid, borrower))],
+                             block_identifier="pending")
+            if _rg[0][0]:
+                _fresh_bs, _ = decode_position(_rg[0][1])
+                if _fresh_bs <= 0 or repaid_shares > _fresh_bs:
+                    log.info("DIAG guard-skip %s/%s repaid=%d fresh_bs=%d (долг упал ниже planned -> underflow неизбежен)",
+                             market_id[:10], borrower[:10], repaid_shares, _fresh_bs)
+                    return {"ok": False, "reason": f"guard: debt dropped {repaid_shares}->{_fresh_bs}, would underflow"}
+        except Exception:
+            pass  # guard-read упал -> продолжаем (sim всё равно отловит underflow)
 
         cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0)
         sim = simulate_tx(preconf_rpc, liq, bot, cd0, block="pending")        # (2) preconf-pending gate
