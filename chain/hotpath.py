@@ -206,7 +206,7 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         from chain.multicall import (aggregate3, encode_id_to_market_params_call, decode_id_to_market_params,
             encode_market_call, decode_market, encode_position_call, decode_position)
         from chain.simulate import to_assets_up
-        from chain.execute import kyber_swap, encode_liquidate, expected_seized, simulate_tx
+        from chain.execute import kyber_swap, univ3_swap, encode_liquidate, expected_seized, simulate_tx
         from strategy.pnl import lif_from_lltv
 
         liq = cfg.liquidator_address
@@ -260,7 +260,9 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
             return {"ok": False, "reason": "seized=0"}
 
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
-        swap = kyber_swap(coll, loan, seized, liq, liq, slippage_bps=slippage_bps)
+        swap = univ3_swap(coll, loan, seized, liq, liq, repaid_assets=repaid_assets)
+        if swap is None:                       # market outside UniV3 paths -> Kyber fallback (unchanged)
+            swap = kyber_swap(coll, loan, seized, liq, liq, slippage_bps=slippage_bps)
 
         # GUARD свежести (skip-only): повторный preconf-read borrow_shares макс. близко к send.
         # Если долг УПАЛ ниже planned repaid -> SKIP (underflow неизбежен). НЕ капаем (seized/swap уже

@@ -61,6 +61,37 @@ def kyber_swap(token_in: str, token_out: str, amount_in: int, sender: str, recip
     }
 
 
+# ---- UniV3 direct-swap (variant A): precomputed multi-hop coll->WETH->USDC, NO in-race quote ----
+UNIV3_SWAP_ROUTER = "0x2626664c2603336E57B271c5C0b26F421741e481"  # Uniswap SwapRouter02 (Base)
+_UNIV3_WETH = "0x4200000000000000000000000000000000000006"
+_UNIV3_USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+_UNIV3_WETH_USDC_FEE = 500
+_UNIV3_EXACT_INPUT_SEL = "b858183f"  # exactInput((bytes,address,uint256,uint256)) verified cast sig
+UNIV3_PATHS = {  # collateral(lower) -> fee tier of coll/WETH pool (verified factory.getPool)
+    "0xcb585250f852c6c6bf90434ab21a00f02833a4af": 3000,   # cbXRP/WETH
+    "0xcbd06e5a2b0c65597161de254aa074e489deb510": 3000,   # cbDOGE/WETH
+    "0xcbada732173e39521cdbe8bf59a6dc85a9fc7b8c": 3000,   # cbADA/WETH
+}
+
+
+def univ3_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_assets, slippage_bps=100):
+    """Drop-in for kyber_swap on cbXRP/cbDOGE/cbADA. Precomputed UniV3 multi-hop coll->WETH->USDC
+    (always-multi, as winners do), NO in-race quote. amountOutMinimum=repaid_assets (debt floor);
+    profit protected by preconf sim + contract minProfit. Returns same {router, calldata} as
+    kyber_swap, or None if token_in has no UniV3 path (caller falls back to kyber_swap)."""
+    from eth_abi import encode
+    coll = token_in.lower()
+    if coll not in UNIV3_PATHS:
+        return None
+    fee = UNIV3_PATHS[coll]
+    path = (bytes.fromhex(token_in[2:]) + int(fee).to_bytes(3, "big")
+            + bytes.fromhex(_UNIV3_WETH[2:]) + int(_UNIV3_WETH_USDC_FEE).to_bytes(3, "big")
+            + bytes.fromhex(_UNIV3_USDC[2:]))
+    params = encode(["(bytes,address,uint256,uint256)"],
+                    [(path, recipient, int(amount_in), int(repaid_assets))])
+    return {"router": UNIV3_SWAP_ROUTER, "calldata": "0x" + _UNIV3_EXACT_INPUT_SEL + params.hex()}
+
+
 def expected_seized(repaid_assets: int, lif: float, price: int) -> int:
     """Collateral (wei) Morpho seizes for repaying `repaid_assets` (loan wei), per _liquidate:
     seized = mulDivDown(wMulDown(repaidAssets, LIF), ORACLE_PRICE_SCALE, price)."""
