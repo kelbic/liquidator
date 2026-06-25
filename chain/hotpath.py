@@ -12,8 +12,11 @@ one wallet) is handled by the send-lock inside dispatch_liquidations (added in C
 DORMANT until wired into block_driven_loop behind cfg.hot_path. No behavior change to the existing loop.
 """
 from __future__ import annotations
+import logging
 import threading
 import time
+
+log = logging.getLogger(__name__)
 
 MORPHO_BLUE = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
 FB_URL = "wss://mainnet.flashblocks.base.org/ws"
