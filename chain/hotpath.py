@@ -351,6 +351,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         groups = dict(shared.groups); debt_by = dict(shared.debt_by); debt_assets_by = dict(shared.debt_assets_by)
 
     ready, meta_by = [], {}
+    _t_read_total = 0.0; _t_prep_total = 0.0   # DIAG latency: read=340-call, sim=prepare_hot
     for mid in feeds.get(agg, []):
         om = meta.get(mid)
         borrowers = groups.get(mid, [])
@@ -362,7 +363,9 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         if price is None:
             if stats is not None: stats["f_noprice"] += 1
             continue
+        _rs = time.perf_counter()
         rp = reads_fn(rpc, mid, borrowers, preconf_rpc=preconf_rpc)
+        _t_read_last = (time.perf_counter() - _rs) * 1000.0; _t_read_total += _t_read_last
         if not rp:
             if stats is not None: stats["f_norp"] += 1
             continue
@@ -377,15 +380,17 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                            total_borrow_assets=int(tba), total_borrow_shares=int(tbs))
                 _c = [(bb, bs, _hf(_ctx, bs, col).hf) for (bb, bs, col, _du) in positions]
                 _bb, _bs, _hv = min(_c, key=lambda x: x[2])
-                log.info("DIAG noflip %s/%s minHF=%.4f bshares=%d price=%d n=%d",
-                         mid[:10], _bb[:10], _hv, _bs, int(price), len(_c))
+                log.info("DIAG noflip %s/%s minHF=%.4f bshares=%d price=%d n=%d read=%.0fms",
+                         mid[:10], _bb[:10], _hv, _bs, int(price), len(_c), _t_read_last)
         for (b, hr, du) in flipped:
             if du < floor:                                   # reaction filter: $2k+ only
                 if stats is not None: stats["f_floor"] += 1
                 continue
             if stats is not None: stats["f_prep"] += 1
+            _ps = time.perf_counter()
             prep = prepare_fn(rpc, preconf_rpc, cfg, mid, b, du,
                               debt_assets_by.get((mid, b), 0), price)
+            _t_prep_total += (time.perf_counter() - _ps) * 1000.0
             if prep.get("ok"):
                 ready.append((mid, b, prep)); meta_by[(mid, b)] = (hr, du)
                 log.info("HOT ready %s/%s hf=%.4f repaid~$%.0f net=$%.2f block=%d subidx=%s",
@@ -404,7 +409,11 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         alerter.send(f"\U0001F6D1 hot path halted: {blocked}", key="hot-killswitch")
         return []
 
+    _ds = time.perf_counter()
     results = dispatch_fn(rpc, cfg, ready, log=log, max_inflight=cfg.max_inflight)
+    _t_send = (time.perf_counter() - _ds) * 1000.0
+    log.info("DIAG timing read=%.0fms sim=%.0fms send=%.0fms n_ready=%d",
+             _t_read_total, _t_prep_total, _t_send, len(ready))
     for r in results:
         hr, du = meta_by.get((r["market_id"], r["borrower"]), (None, 0.0))
         status = (f"submitted:{r.get('status')} net${r.get('net_usd',0):.2f}" if r["sent"]
