@@ -75,14 +75,25 @@ def read_preconf_price(preconf_rpc, oracle):
         return None
 
 
-def read_positions(rpc, mid, borrowers):
-    """market totals + each position at latest -> (tba, tbs, [(borrower, bs, col)]). ONE aggregate3."""
+def read_positions(rpc, mid, borrowers, preconf_rpc=None):
+    """market totals + each position -> (tba, tbs, [(borrower, bs, col)]). ONE aggregate3.
+    Reads on preconf-pending (same source as the flip price + sim) when preconf_rpc is given, so the
+    reaction flip is visible ~1.8s before confirmed; falls back to rpc-latest on degraded preconf."""
     from chain.multicall import aggregate3, encode_market_call, decode_market, encode_position_call, decode_position
     b32 = rpc.to_bytes32(mid)
     calls = [(MORPHO_BLUE, encode_market_call(b32))]
     for b in borrowers:
         calls.append((MORPHO_BLUE, encode_position_call(b32, b)))
-    res = aggregate3(rpc, calls)
+    res = None
+    if preconf_rpc is not None:
+        try:
+            r = aggregate3(preconf_rpc, calls, block_identifier="pending")
+            if r and r[0][0] and r[0][1]:
+                res = r
+        except Exception:
+            res = None
+    if res is None:
+        res = aggregate3(rpc, calls)
     if not res or not res[0][0] or not res[0][1]:
         return None
     m = decode_market(res[0][1]); tba, tbs = m[2], m[3]
@@ -351,14 +362,23 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         if price is None:
             if stats is not None: stats["f_noprice"] += 1
             continue
-        rp = reads_fn(rpc, mid, borrowers)
+        rp = reads_fn(rpc, mid, borrowers, preconf_rpc=preconf_rpc)
         if not rp:
             if stats is not None: stats["f_norp"] += 1
             continue
         tba, tbs, pos = rp
         positions = [(b, bs, col, debt_by.get((mid, b), 0.0)) for (b, bs, col) in pos]
         flipped = _flips(price, lltv_wad, tba, tbs, positions)
-        if stats is not None and not flipped: stats["f_noflip"] += 1
+        if not flipped:
+            if stats is not None: stats["f_noflip"] += 1
+            if positions:                                    # DIAG: what state did we read? (preconf-source check)
+                from chain.simulate import MarketContext as _MC, health_from as _hf
+                _ctx = _MC(oracle="", price=int(price), lltv_wad=int(lltv_wad),
+                           total_borrow_assets=int(tba), total_borrow_shares=int(tbs))
+                _c = [(bb, bs, _hf(_ctx, bs, col).hf) for (bb, bs, col, _du) in positions]
+                _bb, _bs, _hv = min(_c, key=lambda x: x[2])
+                log.info("DIAG noflip %s/%s minHF=%.4f bshares=%d price=%d n=%d",
+                         mid[:10], _bb[:10], _hv, _bs, int(price), len(_c))
         for (b, hr, du) in flipped:
             if du < floor:                                   # reaction filter: $2k+ only
                 if stats is not None: stats["f_floor"] += 1
