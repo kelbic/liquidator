@@ -344,19 +344,26 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         om = meta.get(mid)
         borrowers = groups.get(mid, [])
         if not om or not borrowers:
+            if stats is not None: stats["f_nocand"] += 1
             continue
         oracle, lltv_wad = om
         price = price_fn(preconf_rpc, oracle)
         if price is None:
+            if stats is not None: stats["f_noprice"] += 1
             continue
         rp = reads_fn(rpc, mid, borrowers)
         if not rp:
+            if stats is not None: stats["f_norp"] += 1
             continue
         tba, tbs, pos = rp
         positions = [(b, bs, col, debt_by.get((mid, b), 0.0)) for (b, bs, col) in pos]
-        for (b, hr, du) in _flips(price, lltv_wad, tba, tbs, positions):
+        flipped = _flips(price, lltv_wad, tba, tbs, positions)
+        if stats is not None and not flipped: stats["f_noflip"] += 1
+        for (b, hr, du) in flipped:
             if du < floor:                                   # reaction filter: $2k+ only
+                if stats is not None: stats["f_floor"] += 1
                 continue
+            if stats is not None: stats["f_prep"] += 1
             prep = prepare_fn(rpc, preconf_rpc, cfg, mid, b, du,
                               debt_assets_by.get((mid, b), 0), price)
             if prep.get("ok"):
@@ -416,7 +423,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     last_spawn: dict = {}        # agg -> last spawn time.time() (throttle; survives ws reconnects)
     last_price: dict = {}        # agg -> last preconf price of representative oracle (change-gate)
     stats = {"spawn": 0, "skip": 0, "proceed": 0, "none": 0,    # hot-path health; emitted every HOT_STATS_SEC
-             "poll": 0, "pspawn": 0, "poll_none": 0, "poll_fb": 0}  # poll_fb=oracles filled from latest fallback
+             "poll": 0, "pspawn": 0, "poll_none": 0, "poll_fb": 0,  # poll_fb=oracles filled from latest fallback
+             "f_nocand": 0, "f_noprice": 0, "f_norp": 0, "f_noflip": 0, "f_floor": 0, "f_prep": 0}  # funnel proceed->prepare_hot
     last_stats = time.monotonic()
     poll_seen: dict = {}         # oracle -> last preconf price (poll-local; baseline -> spawn only on move)
     last_poll_block = None       # one preconf-price poll per block
@@ -433,9 +441,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         except Exception:
                             pass
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
-                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d",
+                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
-                                 stats["proceed"], stats["skip"], stats["none"], stats["poll_none"], stats["poll_fb"])
+                                 stats["proceed"], stats["skip"], stats["none"], stats["poll_none"], stats["poll_fb"],
+                                 stats["f_nocand"], stats["f_noprice"], stats["f_norp"], stats["f_noflip"], stats["f_floor"], stats["f_prep"])
                         fb_windows = fb_windows + 1 if stats["poll_fb"] > 0 else 0
                         if fb_windows >= 3 and time.monotonic() - last_fb_alert > 1800:
                             last_fb_alert = time.monotonic()
