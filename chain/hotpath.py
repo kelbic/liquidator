@@ -1,8 +1,10 @@
 """Hot path (Phase 2, PRECONF-triggered). A SECOND trigger beside the block loop: on a real `transmit`
 to one of our aggregators, recompute the affected candidates' HF on the PRE-CONFIRMED price, and for a
 position that flips liquidatable + passes the preconf-pending sim + the net floor + the narrow reaction
-filter ($2k+), prepare and dispatch a liquidation. Reuses the battle-tested prepare/dispatch building
-blocks; ONLY the sourcing (preconf price for sizing + preconf-pending sim) and the trigger differ.
+filter (`hot_min_repaid_usd`, see config.py for the live value — this was hardcoded as "$2k+" here and
+went stale when the floor was lowered to $450), prepare and dispatch a liquidation. Reuses the
+battle-tested prepare/dispatch building blocks; ONLY the sourcing (preconf price for sizing +
+preconf-pending sim) and the trigger differ.
 
 Latency shape: the async recv loop only DETECTS a transmit (precise 94-form match) and spawns a worker
 thread; all slow work (preconf read -> flip -> KyberSwap quote -> sim -> dispatch) runs off the recv
@@ -218,13 +220,15 @@ def _diag_revert_bucket(err: str) -> str:
 
 
 def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_assets, price, slippage_bps=100):
-    """Mirror of execute.prepare_liquidation, PRECONF-sourced. Two and only two differences:
+    """Mirror of execute.prepare_liquidation, PRECONF-sourced — diverges from it in more than the two
+    points below; this is illustrative, not a complete list (params sourcing, swap routing, and extra
+    diagnostic/guard reads have also diverged — check the function body, not this docstring, for the
+    current full set):
       (1) the seize is sized on the PRE-CONFIRMED `price` (passed in, read once by the caller), not a
           fresh latest read — so `expected_seized` matches what the contract seizes at execution;
       (2) the simulate is gated against PRECONF-PENDING (simulate_tx(preconf_rpc, ..., block='pending'))
           where the position is already liquidatable, instead of latest (still healthy pre-confirm).
-    Everything else — fresh market-param/market/position reads, seize math, KyberSwap quote, encode,
-    honest net floor, minProfit=95% — is identical to the armed prepare. Same {ok, ...} shape."""
+    Same {ok, ...} shape as the armed prepare."""
     try:
         from chain.multicall import (aggregate3, encode_id_to_market_params_call, decode_id_to_market_params,
             encode_market_call, decode_market, encode_position_call, decode_position)
