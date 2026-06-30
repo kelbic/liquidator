@@ -28,6 +28,13 @@ HOT_THROTTLE_SEC = 0.25   # min seconds between hot-path spawns PER aggregator. 
 HOT_STATS_SEC = 120       # emit hot-path counters (spawn + gate outcomes) every N seconds. Lets us see
                           # detection is ALIVE without waiting for a flip (the gate is silent on readers).
 
+# 2a: idToMarketParams is immutable per market for its whole life. resolve_meta() already decodes
+# it fully but only kept (oracle, lltv); this cache keeps loan/coll/irm too so prepare_hot can skip
+# its own confirmed-RPC re-fetch of the same data. Module-level by design (not threaded through
+# meta/_process_transmit/kwargs) to avoid touching the existing meta shape used by the gate-check
+# and _process_transmit's unpacking — zero blast radius outside resolve_meta/prepare_hot.
+_FULL_PARAMS_CACHE: dict = {}
+
 
 # ---- pure helpers (unit-tested) ----
 
@@ -180,15 +187,17 @@ def _poll_prices(*, preconf_rpc, rpc_fallback, feeds, meta, poll_seen, stats, sp
 
 
 def resolve_meta(rpc, markets):
-    """{mid: (oracle, lltv_wad)} via ONE aggregate3 of idToMarketParams (immutable)."""
+    """{mid: (oracle, lltv_wad)} via ONE aggregate3 of idToMarketParams (immutable). Also fills
+    _FULL_PARAMS_CACHE (loan/coll/irm too) so prepare_hot can skip its own params re-fetch (2a)."""
     from chain.multicall import aggregate3, encode_id_to_market_params_call, decode_id_to_market_params
     mids = [m.market_id for m in markets if m.market_id]
     calls = [(MORPHO_BLUE, encode_id_to_market_params_call(rpc.to_bytes32(mid))) for mid in mids]
     out = {}
     for mid, (ok, data) in zip(mids, aggregate3(rpc, calls)):
         if ok and data:
-            _loan, _coll, oracle, _irm, lltv = decode_id_to_market_params(data)
+            loan, coll, oracle, irm, lltv = decode_id_to_market_params(data)
             out[mid] = (oracle, lltv)
+            _FULL_PARAMS_CACHE[mid] = (loan, coll, oracle, irm, lltv)
     return out
 
 
@@ -230,9 +239,14 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         bot = w3.eth.account.from_key(cfg.wallet_key).address
         mid = rpc.to_bytes32(market_id)
 
-        # market-PARAMS (статичные адреса рынка) — из подтверждённого rpc (не меняются):
-        rp_params = aggregate3(rpc, [(MORPHO_BLUE, encode_id_to_market_params_call(mid))])
-        loan, coll, oracle, irm, lltv_wad = decode_id_to_market_params(rp_params[0][1])
+        # market-PARAMS (статичные адреса рынка, иммутабельны) — из кэша resolve_meta (2a), без RTT.
+        # Fallback на confirmed-RPC fetch, если кэш ещё не наполнен (до первого resolve_meta).
+        _cached = _FULL_PARAMS_CACHE.get(market_id)
+        if _cached:
+            loan, coll, oracle, irm, lltv_wad = _cached
+        else:
+            rp_params = aggregate3(rpc, [(MORPHO_BLUE, encode_id_to_market_params_call(mid))])
+            loan, coll, oracle, irm, lltv_wad = decode_id_to_market_params(rp_params[0][1])
         # market(tba/tbs)+position(borrow_shares) — из PRECONF pending (ТОТ ЖЕ источник, что sim) для консистентности.
         # fallback на rpc-latest при degraded preconf (теряем 1.8с lead, но не падаем).
         try:
