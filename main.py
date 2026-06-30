@@ -248,7 +248,9 @@ def _refresh_worker(shared, markets, cfg, ctx_cache, log, stop):
                     cfg.eth_price_usd = px            # live ETH/USD -> honest net-cost floor (no hardcode)
             except Exception:
                 pass                                  # keep last good price
+            _t0 = time.time()
             g, db, dab, n = fetch_candidates(markets)
+            log.info("DIAG candidate refresh n=%d dt=%.1fs", n, time.time() - _t0)
             with shared.lock:
                 shared.by_id = {m.market_id: m for m in markets}
                 shared.groups, shared.debt_by, shared.debt_assets_by, shared.n = g, db, dab, n

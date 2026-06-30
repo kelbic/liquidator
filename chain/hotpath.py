@@ -102,6 +102,9 @@ def read_positions(rpc, mid, borrowers, preconf_rpc=None):
         if ok and data:
             bs, col = decode_position(data)
             pos.append((b, bs, col))
+        else:
+            log.info("DIAG read_positions drop %s/%s ok=%s data_len=%d",
+                     mid[:10], b[:10], ok, len(data) if data else 0)
     return tba, tbs, pos
 
 
