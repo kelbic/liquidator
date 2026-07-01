@@ -59,6 +59,44 @@ def _dump_hotset(mid, src, tba, tbs, pos, dropped):
 
 # ---- pure helpers (unit-tested) ----
 
+_SHADOW_SCALE = {"cbXRP": 10**28, "cbDOGE": 10**26, "cbADA": 10**28}   # immutable оракулов (STATE Идея 2)
+
+
+def _build_shadow_map(feeds, meta, markets):
+    """{aggregator_lower: (symbol, scale, oracle)} ТОЛЬКО для одно-фид money-маркетов (SCALE известен).
+    Чистая (юнит). Ротацию агрегатора закрывает часовой re-resolve, пересобирающий карту вместе с
+    feeds/meta; между ротацией и пересборкой shadow просто перестаёт матчить (log-only, безвредно)."""
+    out = {}
+    by_id = {m.market_id: m for m in markets}
+    for agg, mids in feeds.items():
+        for mid in mids:
+            m = by_id.get(mid); om = meta.get(mid)
+            if not m or not om:
+                continue
+            scale = _SHADOW_SCALE.get(getattr(m, "collateral_token", None))
+            if scale:
+                out[agg] = (m.collateral_token, scale, om[0])
+                break
+    return out
+
+
+def _shadow_feed_check(*, sym, agg, answer, scale, oracle, preconf_rpc, price_fn, t0, log):
+    """SHADOW слоя 1 (план п.4): цена, декодированная ИЗ ФИДА (~0.7мс), против цены оракула на
+    preconf (~350мс RTT) на том же транзите. ЛОГ-ONLY — не действует, ничего не спавнит дальше.
+    px_preconf изредка может быть СТАРОЙ ценой (чтение обогнало применение pending) — benign-гонка,
+    НЕ ошибка декодера; ошибка декодера = px_feed не равен НИ старой, НИ новой цене оракула.
+    Правило флипа PRICE_FROM_FEED — в STATE (Идея 2, слой 1)."""
+    px_feed = answer * scale
+    px_pre = None
+    try:
+        px_pre = price_fn(preconf_rpc, oracle)
+    except Exception:
+        px_pre = None
+    log.info("DIAG shadow-feed mkt=%s agg=%s answer=%d px_feed=%d px_preconf=%s match=%s dt=%.0fms",
+             sym, agg[:10], answer, px_feed, px_pre,
+             px_pre is not None and px_pre == px_feed, (time.perf_counter() - t0) * 1000.0)
+
+
 def _price_moved(agg, px, last_price):
     """True if px differs from the last preconf price seen for agg (or first sighting); updates
     last_price. The bare aggregator match also fires on price-READ txs, so this gates the heavy
@@ -651,7 +689,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     import json
     import websockets
     import brotli
-    from chain.feeds import resolve_feeds, extract_txs, block_number_of
+    from chain.feeds import resolve_feeds, extract_txs, block_number_of, decode_forward_answer, FORWARD_SEL
 
     def _default_ws():
         return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
@@ -660,6 +698,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     feeds = resolve_feeds(rpc, markets)
     meta = resolve_meta(rpc, markets)
     agg_set = set(feeds)
+    shadow_map = _build_shadow_map(feeds, meta, markets)         # SHADOW слоя 1 (план п.4, log-only)
+    log.info("DIAG shadow-feed map %s", {a[:10]: s for a, (s, _sc, _o) in shadow_map.items()})
     last_resolve = time.monotonic()
     log.info("hot path: %d aggregators / %d markets (preconf=%s, tip=%.1f gwei, floor repaid $%.0f)",
              len(agg_set), len(meta), preconf_rpc.rpc_url, cfg.tip_gwei, hot_min_repaid(cfg))
@@ -682,6 +722,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         try:
                             feeds = resolve_feeds(rpc, markets); meta = resolve_meta(rpc, markets)
                             agg_set = set(feeds); last_resolve = time.monotonic()
+                            shadow_map = _build_shadow_map(feeds, meta, markets)   # ротация агрегатора
                         except Exception:
                             pass
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
@@ -726,6 +767,17 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         # is not wired into _process_transmit yet, so this has zero effect on hot-path behavior.
                         _spawn_cache_refresh(preconf_rpc=preconf_rpc, shared=shared, bn=bn)
                     idx = d.get("index"); txs = extract_txs(d); now = time.time()
+                    for _raw, _to in txs:                        # SHADOW слоя 1: декод transmit из фида (log-only)
+                        if _raw and FORWARD_SEL in _raw:
+                            _dec = decode_forward_answer(_raw)
+                            if _dec and _dec[0] in shadow_map:
+                                _sym, _scale, _oracle = shadow_map[_dec[0]]
+                                threading.Thread(target=_shadow_feed_check, daemon=True,
+                                                 kwargs=dict(sym=_sym, agg=_dec[0], answer=_dec[1],
+                                                             scale=_scale, oracle=_oracle,
+                                                             preconf_rpc=preconf_rpc,
+                                                             price_fn=read_preconf_price,
+                                                             t0=time.perf_counter(), log=log)).start()
                     for agg in agg_set:                          # BARE match: ANY mention of the aggregator
                         if now - last_spawn.get(agg, 0.0) < HOT_THROTTLE_SEC:
                             continue                             # per-agg throttle: bound preconf reads/spawns

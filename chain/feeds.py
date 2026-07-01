@@ -53,6 +53,36 @@ def resolve_feeds(rpc, markets):
     return dict(aggs)
 
 
+FORWARD_SEL = "6fadcf72"      # forward(address,bytes) — обёртка OCR-transmit (роутеры 0xb277/0x79fc/0x5e46)
+FORWARD_ANSWER_OFF = 676      # эмпирический offset answer в payload (STATE Идея 2: полноразрядно доказан)
+
+
+def decode_forward_answer(raw_hex):
+    """raw flashblock tx hex -> (aggregator_lower, answer_int) для forward-обёрнутого OCR-transmit,
+    иначе None. Чистый слайсинг по hex: находим селектор forward, arg1 = адрес агрегатора (последние
+    20 байт слова 1), answer int256 по эмпирическому offset 676 от начала payload (полноразрядное
+    совпадение на НЕокруглённом тике, 4 транзита / 3 коллатерала — STATE 'Идея 2, слой 1'). Без
+    RLP-парсинга: смещения относительно позиции селектора в raw. None при любом несовпадении формы
+    (нет селектора / короткий payload / знаковый бит) — реальный фильтр от селектора-двойника в RLP
+    делает вызывающая сторона по карте известных фидов."""
+    if not raw_hex:
+        return None
+    i = raw_hex.find(FORWARD_SEL)
+    if i < 0:
+        return None
+    need = i + 8 + (FORWARD_ANSWER_OFF + 32) * 2
+    if len(raw_hex) < need:
+        return None
+    agg = "0x" + raw_hex[i + 32 : i + 72]                        # arg1: address = хвост слова 1
+    try:
+        answer = int(raw_hex[i + 8 + FORWARD_ANSWER_OFF * 2 : need], 16)
+    except ValueError:
+        return None
+    if answer >= 1 << 255:                                       # int256: отрицательных цен не бывает
+        return None
+    return agg, answer
+
+
 def extract_txs(d):
     diff = d.get("diff") or {}
     txs = diff.get("transactions")
