@@ -1,0 +1,173 @@
+{
+  "0x92a7c3a57e17aff701c159c5480073b095100b62": {
+    "markets": [
+      "0xd4a903dc6d949519060c7707f9604fdc9772c046e05c2e3a8fce0bd7196e4109",
+      "0xfdfecf85a4dd90a7637ae2aaf28b35061166f0e62bfc714c565eed9f7e959783"
+    ],
+    "pair": "XRP / USD",
+    "proxy": "0x9f0C1dD78C4CBdF5b9cf923a549A201EdC676D34"
+  },
+  "0x1e536d8f053feab16c65861b7a3462b5b5acd3a2": {
+    "markets": [
+      "0x3a4048c64ba1b375330d376b1ce40e4047d03b47ab4d48af484edec9fec801ba"
+    ],
+    "pair": "wstETH-stETH Exchange Rate",
+    "proxy": "0xB88BAc61a4Ca37C43a3725912B1f472c9A5bc061"
+  },
+  "0x0e3dc8a6a86d2f6f5f67b373a047c267fb1fc3e6": {
+    "markets": [
+      "0x67ebd84b2fb39e3bc5a13d97e4c07abe1ea617e40654826e9abce252e95f049e",
+      "0x5dffffc7d75dc5abfa8dbe6fad9cbdadf6680cbe1428bafe661497520c84a94c"
+    ],
+    "pair": "BTC / USD",
+    "proxy": "0x64c911996D3c6aC71f9b455B1E8E7266BcbD848F"
+  },
+  "0x53fdcab0650570d07e2770004979ef10a86df559": {
+    "markets": [
+      "0x1c21c59df9db44bf6f645d854ee710a8ca17b479451447e9f56758aee10a2fad",
+      "0x7fc498ddcb7707d6f85f6dc81f61edb6dc8d7f1b47a83b55808904790564929a",
+      "0x576db1fa04a04b81eaeb36d14c16730bcfe34c8089abe1a204032e160b459157"
+    ],
+    "pair": "CBETH / ETH",
+    "proxy": "0x806b4Ac04501c29769051e42783cF04dCE41440b"
+  },
+  "0xcd76c50c3210c5aaa9c39d53a4f95bfd8b1a3a19": {
+    "markets": [
+      "0xff0f2bd52ca786a4f8149f96622885e880222d8bed12bbbf5950296be8d03f89"
+    ],
+    "pair": "A port of a chainlink aggregator powered by pyth network feeds",
+    "proxy": "0xCd76c50c3210C5AaA9c39D53A4f95BFd8b1a3a19"
+  },
+  "0x71e021bc2e8a709b72ac7b6036e5b2bf30f263d0": {
+    "markets": [
+      "0x0ca10126f6c94cbd9cf0a48cc9516ae5e3dec5aa68303e6d988ee37c5149bf0d"
+    ],
+    "pair": "CBETH / USD",
+    "proxy": "0xd7818272B9e248357d13057AAb0B417aF31E817d"
+  },
+  "0x474ec38919d3d30d7b717cddea6205130e195572": {
+    "markets": [
+      "0x7dc02ff6c536b1d49d7fba770438d79f5bd1f1c78884629b7d1aaee19675782b"
+    ],
+    "pair": "SOL / USD",
+    "proxy": "0x975043adBb80fc32276CbF9Bbcfd4A601a12462D"
+  },
+  "0x1b70e0ee4041fa9f0e0fa2879b8818eaf4e2d81c": {
+    "markets": [
+      "0x13c42741a359ac4a8aa8287d2be109dcf28344484f91185f9a79bd5a805a55ae",
+      "0xf7e40290f8ca1d5848b3c129502599aa0f0602eb5f5235218797a34242719561"
+    ],
+    "pair": "WSTETH / ETH",
+    "proxy": "0x43a5C292A453A3bF3606fa856197f09D7B74251a"
+  },
+  "0xf0f5eebea4910927b7165d8e3824abb7d7215825": {
+    "markets": [
+      "0x73527ddd796e6d4f48387adaae36f6f3d49d606d7f2a15eb0c931416a58875d8"
+    ],
+    "pair": "DOGE / USD",
+    "proxy": "0x8422f3d3CAFf15Ca682939310d6A5e619AE08e57"
+  },
+  "0x4c78dea223b013511e40b2a08282631a47c53cde": {
+    "markets": [
+      "0x84662b4f95b85d6b082b68d32cf71bb565b3f22f216a65509cc2ede7dccdfe8c",
+      "0xdba352d93a64b17c71104cbddc6aef85cd432322a1446b5b65163cbbc615cd0c"
+    ],
+    "pair": "cbETH-ETH Exchange Rate",
+    "proxy": "0x868a501e68F3D1E89CfC0D22F6b22E8dabce5F04"
+  },
+  "0x54f6b1e6642c882cb9f214bdc896f1e22a5409f2": {
+    "markets": [
+      "0xffd35206a772174c04f599e4034a2f132fc3f7a462ca732affcea92136716573",
+      "0x6aa81f51dfc955df598e18006deae56ce907ac02b0b5358705f1a28fcea23cc0"
+    ],
+    "pair": "wstETH-ETH Exchange Rate",
+    "proxy": "0xa669E5272E60f78299F4824495cE01a3923f4380"
+  },
+  "0x9491aedfe0da70eb110582b66b2edace28d82a5d": {
+    "markets": [
+      "0xd7520ad198b497b6eb75bc690268f4597630dbc12e305e9d4105843bab36e41d",
+      "0xf2a59ad1aec67664c564cb33c33538ab41372363204ce2bdcf00900b7d28c6ab"
+    ],
+    "pair": "ADA / USD",
+    "proxy": "0x34cD971a092d5411bD69C10a5F0A7EEF72C69041"
+  },
+  "0x764a8f2fced3565ee599dde2d5150a69234d7fea": {
+    "markets": [
+      "0xfd0895ba253889c243bf59bc4b96fd1e06d68631241383947b04d1c293a0cfea",
+      "0x78d11c03944e0dc298398f0545dc8195ad201a18b0388cb8058b1bcb89440971"
+    ],
+    "pair": "weETH / eETH Exchange Rate",
+    "proxy": "0x35e9D7001819Ea3B39Da906aE6b06A62cfe2c181"
+  },
+  "0x1e0b2c3896338fbb201c4f0a27c6904801dca06b": {
+    "markets": [
+      "0xa9b5142fa687a24c275faf731f13b52faa9873252bb4e1cb6077aa1f412edb0b",
+      "0x67a66cbacb2fe48ec4326932d4528215ad11656a86135f2795f5b90e501eb538"
+    ],
+    "pair": "ETH / USD",
+    "proxy": "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
+  },
+  "0x5bf848b4ef13bd590ea41ad664ff45b155d1c582": {
+    "markets": [
+      "0x9125d0fa03c3137166df68bcc72283477830de2a4a5536512374c573ad4583c3"
+    ],
+    "pair": "LTC / USD",
+    "proxy": "0x206a34e47093125fbf4C75b7c7E88b84c6A77a69"
+  },
+  "0x31d099c106cd73e731972fdf1390cab77f59dade": {
+    "markets": [
+      "0x4944a1169bc07b441473b830308ffe5bb535c10a9f824e33988b60738120c48e"
+    ],
+    "pair": "Moonwell Bounded Composite Oracle",
+    "proxy": "0x31d099C106cd73E731972Fdf1390Cab77F59DaDe"
+  },
+  "0x998a521d787457c646b15fdfd24beffd09fbf2cf": {
+    "markets": [
+      "0x2e2548390b8894d2ffaaababebc2b5f2501920e03a4c611b63b46e19bfc6b75d"
+    ],
+    "pair": "uniBTC/BTC exchange rate",
+    "proxy": "0x998a521d787457C646b15FDFd24beffd09Fbf2CF"
+  },
+  "0xe18a8d430d611e79d978cf7396fda01018b1102b": {
+    "markets": [
+      "0x87c7d6527a86fb5acef2e610c05c4a89810f1abc1af36498a5912167b78f6321"
+    ],
+    "pair": "VVV / USD",
+    "proxy": "0xaABc55Ca55D70B034e4daA2551A224239890282F"
+  },
+  "0x5c4c8d6f6bf79b718f3e8399aabdfed01cb7e48f": {
+    "markets": [
+      "0x30767836635facec1282e6ef4a5981406ed4e72727b3a63a3a72c74e8279a8d7"
+    ],
+    "pair": "RedStone Price Feed for LBTC_FUNDAMENTAL",
+    "proxy": "0x5C4c8d6f6Bf79B718F3e8399AaBdFEd01cB7e48f"
+  },
+  "0x7f73eb1ae276ef4d155f9cf9a81986db343cf1ca": {
+    "markets": [
+      "0x6b61d4738919b56fff396c9bb29c61af495aa24efc1aca80f2563c34a6556312"
+    ],
+    "pair": "USDC / USD",
+    "proxy": "0x1401Fd60F9ba4F718a2fE6149aadf3d1F0dB1b0A"
+  },
+  "0x69afba65e4c16fabfe2baf4916ef90f986921106": {
+    "markets": [
+      "0x0103cbcd14c690f68a91ec7c84607153311e9954c94ac6eac06c9462db3fabb6"
+    ],
+    "pair": "RETH / ETH",
+    "proxy": "0xf397bF97280B488cA19ee3093E81C0a77F02e9a5"
+  },
+  "0x51ce3091cf646587e02cad83b580992f8723e718": {
+    "markets": [
+      "0xc9658cac13a9b9b5c1ebaa8ce19c735283cc761ff528d149a7221047bb7fab45"
+    ],
+    "pair": "cbBTC / USD",
+    "proxy": "0x07DA0E54543a844a80ABE69c8A12F22B3aA59f9D"
+  },
+  "0xfcddfb2294beba43987516371febb2e677eb403e": {
+    "markets": [
+      "0xdaa04f6819210b11fe4e3b65300c725c32e55755e3598671559b9ae3bac453d7"
+    ],
+    "pair": "AERO / USD",
+    "proxy": "0x4EC5970fC728C5f65ba413992CD5fF6FD70fcfF0"
+  }
+}
