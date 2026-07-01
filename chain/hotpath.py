@@ -529,6 +529,11 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                                                        feeds=feeds, meta=meta, shared=shared,
                                                                        store=store, guard=guard, alerter=alerter,
                                                                        log=log, last_price=last_price, stats=stats))).start()
+                        # Layer 2, measurement phase (C temporary — see STATE.md): fills _POSITION_CACHE +
+                        # logs refresh-miss/cycle timing. Does NOT touch reads_fn — read_positions_cached
+                        # is not wired into _process_transmit yet, so this has zero effect on hot-path behavior.
+                        threading.Thread(target=_refresh_position_caches, daemon=True,
+                                         kwargs=dict(preconf_rpc=preconf_rpc, shared=shared, bn=bn)).start()
                     idx = d.get("index"); txs = extract_txs(d); now = time.time()
                     for agg in agg_set:                          # BARE match: ANY mention of the aggregator
                         if now - last_spawn.get(agg, 0.0) < HOT_THROTTLE_SEC:
@@ -546,3 +551,95 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
             log.warning("hot path ws error (%s) — reconnecting in 3s", type(e).__name__)
             alerter.send("\U0001F6A8 hot-path reconnect — check journalctl", key="hot-wsserr")
             await asyncio.sleep(3)
+
+
+
+# ---- Layer 2 (Идея 2): continuous background position cache, money-markets only ----
+# Scope: только рынки из execute.UNIV3_PATHS (валидированный сустейном масштаб — один рынок,
+# 340 вызовов/блок; полный охват всех ~40 рынков и поведение ПОД каскадом НЕ провалидированы,
+# см. STATE.md "РАЗБИВКА — симметрия с декодером ЧАСТИЧНАЯ"). Любой рынок вне кэша падает в
+# read_positions без изменений — нулевой риск для непокрытых рынков.
+
+_POSITION_CACHE_LOCK = threading.Lock()
+_POSITION_CACHE: dict = {}  # {market_id: (tba, tbs, {borrower: (bs, col)})}
+
+
+def refresh_position_cache(preconf_rpc, mid, borrowers):
+    """Background per-block refresh for ONE money-market. A borrower whose position() call in the
+    batch comes back ok=False/empty is EXCLUDED from the cache (never left stale, never silently
+    dropped) and logged — this is what closes hypothesis A for cache-covered markets. Pure side
+    effect on _POSITION_CACHE; returns nothing."""
+    from chain.multicall import aggregate3, encode_market_call, decode_market, encode_position_call, decode_position
+    if not borrowers:
+        return
+    b32 = preconf_rpc.to_bytes32(mid)
+    calls = [(MORPHO_BLUE, encode_market_call(b32))] + [(MORPHO_BLUE, encode_position_call(b32, b)) for b in borrowers]
+    try:
+        res = aggregate3(preconf_rpc, calls, block_identifier="pending")
+    except Exception as e:
+        log.info("DIAG position-cache refresh-fail market=%s err=%s", mid[:10], str(e)[:80])
+        return
+    if not res or not res[0][0] or not res[0][1]:
+        log.info("DIAG position-cache refresh-fail market=%s reason=market-call-failed", mid[:10])
+        return
+    m = decode_market(res[0][1]); tba, tbs = m[2], m[3]
+    positions = {}
+    for b, (ok, data) in zip(borrowers, res[1:]):
+        if ok and data:
+            bs, col = decode_position(data)
+            positions[b] = (bs, col)
+        else:
+            log.info("DIAG position-cache refresh-miss market=%s borrower=%s ok=%s", mid[:10], b[:10], ok)
+    with _POSITION_CACHE_LOCK:
+        _POSITION_CACHE[mid] = (tba, tbs, positions)
+
+
+def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None):
+    """Drop-in for read_positions (same signature — swaps in via _process_transmit's reads_fn=
+    default, no call-site change needed). Market not yet in _POSITION_CACHE (not money-market-
+    covered, or not refreshed yet) -> unchanged fallback to the original live read_positions.
+    Market IS cached but a specific borrower is missing (last refresh-miss, or never seen) -> that
+    borrower is EXCLUDED from this transmit's candidates + logged (C: skip + log, never act on
+    unconfirmed data), everyone else in the same market is served normally from cache, zero RTT."""
+    with _POSITION_CACHE_LOCK:
+        cached = _POSITION_CACHE.get(mid)
+    if cached is None:
+        return read_positions(rpc, mid, borrowers, preconf_rpc=preconf_rpc)
+    tba, tbs, positions = cached
+    pos = []
+    for b in borrowers:
+        p = positions.get(b)
+        if p is not None:
+            bs, col = p
+            pos.append((b, bs, col))
+        else:
+            log.info("DIAG position-cache stale-skip market=%s borrower=%s", mid[:10], b[:10])
+    return tba, tbs, pos
+
+
+def _refresh_position_caches(*, preconf_rpc, shared, bn):
+    """Per-block driver (Layer 2, measurement phase — see STATE.md 'C temporary'). Refreshes
+    _POSITION_CACHE for every money-market (UNIV3_PATHS collateral) via refresh_position_cache.
+    PURE MEASUREMENT: writes _POSITION_CACHE and logs refresh-miss/-fail + cycle timing, but does
+    NOT touch reads_fn/_process_transmit — the armed hot path keeps reading via the original live
+    read_positions, completely unchanged, until reads_fn is explicitly swapped (deliberately not
+    done yet). One market's decode/network hiccup does not stop the cycle for the others."""
+    from chain.execute import UNIV3_PATHS
+    with shared.lock:
+        groups = dict(shared.groups)
+    _t0 = time.time()
+    n_markets = 0
+    for mid, borrowers in groups.items():
+        params = _FULL_PARAMS_CACHE.get(mid)
+        if not params:
+            continue
+        _loan, coll, _oracle, _irm, _lltv = params
+        if coll.lower() not in UNIV3_PATHS:
+            continue
+        try:
+            refresh_position_cache(preconf_rpc, mid, borrowers)
+            n_markets += 1
+        except Exception:
+            log.exception("position-cache refresh error market=%s", mid[:10])
+    if n_markets:
+        log.info("DIAG position-cache cycle markets=%d dt=%.1fs block=%s", n_markets, time.time() - _t0, bn)
