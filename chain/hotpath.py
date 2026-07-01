@@ -37,6 +37,25 @@ HOT_STATS_SEC = 120       # emit hot-path counters (spawn + gate outcomes) every
 # and _process_transmit's unpacking — zero blast radius outside resolve_meta/prepare_hot.
 _FULL_PARAMS_CACHE: dict = {}
 
+# Ground-truth полного горячего набора (A3): journal получает только счётчик (hotset n=.. src=..),
+# сам набор (borrower:bs пары) пишется сюда — сводить по адресу ликвидированного на каскаде разводит
+# L (в дампе с bs=0) / B (отсутствует) / A (ok=False в drop-логе) / A' (src=confirmed). Дёшево на диск,
+# не топит journal в каскаде (pspawn до 145). Ротацию файла — на владельце (logrotate/ручной rm).
+_HOTSET_LOG_PATH = "/root/liquidator/hotset.log"
+
+
+def _dump_hotset(mid, src, tba, tbs, pos, dropped):
+    """Append одной строки: block-набор borrower:bs (+ dropped ok=False адреса). Best-effort, не
+    роняет горячий путь при ошибке записи (диск полон/права)."""
+    try:
+        parts = " ".join("%s:%d" % (b[:10], bs) for (b, bs, _col) in pos)
+        drp = (" DROPPED=" + ",".join(d[:10] for d in dropped)) if dropped else ""
+        with open(_HOTSET_LOG_PATH, "a") as _f:
+            _f.write("%.3f mid=%s src=%s n=%d tba=%d tbs=%d | %s%s\n"
+                     % (time.time(), mid[:10], src, len(pos), tba, tbs, parts, drp))
+    except Exception:
+        pass
+
 
 # ---- pure helpers (unit-tested) ----
 
@@ -84,36 +103,42 @@ def read_preconf_price(preconf_rpc, oracle):
         return None
 
 
-def read_positions(rpc, mid, borrowers, preconf_rpc=None):
+def read_positions(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
     """market totals + each position -> (tba, tbs, [(borrower, bs, col)]). ONE aggregate3.
     Reads on preconf-pending (same source as the flip price + sim) when preconf_rpc is given, so the
-    reaction flip is visible ~1.8s before confirmed; falls back to rpc-latest on degraded preconf."""
+    reaction flip is visible ~1.8s before confirmed; falls back to rpc-latest on degraded preconf.
+    src_out (opt. mutable dict): records which source served the read ('preconf'/'confirmed') so the
+    caller can flag A' (silent confirmed-fallback -> stale debt -> false flip). Return shape unchanged."""
     from chain.multicall import aggregate3, encode_market_call, decode_market, encode_position_call, decode_position
     b32 = rpc.to_bytes32(mid)
     calls = [(MORPHO_BLUE, encode_market_call(b32))]
     for b in borrowers:
         calls.append((MORPHO_BLUE, encode_position_call(b32, b)))
-    res = None
+    res = None; _src = "confirmed"
     if preconf_rpc is not None:
         try:
             r = aggregate3(preconf_rpc, calls, block_identifier="pending")
             if r and r[0][0] and r[0][1]:
-                res = r
+                res = r; _src = "preconf"
         except Exception:
             res = None
     if res is None:
-        res = aggregate3(rpc, calls)
+        res = aggregate3(rpc, calls)                          # A': silent confirmed-fallback (src=confirmed below)
+    if src_out is not None:
+        src_out["src"] = _src
     if not res or not res[0][0] or not res[0][1]:
         return None
     m = decode_market(res[0][1]); tba, tbs = m[2], m[3]
-    pos = []
+    pos = []; _dropped = []
     for b, (ok, data) in zip(borrowers, res[1:]):
         if ok and data:
             bs, col = decode_position(data)
             pos.append((b, bs, col))
         else:
+            _dropped.append(b)
             log.info("DIAG read_positions drop %s/%s ok=%s data_len=%d",
                      mid[:10], b[:10], ok, len(data) if data else 0)
+    _dump_hotset(mid, _src, tba, tbs, pos, _dropped)          # A3: full set to disk, counter to journal
     return tba, tbs, pos
 
 
@@ -176,7 +201,7 @@ def refresh_position_cache(preconf_rpc, mid, borrowers):
         _POSITION_CACHE[mid] = (tba, tbs, positions)
 
 
-def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None):
+def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
     """Drop-in for read_positions (same signature — swaps in via _process_transmit's reads_fn=
     default, no call-site change needed). Market not yet in _POSITION_CACHE (not money-market-
     covered, or not refreshed yet) -> unchanged fallback to the original live read_positions.
@@ -188,8 +213,10 @@ def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None):
     with _POSITION_CACHE_LOCK:
         cached = _POSITION_CACHE.get(mid)
     if cached is None:
-        return read_positions(rpc, mid, borrowers, preconf_rpc=preconf_rpc)
+        return read_positions(rpc, mid, borrowers, preconf_rpc=preconf_rpc, src_out=src_out)
     tba, tbs, positions = cached
+    if src_out is not None:
+        src_out["src"] = "cache"
     now = time.time()
     pos = []
     for b in borrowers:
@@ -512,7 +539,9 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             if stats is not None: stats["f_noprice"] += 1
             continue
         _rs = time.perf_counter()
-        rp = reads_fn(rpc, mid, borrowers, preconf_rpc=preconf_rpc)
+        _src_out = {}
+        rp = reads_fn(rpc, mid, borrowers, preconf_rpc=preconf_rpc, src_out=_src_out)
+        _rsrc = _src_out.get("src", "?")
         with _POSITION_CACHE_LOCK:
             _cached = _POSITION_CACHE.get(mid)
         if _cached is not None:
@@ -524,6 +553,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             if stats is not None: stats["f_norp"] += 1
             continue
         tba, tbs, pos = rp
+        log.info("DIAG hotset mid=%s src=%s n=%d block=%d", mid[:10], _rsrc, len(pos), block)  # full set on disk
         positions = [(b, bs, col, debt_by.get((mid, b), 0.0)) for (b, bs, col) in pos]
         flipped = _flips(price, lltv_wad, tba, tbs, positions)
         if not flipped:
@@ -534,8 +564,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                            total_borrow_assets=int(tba), total_borrow_shares=int(tbs))
                 _c = [(bb, bs, _hf(_ctx, bs, col).hf) for (bb, bs, col, _du) in positions]
                 _bb, _bs, _hv = min(_c, key=lambda x: x[2])
-                log.info("DIAG noflip %s/%s minHF=%.4f bshares=%d px=%d n=%d price=%.0fms read=%.0fms",
-                         mid[:10], _bb[:10], _hv, _bs, int(price), len(_c), _t_price_last, _t_read_last)
+                log.info("DIAG noflip %s/%s minHF=%.4f bshares=%d px=%d n=%d src=%s price=%.0fms read=%.0fms",
+                         mid[:10], _bb[:10], _hv, _bs, int(price), len(_c), _rsrc, _t_price_last, _t_read_last)
         for (b, hr, du) in flipped:
             if du < floor:                                   # reaction filter: $2k+ only
                 if stats is not None: stats["f_floor"] += 1

@@ -210,6 +210,9 @@ class _Shared:
         self.lock = threading.Lock()
         self.by_id = {m.market_id: m for m in markets}
         self.groups, self.debt_by, self.debt_assets_by, self.n = {}, {}, {}, 0
+        from collections import deque
+        self.groups_history = deque(maxlen=64)   # (monotonic_ts, {mid: frozenset(borrowers)}) — closes B
+                                                 # retrospectively: was borrower in groups at transmit-time N?
 
     def snapshot(self):
         with self.lock:
@@ -254,6 +257,8 @@ def _refresh_worker(shared, markets, cfg, ctx_cache, log, stop):
             with shared.lock:
                 shared.by_id = {m.market_id: m for m in markets}
                 shared.groups, shared.debt_by, shared.debt_assets_by, shared.n = g, db, dab, n
+                shared.groups_history.append(                          # snapshot per fetch (monotonic ts)
+                    (time.monotonic(), {mid: frozenset(bs) for mid, bs in g.items()}))
         except Exception:
             log.exception("candidate refresh error")
         stop.wait(cfg.candidate_refresh_sec)
