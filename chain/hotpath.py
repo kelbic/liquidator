@@ -59,6 +59,47 @@ def _dump_hotset(mid, src, tba, tbs, pos, dropped):
 
 # ---- pure helpers (unit-tested) ----
 
+_BF_HIST: dict = {}          # bn -> fb-baseFee (последние ~16 блоков)
+_BF_LAST_LOG = 0.0           # троттл лога 60с
+_BF_GAPS = 0                 # разрывы bn между fb-записями с последнего лога (= пропуски index-0)
+_BF_PREV_BN = None
+
+
+def _basefee_probe(*, bn, fb, rpc, log):
+    """5a (LOG-ONLY, перед SEND-2): fb-baseFee из flashblock-хедера vs Alchemy get_block(N) по
+    НОМЕРУ блока (лаг 3 — блок к этому моменту подтверждён) — тот же аксессор, что в send_tx
+    (execute.py get_block().baseFeePerGas). SEND-2 ПЕРЕНОСИТ send-путь на fb-источник; этот замер
+    решает: чисто (eq=True, gap~0) -> SEND-2 как спроектирован; иначе -> fallback max(fb,last_alch)
+    или fb x1.25. gap60s = пропущенные index-0 кадры (недоступность источника). Вызывается только
+    из фид-петли (один тред) -> глобалы без лока; сравнение — в daemon-треде (Alchemy-RTT вне петли).
+    После разрыва bn лог откладывается, пока tgt в дыре (счётчик gap не теряется) — юнит."""
+    global _BF_LAST_LOG, _BF_GAPS, _BF_PREV_BN
+    if _BF_PREV_BN is not None and bn > _BF_PREV_BN + 1:
+        _BF_GAPS += bn - _BF_PREV_BN - 1
+    _BF_PREV_BN = bn
+    _BF_HIST[bn] = fb
+    for k in [k for k in _BF_HIST if k < bn - 16]:
+        _BF_HIST.pop(k, None)
+    now = time.monotonic()
+    if now - _BF_LAST_LOG < 60.0:
+        return
+    tgt = bn - 3
+    fb_t = _BF_HIST.get(tgt)
+    if fb_t is None:                 # прогрев (<3 блоков) / пропуск tgt: троттл не жжём, повтор блоком позже
+        return
+    _BF_LAST_LOG = now
+    gaps = _BF_GAPS; _BF_GAPS = 0
+    def _cmp():
+        alch = None
+        try:
+            alch = int(rpc._web3().eth.get_block(tgt).get("baseFeePerGas") or 0)
+        except Exception:
+            pass
+        log.info("DIAG basefee bn=%d fb=%s alch=%s eq=%s gap60s=%d",
+                 tgt, fb_t, alch, (fb_t is not None and alch is not None and fb_t == alch), gaps)
+    threading.Thread(target=_cmp, daemon=True).start()
+
+
 _SHADOW_SCALE = {"cbXRP": 10**28, "cbDOGE": 10**26, "cbADA": 10**28}   # immutable оракулов (STATE Идея 2)
 
 
@@ -689,7 +730,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     import json
     import websockets
     import brotli
-    from chain.feeds import resolve_feeds, extract_txs, block_number_of, decode_forward_answer, FORWARD_SEL
+    from chain.feeds import resolve_feeds, extract_txs, block_number_of, decode_forward_answer, FORWARD_SEL, basefee_of
 
     def _default_ws():
         return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
@@ -755,6 +796,9 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         continue
                     if bn != last_poll_block:                 # one preconf-price poll per block (money markets)
                         last_poll_block = bn
+                        _bf = basefee_of(d)                   # 5a: index-0 кадр несёт base-хедер
+                        if _bf is not None:
+                            _basefee_probe(bn=bn, fb=_bf, rpc=rpc, log=log)
                         threading.Thread(target=_poll_prices, daemon=True,
                                          kwargs=dict(preconf_rpc=preconf_rpc, rpc_fallback=rpc, feeds=feeds, meta=meta,
                                                      poll_seen=poll_seen, stats=stats, bn=bn, log=log,

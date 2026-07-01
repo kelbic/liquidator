@@ -113,6 +113,16 @@ def match_aggs(txs, agg_set):
     return hit
 
 
+def basefee_of(d):
+    """baseFee из index-0 кадра (base-хедер), int wei; None если кадр без base/поля. Имя поля —
+    snake_case как block_number; camelCase-фолбэк на случай варианта шлюза (живой DIAG покажет)."""
+    base = d.get("base") if isinstance(d.get("base"), dict) else {}
+    bf = base.get("base_fee_per_gas") or base.get("baseFeePerGas")
+    if bf is None:
+        return None
+    return int(bf, 16) if isinstance(bf, str) and bf.startswith("0x") else int(bf)
+
+
 def block_number_of(d):
     base = d.get("base") if isinstance(d.get("base"), dict) else {}
     meta = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
