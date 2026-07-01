@@ -234,6 +234,37 @@ def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
     return tba, tbs, pos
 
 
+_CACHE_REFRESH_THREAD = None      # re-entrancy guard (план п.3): один цикл за раз
+_CACHE_REFRESH_STARTED = 0.0      # monotonic старт живого цикла (для busy-skip running=)
+_CACHE_SKIP_N = 0                 # skip'ов с последнего лога (троттл 60с)
+_CACHE_SKIP_LOG_TS = 0.0
+
+
+def _spawn_cache_refresh(*, preconf_rpc, shared, bn):
+    """Re-entrancy guard for the Layer-2 driver (plan #3). The driver used to be spawned as a NEW
+    thread EVERY block while one cycle takes 1.9-2.4s ~= block time: any RTT degradation =>
+    overlapping cycles => thread pile-up => self-load on the battle preconf exactly at cascade
+    peak (the plausible trigger of the A' confirmed-fallback). One cycle at a time: if the
+    previous one is still alive, skip this block. busy-skip is throttled to 1 line/60s with an
+    accumulated count — n/running are the live signal of preconf strain (correlate with
+    src=confirmed). Called only from the single feed-loop thread => no lock around check-then-set."""
+    global _CACHE_REFRESH_THREAD, _CACHE_REFRESH_STARTED, _CACHE_SKIP_N, _CACHE_SKIP_LOG_TS
+    t = _CACHE_REFRESH_THREAD
+    if t is not None and t.is_alive():
+        _CACHE_SKIP_N += 1
+        now = time.monotonic()
+        if now - _CACHE_SKIP_LOG_TS >= 60.0:
+            log.info("DIAG cache-refresh busy-skip n=%d running=%.1fs bn=%d",
+                     _CACHE_SKIP_N, now - _CACHE_REFRESH_STARTED, bn)
+            _CACHE_SKIP_N = 0
+            _CACHE_SKIP_LOG_TS = now
+        return
+    _CACHE_REFRESH_STARTED = time.monotonic()
+    _CACHE_REFRESH_THREAD = threading.Thread(target=_refresh_position_caches, daemon=True,
+                                             kwargs=dict(preconf_rpc=preconf_rpc, shared=shared, bn=bn))
+    _CACHE_REFRESH_THREAD.start()
+
+
 def _refresh_position_caches(*, preconf_rpc, shared, bn):
     """Per-block driver (Layer 2, measurement phase — see STATE.md 'C temporary'). Refreshes
     _POSITION_CACHE for every money-market (UNIV3_PATHS collateral) via refresh_position_cache.
@@ -693,8 +724,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         # Layer 2, measurement phase (C temporary — see STATE.md): fills _POSITION_CACHE +
                         # logs refresh-miss/cycle timing. Does NOT touch reads_fn — read_positions_cached
                         # is not wired into _process_transmit yet, so this has zero effect on hot-path behavior.
-                        threading.Thread(target=_refresh_position_caches, daemon=True,
-                                         kwargs=dict(preconf_rpc=preconf_rpc, shared=shared, bn=bn)).start()
+                        _spawn_cache_refresh(preconf_rpc=preconf_rpc, shared=shared, bn=bn)
                     idx = d.get("index"); txs = extract_txs(d); now = time.time()
                     for agg in agg_set:                          # BARE match: ANY mention of the aggregator
                         if now - last_spawn.get(agg, 0.0) < HOT_THROTTLE_SEC:
