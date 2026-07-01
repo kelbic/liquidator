@@ -447,7 +447,7 @@ def hot_min_repaid(cfg):
 
 def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, meta, shared,
                       store, guard, alerter, log, last_price=None, stats=None,
-                      price_fn=read_preconf_price, reads_fn=read_positions_cached,
+                      price_fn=read_preconf_price, reads_fn=read_positions,
                       prepare_fn=prepare_hot, dispatch_fn=None):
     """For one detected transmit: per affected market, read the preconf price, recompute flips, keep only
     reaction prizes (repaid >= hot_min_repaid), check the SHARED kill-switch, prepare_hot, and dispatch
