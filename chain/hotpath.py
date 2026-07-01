@@ -450,7 +450,14 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
 
         min_profit_final = profit_wei * 95 // 100
         cd1 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit_final)
-        return {"ok": True, "calldata": cd1, "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd}
+        # gas оцениваем на PRECONF-pending (позиция уже ликвидируема), иначе send_tx оценит на
+        # confirmed-Alchemy, где reaction-флип ещё healthy -> estimate_gas ревертит -> tx НЕ уходит.
+        try:
+            _gas = preconf_rpc._web3().eth.estimate_gas({"from": bot, "to": liq, "data": cd1}, block_identifier="pending")
+            _gas_limit = int(_gas) * 12 // 10
+        except Exception:
+            _gas_limit = cfg.gas_limit_est
+        return {"ok": True, "calldata": cd1, "gas": _gas_limit, "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd}
     except Exception as e:
         return {"ok": False, "reason": f"error: {type(e).__name__}: {str(e)[:120]}"}
 

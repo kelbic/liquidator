@@ -326,9 +326,10 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
         sent = []
         for i, (mid, borrower, prep) in enumerate(batch):
             try:
-                res = send(rpc, cfg.wallet_key,
-                           {"to": cfg.liquidator_address, "data": prep["calldata"], "nonce": base_nonce + i},
-                           wait=False, min_tip_wei=tip)
+                _txd = {"to": cfg.liquidator_address, "data": prep["calldata"], "nonce": base_nonce + i}
+                if prep.get("gas"):                          # explicit gas from prep (hot path: estimated on preconf)
+                    _txd["gas"] = prep["gas"]                # -> send_tx skips its stale-Alchemy estimate_gas
+                res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip)
                 sent.append((mid, borrower, prep, res["hash"]))
                 if log:
                     log.info("dispatch: sent %s/%s nonce=%d tx=%s net~$%.2f",
