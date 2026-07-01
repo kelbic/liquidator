@@ -128,6 +128,22 @@ _POSITION_CACHE: dict = {}  # {market_id: (tba, tbs, {borrower: (bs, col, last_o
 _POSITION_CACHE_MAX_AGE_SEC = 6.0  # ~3 cycles at the observed dt=1.9-2.4s/5-market cycle
 
 
+def _cache_coverage_stats(borrowers, cached_positions, now):
+    """PURE: for a live-read borrower list, how many would have been found in the position cache
+    (in_cache) vs never-seen, how old the found ones are, and WHICH ones were missing (short
+    addresses, capped) — so a missing borrower can be cross-referenced by address against the
+    drop-log, distinguishing 'cache hasn't caught up yet' from 'this borrower fails in both paths
+    for the same underlying reason'. No RTT, no side effects — pure comparison against whatever's
+    already in memory. Used to measure never-seen frequency under real transmit load WITHOUT
+    switching the hot path to consume the cache (see STATE.md)."""
+    ages = [now - cached_positions[b][2] for b in borrowers if b in cached_positions]
+    missing = [b[:10] for b in borrowers if b not in cached_positions]
+    in_cache = len(ages)
+    avg_age = sum(ages) / len(ages) if ages else 0.0
+    max_age = max(ages) if ages else 0.0
+    return in_cache, len(borrowers), avg_age, max_age, missing[:10]
+
+
 def refresh_position_cache(preconf_rpc, mid, borrowers):
     """Background per-block refresh for ONE money-market. A borrower whose position() call in the
     batch comes back ok=False/empty is logged (refresh-miss) but their PREVIOUS cache entry (if any)
@@ -490,6 +506,12 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             continue
         _rs = time.perf_counter()
         rp = reads_fn(rpc, mid, borrowers, preconf_rpc=preconf_rpc)
+        with _POSITION_CACHE_LOCK:
+            _cached = _POSITION_CACHE.get(mid)
+        if _cached is not None:
+            _in_cache, _total, _avg_age, _max_age, _missing = _cache_coverage_stats(borrowers, _cached[2], time.time())
+            log.info("DIAG cache-coverage market=%s in_cache=%d/%d avg_age=%.1fs max_age=%.1fs missing=%s",
+                     mid[:10], _in_cache, _total, _avg_age, _max_age, ",".join(_missing) if _missing else "-")
         _t_read_last = (time.perf_counter() - _rs) * 1000.0; _t_read_total += _t_read_last
         if not rp:
             if stats is not None: stats["f_norp"] += 1
