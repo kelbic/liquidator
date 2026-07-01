@@ -561,14 +561,15 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
 # read_positions без изменений — нулевой риск для непокрытых рынков.
 
 _POSITION_CACHE_LOCK = threading.Lock()
-_POSITION_CACHE: dict = {}  # {market_id: (tba, tbs, {borrower: (bs, col)})}
+_POSITION_CACHE: dict = {}  # {market_id: (tba, tbs, {borrower: (bs, col, last_ok_ts)})}
+_POSITION_CACHE_MAX_AGE_SEC = 6.0  # ~3 cycles at the observed dt=1.9-2.4s/5-market cycle
 
 
 def refresh_position_cache(preconf_rpc, mid, borrowers):
     """Background per-block refresh for ONE money-market. A borrower whose position() call in the
-    batch comes back ok=False/empty is EXCLUDED from the cache (never left stale, never silently
-    dropped) and logged — this is what closes hypothesis A for cache-covered markets. Pure side
-    effect on _POSITION_CACHE; returns nothing."""
+    batch comes back ok=False/empty is logged (refresh-miss) but their PREVIOUS cache entry (if any)
+    is left untouched — not wiped, not refreshed. Freshness is enforced downstream by age at read
+    time (read_positions_cached), not by dropping on a single missed cycle."""
     from chain.multicall import aggregate3, encode_market_call, decode_market, encode_position_call, decode_position
     if not borrowers:
         return
@@ -583,14 +584,16 @@ def refresh_position_cache(preconf_rpc, mid, borrowers):
         log.info("DIAG position-cache refresh-fail market=%s reason=market-call-failed", mid[:10])
         return
     m = decode_market(res[0][1]); tba, tbs = m[2], m[3]
-    positions = {}
-    for b, (ok, data) in zip(borrowers, res[1:]):
-        if ok and data:
-            bs, col = decode_position(data)
-            positions[b] = (bs, col)
-        else:
-            log.info("DIAG position-cache refresh-miss market=%s borrower=%s ok=%s", mid[:10], b[:10], ok)
+    now = time.time()
     with _POSITION_CACHE_LOCK:
+        prev = _POSITION_CACHE.get(mid)
+        positions = dict(prev[2]) if prev else {}
+        for b, (ok, data) in zip(borrowers, res[1:]):
+            if ok and data:
+                bs, col = decode_position(data)
+                positions[b] = (bs, col, now)
+            else:
+                log.info("DIAG position-cache refresh-miss market=%s borrower=%s ok=%s", mid[:10], b[:10], ok)
         _POSITION_CACHE[mid] = (tba, tbs, positions)
 
 
@@ -598,22 +601,30 @@ def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None):
     """Drop-in for read_positions (same signature — swaps in via _process_transmit's reads_fn=
     default, no call-site change needed). Market not yet in _POSITION_CACHE (not money-market-
     covered, or not refreshed yet) -> unchanged fallback to the original live read_positions.
-    Market IS cached but a specific borrower is missing (last refresh-miss, or never seen) -> that
-    borrower is EXCLUDED from this transmit's candidates + logged (C: skip + log, never act on
-    unconfirmed data), everyone else in the same market is served normally from cache, zero RTT."""
+    Market IS cached: a borrower's entry younger than _POSITION_CACHE_MAX_AGE_SEC is served from
+    cache (zero RTT); a borrower missing entirely, or present but older than the threshold, is
+    EXCLUDED from this transmit's candidates + logged (A-with-age-bound: trust recent cache,
+    never act on data past the freshness window), everyone else in the same market is served
+    normally, zero RTT."""
     with _POSITION_CACHE_LOCK:
         cached = _POSITION_CACHE.get(mid)
     if cached is None:
         return read_positions(rpc, mid, borrowers, preconf_rpc=preconf_rpc)
     tba, tbs, positions = cached
+    now = time.time()
     pos = []
     for b in borrowers:
         p = positions.get(b)
-        if p is not None:
-            bs, col = p
+        if p is None:
+            log.info("DIAG position-cache stale-skip market=%s borrower=%s reason=never-seen", mid[:10], b[:10])
+            continue
+        bs, col, last_ok_ts = p
+        age = now - last_ok_ts
+        if age <= _POSITION_CACHE_MAX_AGE_SEC:
             pos.append((b, bs, col))
         else:
-            log.info("DIAG position-cache stale-skip market=%s borrower=%s", mid[:10], b[:10])
+            log.info("DIAG position-cache stale-skip market=%s borrower=%s reason=too-old age=%.1fs",
+                     mid[:10], b[:10], age)
     return tba, tbs, pos
 
 
