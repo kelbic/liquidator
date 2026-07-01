@@ -11,3 +11,5 @@ contracts/out/
 contracts/cache/
 contracts/lib/
 contracts/broadcast/
+hotset.log
+*.bak-*
