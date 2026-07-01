@@ -38,7 +38,7 @@ for it in items:
     bn = it.get("blockNumber")
     d = it.get("data") or {}
     liq = d.get("liquidator", "") or ""
-    print(f"  block={bn} user={user_addr} liquidator={liq} txHash={it.get('txHash')}")
+    print(f"  ts={it.get('timestamp')} block={bn} user={user_addr} liquidator={liq} txHash={it.get('txHash')}")
     if user_addr.lower().startswith(BORROWER_PREFIX):
         match = it
 
