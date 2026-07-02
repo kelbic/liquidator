@@ -63,6 +63,21 @@ _BF_HIST: dict = {}          # bn -> fb-baseFee (последние ~16 блок
 _BF_LAST_LOG = 0.0           # троттл лога 60с
 _BF_GAPS = 0                 # разрывы bn между fb-записями с последнего лога (= пропуски index-0)
 _BF_PREV_BN = None
+_BF_LATEST = None            # (bn, fb_wei, monotonic_ts) — последний index-0 baseFee (SEND-2)
+
+
+def _fresh_basefee(max_age_sec=6.0):
+    """SEND-2 гард свежести: fb-baseFee, если последний index-0 кадр не старше 3 блоков (6с),
+    иначе None -> prep не несёт fee -> send_tx идёт старым Alchemy-путём. Защита от «фид жив,
+    кадры не идут» (gap60s-класс: 0.017% в покое, каскад неизвестен — watch-item). Пишет слот
+    фид-петля, читает тред prepare_hot: подмена кортежа атомарна (GIL), гонка максимум на один
+    кадр ~200мс — гард переваривает."""
+    if _BF_LATEST is None:
+        return None
+    _bn, fb, ts = _BF_LATEST
+    if time.monotonic() - ts > max_age_sec:
+        return None
+    return fb
 
 
 def _basefee_probe(*, bn, fb, rpc, log):
@@ -73,11 +88,12 @@ def _basefee_probe(*, bn, fb, rpc, log):
     или fb x1.25. gap60s = пропущенные index-0 кадры (недоступность источника). Вызывается только
     из фид-петли (один тред) -> глобалы без лока; сравнение — в daemon-треде (Alchemy-RTT вне петли).
     После разрыва bn лог откладывается, пока tgt в дыре (счётчик gap не теряется) — юнит."""
-    global _BF_LAST_LOG, _BF_GAPS, _BF_PREV_BN
+    global _BF_LAST_LOG, _BF_GAPS, _BF_PREV_BN, _BF_LATEST
     if _BF_PREV_BN is not None and bn > _BF_PREV_BN + 1:
         _BF_GAPS += bn - _BF_PREV_BN - 1
     _BF_PREV_BN = bn
     _BF_HIST[bn] = fb
+    _BF_LATEST = (bn, fb, time.monotonic())
     for k in [k for k in _BF_HIST if k < bn - 16]:
         _BF_HIST.pop(k, None)
     now = time.monotonic()
@@ -594,7 +610,13 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
             _gas_limit = int(_gas) * 12 // 10
         except Exception:
             _gas_limit = cfg.gas_limit_est
-        return {"ok": True, "calldata": cd1, "gas": _gas_limit, "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd}
+        _prep = {"ok": True, "calldata": cd1, "gas": _gas_limit, "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd}
+        _fb = _fresh_basefee()
+        if _fb is not None:                                   # SEND-2: fee из fb-хедера (0 Alchemy-RTT в send)
+            _tip = int(cfg.tip_gwei * 1e9)
+            _prep["max_fee"] = _fb * 2 + _tip                 # та же формула base*2+tip, но base = pending-блок из фида
+            _prep["tip"] = _tip
+        return _prep
     except Exception as e:
         return {"ok": False, "reason": f"error: {type(e).__name__}: {str(e)[:120]}"}
 

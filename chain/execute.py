@@ -329,6 +329,9 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                 _txd = {"to": cfg.liquidator_address, "data": prep["calldata"], "nonce": base_nonce + i}
                 if prep.get("gas"):                          # explicit gas from prep (hot path: estimated on preconf)
                     _txd["gas"] = prep["gas"]                # -> send_tx skips its stale-Alchemy estimate_gas
+                if prep.get("max_fee"):                      # SEND-2: fees from fb-header via prep (hot path)
+                    _txd["maxFeePerGas"] = prep["max_fee"]   # -> send_tx skips BOTH Alchemy fee-RTTs
+                    _txd["maxPriorityFeePerGas"] = prep["tip"]
                 res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip)
                 sent.append((mid, borrower, prep, res["hash"]))
                 if log:
