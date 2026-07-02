@@ -639,6 +639,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     if dispatch_fn is None:
         from chain.execute import dispatch_liquidations as dispatch_fn  # noqa: F811
     floor = hot_min_repaid(cfg)
+    _gate_px = {}                                            # 2b: цена оракула, прочитанная gate -> переиспользовать в цикле
     # price-change gate: the bare match also fires on price-READ txs. Read ONE representative oracle
     # preconf price; if it has not moved since last sighting this was a reader, not a transmit -> skip
     # the 340-call multicall + flips. This is what makes the bare match viable on the hot path.
@@ -647,6 +648,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         if rep is None:
             return []
         px = price_fn(preconf_rpc, rep)
+        if px is not None:
+            _gate_px[rep] = px                               # 2b: рынок с этим оракулом не будет читать 2-й раз
         moved = _price_moved(agg, px, last_price)
         if stats is not None:                                # health buckets (none=preconf unreadable)
             stats["none" if px is None else ("proceed" if moved else "skip")] += 1
@@ -665,7 +668,10 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             continue
         oracle, lltv_wad = om
         _pxs = time.perf_counter()
-        price = price_fn(preconf_rpc, oracle)
+        if oracle in _gate_px:                               # 2b: gate уже прочитал этот оракул -> без 2-го RTT
+            price = _gate_px[oracle]
+        else:
+            price = price_fn(preconf_rpc, oracle)
         _t_price_last = (time.perf_counter() - _pxs) * 1000.0
         if price is None:
             if stats is not None: stats["f_noprice"] += 1
