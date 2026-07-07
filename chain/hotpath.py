@@ -855,6 +855,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             if _dec and _dec[0] in shadow_map:
                                 _sym, _scale, _oracle = shadow_map[_dec[0]]
                                 if cfg.price_from_feed:       # Layer1 LIVE: feed price triggers _process_transmit + dedups poll
+                                    log.info("DIAG feed-spawn mkt=%s oracle=%s bn=%s px_hint=%d",
+                                             _sym, _oracle[:10], bn, _dec[1] * _scale)
                                     feed_handled.add((_oracle, bn))
                                     threading.Thread(target=_process_transmit,
                                                      args=(_dec[0], bn, "feed", time.time()),
