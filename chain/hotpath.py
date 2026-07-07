@@ -860,7 +860,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                     feed_handled.add((_oracle, bn))
                                     threading.Thread(target=_process_transmit,
                                                      args=(_dec[0], bn, "feed", time.time()),
-                                                     kwargs=dict(spawn_kwargs, last_price=last_price,
+                                                     kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,
+                                                                 feeds=feeds, meta=meta, shared=shared,
+                                                                 store=store, guard=guard, alerter=alerter,
+                                                                 log=log, last_price=last_price, stats=stats,
                                                                  px_hint=_dec[1] * _scale, hint_oracle=_oracle),
                                                      daemon=True).start()
                                 threading.Thread(target=_shadow_feed_check, daemon=True,
