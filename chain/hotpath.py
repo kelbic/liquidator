@@ -698,7 +698,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             if stats is not None: stats["f_norp"] += 1
             continue
         tba, tbs, pos = rp
-        log.info("DIAG hotset mid=%s src=%s n=%d block=%d", mid[:10], _rsrc, len(pos), block)  # full set on disk
+        log.info("DIAG hotset mid=%s src=%s trig=%s n=%d block=%d", mid[:10], _rsrc, subidx, len(pos), block)  # full set on disk
         positions = [(b, bs, col, debt_by.get((mid, b), 0.0)) for (b, bs, col) in pos]
         flipped = _flips(price, lltv_wad, tba, tbs, positions)
         if not flipped:
@@ -709,8 +709,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                            total_borrow_assets=int(tba), total_borrow_shares=int(tbs))
                 _c = [(bb, bs, _hf(_ctx, bs, col).hf) for (bb, bs, col, _du) in positions]
                 _bb, _bs, _hv = min(_c, key=lambda x: x[2])
-                log.info("DIAG noflip %s/%s minHF=%.4f bshares=%d px=%d n=%d src=%s price=%.0fms read=%.0fms",
-                         mid[:10], _bb[:10], _hv, _bs, int(price), len(_c), _rsrc, _t_price_last, _t_read_last)
+                log.info("DIAG noflip %s/%s minHF=%.4f bshares=%d px=%d n=%d src=%s trig=%s price=%.0fms read=%.0fms",
+                         mid[:10], _bb[:10], _hv, _bs, int(price), len(_c), _rsrc, subidx, _t_price_last, _t_read_last)
         for (b, hr, du) in flipped:
             if du < floor:                                   # reaction filter: $2k+ only
                 if stats is not None: stats["f_floor"] += 1
