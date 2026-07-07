@@ -421,9 +421,11 @@ def read_preconf_prices(preconf_rpc, oracles, rpc_fallback=None):
     return out, n_fb
 
 
-def _poll_changed(prices, poll_seen, oracle2agg):
+def _poll_changed(prices, poll_seen, oracle2agg, feed_handled=None, bn=None):
     """PURE: given {oracle: price|None}, update poll_seen (baseline on first sighting) and return the
-    set of aggregators whose oracle price MOVED. First sighting -> no spawn; None price -> skipped."""
+    set of aggregators whose oracle price MOVED. First sighting -> no spawn; None price -> skipped.
+    Layer1 dedup: if feed_handled contains (oracle, bn), the feed already spawned this transmit ->
+    still update poll_seen baseline (so next block compares correctly) but DON'T re-add to changed."""
     changed = set()
     for o, px in prices.items():
         if px is None:
@@ -431,12 +433,14 @@ def _poll_changed(prices, poll_seen, oracle2agg):
         prev = poll_seen.get(o)
         poll_seen[o] = px
         if prev is not None and px != prev:
+            if feed_handled is not None and (o, bn) in feed_handled:
+                continue                        # feed already spawned this (oracle, block) -> skip poll dup
             changed.add(oracle2agg.get(o))
     changed.discard(None)
     return changed
 
 
-def _poll_prices(*, preconf_rpc, rpc_fallback, feeds, meta, poll_seen, stats, spawn_kwargs, bn, log):
+def _poll_prices(*, preconf_rpc, rpc_fallback, feeds, meta, poll_seen, stats, spawn_kwargs, bn, log, feed_handled=None):
     """Per-block trigger: batch-read all oracle preconf prices; spawn a (gated) _process_transmit for
     each aggregator whose price moved. The agg-level gate dedups vs any bare-match spawn. This is what
     gives cbXRP/cbDOGE/cbADA a detection trigger at all (they never surface in the flashblock stream)."""
@@ -451,7 +455,7 @@ def _poll_prices(*, preconf_rpc, rpc_fallback, feeds, meta, poll_seen, stats, sp
         stats["poll"] += 1
         stats["poll_none"] += sum(1 for v in prices.values() if v is None)
         stats["poll_fb"] += n_fb
-    changed = _poll_changed(prices, poll_seen, oracle2agg)
+    changed = _poll_changed(prices, poll_seen, oracle2agg, feed_handled=feed_handled, bn=bn)
     if stats is not None:
         stats["pspawn"] += len(changed)
     for agg in changed:
@@ -630,7 +634,8 @@ def hot_min_repaid(cfg):
 def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, meta, shared,
                       store, guard, alerter, log, last_price=None, stats=None,
                       price_fn=read_preconf_price, reads_fn=read_positions,
-                      prepare_fn=prepare_hot, dispatch_fn=None):
+                      prepare_fn=prepare_hot, dispatch_fn=None,
+                      px_hint=None, hint_oracle=None):
     """For one detected transmit: per affected market, read the preconf price, recompute flips, keep only
     reaction prizes (repaid >= hot_min_repaid), check the SHARED kill-switch, prepare_hot, and dispatch
     the passers. Injectable seams (price_fn/reads_fn/prepare_fn/dispatch_fn) for unit tests. Returns the
@@ -640,6 +645,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         from chain.execute import dispatch_liquidations as dispatch_fn  # noqa: F811
     floor = hot_min_repaid(cfg)
     _gate_px = {}                                            # 2b: цена оракула, прочитанная gate -> переиспользовать в цикле
+    if px_hint is not None and hint_oracle is not None:      # Layer1: feed price seeds ONLY its own oracle (2b logic reuses it in loop)
+        _gate_px[hint_oracle] = px_hint
     # price-change gate: the bare match also fires on price-READ txs. Read ONE representative oracle
     # preconf price; if it has not moved since last sighting this was a reader, not a transmit -> skip
     # the 340-call multicall + flips. This is what makes the bare match viable on the hot path.
@@ -780,6 +787,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
              "f_nocand": 0, "f_noprice": 0, "f_norp": 0, "f_noflip": 0, "f_floor": 0, "f_prep": 0}  # funnel proceed->prepare_hot
     last_stats = time.monotonic()
     poll_seen: dict = {}         # oracle -> last preconf price (poll-local; baseline -> spawn only on move)
+    feed_handled: set = set()    # Layer1: (oracle, bn) spawned by feed this block -> poll skips dup; cleared on block change
     last_poll_block = None       # one preconf-price poll per block
     fb_windows = 0               # consecutive stats windows with poll_fb>0 (preconf degradation streak)
     last_fb_alert = 0.0          # monotonic of last degradation alert (anti-flood)
@@ -824,12 +832,14 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         continue
                     if bn != last_poll_block:                 # one preconf-price poll per block (money markets)
                         last_poll_block = bn
+                        feed_handled.clear()                  # Layer1: dedup set is per-block -> clear on block change
                         _bf = basefee_of(d)                   # 5a: index-0 кадр несёт base-хедер
                         if _bf is not None:
                             _basefee_probe(bn=bn, fb=_bf, rpc=rpc, log=log)
                         threading.Thread(target=_poll_prices, daemon=True,
                                          kwargs=dict(preconf_rpc=preconf_rpc, rpc_fallback=rpc, feeds=feeds, meta=meta,
                                                      poll_seen=poll_seen, stats=stats, bn=bn, log=log,
+                                                     feed_handled=feed_handled,
                                                      spawn_kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,
                                                                        feeds=feeds, meta=meta, shared=shared,
                                                                        store=store, guard=guard, alerter=alerter,
@@ -844,6 +854,13 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             _dec = decode_forward_answer(_raw)
                             if _dec and _dec[0] in shadow_map:
                                 _sym, _scale, _oracle = shadow_map[_dec[0]]
+                                if cfg.price_from_feed:       # Layer1 LIVE: feed price triggers _process_transmit + dedups poll
+                                    feed_handled.add((_oracle, bn))
+                                    threading.Thread(target=_process_transmit,
+                                                     args=(_dec[0], bn, "feed", time.time()),
+                                                     kwargs=dict(spawn_kwargs, last_price=last_price,
+                                                                 px_hint=_dec[1] * _scale, hint_oracle=_oracle),
+                                                     daemon=True).start()
                                 threading.Thread(target=_shadow_feed_check, daemon=True,
                                                  kwargs=dict(sym=_sym, agg=_dec[0], answer=_dec[1],
                                                              scale=_scale, oracle=_oracle,
