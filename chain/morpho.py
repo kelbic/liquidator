@@ -141,13 +141,20 @@ def _query_page(keys: list[str], skip: int, first: int, api_url: str, timeout: i
 
 
 def _fetch_borrower_positions(keys: list[str], api_url: str, page: int = 1000,
-                              max_pages: int = 20, timeout: int = 15) -> list:
+                              max_pages: int = 20, timeout: int = 15,
+                              cycle_deadline: float = 30.0) -> list:
     """All BORROWER positions across markets, no truncation. Because positions are ordered
     by borrowShares desc, suppliers (borrowShares==0) sort last -> stop at the first zero.
-    Single first:1000 would have capped at one big market; this paginates all of them."""
+    Single first:1000 would have capped at one big market; this paginates all of them.
+    cycle_deadline caps TOTAL wall-time: a bad API can stack timeout*retry across pages into
+    minutes (measured: 5 hangs >60s/3d, max 1767s = 30min blind hot-set). On deadline, return
+    what we have (first pages = largest debts) rather than block the refresh thread for minutes."""
     out: list = []
     skip = 0
+    _t0 = time.monotonic()
     for _ in range(max_pages):
+        if time.monotonic() - _t0 > cycle_deadline:
+            break                               # budget exhausted -> return partial (biggest debts first)
         batch = _query_page(keys, skip, page, api_url, timeout)
         for it in batch:
             if _int((it.get("state") or {}).get("borrowShares")) == 0:
