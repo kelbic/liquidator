@@ -76,7 +76,15 @@ Watch: `DIAG seq-send` (ошибки секвенсера), `dispatch: sent .. n
   кэша, только direct-маршруты, minProfit=50% бонуса; исход гарантируют контракты, промах = газ
   реверта под kill-switch. Включать ПОСЛЕ того, как обычный путь покажет живые выстрелы.
 
-**ПЕРЕЕЗД В US-EAST ГОТОВ К CUTOVER (07-08):** новый VPS Charlotte NC `185.173.146.134`
+**ПЕРЕЕХАЛИ: БОТ В БОЮ НА CHARLOTTE С 07-08 19:52 UTC.** Cutover чистый (Вена stop+DISABLE =
+выключенный бэкап, НЕ включать — nonce; db с дневными тоталами и snapshot перенесены; warm-start
+676 кандидатов). **Эффект немедленный: position-cache cycle 2.0–2.6с (Вена) → 0.6–0.8с** — сустейн-
+вопрос слоя 2 снят, цикл < трети блока. Ошибок 0. Прод теперь `/root/liquidator` на
+`185.173.146.134` (TZ=UTC, daily timer 08:00 UTC); деплой на него: владелец `git push` origin →
+Charlotte `git pull origin main`, либо ассистент git-bundle+scp с сандбокса (сандбокс живёт на
+Вене-хосте). Журнал Charlotte ассистент читает по ssh. Ниже — история подготовки:
+
+**(история) ПЕРЕЕЗД В US-EAST ГОТОВ К CUTOVER (07-08):** новый VPS Charlotte NC `185.173.146.134`
 (NetCrafters, root у ассистента). Замер: sequencer warm=30ms, preconf=38ms (Вена=121/133) —
 **−90мс/вызов подтверждён на боевой машине.** Площадка собрана: репо (origin, HEAD 5958360+),
 venv (py3.14/web3 7.16 == Вена), covered_markets/feed_to_market перенесены, systemd-юниты
