@@ -201,6 +201,12 @@ oracle-update. Все три части нужны вместе для «нол�
 - **cbBTC/USDC ($69M/30д) — дыра покрытия реальна, но НЕ джекпот** (MID $10–100k: 58 ботов плотнее cbXRP).
 - **Покрытие расширять не на что** (7 слепых рынков 0 ликв/30д, composite закрыт поллингом, FUSD-оракул None).
 - **«Мгновенный флип на ноже» структурно НЕ наш** (VVV/cbBTC 07-05: HF висит на ноже, атомарное взятие).
+- **UniV3-маршруты для cbLTC и EURC — МЕРТВЫ, не переоткрывать** (проверено живым RPC 07-08:
+  cbLTC/WETH 3000 и WETH/EURC 500 существуют с liquidity=0; cbLTC/USDC только 10000 с liq=0;
+  EURC/USDC 100 liq=0; Aerodrome basic (vAMM) тоже пуст — $6.1k cbBTC давал выход $61). Глубина —
+  ТОЛЬКО Aerodrome Slipstream: cbBTC/EURC ts=100, cbLTC/WETH ts=200, WETH/USDC ts=100, USDC/EURC
+  ts=1 (~$10M). Роутер `0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5`, exactInput v1-ФОРМА С deadline
+  (селектор `c04b8d59`, НЕ b858183f), factory=CL `0x5e7BB104…` — сверено bytecode.
 - **Silo-трек закрыт** (TVL/объёмы малы; `/root/silo/`, SILO_STATE.md).
 - **Win-rate ретроспективно невычислим** — только живой огонь.
 
