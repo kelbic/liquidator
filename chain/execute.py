@@ -385,6 +385,44 @@ def _revert_bucket(err_str: str) -> str:
     return err_str[:80]
 
 
+_LIQUIDATE_EVENT_SIG = None   # keccak сигнатуры события Morpho.Liquidate (лениво, нужен eth_utils)
+
+
+def _submit_xray(rpc, borrower, block_number, our_index, log):
+    """P2-12 submit-side телеметрия: наш выстрел замайнился — кто взял жертву в ЭТОМ блоке и с
+    каким tx-index. Узкий getLogs fromBlock==toBlock (урок 30: обходит range-limit), фильтр по
+    topic3=borrower (неоспоримый источник жертвы). Дельта=our-winner: на сколько позиций в блоке
+    нас обошли — ЕДИНСТВЕННАЯ честная метрика submit-side проигрыша (gap-запрет не задет: это
+    наши собственные выстрелы, не пере-мер чужих). Диагностика, не роняет receipt-путь."""
+    global _LIQUIDATE_EVENT_SIG
+    try:
+        from eth_utils import keccak
+        if _LIQUIDATE_EVENT_SIG is None:
+            _LIQUIDATE_EVENT_SIG = "0x" + keccak(
+                text="Liquidate(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)").hex()
+        w3 = rpc._web3()
+        topic_b = "0x" + borrower[2:].lower().rjust(64, "0")
+        logs = w3.eth.get_logs({"fromBlock": block_number, "toBlock": block_number,
+                                "address": _MORPHO_BLUE,
+                                "topics": [_LIQUIDATE_EVENT_SIG, None, None, topic_b]})
+        if not logs:
+            if log:
+                log.info("submit-xray: borrower %s НЕ ликвидирован в блоке %d (наш idx=%s) — "
+                         "реверт НЕ гонка за жертву (смотреть reason)", borrower[:10], block_number, our_index)
+            return
+        w = logs[0]
+        widx = w.get("transactionIndex")
+        if log:
+            log.info("submit-xray: победитель idx=%s наш idx=%s дельта=%s tx=%s block=%d",
+                     widx, our_index,
+                     (our_index - widx) if isinstance(our_index, int) and isinstance(widx, int) else "?",
+                     w.get("transactionHash").hex() if w.get("transactionHash") is not None else "?",
+                     block_number)
+    except Exception as e:
+        if log:
+            log.info("submit-xray fail: %s", type(e).__name__)
+
+
 def _revert_reason(rpc, tx_hash, block_number):
     """Best-effort revert reason for a mined-but-reverted tx: replay it as eth_call at the mined block
     and surface the revert string/selector via _revert_bucket. DIAGNOSTIC ONLY (block end-state may
@@ -482,13 +520,19 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                                              int(rcpt.get("effectiveGasPrice") or 0), status, cfg.eth_price_usd)
             row = {"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
                    "status": status, "gas_used": rcpt.get("gasUsed"),
-                   "net_usd": net_usd, "gas_usd": gas_usd}
+                   "net_usd": net_usd, "gas_usd": gas_usd,
+                   "tx_index": rcpt.get("transactionIndex")}   # P2-12: submit-side позиция в блоке
+            if status == 1 and log:
+                log.info("submit-xray: WIN idx=%s block=%s tx=%s",
+                         rcpt.get("transactionIndex"), rcpt.get("blockNumber"), h)
             if status != 1:                                  # diagnose the revert (lost race vs structural)
                 reason = _revert_reason(rpc, h, rcpt.get("blockNumber"))
                 row["revert_reason"] = reason
                 if log:
                     log.warning("liquidate revert %s/%s reason=%s tx=%s",
                                 mid[:10], borrower[:10], reason, h)
+                _submit_xray(rpc, borrower, rcpt.get("blockNumber"),
+                             rcpt.get("transactionIndex"), log)   # P2-12: кто взял и с какой дельтой
             results.append(row)
         except Exception as e:
             # outcome unknown -> conservatively book estimated cost as a LOSS, never a phantom profit
