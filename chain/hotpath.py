@@ -116,7 +116,9 @@ def _basefee_probe(*, bn, fb, rpc, log):
     threading.Thread(target=_cmp, daemon=True).start()
 
 
-_SHADOW_SCALE = {"cbXRP": 10**28, "cbDOGE": 10**26, "cbADA": 10**28}   # immutable оракулов (STATE Идея 2)
+_SHADOW_SCALE = {"cbXRP": 10**28, "cbDOGE": 10**26, "cbADA": 10**28,   # immutable оракулов (STATE Идея 2)
+                 "cbLTC": 10**28}   # P1-8: цена cbLTC ×1e28 (STATE «цена cbADA/cbLTC ×1e28»); карта
+                                    # матчится только если агрегатор всплывает в resolve_feeds — иначе no-op
 
 
 def _build_shadow_map(feeds, meta, markets):
@@ -238,7 +240,7 @@ def read_positions(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
 
 
 # ---- Layer 2 (Идея 2): continuous background position cache, money-markets only ----
-# Scope: только рынки из execute.UNIV3_PATHS (валидированный сустейном масштаб — один рынок,
+# Scope: только рынки из execute.ROUTE_COLLATERALS (P1-8: +cbLTC/cbBTC; сустейн валидирован на одном рынке,
 # 340 вызовов/блок; полный охват всех ~40 рынков и поведение ПОД каскадом НЕ провалидированы,
 # см. STATE.md "РАЗБИВКА — симметрия с декодером ЧАСТИЧНАЯ"). Любой рынок вне кэша падает в
 # read_positions без изменений — нулевой риск для непокрытых рынков.
@@ -367,7 +369,7 @@ def _refresh_position_caches(*, preconf_rpc, shared, bn):
     NOT touch reads_fn/_process_transmit — the armed hot path keeps reading via the original live
     read_positions, completely unchanged, until reads_fn is explicitly swapped (deliberately not
     done yet). One market's decode/network hiccup does not stop the cycle for the others."""
-    from chain.execute import UNIV3_PATHS
+    from chain.execute import ROUTE_COLLATERALS
     with shared.lock:
         groups = dict(shared.groups)
     _t0 = time.time()
@@ -377,7 +379,7 @@ def _refresh_position_caches(*, preconf_rpc, shared, bn):
         if not params:
             continue
         _loan, coll, _oracle, _irm, _lltv = params
-        if coll.lower() not in UNIV3_PATHS:
+        if coll.lower() not in ROUTE_COLLATERALS:    # P1-8: +cbLTC/cbBTC (Slipstream-маршруты)
             continue
         try:
             refresh_position_cache(preconf_rpc, mid, borrowers)
@@ -494,6 +496,44 @@ def _diag_revert_bucket(err: str) -> str:
     return "other"
 
 
+def _seized_exact(repaid_shares, lif_wad, price, tba, tbs):
+    """P1-7: seizedAssets ТОЧНО по канону Morpho._liquidate (ветка repaidShares>0):
+    toAssetsDown -> wMulDown(LIF) -> mulDivDown(SCALE, price), все floor. Прежний expected_seized
+    считал от to_assets_up (репэй-сторона) — оценка сверху на wei-округлениях; для amount_in свопа
+    нужен ТОЧНЫЙ приход залога (amount_in > баланса = SwapFailed), для капа — точное сравнение
+    с collateral (иначе Panic 0x11)."""
+    from chain.simulate import to_assets_down
+    from chain.execute import ORACLE_PRICE_SCALE, WAD
+    assets_down = to_assets_down(repaid_shares, tba, tbs)
+    return (assets_down * lif_wad // WAD) * ORACLE_PRICE_SCALE // price
+
+
+def _cap_repaid_shares(borrow_shares, collateral, price, lif_wad, tba, tbs):
+    """P1-7: max repaidShares, при котором seized <= collateral в арифметике канона — глубокая
+    позиция (залог не покрывает долг+бонус) раньше давала Panic 0x11 (collateral -= seized) ->
+    sim-revert -> skip, и главные призы каскадов терялись. Кап ДО сайзинга свопа (запрет STATE
+    «НЕ капаем» относился к пост-хок капу ПОСЛЕ расчёта свопа — там mismatch). При капе забирается
+    весь залог -> Morpho сам списывает остаток долга (bad-debt socialization). Это НЕ закрытый
+    seizedAssets-режим: вход контракта прежний (repaidShares). Floor-инверсия + верификация вперёд
+    точной формулой; чистая (юнит)."""
+    from chain.simulate import to_shares_down
+    from chain.execute import ORACLE_PRICE_SCALE, WAD
+    bs = int(borrow_shares)
+    if bs <= 0:
+        return 0
+    if _seized_exact(bs, lif_wad, price, tba, tbs) <= collateral:
+        return bs                                            # весь долг помещается — кап не нужен
+    cap_assets = (collateral * price // ORACLE_PRICE_SCALE) * WAD // lif_wad
+    rs = min(to_shares_down(cap_assets, tba, tbs), bs)
+    for _ in range(4):                                       # floor-инверсия может промахнуться на wei
+        if rs <= 0:
+            return 0
+        if _seized_exact(rs, lif_wad, price, tba, tbs) <= collateral:
+            return rs
+        rs -= max(1, rs // 10**6)
+    return 0
+
+
 _GAS_CACHE: dict = {}   # market_id -> padded gas от последнего успешного preconf-estimate (P0-4).
                         # Газ-профиль стабилен per-market (тот же UniV3-путь, та же форма tx);
                         # send всегда шлёт max(cached, cfg.gas_limit_est) — лимит с запасом бесплатен.
@@ -514,7 +554,7 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         from chain.multicall import (aggregate3, encode_id_to_market_params_call, decode_id_to_market_params,
             encode_market_call, decode_market, encode_position_call, decode_position)
         from chain.simulate import to_assets_up
-        from chain.execute import kyber_swap, univ3_swap, encode_liquidate, expected_seized, simulate_tx
+        from chain.execute import kyber_swap, direct_swap, encode_liquidate, simulate_tx
         from strategy.pnl import lif_from_lltv
 
         liq = cfg.liquidator_address
@@ -572,17 +612,27 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
                 pass
         threading.Thread(target=_diag_divergence, daemon=True).start()
 
-        repaid_shares = int(borrow_shares)
+        _lif = lif_from_lltv(lltv_wad / 10**18)
+        _lif_wad = int(round(_lif * 10**18))
+        # P1-7: кап на глубокой позиции (seized>collateral был Panic 0x11 -> skip); seized ТОЧНО
+        # по канону (toAssetsDown), а не оценкой сверху — amount_in свопа = реальный приход залога.
+        repaid_shares = _cap_repaid_shares(int(borrow_shares), int(collateral_dbg), int(price),
+                                           _lif_wad, tba, tbs)
+        if repaid_shares <= 0:
+            return {"ok": False, "reason": "cap: no repayable shares (collateral~0)"}
+        if repaid_shares < int(borrow_shares):
+            log.info("DIAG cap %s/%s bs=%d -> repaid_shares=%d (deep position: весь залог, остаток долга спишет Morpho)",
+                     market_id[:10], borrower[:10], int(borrow_shares), repaid_shares)
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)
-        seized = expected_seized(repaid_assets, lif_from_lltv(lltv_wad / 10**18), int(price))   # (1) preconf price
+        seized = _seized_exact(repaid_shares, _lif_wad, int(price), tba, tbs)   # (1) preconf price, канон-точно
         if seized == 0:
             log.info("DIAG seized=0 %s/%s repaid_shares=%d repaid_assets=%d collateral=%d tba=%d tbs=%d price=%d lltv=%d",
                      market_id[:10], borrower[:10], repaid_shares, repaid_assets, collateral_dbg, tba, tbs, int(price), lltv_wad)
             return {"ok": False, "reason": "seized=0"}
 
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
-        swap = univ3_swap(coll, loan, seized, liq, liq, repaid_assets=repaid_assets)
-        if swap is None:                       # market outside UniV3 paths -> Kyber fallback (unchanged)
+        swap = direct_swap(coll, loan, seized, liq, liq, repaid_assets=repaid_assets)
+        if swap is None:                       # market outside direct routes -> Kyber fallback (unchanged)
             swap = kyber_swap(coll, loan, seized, liq, liq, slippage_bps=slippage_bps)
 
         # P0-4: guard-read свежести УДАЛЁН — он дублировал sim: тот же preconf-pending источник, а sim
@@ -651,6 +701,62 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         return {"ok": False, "reason": f"error: {type(e).__name__}: {str(e)[:120]}"}
 
 
+def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_assets, price, state):
+    """P1-9 fast-lane (флаг cfg.fast_lane, OFF по умолчанию): подготовка БЕЗ sim и БЕЗ estimate —
+    ноль RTT, путь decode->send ~150-250мс. Безопасность НЕ на sim, а на контрактах: Morpho
+    HEALTHY_POSITION ревертит до трансферов, наш minProfit/SwapFailed/CannotRepay ревертят своп-
+    исход; цена промаха = газ реверта (~центы при Base-fee), учитывается kill-switch'ем как loss.
+    Условия (иначе {ok:False} и обычный prepare_hot с sim): state от caller; params в кэше;
+    маршрут direct_swap (Kyber в fast-lane запрещён — серверный RTT); fee из fb-хедера свежий
+    (SEND-2); gas из per-market кэша либо cfg.gas_limit_est.
+    minProfit аналитический: 50% теоретического бонуса repaid*(LIF-1) — запас на слиппаж/старение."""
+    try:
+        from chain.simulate import to_assets_up
+        from chain.execute import direct_swap, encode_liquidate, WAD
+        from strategy.pnl import lif_from_lltv
+
+        liq = cfg.liquidator_address
+        if not liq or state is None:
+            return {"ok": False, "reason": "fast: no state/liquidator"}
+        _fb = _fresh_basefee()
+        if _fb is None:
+            return {"ok": False, "reason": "fast: fb-basefee stale"}
+        params = _FULL_PARAMS_CACHE.get(market_id)
+        if not params:
+            return {"ok": False, "reason": "fast: params not cached"}
+        loan, coll, oracle, irm, lltv_wad = params
+        tba, tbs, borrow_shares, collateral = state
+        if borrow_shares <= 0:
+            return {"ok": False, "reason": "fast: no debt"}
+        _lif = lif_from_lltv(lltv_wad / 10**18)
+        _lif_wad = int(round(_lif * 10**18))
+        repaid_shares = _cap_repaid_shares(int(borrow_shares), int(collateral), int(price),
+                                           _lif_wad, tba, tbs)
+        if repaid_shares <= 0:
+            return {"ok": False, "reason": "fast: cap=0"}
+        repaid_assets = to_assets_up(repaid_shares, tba, tbs)
+        seized = _seized_exact(repaid_shares, _lif_wad, int(price), tba, tbs)
+        if seized == 0:
+            return {"ok": False, "reason": "fast: seized=0"}
+        swap = direct_swap(coll, loan, seized, liq, liq, repaid_assets=repaid_assets)
+        if swap is None:
+            return {"ok": False, "reason": "fast: no direct route"}
+        min_profit = repaid_assets * (_lif_wad - WAD) // WAD // 2
+        if min_profit <= 0:
+            return {"ok": False, "reason": "fast: zero bonus"}
+        profit_usd, cost_usd, net_usd = _net_gate(min_profit, debt_usd, debt_assets, cfg)
+        if net_usd < cfg.min_profit_usd:
+            return {"ok": False, "reason": f"fast: net ${net_usd:.2f} < min (analytic floor)"}
+        mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
+        cd = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit)
+        _tip = int(cfg.tip_gwei * 1e9)
+        return {"ok": True, "calldata": cd, "gas": max(_GAS_CACHE.get(market_id, 0), cfg.gas_limit_est),
+                "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd,
+                "max_fee": _fb * 2 + _tip, "tip": _tip, "fast": True}
+    except Exception as e:
+        return {"ok": False, "reason": f"fast error: {type(e).__name__}: {str(e)[:80]}"}
+
+
 # ---- per-transmit worker (reaction filter + kill-switch + dispatch) ----
 
 def hot_min_repaid(cfg):
@@ -669,6 +775,11 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     from strategy.guard import GuardState
     if dispatch_fn is None:
         from chain.execute import dispatch_liquidations as dispatch_fn  # noqa: F811
+    if reads_fn is read_positions and getattr(cfg, "positions_from_cache", False):
+        # P1-6 потребление слоя 2 (флаг POSITIONS_FROM_CACHE, OFF по умолчанию): только для
+        # ДЕФОЛТНОГО seam (инжектированные reads_fn тестов не трогаем). read_positions_cached
+        # сам падает в живой read_positions для рынков вне кэша — нулевой риск непокрытым.
+        reads_fn = read_positions_cached
     floor = hot_min_repaid(cfg)
     _gate_px = {}                                            # 2b: цена оракула, прочитанная gate -> переиспользовать в цикле
     if px_hint is not None and hint_oracle is not None:
@@ -732,6 +843,21 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             if stats is not None: stats["f_norp"] += 1
             continue
         tba, tbs, pos = rp
+        if _cached is not None and _rsrc != "cache":
+            # P1-6 log-only КАЛИБРОВКА (гейт потребления по чеклисту STATE): значения кэша vs живое
+            # чтение на том же транзите. mism=0 на потоке -> кэш можно включать (POSITIONS_FROM_CACHE=1).
+            _nw = time.time(); _same = 0; _mm = []
+            for (_b2, _bs2, _col2) in pos:
+                _c2 = _cached[2].get(_b2)
+                if _c2 is None or _nw - _c2[2] > _POSITION_CACHE_MAX_AGE_SEC:
+                    continue
+                if _c2[0] == _bs2 and _c2[1] == _col2:
+                    _same += 1
+                else:
+                    _mm.append(_b2[:8])
+            log.info("DIAG cache-divergence market=%s same=%d mism=%d tba_eq=%s tbs_eq=%s bad=%s",
+                     mid[:10], _same, len(_mm), _cached[0] == tba, _cached[1] == tbs,
+                     ",".join(_mm[:5]) if _mm else "-")
         log.info("DIAG hotset mid=%s src=%s trig=%s n=%d block=%d", mid[:10], _rsrc, subidx, len(pos), block)  # full set on disk
         positions = [(b, bs, col, debt_by.get((mid, b), 0.0)) for (b, bs, col) in pos]
         pos_by = {b: (bs, col) for (b, bs, col) in pos}      # P0-4: state для prepare_hot без повторного RTT
@@ -751,8 +877,22 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                 if stats is not None: stats["f_floor"] += 1
                 continue
             if stats is not None: stats["f_prep"] += 1
+            _bc = pos_by.get(b)
+            if (getattr(cfg, "fast_lane", False) and _bc
+                    and du >= getattr(cfg, "fast_lane_min_repaid_usd", 1000.0)):
+                _fs = time.perf_counter()                    # P1-9: fast-lane БЕЗ sim; при ok обычный
+                fprep = prepare_fast(rpc, preconf_rpc, cfg, mid, b, du,   # prepare НЕ дублируем (2-я tx
+                                     debt_assets_by.get((mid, b), 0), price,   # сожгла бы nonce+газ)
+                                     (tba, tbs, _bc[0], _bc[1]))
+                _t_prep_total += (time.perf_counter() - _fs) * 1000.0
+                if fprep.get("ok"):
+                    ready.append((mid, b, fprep)); meta_by[(mid, b)] = (hr, du)
+                    log.info("HOT ready FAST %s/%s hf=%.4f repaid~$%.0f net>=$%.2f block=%d subidx=%s",
+                             mid[:10], b[:10], hr.hf, du, fprep["net_usd"], block, subidx)
+                    continue
+                log.info("DIAG fast-lane fallback %s/%s: %s", mid[:10], b[:10], str(fprep.get("reason"))[:60])
             _ps = time.perf_counter()
-            _bc = pos_by.get(b)                              # P0-4: (tba,tbs,bs,col) из read_positions этого же
+            # P0-4: (tba,tbs,bs,col) из read_positions этого же
             prep = prepare_fn(rpc, preconf_rpc, cfg, mid, b, du,   # триггера (мс назад, тот же preconf) -> prepare_hot
                               debt_assets_by.get((mid, b), 0), price,   # не перечитывает market/position (~-350мс)
                               state=((tba, tbs, _bc[0], _bc[1]) if _bc else None))

@@ -107,6 +107,16 @@ def to_assets_up(shares: int, total_assets: int, total_shares: int) -> int:
     return _mul_div_up(shares, total_assets + VIRTUAL_ASSETS, total_shares + VIRTUAL_SHARES)
 
 
+def to_shares_down(assets: int, total_assets: int, total_shares: int) -> int:
+    """SharesMathLib.toSharesDown (floor) with virtual shares/assets — P1-7 (кап repaidShares)."""
+    return assets * (total_shares + VIRTUAL_SHARES) // (total_assets + VIRTUAL_ASSETS)
+
+
+def to_assets_down(shares: int, total_assets: int, total_shares: int) -> int:
+    """SharesMathLib.toAssetsDown (floor) — канон seize-ветки liquidate (repaidShares>0)."""
+    return shares * (total_assets + VIRTUAL_ASSETS) // (total_shares + VIRTUAL_SHARES)
+
+
 def max_borrow(collateral: int, price: int, lltv_wad: int) -> int:
     """wMulDown(mulDivDown(collateral, price, 1e36), lltv) — the contract's health cap."""
     mb = (collateral * price) // ORACLE_PRICE_SCALE   # mulDivDown

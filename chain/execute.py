@@ -117,12 +117,26 @@ def kyber_swap(token_in: str, token_out: str, amount_in: int, sender: str, recip
     }
 
 
-# ---- UniV3 direct-swap (variant A): precomputed multi-hop coll->WETH->USDC, NO in-race quote ----
+# ---- direct-swap (variant A): прекомпьютед-маршруты, НОЛЬ серверных RTT в гонке ----
+# Два роутера с одной path-механикой (token + 3 байта + token ...):
+#  - Uniswap SwapRouter02: 3 байта = fee tier; exactInput((bytes,address,uint256,uint256)).
+#  - Aerodrome Slipstream SwapRouter: 3 байта = tickSpacing; exactInput v1-форма С deadline
+#    ((bytes,address,uint256,uint256,uint256)) — селекторы/factory верифицированы bytecode 07-08.
+# Пулы верифицированы 07-08 (factory.getPool + liquidity()>0 живым RPC):
+#  cbXRP/cbDOGE/cbADA -> WETH(3000) -> USDC(500) UniV3 (как было);
+#  cbBTC -> EURC напрямую Slipstream ts=100 (UniV3 WETH/EURC и Aerodrome-basic ПУСТЫЕ — 07-08);
+#  cbLTC -> WETH ts=200 -> USDC ts=100 Slipstream (на UniV3 у cbLTC ликвидности НЕТ вообще).
 UNIV3_SWAP_ROUTER = "0x2626664c2603336E57B271c5C0b26F421741e481"  # Uniswap SwapRouter02 (Base)
+AERO_CL_ROUTER = "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"     # Aerodrome Slipstream SwapRouter (Base)
 _UNIV3_WETH = "0x4200000000000000000000000000000000000006"
 _UNIV3_USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+_EURC = "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42"
+_CBBTC = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
+_CBLTC = "0xcb17c9db87b595717c857a08468793f5bab6445f"
 _UNIV3_WETH_USDC_FEE = 500
-_UNIV3_EXACT_INPUT_SEL = "b858183f"  # exactInput((bytes,address,uint256,uint256)) verified cast sig
+_UNIV3_EXACT_INPUT_SEL = "b858183f"    # exactInput((bytes,address,uint256,uint256)) verified cast sig
+_AERO_EXACT_INPUT_SEL = "c04b8d59"     # exactInput((bytes,address,uint256,uint256,uint256)) verified bytecode
+_AERO_DEADLINE = 2 ** 63               # v1-форма требует deadline; константа = «не истекает»
 UNIV3_PATHS = {  # collateral(lower) -> fee tier of coll/WETH pool (verified factory.getPool)
     "0xcb585250f852c6c6bf90434ab21a00f02833a4af": 3000,   # cbXRP/WETH
     "0xcbd06e5a2b0c65597161de254aa074e489deb510": 3000,   # cbDOGE/WETH
@@ -130,22 +144,49 @@ UNIV3_PATHS = {  # collateral(lower) -> fee tier of coll/WETH pool (verified fac
 }
 
 
-def univ3_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_assets, slippage_bps=100):
-    """Drop-in for kyber_swap on cbXRP/cbDOGE/cbADA. Precomputed UniV3 multi-hop coll->WETH->USDC
-    (always-multi, as winners do), NO in-race quote. amountOutMinimum=repaid_assets (debt floor);
-    profit protected by preconf sim + contract minProfit. Returns same {router, calldata} as
-    kyber_swap, or None if token_in has no UniV3 path (caller falls back to kyber_swap)."""
+def _pack_path(*hops) -> bytes:
+    """UniV3/Slipstream path: token (+ 3-байтовый fee/tickSpacing + token)*. Чистая (юнит)."""
+    out = bytes.fromhex(hops[0][2:])
+    for i in range(1, len(hops), 2):
+        out += int(hops[i]).to_bytes(3, "big") + bytes.fromhex(hops[i + 1][2:])
+    return out
+
+
+_SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
+    (_CBBTC, _EURC): {"router": AERO_CL_ROUTER, "style": "v1",
+                      "path": _pack_path(_CBBTC, 100, _EURC)},
+    (_CBLTC, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
+                            "path": _pack_path(_CBLTC, 200, _UNIV3_WETH, 100, _UNIV3_USDC)},
+}
+for _coll, _fee in UNIV3_PATHS.items():   # существующие UniV3-пути -> та же таблица (loan=USDC)
+    _SWAP_ROUTES[(_coll, _UNIV3_USDC)] = {"router": UNIV3_SWAP_ROUTER, "style": "02",
+                                          "path": _pack_path(_coll, _fee, _UNIV3_WETH,
+                                                             _UNIV3_WETH_USDC_FEE, _UNIV3_USDC)}
+ROUTE_COLLATERALS = {c for (c, _l) in _SWAP_ROUTES}   # scope слоя 2 (кэш позиций) и fast-lane
+
+
+def direct_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_assets, slippage_bps=100):
+    """Drop-in for kyber_swap на прямых маршрутах, NO in-race quote. P1-8 fix: token_out ЧЕСТНЫЙ
+    ключ маршрута (раньше univ3_swap хардкодил USDC-выход — для EURC-рынка контракт получил бы
+    USDC и упал CannotRepay). amountOutMinimum=repaid_assets (debt floor); profit protected by
+    preconf sim + contract minProfit. Returns {router, calldata} или None (caller -> kyber_swap)."""
     from eth_abi import encode
-    coll = token_in.lower()
-    if coll not in UNIV3_PATHS:
+    r = _SWAP_ROUTES.get((token_in.lower(), token_out.lower()))
+    if r is None:
         return None
-    fee = UNIV3_PATHS[coll]
-    path = (bytes.fromhex(token_in[2:]) + int(fee).to_bytes(3, "big")
-            + bytes.fromhex(_UNIV3_WETH[2:]) + int(_UNIV3_WETH_USDC_FEE).to_bytes(3, "big")
-            + bytes.fromhex(_UNIV3_USDC[2:]))
+    if r["style"] == "v1":     # Slipstream: v1-форма с deadline
+        params = encode(["(bytes,address,uint256,uint256,uint256)"],
+                        [(r["path"], recipient, _AERO_DEADLINE, int(amount_in), int(repaid_assets))])
+        return {"router": r["router"], "calldata": "0x" + _AERO_EXACT_INPUT_SEL + params.hex()}
     params = encode(["(bytes,address,uint256,uint256)"],
-                    [(path, recipient, int(amount_in), int(repaid_assets))])
-    return {"router": UNIV3_SWAP_ROUTER, "calldata": "0x" + _UNIV3_EXACT_INPUT_SEL + params.hex()}
+                    [(r["path"], recipient, int(amount_in), int(repaid_assets))])
+    return {"router": r["router"], "calldata": "0x" + _UNIV3_EXACT_INPUT_SEL + params.hex()}
+
+
+def univ3_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_assets, slippage_bps=100):
+    """Обратная совместимость (пробники/скрипты): теперь тонкая обёртка direct_swap."""
+    return direct_swap(token_in, token_out, amount_in, sender, recipient,
+                       repaid_assets=repaid_assets, slippage_bps=slippage_bps)
 
 
 def expected_seized(repaid_assets: int, lif: float, price: int) -> int:
