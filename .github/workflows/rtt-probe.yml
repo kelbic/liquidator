@@ -1,0 +1,19 @@
+# P2-11: замер per-call RTT до Base-эндпоинтов из GitHub-раннера (Azure, обычно US-East).
+# Запуск руками: GitHub -> Actions -> "RTT probe (us-east)" -> Run workflow.
+# Сравнивать warm_median с базлайном Aeza/Вена: sequencer=121ms, preconf=133ms.
+# warm<50ms => гео-рычаг подтверждён (-90-100ms на каждый вызов горячего пути).
+name: RTT probe (us-east)
+on:
+  workflow_dispatch:
+
+jobs:
+  rtt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: where am I
+        run: curl -s https://ipinfo.io/json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('org'),'|',d.get('city'),d.get('region'),d.get('country'))"
+      - name: rtt probe (3 series)
+        run: |
+          for i in 1 2 3; do python3 analysis/rtt_probe.py; echo "---"; done
