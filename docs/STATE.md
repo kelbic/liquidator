@@ -48,7 +48,16 @@ Kill-switch $60 loss / $100 gas / день — честный (`715d3f5`), до�
 enable --now liquidator-daily.timer`. `.env` менять НЕ нужно (SEQUENCER_RPC дефолтом включён).
 Watch: `DIAG seq-send` (ошибки секвенсера), `dispatch: sent .. nonce=` (nonce-кэш), hot stats.
 
-**P1-ПАКЕТ СОБРАН (07-08, `6669137`, НЕ ЗАДЕПЛОЕН; два флага OFF до калибровки):**
+**P0+P1 ЗАДЕПЛОЕНЫ НА VPS 07-08 18:41 (git pull 75ef31a→8dee451, рестарт чистый).** Post-deploy
+по журналу: 0 ошибок; hot stats poll=60/none=0/fb=0; shadow-map теперь 4 рынка (+cbLTC
+0x5bf848b4); position-cache markets=5 (+cbBTC/EURC, +cbLTC через ROUTE_COLLATERALS), dt=2.0-2.5с
+(сустейн в норме, busy-skip единичный); **cache-divergence уже пишет mism=0 tba_eq=True** —
+калибровка слоя 2 пошла. Ассистент имеет read-only журнал (systemd-journal) с этой сессии;
+/root и systemctl — только владелец. Владельцу осталось: (1) установить daily-таймер;
+(2) `ls -la /root/liquidator/candidates_snapshot.json` (файл должен обновляться ~60с) — строка
+`warm-start:` подтвердится на СЛЕДУЮЩЕМ рестарте (на деплойном снапшота ещё не было).
+
+**P1-ПАКЕТ СОБРАН (07-08, `6669137`; два флага OFF до калибровки):**
 - **Слой 2 потребление — ГОТОВО за флагом `POSITIONS_FROM_CACHE` (OFF).** Гейт включения:
   `DIAG cache-divergence` (значения кэша vs живое чтение на том же транзите) должен показывать
   mism=0 на потоке ≥ суток → тогда флаг ON. Рынки вне кэша падают в живой read без изменений.
@@ -56,8 +65,9 @@ Watch: `DIAG seq-send` (ошибки секвенсера), `dispatch: sent .. n
   позиции давал Panic 0x11 → skip (главные призы каскадов). Кап ДО сайзинга свопа (запрет «НЕ
   капаем» касался пост-хок капа); весь залог, остаток спишет Morpho (bad debt). seized теперь
   ТОЧНО по канону (toAssetsDown), не оценкой сверху. Fuzz 2000 состояний: 0 нарушений
-  seized≤collateral. Владельцу: cast-форк на историческом panic-underflow кейсе (calldata+блок
-  есть в старых DIAG sim-revert) — финальная сверка на чейне.
+  seized≤collateral. cast-форк-сверка НЕВОЗМОЖНА: в журнале (30д) НОЛЬ sim-revert panic-кейсов
+  (согласуется с «Panic был лог-призраком») — реального кейса не существует. Страховка капа =
+  прод-sim (остаётся гейтом каждого сенда): неверный кап → sim-revert → skip, деньги не рискуют.
 - **Маршруты: cbBTC/EURC и cbLTC/USDC открыты через Aerodrome Slipstream** (см. «Закрыто» — UniV3
   для них МЁРТВ, это проверено). direct_swap: token_out — честный ключ (был хардкод USDC-выхода:
   EURC-рынок упал бы CannotRepay). Scope слоя 2 → ROUTE_COLLATERALS (5 коллатералей). Первый
