@@ -32,6 +32,22 @@ Kill-switch $60 loss / $100 gas / день — честный (`715d3f5`), до�
 `0x54730EE13f10C073772f25ee475EE13f2252Fb82` (`liquidate()` = onlyOwner). Кошелёк `0xE2Aca8e…`,
 рантвей ~$44 (≈29 ревертов при 6 gwei = потолок риска). Соседи VPS (twidgest/essayist) не задеты.
 
+**P0-ПАКЕТ СОБРАН (07-08, `a254462`, НЕ ЗАДЕПЛОЕН на VPS):** аудит с каноническим Morpho.liquidate
+показал: сквозной горячий путь был ~2.5–3с ПОСЛЕДОВАТЕЛЬНЫХ RTT (8–9 обращений × ~343мс) — больше
+блока Base, reaction-класс был недостижим НЕЗАВИСИМО от рынка. Тезис «победа ждёт рынка» ПЕРЕСМОТРЕН:
+ждала кода. P0 срезает до ~0.9с: (а) feed-gate fix — px_hint теперь ЦЕНА цикла, gate не читает preconf
+(раньше слой 1 давал ранний триггер, но НЕ раннюю цену: gate перезаписывал хинт, а при preconf-лаге
+убивал feed-спавн при уже дедупнутом poll — триггер терялся на блок); (б) prepare_hot без rp_state-дубля
+(state от read_positions), DIAG-read в тред, guard-read удалён (дублировал sim), gas per-market кэш;
+(в) локальный nonce (0 RTT) + SEND-3 raw в секвенсер параллельно Alchemy (SEQUENCER_RPC, "off"=выкл);
+(г) warm-start кандидатов с диска (снапшот 60с, age≤1ч) — слепые окна рестартов закрыты; (д) времена
+рестартов в missed.py + daily_summary + liquidator-daily.timer; (е) inflight-гейт kill-switch ОЖИЛ
+(был хардкод GuardState(inflight=0) в 4 местах). 23 юнит-смоука зелёные (venv-песочница).
+**ДЕПЛОЙ (владелец):** git pull на VPS → restart → в journal ждать `warm-start:` строку; таймер:
+`cp liquidator-daily.{service,timer} /etc/systemd/system/ && systemctl daemon-reload && systemctl
+enable --now liquidator-daily.timer`. `.env` менять НЕ нужно (SEQUENCER_RPC дефолтом включён).
+Watch: `DIAG seq-send` (ошибки секвенсера), `dispatch: sent .. nonce=` (nonce-кэш), hot stats.
+
 **ГДЕ МЫ (07-08):** Архитектура латентности **почти собрана, план ПОЛОН, нового рычага нет.**
 Три части «архитектуры победителя» (ноль RPC в горячем пути):
 1. **Декодер цены (слой 1) — ЕСТЬ, включён, РАБОТАЕТ.** Снимает RTT цены (~350мс).
@@ -328,7 +344,9 @@ Market dataclass: `collateral_token` = СИМВОЛ-строка (не адре�
 `3d01117` re-entrancy guard refresh → `8022294` shadow-декодер слоя 1 (log-only) → `7ffa476` baseFee-
 замер → `9b07737` SEND-2 (fee из fb-хедера, 0 Alchemy в send) → `f8ed3ea` 2b (переиспользование
 gate-цены) → `2c2d6fe` UniV3-direct вариант A (Kyber выкинут) → `008970d` refresh-дедлайн (гигиена) →
-`debc80f` слой 1 за флагом → `8278263` NameError-фикс (слой 1 был мёртв) → `c871ae8` trig=subidx.
+`debc80f` слой 1 за флагом → `8278263` NameError-фикс (слой 1 был мёртв) → `c871ae8` trig=subidx →
+`a254462` P0-пакет (feed-gate fix: слой 1 теперь реально снимает ценовой RTT; prepare_hot −3 RTT;
+nonce-кэш; SEND-3 секвенсер; warm-start; inflight-гейт ожил; daily-сводка).
 Плюс: `PRICE_FROM_FEED=1` включён (подтверждён /proc/PID/environ). health_from калибрована.
 
 ---
