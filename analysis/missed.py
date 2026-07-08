@@ -113,9 +113,35 @@ def jlog(grep, hours):
 print("\n───────── [2] НАШИ ВЫСТРЕЛЫ (ACTIONABLE / submitted:N / revert) ─────────")
 print(jlog(r"ACTIONABLE|liquidate revert", HOURS))
 _rest = jlog(r"EXECUTE mode", HOURS)
-n_rest = 0 if _rest.strip() == "(нет)" else sum(1 for l in _rest.splitlines() if "EXECUTE" in l)
+_rest_lines = [] if _rest.strip() == "(нет)" else [l for l in _rest.splitlines() if "EXECUTE" in l]
+n_rest = len(_rest_lines)
 print(f"\n  (рестартов/деплоев за окно: {n_rest} — это НЕ выстрелы, а перезапуски бота; "
       f"если их больше, чем ты деплоил — был crash-loop)")
+# P0-2: ВРЕМЕНА рестартов (раньше печаталось только число — сопоставить с целями было нельзя)
+_rest_ts = []
+for _l in _rest_lines:
+    _m = re.match(r"\s*(\w{3} +\d+ \d\d:\d\d:\d\d)", _l)
+    if _m:
+        try:
+            _t = dt.datetime.strptime(f"{dt.datetime.now().year} {_m.group(1)}", "%Y %b %d %H:%M:%S")
+            _rest_ts.append(_t.timestamp())
+            print(f"    рестарт: {_m.group(1)}")
+        except ValueError:
+            print(f"    рестарт (время не распарсено): {_l.strip()[:60]}")
+# корреляция: хот-цель в окне [-1мин; +3мин] от рестарта = слепое окно холодного старта
+# (теперь закрывается warm-start'ом; строка ниже — проверка, что он реально закрыл класс)
+try:
+    _blind = [(r, t) for r in rows if r["who"] != "us" and r["repaid_usd"] >= HOT
+              for t in _rest_ts if -60 <= r["ts"] - t <= 180]
+    if _blind:
+        print("  ⚠ хот-цели В ОКНЕ рестарта (±3 мин — до warm-start были слепыми):")
+        for r, t in _blind:
+            print(f"    {dt.datetime.fromtimestamp(r['ts']):%m-%d %H:%M} {r['pair']:<13} repaid ${r['repaid_usd']:,.0f} "
+                  f"(+{r['ts']-t:.0f}с после рестарта {dt.datetime.fromtimestamp(t):%H:%M:%S})")
+    elif _rest_ts:
+        print("  (хот-целей в ±3 мин от рестартов нет)")
+except NameError:
+    print("  (блок [1] упал — корреляция рестартов с целями недоступна)")
 
 # ---------- 3. РАСКЛАД revert-причин ----------
 print("\n───────── [3] РАСКЛАД revert-ПРИЧИН (выборка для решения по латентности) ─────────")

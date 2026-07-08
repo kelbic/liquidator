@@ -11,6 +11,7 @@ Two-tier scan (cheap -> precise):
 """
 from __future__ import annotations
 import json
+import os
 import asyncio
 import threading
 import logging
@@ -18,7 +19,7 @@ import time
 from collections import defaultdict
 
 from config import Config
-from chain.execute import try_liquidate, prepare_liquidation, dispatch_liquidations
+from chain.execute import try_liquidate, prepare_liquidation, dispatch_liquidations, current_inflight
 from store import Store
 from alerts import Alerter
 from strategy.scanner import load_covered_markets
@@ -64,6 +65,43 @@ def fetch_candidates(markets):
     return dict(groups), debt_by, debt_assets_by, len(candidates)
 
 
+# ---- warm-start (P0-1): снапшот candidate set на диск + загрузка при рестарте ----
+# Рестарт (деплой/крэш) обнулял shared.groups до первого fetch_candidates (~1-2 мин слепого окна
+# горячего пути на КАЖДЫЙ рестарт). Снапшот пишется refresh-воркером каждые ~60с (tmp+rename,
+# атомарно); при старте block_driven_loop грузится, если не старше WARM_START_MAX_AGE_SEC.
+# Устаревание безопасно: погашенная позиция даст bs=0 при живом on-chain чтении и отпадёт сама;
+# НОВЫЙ заёмщик до первого API-фетча не виден так же, как и без warm-start.
+WARM_START_MAX_AGE_SEC = 3600.0
+
+
+def _save_candidates_snapshot(path, groups, debt_by, debt_assets_by, n):
+    """Best-effort: ошибка записи не роняет refresh-воркер. Ключи-кортежи -> 'mid|borrower'."""
+    try:
+        payload = {"ts": time.time(), "n": n, "groups": groups,
+                   "debt_by": {f"{m}|{b}": v for (m, b), v in debt_by.items()},
+                   "debt_assets_by": {f"{m}|{b}": v for (m, b), v in debt_assets_by.items()}}
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _load_candidates_snapshot(path, max_age_sec=WARM_START_MAX_AGE_SEC):
+    """(groups, debt_by, debt_assets_by, n) либо None (нет файла / стар / битый)."""
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+        if time.time() - float(d.get("ts", 0)) > max_age_sec:
+            return None
+        def _unkey(dd):
+            return {tuple(k.split("|", 1)): v for k, v in dd.items()}
+        return dict(d["groups"]), _unkey(d["debt_by"]), _unkey(d["debt_assets_by"]), int(d.get("n", 0))
+    except Exception:
+        return None
+
+
 def _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, guard, alerter, log,
                         prepare_fn=prepare_liquidation, dispatch_fn=dispatch_liquidations):
     """Monitor: record paper. Execute: kill switch ONCE, prepare each (fresh reads+simulate+floor),
@@ -88,7 +126,7 @@ def _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, gu
 
     today = store.realized_today()
     blocked = guard.blocked_reason(GuardState(realized_net_today=today["net"],
-                                              gas_spent_today=today["gas"], inflight=0))
+                                              gas_spent_today=today["gas"], inflight=current_inflight()))
     if blocked:
         for mid, borrower, hr, sr in actionable:
             _record(mid, borrower, hr, sr, f"blocked:{blocked}")
@@ -259,6 +297,7 @@ def _refresh_worker(shared, markets, cfg, ctx_cache, log, stop):
                 shared.groups, shared.debt_by, shared.debt_assets_by, shared.n = g, db, dab, n
                 shared.groups_history.append(                          # snapshot per fetch (monotonic ts)
                     (time.monotonic(), {mid: frozenset(bs) for mid, bs in g.items()}))
+            _save_candidates_snapshot(cfg.candidates_snapshot_path, g, db, dab, n)   # P0-1 warm-start
         except Exception:
             log.exception("candidate refresh error")
         stop.wait(cfg.candidate_refresh_sec)
@@ -356,6 +395,13 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
     candidates+markets so the per-block path never blocks on the API. Reconnects on wss drop."""
     import websockets
     shared = _Shared(markets)
+    _snap = _load_candidates_snapshot(cfg.candidates_snapshot_path)      # P0-1: закрыть слепое окно рестарта
+    if _snap:
+        _g, _db, _dab, _n = _snap
+        with shared.lock:
+            shared.groups, shared.debt_by, shared.debt_assets_by, shared.n = _g, _db, _dab, _n
+        log.info("warm-start: %d candidates / %d markets из снапшота (age<=%.0fс) — hot path видит набор с первого блока",
+                 _n, len(_g), WARM_START_MAX_AGE_SEC)
     stop = threading.Event()
     threading.Thread(target=_refresh_worker, args=(shared, markets, cfg, ctx_cache, log, stop),
                      daemon=True).start()
@@ -383,7 +429,8 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     fails = 0   # blocks are flowing on this source
                     by_id, groups, debt_by, debt_assets_by, ncand = shared.snapshot()
                     today = store.realized_today()
-                    gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"], inflight=0)
+                    gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"],
+                                    inflight=current_inflight())
                     blocked = guard.blocked_reason(gs)
                     if blocked and cfg.mode == "execute":
                         if time.time() - last_hb >= HEARTBEAT_SEC:
@@ -456,7 +503,8 @@ def main():
                 last_rescan = time.time()
             t0 = time.time()
             today = store.realized_today()
-            st = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"], inflight=0)
+            st = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"],
+                            inflight=current_inflight())
             blocked = guard.blocked_reason(st)
             if blocked and cfg.mode == "execute":
                 log.error("kill switch engaged: %s", blocked)

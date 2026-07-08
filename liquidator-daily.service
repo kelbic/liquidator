@@ -1,0 +1,17 @@
+# /etc/systemd/system/liquidator-daily.service — ежедневная TG-сводка (P0-2).
+# Установка: cp liquidator-daily.{service,timer} /etc/systemd/system/ && systemctl daemon-reload \
+#            && systemctl enable --now liquidator-daily.timer
+# ВАЖНО: НЕТ inline-комментариев после директив — только на своих строках.
+[Unit]
+Description=liquidator daily TG summary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/liquidator
+EnvironmentFile=/root/liquidator/.env
+ExecStart=/root/liquidator/venv/bin/python -m analysis.daily_summary 24
+CPUWeight=10
+MemoryMax=256M
+NoNewPrivileges=true

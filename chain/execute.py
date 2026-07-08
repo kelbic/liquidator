@@ -7,11 +7,67 @@ stdlib HTTP (urllib) like morpho.py — runs on `python3`; only the eth_call pat
 """
 from __future__ import annotations
 import json
+import logging
 import threading
 import urllib.request
 from urllib.parse import urlencode
 
+log = logging.getLogger(__name__)
+
 _SEND_LOCK = threading.Lock()   # serialize dispatch nonce-fetch+send across the block loop and hot path
+
+# P0-4: локальный nonce-трекер — снимает get_transaction_count (~150-300мс Alchemy) из send-пути.
+# Инварианты: читается/пишется ТОЛЬКО под _SEND_LOCK; после успешного батча next=base+len(sent);
+# любая send-ошибка -> инвалидация (следующий dispatch пере-читает RPC — самолечение от nonce-дрейфа);
+# фоновый reconcile после батча подтягивает max(rpc, local) (внешняя tx с кошелька поднимет base,
+# dropped-tx лечится веткой инвалидации, вниз reconcile НЕ опускает — иначе гонка с только что
+# отправленным батчем, который RPC ещё не видит).
+_LOCAL_NONCE: dict = {}         # bot address -> next unused nonce
+
+# P0: живой inflight для kill-switch (был хардкод GuardState(inflight=0) -> гейт мёртв).
+# +1 на каждый принятый send, -1 при получении receipt/timeout (или сразу при wait_receipts=False).
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT = 0
+
+
+def current_inflight() -> int:
+    with _INFLIGHT_LOCK:
+        return _INFLIGHT
+
+
+def _inflight_add(n: int):
+    global _INFLIGHT
+    with _INFLIGHT_LOCK:
+        _INFLIGHT = max(0, _INFLIGHT + n)
+
+
+def _post_raw_tx(url: str, raw_hex: str, timeout: int = 5):
+    """SEND-3: eth_sendRawTransaction напрямую в секвенсер Base ПАРАЛЛЕЛЬНО с Alchemy-путём.
+    Best-effort в daemon-треде: дубль безвреден (второй приём = 'already known'), ошибка здесь
+    НЕ роняет send-путь. Смысл: убрать Alchemy-прокси-хоп из гонки за включение."""
+    try:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
+                           "params": [raw_hex]}).encode()
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = json.loads(r.read())
+        err = resp.get("error")
+        if err and "already known" not in str(err.get("message", "")).lower():
+            log.info("DIAG seq-send %s err=%s", url, str(err)[:120])
+    except Exception as e:
+        log.info("DIAG seq-send %s fail=%s", url, type(e).__name__)
+
+
+def _reconcile_nonce(w3, bot: str):
+    """Фоновая сверка локального nonce с RPC после батча (см. инварианты _LOCAL_NONCE)."""
+    try:
+        n = int(w3.eth.get_transaction_count(bot, "pending"))
+        with _SEND_LOCK:
+            cur = _LOCAL_NONCE.get(bot)
+            if cur is not None:
+                _LOCAL_NONCE[bot] = max(n, cur)
+    except Exception:
+        pass
 
 ORACLE_PRICE_SCALE = 10 ** 36
 WAD = 10 ** 18
@@ -138,8 +194,10 @@ def simulate_tx(rpc, liquidator_addr: str, from_addr: str, calldata: str,
 # --- sign + submit (EIP-1559 on Base) ---
 
 def send_tx(rpc, key: str, tx: dict, wait: bool = True, timeout: int = 120,
-            min_tip_wei: int = 0) -> dict:
-    """Sign `tx` with `key` and submit to Base. Fills from/chainId/nonce/fees/gas if absent."""
+            min_tip_wei: int = 0, broadcast_raw_urls: list | None = None) -> dict:
+    """Sign `tx` with `key` and submit to Base. Fills from/chainId/nonce/fees/gas if absent.
+    broadcast_raw_urls (SEND-3): доп. endpoints (секвенсер) для параллельного raw-broadcast —
+    треды стартуют ДО Alchemy-сенда, hash детерминирован от подписи, дубль безвреден."""
     w3 = rpc._web3()
     acct = w3.eth.account.from_key(key)
     t = dict(tx)
@@ -156,6 +214,10 @@ def send_tx(rpc, key: str, tx: dict, wait: bool = True, timeout: int = 120,
         t["gas"] = int(w3.eth.estimate_gas(t) * 12 // 10)
     signed = acct.sign_transaction(t)
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+    if broadcast_raw_urls:
+        raw_hex = "0x" + bytes(raw).hex()
+        for _u in broadcast_raw_urls:
+            threading.Thread(target=_post_raw_tx, args=(_u, raw_hex), daemon=True).start()
     h = w3.eth.send_raw_transaction(raw)
     out = {"hash": h.hex(), "status": None, "gas_used": None, "receipt": None}
     if wait:
@@ -240,8 +302,10 @@ def try_liquidate(rpc, cfg, market_id: str, borrower: str, debt_usd: float,
             out["net_usd"] = prep["net_usd"]
         return out
     try:
+        _seq = str(getattr(cfg, "sequencer_rpc", "") or "")
         res = send_tx(rpc, cfg.wallet_key, {"to": cfg.liquidator_address, "data": prep["calldata"]},
-                      min_tip_wei=int(cfg.tip_gwei * 1e9))
+                      min_tip_wei=int(cfg.tip_gwei * 1e9),
+                      broadcast_raw_urls=([_seq] if (_seq and _seq.lower() not in ("off", "none", "0")) else None))
     except Exception as e:
         return {"sent": False, "reason": f"send error: {type(e).__name__}: {str(e)[:120]}"}
     if log:
@@ -318,12 +382,17 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
         return results
     w3 = rpc._web3()
     bot = w3.eth.account.from_key(cfg.wallet_key).address
+    _seq = str(getattr(cfg, "sequencer_rpc", "") or "")
+    _bcast = [_seq] if (_seq and _seq.lower() not in ("off", "none", "0")) else None
     with _SEND_LOCK:                                         # serialize nonce-fetch+send across senders (block loop + hot path)
-        base_nonce = int(w3.eth.get_transaction_count(bot, "pending"))
+        base_nonce = _LOCAL_NONCE.get(bot)                   # P0-4: локальный nonce (0 RTT); RPC только на холодном
+        if base_nonce is None:                               # кэше/после инвалидации (см. инварианты у _LOCAL_NONCE)
+            base_nonce = int(w3.eth.get_transaction_count(bot, "pending"))
         tip = int(cfg.tip_gwei * 1e9)
         batch = prepared[:max_inflight]
 
         sent = []
+        _send_failed = False
         for i, (mid, borrower, prep) in enumerate(batch):
             try:
                 _txd = {"to": cfg.liquidator_address, "data": prep["calldata"], "nonce": base_nonce + i}
@@ -332,8 +401,13 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                 if prep.get("max_fee"):                      # SEND-2: fees from fb-header via prep (hot path)
                     _txd["maxFeePerGas"] = prep["max_fee"]   # -> send_tx skips BOTH Alchemy fee-RTTs
                     _txd["maxPriorityFeePerGas"] = prep["tip"]
-                res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip)
+                if send_fn is None:                          # SEND-3 только через штатный send_tx (инжектированный
+                    res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip,   # send_fn тестов не знает kwarg)
+                               broadcast_raw_urls=_bcast)
+                else:
+                    res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip)
                 sent.append((mid, borrower, prep, res["hash"]))
+                _inflight_add(1)
                 if log:
                     log.info("dispatch: sent %s/%s nonce=%d tx=%s net~$%.2f",
                              mid[:10], borrower[:10], base_nonce + i, res["hash"], prep["net_usd"])
@@ -344,9 +418,16 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                 results.append({"market_id": mid, "borrower": borrower, "sent": False,
                                 "reason": f"send error: {type(e).__name__}: {str(e)[:80]}",
                                 "net_usd": prep["net_usd"]})
+                _send_failed = True
+                _LOCAL_NONCE.pop(bot, None)  # не знаем, съелся ли nonce -> следующий dispatch пере-читает RPC
                 break   # nonce gap -> later txs would be stuck; next block re-derives the base nonce
+        if not _send_failed:
+            _LOCAL_NONCE[bot] = base_nonce + len(sent)
+    if sent:                                                 # фоновая сверка nonce с RPC (вне лока)
+        threading.Thread(target=_reconcile_nonce, args=(w3, bot), daemon=True).start()
 
     if not wait_receipts:
+        _inflight_add(-len(sent))    # receipts здесь не отслеживаются -> не копим фантомный inflight
         for mid, borrower, prep, h in sent:
             results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
                             "status": None, "gas_used": None, "net_usd": prep["net_usd"]})
@@ -374,4 +455,6 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                             "status": None, "gas_used": None,
                             "net_usd": -prep["cost_usd"], "gas_usd": prep["cost_usd"],
                             "reason": f"receipt timeout: {type(e).__name__}"})
+        finally:
+            _inflight_add(-1)        # receipt получен либо timeout -> tx больше не «в полёте»
     return results

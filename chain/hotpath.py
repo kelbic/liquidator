@@ -494,7 +494,13 @@ def _diag_revert_bucket(err: str) -> str:
     return "other"
 
 
-def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_assets, price, slippage_bps=100):
+_GAS_CACHE: dict = {}   # market_id -> padded gas от последнего успешного preconf-estimate (P0-4).
+                        # Газ-профиль стабилен per-market (тот же UniV3-путь, та же форма tx);
+                        # send всегда шлёт max(cached, cfg.gas_limit_est) — лимит с запасом бесплатен.
+
+
+def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_assets, price, slippage_bps=100,
+                state=None):
     """Mirror of execute.prepare_liquidation, PRECONF-sourced — diverges from it in more than the two
     points below; this is illustrative, not a complete list (params sourcing, swap routing, and extra
     diagnostic/guard reads have also diverged — check the function body, not this docstring, for the
@@ -526,37 +532,45 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         else:
             rp_params = aggregate3(rpc, [(MORPHO_BLUE, encode_id_to_market_params_call(mid))])
             loan, coll, oracle, irm, lltv_wad = decode_id_to_market_params(rp_params[0][1])
-        # market(tba/tbs)+position(borrow_shares) — из PRECONF pending (ТОТ ЖЕ источник, что sim) для консистентности.
-        # fallback на rpc-latest при degraded preconf (теряем 1.8с lead, но не падаем).
-        try:
-            rp_state = aggregate3(preconf_rpc, [(MORPHO_BLUE, encode_market_call(mid)),
-                                                (MORPHO_BLUE, encode_position_call(mid, borrower))],
-                                  block_identifier="pending")
-            _preconf_ok = rp_state[0][0] and rp_state[1][0]
-        except Exception:
-            _preconf_ok = False
-        if _preconf_ok:
-            m = decode_market(rp_state[0][1]); tba, tbs = m[2], m[3]
-            borrow_shares, collateral_dbg = decode_position(rp_state[1][1])
-            _snap_src = "preconf"
+        # market(tba/tbs)+position(borrow_shares): P0-4 — штатно приходят от caller'а (state=), который
+        # миллисекундами раньше прочитал их тем же read_positions из ТОГО ЖЕ preconf-pending. Повторное
+        # чтение здесь было чистым дублем (~350мс RTT). Fallback-чтение остаётся для вызова без state.
+        if state is not None:
+            tba, tbs, borrow_shares, collateral_dbg = state
+            _snap_src = "caller"
         else:
-            rp_fb = aggregate3(rpc, [(MORPHO_BLUE, encode_market_call(mid)),
-                                     (MORPHO_BLUE, encode_position_call(mid, borrower))])
-            m = decode_market(rp_fb[0][1]); tba, tbs = m[2], m[3]
-            borrow_shares, collateral_dbg = decode_position(rp_fb[1][1])
-            _snap_src = "rpc-fallback"
+            try:
+                rp_state = aggregate3(preconf_rpc, [(MORPHO_BLUE, encode_market_call(mid)),
+                                                    (MORPHO_BLUE, encode_position_call(mid, borrower))],
+                                      block_identifier="pending")
+                _preconf_ok = rp_state[0][0] and rp_state[1][0]
+            except Exception:
+                _preconf_ok = False
+            if _preconf_ok:
+                m = decode_market(rp_state[0][1]); tba, tbs = m[2], m[3]
+                borrow_shares, collateral_dbg = decode_position(rp_state[1][1])
+                _snap_src = "preconf"
+            else:
+                rp_fb = aggregate3(rpc, [(MORPHO_BLUE, encode_market_call(mid)),
+                                         (MORPHO_BLUE, encode_position_call(mid, borrower))])
+                m = decode_market(rp_fb[0][1]); tba, tbs = m[2], m[3]
+                borrow_shares, collateral_dbg = decode_position(rp_fb[1][1])
+                _snap_src = "rpc-fallback"
         if borrow_shares == 0:
             return {"ok": False, "reason": "no debt (cleared)"}
-        # ДИАГНОСТИКА расхождения: confirmed borrow_shares vs preconf — подтверждает рассогласование на флипе.
-        try:
-            _rp_conf = aggregate3(rpc, [(MORPHO_BLUE, encode_position_call(mid, borrower))])
-            _bs_conf, _ = decode_position(_rp_conf[0][1])
-            if _bs_conf != borrow_shares:
-                log.info("DIAG divergence %s/%s src=%s preconf_bs=%d confirmed_bs=%d ratio=%.2f",
-                         market_id[:10], borrower[:10], _snap_src, borrow_shares, _bs_conf,
-                         (_bs_conf / borrow_shares if borrow_shares else 0))
-        except Exception:
-            pass
+        # ДИАГНОСТИКА расхождения preconf vs confirmed — В ТРЕДЕ (P0-4: было синхронно = 150-300мс
+        # Alchemy-RTT В горячем пути ради лога; вывод тот же, задержки ноль).
+        def _diag_divergence(_bs_pre=int(borrow_shares), _src=_snap_src):
+            try:
+                _rp_conf = aggregate3(rpc, [(MORPHO_BLUE, encode_position_call(mid, borrower))])
+                _bs_conf, _ = decode_position(_rp_conf[0][1])
+                if _bs_conf != _bs_pre:
+                    log.info("DIAG divergence %s/%s src=%s preconf_bs=%d confirmed_bs=%d ratio=%.2f",
+                             market_id[:10], borrower[:10], _src, _bs_pre, _bs_conf,
+                             (_bs_conf / _bs_pre if _bs_pre else 0))
+            except Exception:
+                pass
+        threading.Thread(target=_diag_divergence, daemon=True).start()
 
         repaid_shares = int(borrow_shares)
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)
@@ -571,22 +585,27 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         if swap is None:                       # market outside UniV3 paths -> Kyber fallback (unchanged)
             swap = kyber_swap(coll, loan, seized, liq, liq, slippage_bps=slippage_bps)
 
-        # GUARD свежести (skip-only): повторный preconf-read borrow_shares макс. близко к send.
-        # Если долг УПАЛ ниже planned repaid -> SKIP (underflow неизбежен). НЕ капаем (seized/swap уже
-        # посчитаны от repaid_shares -> кап = swap-mismatch -> SwapFailed). Либо planned как есть, либо skip.
-        try:
-            _rg = aggregate3(preconf_rpc, [(MORPHO_BLUE, encode_position_call(mid, borrower))],
-                             block_identifier="pending")
-            if _rg[0][0]:
-                _fresh_bs, _ = decode_position(_rg[0][1])
-                if _fresh_bs <= 0 or repaid_shares > _fresh_bs:
-                    log.info("DIAG guard-skip %s/%s repaid=%d fresh_bs=%d (долг упал ниже planned -> underflow неизбежен)",
-                             market_id[:10], borrower[:10], repaid_shares, _fresh_bs)
-                    return {"ok": False, "reason": f"guard: debt dropped {repaid_shares}->{_fresh_bs}, would underflow"}
-        except Exception:
-            pass  # guard-read упал -> продолжаем (sim всё равно отловит underflow)
+        # P0-4: guard-read свежести УДАЛЁН — он дублировал sim: тот же preconf-pending источник, а sim
+        # ниже ревертит (Panic 0x11) на том же устаревшем долге и даёт тот же skip. Отдельное чтение
+        # стоило ~350мс RTT в горячем пути и ловило только окно «между guard и sim» ~0мс шириной.
 
         cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0)
+        # P0-4: gas per-market из кэша; при промахе estimate_gas идёт ПАРАЛЛЕЛЬНО sim (оба preconf,
+        # cd0/cd1 по газу эквивалентны — отличаются одним сравнением minProfit) -> первый выстрел по
+        # рынку платит max(sim, estimate) вместо суммы, последующие — только sim.
+        _cached_gas = _GAS_CACHE.get(market_id)
+        _gas_holder: dict = {}
+        _est_thread = None
+        if _cached_gas is None:
+            def _do_estimate():
+                try:
+                    _g = preconf_rpc._web3().eth.estimate_gas({"from": bot, "to": liq, "data": cd0},
+                                                              block_identifier="pending")
+                    _gas_holder["gas"] = int(_g) * 12 // 10
+                except Exception:
+                    pass
+            _est_thread = threading.Thread(target=_do_estimate, daemon=True)
+            _est_thread.start()
         sim = simulate_tx(preconf_rpc, liq, bot, cd0, block="pending")        # (2) preconf-pending gate
         if not sim["ok"]:
             # DIAG: логируем ВСЕ sim-revert'ы (не только Panic/seized) с бакетом причины + calldata+блок для форка.
@@ -607,13 +626,20 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
 
         min_profit_final = profit_wei * 95 // 100
         cd1 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit_final)
-        # gas оцениваем на PRECONF-pending (позиция уже ликвидируема), иначе send_tx оценит на
-        # confirmed-Alchemy, где reaction-флип ещё healthy -> estimate_gas ревертит -> tx НЕ уходит.
-        try:
-            _gas = preconf_rpc._web3().eth.estimate_gas({"from": bot, "to": liq, "data": cd1}, block_identifier="pending")
-            _gas_limit = int(_gas) * 12 // 10
-        except Exception:
-            _gas_limit = cfg.gas_limit_est
+        # gas: из per-market кэша (0 RTT) либо от параллельного preconf-estimate выше. Явный gas в prep
+        # по-прежнему нужен, иначе send_tx оценит на confirmed-Alchemy, где reaction-флип ещё healthy ->
+        # estimate_gas ревертит -> tx НЕ уходит. Лимит всегда max(..., cfg.gas_limit_est) — запас бесплатен.
+        if _cached_gas is not None:
+            _gas_limit = max(_cached_gas, cfg.gas_limit_est)
+        else:
+            if _est_thread is not None:
+                _est_thread.join(timeout=2.0)
+            _est = _gas_holder.get("gas")
+            if _est is not None:
+                _GAS_CACHE[market_id] = _est
+                _gas_limit = max(_est, cfg.gas_limit_est)
+            else:
+                _gas_limit = cfg.gas_limit_est
         _prep = {"ok": True, "calldata": cd1, "gas": _gas_limit, "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd}
         _fb = _fresh_basefee()
         if _fb is not None:                                   # SEND-2: fee из fb-хедера (0 Alchemy-RTT в send)
@@ -645,12 +671,20 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         from chain.execute import dispatch_liquidations as dispatch_fn  # noqa: F811
     floor = hot_min_repaid(cfg)
     _gate_px = {}                                            # 2b: цена оракула, прочитанная gate -> переиспользовать в цикле
-    if px_hint is not None and hint_oracle is not None:      # Layer1: feed price seeds ONLY its own oracle (2b logic reuses it in loop)
+    if px_hint is not None and hint_oracle is not None:
+        # P0-3: feed-декод (FORWARD_SEL точной формы) = сам transmit, gate ему не нужен. Раньше gate ниже
+        # ЧИТАЛ preconf (~350мс) и ПЕРЕЗАПИСЫВАЛ хинт; при preconf-лаге (~0.5с) старая цена давала
+        # moved=False -> feed-спавн умирал, а poll этого блока уже дедупнут через feed_handled -> триггер
+        # уезжал на блок позже. Теперь: хинт = цена цикла, baseline обновляем, gate НЕ читаем (0 RTT).
         _gate_px[hint_oracle] = px_hint
+        if last_price is not None:
+            _price_moved(agg, px_hint, last_price)           # baseline для последующих bare-match gate'ов
+        if stats is not None:
+            stats["proceed"] += 1
     # price-change gate: the bare match also fires on price-READ txs. Read ONE representative oracle
     # preconf price; if it has not moved since last sighting this was a reader, not a transmit -> skip
     # the 340-call multicall + flips. This is what makes the bare match viable on the hot path.
-    if last_price is not None:
+    elif last_price is not None:
         rep = next((meta[m][0] for m in feeds.get(agg, []) if meta.get(m)), None)
         if rep is None:
             return []
@@ -700,6 +734,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         tba, tbs, pos = rp
         log.info("DIAG hotset mid=%s src=%s trig=%s n=%d block=%d", mid[:10], _rsrc, subidx, len(pos), block)  # full set on disk
         positions = [(b, bs, col, debt_by.get((mid, b), 0.0)) for (b, bs, col) in pos]
+        pos_by = {b: (bs, col) for (b, bs, col) in pos}      # P0-4: state для prepare_hot без повторного RTT
         flipped = _flips(price, lltv_wad, tba, tbs, positions)
         if not flipped:
             if stats is not None: stats["f_noflip"] += 1
@@ -717,8 +752,10 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                 continue
             if stats is not None: stats["f_prep"] += 1
             _ps = time.perf_counter()
-            prep = prepare_fn(rpc, preconf_rpc, cfg, mid, b, du,
-                              debt_assets_by.get((mid, b), 0), price)
+            _bc = pos_by.get(b)                              # P0-4: (tba,tbs,bs,col) из read_positions этого же
+            prep = prepare_fn(rpc, preconf_rpc, cfg, mid, b, du,   # триггера (мс назад, тот же preconf) -> prepare_hot
+                              debt_assets_by.get((mid, b), 0), price,   # не перечитывает market/position (~-350мс)
+                              state=((tba, tbs, _bc[0], _bc[1]) if _bc else None))
             _t_prep_total += (time.perf_counter() - _ps) * 1000.0
             if prep.get("ok"):
                 ready.append((mid, b, prep)); meta_by[(mid, b)] = (hr, du)
@@ -730,9 +767,11 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     if not ready:
         return []
 
+    from chain.execute import current_inflight
     today = store.realized_today()                           # SHARED kill-switch with the block loop
     blocked = guard.blocked_reason(GuardState(realized_net_today=today["net"],
-                                              gas_spent_today=today["gas"], inflight=0))
+                                              gas_spent_today=today["gas"],
+                                              inflight=current_inflight()))   # P0: был хардкод 0 — inflight-гейт мёртв
     if blocked:
         log.error("HOT kill switch engaged: %s — %d ready NOT dispatched", blocked, len(ready))
         alerter.send(f"\U0001F6D1 hot path halted: {blocked}", key="hot-killswitch")
