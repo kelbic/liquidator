@@ -117,8 +117,10 @@ def _basefee_probe(*, bn, fb, rpc, log):
 
 
 _SHADOW_SCALE = {"cbXRP": 10**28, "cbDOGE": 10**26, "cbADA": 10**28,   # immutable оракулов (STATE Идея 2)
-                 "cbLTC": 10**28}   # P1-8: цена cbLTC ×1e28 (STATE «цена cbADA/cbLTC ×1e28»); карта
-                                    # матчится только если агрегатор всплывает в resolve_feeds — иначе no-op
+                 "cbLTC": 10**26}   # P1-8, ИСПРАВЛЕНО 07-08: STATE-строка «цена cbADA/cbLTC ×1e28» была
+                                    # НЕВЕРНА для cbLTC — живой shadow-чек дал match=False ровно 100×
+                                    # (px_preconf/answer=1e26), decimals с чейна: cbLTC=8 (как cbDOGE→1e26),
+                                    # cbADA=6→1e28. Формула: 1e36·10^(loanDec−collDec)/1e8_answer.
 
 
 def _build_shadow_map(feeds, meta, markets):
