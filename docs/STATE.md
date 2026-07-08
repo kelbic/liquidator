@@ -76,6 +76,19 @@ Watch: `DIAG seq-send` (ошибки секвенсера), `dispatch: sent .. n
   кэша, только direct-маршруты, minProfit=50% бонуса; исход гарантируют контракты, промах = газ
   реверта под kill-switch. Включать ПОСЛЕ того, как обычный путь покажет живые выстрелы.
 
+**ПЕРЕЕЗД В US-EAST ГОТОВ К CUTOVER (07-08):** новый VPS Charlotte NC `185.173.146.134`
+(NetCrafters, root у ассистента). Замер: sequencer warm=30ms, preconf=38ms (Вена=121/133) —
+**−90мс/вызов подтверждён на боевой машине.** Площадка собрана: репо (origin, HEAD 5958360+),
+venv (py3.14/web3 7.16 == Вена), covered_markets/feed_to_market перенесены, systemd-юниты
+установлены DISABLED, `.env` собран (несекретные строки с Вены; **WALLET_KEY/RPC_URL/TG_BOT_TOKEN
+= плейсхолдеры `__FILL_ME__`**), конфиг+импорт валидированы (mode=execute hot=True tip=6.0 флаги
+OFF), P0+P1 смоук зелёные (кроме устаревшего cbLTC=1e28-ассерта — фикс на месте).
+**ОСТАЛОСЬ 2 ШАГА:** (1) ВЛАДЕЛЕЦ вписывает 3 секрета в `/root/liquidator/.env` на Charlotte;
+(2) по «го» ассистент гонит `scratchpad/cutover.sh` — строгий порядок: Вена stop+disable →
+финальные db+snapshot Вена→Charlotte → Charlotte enable+start → журнал-проверка. Вена =
+выключенный бэкап (НЕ enable — два инстанса с одним кошельком = nonce-крах). Cutover в тихое
+окно. Charlotte TZ=UTC (daily timer 08:00 UTC).
+
 **P0-3 ПОДТВЕРЖДЁН В БОЮ (07-08 18:52, cbADA, прямое A/B в одном журнале):** feed-spawn с px_hint →
 `noflip trig=feed price=0ms read=421ms` против соседнего `trig=poll price=381ms` — gate-RTT цены
 РЕАЛЬНО снят; сквозной декод→HF(11 позиций)=422мс, из них 421мс = read_positions (снимет включение
