@@ -17,6 +17,12 @@
 - Ассистент имеет root-ssh на ОБЕ машины (дан владельцем 07-08). Секреты (WALLET_KEY/RPC_URL/
   TG_BOT_TOKEN) в `.env` — их вписывал ВЛАДЕЛЕЦ, ассистент не трогает.
 
+## ГИГИЕНА (закрытое)
+- **TG-алертинг был МЁРТВ до 07-09 12:50** — `TG_ADMIN_ID` пуст в .env (и на Вене тоже, изначально).
+  Токен @essayist_bot валиден, но без chat_id все `alerter.send()` молча возвращали False (HOT/
+  kill-switch/сводка не доходили). Чинено: `TG_ADMIN_ID=265715923` прописан на ОБЕИХ машинах,
+  тест-отправка ok, бот рестартнут. Живые алерты теперь работают.
+
 ## ЧТО В БОЮ СЕЙЧАС (флаги живого процесса — проверять ТОЛЬКО через
 ## `/proc/$(systemctl show -p MainPID --value liquidator-bot)/environ`, НЕ python -c)
 - `HOT_PATH=1 PRICE_FROM_FEED=1 MODE=execute LOOP_MODE=block`, TIP_GWEI=6.0, floor $450.
