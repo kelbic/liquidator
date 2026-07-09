@@ -993,6 +993,9 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     last_poll_block = None       # one preconf-price poll per block
     fb_windows = 0               # consecutive stats windows with poll_fb>0 (preconf degradation streak)
     last_fb_alert = 0.0          # monotonic of last degradation alert (anti-flood)
+    recon_ts = []                # monotonic'ы реконнектов hot-path ws; одиночный разрыв публичного
+    last_recon_alert = 0.0       # Flashblocks-WS = НОРМА (роняет соединение раз в час-два) -> TG молчит,
+                                 # алерт ТОЛЬКО на серию (3+ за 180с = реальная нестабильность фида/сети)
     while not stop.is_set():
         try:
             async with ws_factory() as ws:
@@ -1089,5 +1092,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                              daemon=True).start()
         except Exception as e:
             log.warning("hot path ws error (%s) — reconnecting in 3s", type(e).__name__)
-            alerter.send("\U0001F6A8 hot-path reconnect — check journalctl", key="hot-wsserr")
+            _now = time.monotonic()
+            recon_ts = [t for t in recon_ts if _now - t <= 180.0] + [_now]   # окно 180с
+            if len(recon_ts) >= 3 and _now - last_recon_alert > 600.0:       # серия -> реальная проблема
+                last_recon_alert = _now
+                alerter.send("\U0001F6A8 hot-path %d реконнектов за 3 мин — check journalctl" % len(recon_ts),
+                             key="hot-wsserr")
             await asyncio.sleep(3)
