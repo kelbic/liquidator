@@ -46,6 +46,15 @@
   реверты, mism>0, tba_eq=False, cbLTC mismatch, крэш-луп, kill-switch).
 - **Daily TG-сводка:** systemd timer на Charlotte, 08:00 UTC (независимо от сессии).
 
+## cbBTC/USDC — В КОНТЕСТЕ с 07-09 13:27 (`ab1393f`, CBBTC_PLAN исполнен)
+Крупнейший рынок протокола ($1.23B borrow, 482 ликв/$15.8M/30д, ~7 призов ≥$450 в день, 58 ботов).
+Что вошло: bounded mega-fetch (morpho.py, топ-3000 по долгу — иначе API skip-лимит ронял refresh),
+INCLUDE_MARKETS allowlist (build_covered_markets), маршрут cbBTC→WETH(500)→USDC(500), shadow
+scale 1e26 (бит-в-бит) + quote-фильтр _build_shadow_map (loan=USDC only — общий агрегатор с
+cbBTC/EURC). Watch: `DIAG mega-fetch cap` (хвост отрезан — поднять MEGA_FETCH_MAX_PAGES),
+`shadow-feed mkt=cbBTC match` (False → убрать из _SHADOW_SCALE немедленно, poll безопасен),
+первые submit-xray дельты на cbBTC (мера контеста против 58 ботов). Откат: см. CBBTC_PLAN.md.
+
 ## СЛЕДУЮЩИЕ ШАГИ (по порядку)
 1. Вечерний гейт (cron сам, см. выше).
 2. Первое reaction-событие рынка → смотреть `submit-xray` дельту (хватает ли скорости).
