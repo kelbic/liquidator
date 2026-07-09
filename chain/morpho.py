@@ -12,10 +12,13 @@ API, so the position query only needs `marketId` to map a position back to its l
 """
 from __future__ import annotations
 import json
+import logging
 import urllib.request
 import urllib.error
 import time
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 from strategy.scanner import Market
 
@@ -29,6 +32,15 @@ MORPHO_API_URL = "https://api.morpho.org/graphql"
 # Morpho ревертит 0x81ceff30 на ~нулевом долге. Режем на стадии кандидата, чтобы они не
 # засоряли hot set / simulations. (Бэклог STATE; в Config не тянем — хватает дефолта модуля.)
 MIN_DEBT_USD = 1.0
+
+# Мега-рынки (CBBTC_PLAN 07-09): >10000 заёмщиков -> merged-пагинация упирается в API-лимит
+# skip<=10000 и РОНЯЕТ весь candidate refresh; orderBy:HealthFactor у API нет (400). Такие рынки
+# фетчатся ОТДЕЛЬНО, bounded: top-N по долгу (BorrowShares desc). near-risk концентрируется в
+# высоких рангах долга: на cbBTC/USDC ВСЕ 25 near-risk (HF<=1.10, debt>=$450) в top-3000 (замер).
+MEGA_MARKETS = frozenset({
+    "0x9103c3b4e834476c9a62ea009ba2c884ee42e94e6e314a26f04d312434191836",   # cbBTC/USDC $1.23B
+})
+MEGA_FETCH_MAX_PAGES = 3   # top-3000 по долгу; при упоре в кап пишется предупреждение в лог
 
 # marketUniqueKey is keccak(loanToken,collateralToken,oracle,irm,lltv); token/oracle
 # addresses differ per chain, so Base keys can't collide with other chains -> no chainId
@@ -166,12 +178,41 @@ def _fetch_borrower_positions(keys: list[str], api_url: str, page: int = 1000,
     return out
 
 
+def _fetch_market_bounded(key: str, api_url: str, max_pages: int = MEGA_FETCH_MAX_PAGES,
+                          page: int = 1000, timeout: int = 15) -> list:
+    """Bounded fetch ОДНОГО мега-рынка (CBBTC_PLAN): top (max_pages*page) заёмщиков по долгу
+    (BorrowShares desc), стоп на supplier-хвосте (borrowShares==0). НЕ пагинирует к API-лимиту
+    skip<=10000. Кап может отрезать глубокий хвост мелких долгов — near-risk с призом живут в
+    верхних рангах (замер 07-09: 25/25 в top-3000); упор в кап логируется как watch-сигнал."""
+    out: list = []
+    skip = 0
+    for _ in range(max_pages):
+        batch = _query_page([key], skip, page, api_url, timeout)
+        for it in batch:
+            if _int((it.get("state") or {}).get("borrowShares")) == 0:
+                return out
+            out.append(it)
+        if len(batch) < page:
+            return out
+        skip += page
+    log.info("DIAG mega-fetch cap market=%s top-%d исчерпан (заёмщиков больше) — хвост отрезан",
+             key[:10], max_pages * page)
+    return out
+
+
 def positions_at_risk(markets: list[Market], hf_ceiling: float = 1.0, min_debt_usd: float = MIN_DEBT_USD,
                       api_url: str = MORPHO_API_URL) -> list[Position]:
-    """At-risk positions across covered markets, via the Morpho API."""
+    """At-risk positions across covered markets, via the Morpho API. Мега-рынки (MEGA_MARKETS)
+    фетчатся отдельно bounded-путём — merged-пагинация с ними упиралась в API skip-лимит и
+    роняла ВЕСЬ candidate refresh (CBBTC_PLAN, правка 1)."""
     keys = [m.market_id for m in markets if m.market_id]
     if not keys:
         return []
     lltv_by_key = {m.market_id: m.lltv for m in markets if m.market_id}
-    items = _fetch_borrower_positions(keys, api_url)
+    mega_lc = {m.lower() for m in MEGA_MARKETS}
+    normal = [k for k in keys if k.lower() not in mega_lc]
+    mega = [k for k in keys if k.lower() in mega_lc]
+    items = _fetch_borrower_positions(normal, api_url) if normal else []
+    for mk in mega:
+        items = items + _fetch_market_bounded(mk, api_url)
     return parse_positions({"data": {"marketPositions": {"items": items}}}, lltv_by_key, hf_ceiling, min_debt_usd)

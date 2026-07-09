@@ -117,22 +117,31 @@ def _basefee_probe(*, bn, fb, rpc, log):
 
 
 _SHADOW_SCALE = {"cbXRP": 10**28, "cbDOGE": 10**26, "cbADA": 10**28,   # immutable оракулов (STATE Идея 2)
-                 "cbLTC": 10**26}   # P1-8, ИСПРАВЛЕНО 07-08: STATE-строка «цена cbADA/cbLTC ×1e28» была
+                 "cbLTC": 10**26,   # P1-8, ИСПРАВЛЕНО 07-08: STATE-строка «цена cbADA/cbLTC ×1e28» была
                                     # НЕВЕРНА для cbLTC — живой shadow-чек дал match=False ровно 100×
                                     # (px_preconf/answer=1e26), decimals с чейна: cbLTC=8 (как cbDOGE→1e26),
                                     # cbADA=6→1e28. Формула: 1e36·10^(loanDec−collDec)/1e8_answer.
+                 "cbBTC": 10**26}   # CBBTC_PLAN 07-09: SCALE_FACTOR оракула = 1e26, подтверждён БИТ-В-БИТ
+                                    # (answer*1e26 == price(), остаток 0). Гейт: первый live shadow-чек
+                                    # match=False -> убрать строку немедленно (poll-путь безопасен без неё).
 
 
 def _build_shadow_map(feeds, meta, markets):
     """{aggregator_lower: (symbol, scale, oracle)} ТОЛЬКО для одно-фид money-маркетов (SCALE известен).
     Чистая (юнит). Ротацию агрегатора закрывает часовой re-resolve, пересобирающий карту вместе с
-    feeds/meta; между ротацией и пересборкой shadow просто перестаёт матчить (log-only, безвредно)."""
+    feeds/meta; между ротацией и пересборкой shadow просто перестаёт матчить (log-only, безвредно).
+    CBBTC_PLAN: ТОЛЬКО loan=USDC — _SHADOW_SCALE выведен для USD-quote (answer*scale==price
+    USD-оракула); один агрегатор могут делить рынки с РАЗНЫМ quote (cbBTC/USDC и cbBTC/EURC оба
+    резолвятся в cbBTC/USD-фид), и посадить USD-scale на EURC-оракул = неверный px_hint +
+    вечный match=False. Не-USDC рынки остаются на poll-детекции (как и было)."""
     out = {}
     by_id = {m.market_id: m for m in markets}
     for agg, mids in feeds.items():
         for mid in mids:
             m = by_id.get(mid); om = meta.get(mid)
             if not m or not om:
+                continue
+            if getattr(m, "loan_token", "") != "USDC":
                 continue
             scale = _SHADOW_SCALE.get(getattr(m, "collateral_token", None))
             if scale:

@@ -21,6 +21,14 @@ BASE_CHAIN_ID = 8453
 DEFAULT_SLIPPAGE = 0.01   # conservative placeholder; refined per-market by monitor/Dune later
 MIN_BONUS = 0.01          # drop markets whose LIF bonus <= this (uneconomical: bonus < slippage)
 MAX_BORROW_USD = 30_000_000   # exclude mega-cap markets: contested (we won't win) AND huge position counts
+
+# CBBTC_PLAN 07-09: точечное переоткрытие мега-рынков ПОСЛЕ срезки латентности (2.5-3с -> 50-100мс).
+# Вердикт «contested, we won't win» был вынесен при старом пути; cbBTC/USDC = 482 ликв/$15.8M за 30д
+# (204 приза >=$450). Включается ИМЕННО перечислением — НЕ снятием MAX_BORROW_USD (иначе затащим
+# WETH/USDC и прочие мега-рынки без решения). Сустейн закрыт MEGA_MARKETS bounded-фетчем (morpho.py).
+INCLUDE_MARKETS = frozenset({
+    "0x9103c3b4e834476c9a62ea009ba2c884ee42e94e6e314a26f04d312434191836",   # cbBTC/USDC
+})
 # collateral our swap venue (KyberSwap) cannot exit -> liquidation would revert; don't waste a slot.
 # Pendle PT tokens trade on Pendle's own AMM, not the DEXs Kyber aggregates.
 EXIT_BLOCKED_COLLATERAL = ("PT-",)
@@ -83,13 +91,15 @@ def select_markets(items, min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD
                    exclude_collateral_prefixes=EXIT_BLOCKED_COLLATERAL):
     """Pure: filter (real borrow, valid collateral, bonus>slippage) + map -> records.
     Carries a private _borrow_usd for inspection/sort; stripped before JSON."""
+    inc_lc = {m.lower() for m in INCLUDE_MARKETS}
     rows = []
     for it in items:
         st = it.get("state") or {}
         borrow = float(st.get("borrowAssetsUsd") or 0)
-        if borrow < min_borrow_usd or borrow > max_borrow_usd:
-            continue
         key = it.get("marketId")
+        included = (key or "").lower() in inc_lc          # CBBTC_PLAN: allowlist обходит borrow-границы
+        if not included and (borrow < min_borrow_usd or borrow > max_borrow_usd):
+            continue
         col = it.get("collateralAsset") or {}
         loan = it.get("loanAsset") or {}
         if not key or not col.get("symbol"):   # idle/unrecognized-collateral markets -> skip
@@ -113,7 +123,15 @@ def select_markets(items, min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD
             "_borrow_usd": round(borrow, 0),
         })
     rows.sort(key=lambda m: m["_borrow_usd"], reverse=True)
-    return rows[:max_markets]
+    selected = rows[:max_markets]
+    # CBBTC_PLAN: allowlist-рынок обязан попасть в выдачу, даже если top-N вытеснил его
+    have = {m["market_id"].lower() for m in selected}
+    for m in rows:
+        mlc = m["market_id"].lower()
+        if mlc in inc_lc and mlc not in have:
+            selected.append(m)
+            have.add(mlc)
+    return selected
 
 
 def to_json_records(selected) -> list:

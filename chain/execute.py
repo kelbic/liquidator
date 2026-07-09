@@ -169,6 +169,10 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
                       "path": _pack_path(_CBBTC, 100, _EURC)},
     (_CBLTC, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_CBLTC, 200, _UNIV3_WETH, 100, _UNIV3_USDC)},
+    # CBBTC_PLAN 07-09: cbBTC/USDC — QuoterV2 live: $2k->$2009, $30k->$30103 (~0.3% impact); fee 500
+    # на обоих хопах чуть лучше 3000 (пулы верифицированы 07-08: cbBTC/WETH 500 liq>0, WETH/USDC 500).
+    (_CBBTC, _UNIV3_USDC): {"router": UNIV3_SWAP_ROUTER, "style": "02",
+                            "path": _pack_path(_CBBTC, 500, _UNIV3_WETH, 500, _UNIV3_USDC)},
 }
 for _coll, _fee in UNIV3_PATHS.items():   # существующие UniV3-пути -> та же таблица (loan=USDC)
     _SWAP_ROUTES[(_coll, _UNIV3_USDC)] = {"router": UNIV3_SWAP_ROUTER, "style": "02",
