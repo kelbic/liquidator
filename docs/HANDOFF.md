@@ -55,6 +55,13 @@ cbBTC/EURC). Watch: `DIAG mega-fetch cap` (хвост отрезан — под�
 `shadow-feed mkt=cbBTC match` (False → убрать из _SHADOW_SCALE немедленно, poll безопасен),
 первые submit-xray дельты на cbBTC (мера контеста против 58 ботов). Откат: см. CBBTC_PLAN.md.
 
+## MONEY-PATH ВАЛИДИРОВАН НА ФОРКЕ 07-09 — но 3 находки на крупных призах (см. STATE)
+Fork-replay доказал: liquidate замайнивается, профит реально списывается (cbBTC $1.8M -> $39,564).
+АКТИВНЫЙ РИСК до фикса: fast-lane на КРУПНОМ призе cbBTC ($1M+) ревертит (F1 minProfit / F2 OOG-газ) —
+дорогой revert после свопа. Бэкстоп: kill-switch ($100 gas/день, 1 мега-OOG его пробьёт -> halt).
+ФИКС ГОТОВ К ПРИМЕНЕНИЮ: `FAST_LANE_MAX_REPAID_USD`≈$75k — выше -> prepare_hot (sim+estimate).
+Целевой диапазон $450–30k НЕ затронут (fast-lane там корректен). Foundry установлен на Charlotte.
+
 ## СЛЕДУЮЩИЕ ШАГИ (по порядку)
 1. Вечерний гейт (cron сам, см. выше).
 2. Первое reaction-событие рынка → смотреть `submit-xray` дельту (хватает ли скорости).
