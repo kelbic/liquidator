@@ -55,12 +55,14 @@ cbBTC/EURC). Watch: `DIAG mega-fetch cap` (хвост отрезан — под�
 `shadow-feed mkt=cbBTC match` (False → убрать из _SHADOW_SCALE немедленно, poll безопасен),
 первые submit-xray дельты на cbBTC (мера контеста против 58 ботов). Откат: см. CBBTC_PLAN.md.
 
-## MONEY-PATH ВАЛИДИРОВАН НА ФОРКЕ 07-09 — но 3 находки на крупных призах (см. STATE)
-Fork-replay доказал: liquidate замайнивается, профит реально списывается (cbBTC $1.8M -> $39,564).
-АКТИВНЫЙ РИСК до фикса: fast-lane на КРУПНОМ призе cbBTC ($1M+) ревертит (F1 minProfit / F2 OOG-газ) —
-дорогой revert после свопа. Бэкстоп: kill-switch ($100 gas/день, 1 мега-OOG его пробьёт -> halt).
-ФИКС ГОТОВ К ПРИМЕНЕНИЮ: `FAST_LANE_MAX_REPAID_USD`≈$75k — выше -> prepare_hot (sim+estimate).
-Целевой диапазон $450–30k НЕ затронут (fast-lane там корректен). Foundry установлен на Charlotte.
+## MONEY-PATH ВАЛИДИРОВАН НА ФОРКЕ 07-09 (механика чиста; эконом-цифры перепроверены — см. STATE)
+Fork-replay доказал МЕХАНИКУ: liquidate замайнивается, профит списывается, event есть. Первые
+эконом-находки были ЗАРАЖЕНЫ (мок только оракула, не DEX); перепроверено QuoterV2. ВЕРНО:
+fast-lane безопасен до ~$500k (не $75k); $500k-1.3M -> sim-путь; >$1.3M убыточны через одиночный
+UniV3 (ёмкость маршрута) -> sim пропускает. Целевой $450-30k слиппаж <0.11% — безопасен.
+ФИКС ГОТОВ: `FAST_LANE_MAX_REPAID_USD ≈ $500k` -> выше идём prepare_hot (sim+estimate). АКТИВНЫЙ
+РИСК до фикса низкий: fast-lane на призе >$1.3M ревертнул бы (contract minProfit) — редко,
+kill-switch бэкстоп. Foundry на Charlotte. Slipstream-сплит поднял бы потолок профитности (backlog).
 
 ## СЛЕДУЮЩИЕ ШАГИ (по порядку)
 1. Вечерний гейт (cron сам, см. выше).
