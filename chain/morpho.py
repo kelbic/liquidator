@@ -126,8 +126,11 @@ _RETRYABLE_HTTP = (429, 500, 502, 503, 504)
 def _query_page(keys: list[str], skip: int, first: int, api_url: str, timeout: int,
                 retries: int = 3) -> list:
     """One page of marketPositions (ordered by borrowShares desc). I/O with retry-on-transient
-    (timeout / URLError / 429 / 5xx) so a single API hiccup doesn't drop a whole scan cycle.
-    Non-transient (HTTP 4xx, GraphQL errors) propagate immediately."""
+    (timeout / URLError / ConnectionError / 429 / 5xx) so a single API hiccup doesn't drop a whole
+    scan cycle. Non-transient (HTTP 4xx, GraphQL errors) propagate immediately.
+    ConnectionError (вкл. ConnectionResetError [Errno 104] — обрыв TLS в ssl.read, инцидент 07-09)
+    — подкласс OSError, НЕ URLError, и urllib пробрасывает его голым мимо URLError-ветки; ловим
+    явно. Запрос идемпотентен (read-only GraphQL) -> повтор безопасен."""
     body = json.dumps({"query": _POSITIONS_QUERY,
                        "variables": {"keys": keys, "first": first, "skip": skip}}).encode()
     last_exc = None
@@ -144,7 +147,7 @@ def _query_page(keys: list[str], skip: int, first: int, api_url: str, timeout: i
             if e.code not in _RETRYABLE_HTTP or attempt == retries - 1:
                 raise
             last_exc = e
-        except (urllib.error.URLError, TimeoutError) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             if attempt == retries - 1:
                 raise
             last_exc = e
