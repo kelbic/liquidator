@@ -64,6 +64,17 @@ UniV3 (ёмкость маршрута) -> sim пропускает. Целев�
 РИСК до фикса низкий: fast-lane на призе >$1.3M ревертнул бы (contract minProfit) — редко,
 kill-switch бэкстоп. Foundry на Charlotte. Slipstream-сплит поднял бы потолок профитности (backlog).
 
+## ИЗВЕСТНЫЙ ДЕФЕКТ (07-09, refresh-путь, НЕ money-path) — 1 сбой за 2ч, самовосстановился
+`candidate refresh error: ConnectionResetError [Errno 104]` (Morpho API оборвал TLS в ssl.read).
+Два дефекта: (A регрессия cbBTC-патча) сбой мега-fetch в positions_at_risk роняет ВЕСЬ refresh,
+включая normal-рынки — до cbBTC был один merged-вызов, теперь два раздельных и сбой второго
+теряет первый; (B корневой, предсуществующий) `_query_page` ретраит только URLError/TimeoutError/
+HTTPError, а `ConnectionResetError`(OSError, НЕ URLError) всплывает голым мимо ретраев. Влияние
+низкое: refresh фоновый (не шлёт tx), пропуск 1 цикла, warm-start+cycle_deadline страхуют.
+ФИКС ГОТОВ (2 части, ~5 строк): (1) try/except вокруг мега-fetch в positions_at_risk (сбой одного
+рынка не теряет остальные); (2) добавить ConnectionError в retry-класс _query_page (чинит для ВСЕХ
+путей). Смоук: мок _query_page с ConnectionResetError -> ретрай; сбой мега -> normal доезжают.
+
 ## БЭКЛОГ (не срочно, решение владельца 07-09 — ждём событий)
 - **FAST_LANE_MAX_REPAID_USD ≈ $500k** — закрывает бессмысленный fast-lane-реверт на призе >$1.3M
   (убыточен через одиночный UniV3). Риск НИЗКИЙ (редко + kill-switch бэкстоп), целевой $450-30k
