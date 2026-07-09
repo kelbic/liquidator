@@ -71,9 +71,11 @@ kill-switch бэкстоп. Foundry на Charlotte. Slipstream-сплит под
 теряет первый; (B корневой, предсуществующий) `_query_page` ретраит только URLError/TimeoutError/
 HTTPError, а `ConnectionResetError`(OSError, НЕ URLError) всплывает голым мимо ретраев. Влияние
 низкое: refresh фоновый (не шлёт tx), пропуск 1 цикла, warm-start+cycle_deadline страхуют.
-ФИКС ГОТОВ (2 части, ~5 строк): (1) try/except вокруг мега-fetch в positions_at_risk (сбой одного
-рынка не теряет остальные); (2) добавить ConnectionError в retry-класс _query_page (чинит для ВСЕХ
-путей). Смоук: мок _query_page с ConnectionResetError -> ретрай; сбой мега -> normal доезжают.
+ЧАСТЬ 1 ИСПРАВЛЕНА (07-09, коммит после fork-разбора): ConnectionError в retry-класс _query_page
+(корень — чинит все пути; латентность не затронута, только фоновый refresh). ЧАСТЬ 2 (per-market
+изоляция мега-fetch) — BACKLOG, НЕ наивно: текущий _refresh_worker сохраняет last-good при любом
+сбое (безопасно), наивная изоляция уронила бы cbBTC в пустоту -> нужен аккуратный per-market-merge
+(делать только если появятся СТОЙКИЕ сбои одного рынка, замораживающие весь refresh).
 
 ## БЭКЛОГ (не срочно, решение владельца 07-09 — ждём событий)
 - **FAST_LANE_MAX_REPAID_USD ≈ $500k** — закрывает бессмысленный fast-lane-реверт на призе >$1.3M
