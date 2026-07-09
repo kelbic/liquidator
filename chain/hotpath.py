@@ -937,7 +937,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                                               inflight=current_inflight()))   # P0: был хардкод 0 — inflight-гейт мёртв
     if blocked:
         log.error("HOT kill switch engaged: %s — %d ready NOT dispatched", blocked, len(ready))
-        alerter.send(f"\U0001F6D1 hot path halted: {blocked}", key="hot-killswitch")
+        alerter.send_async(f"\U0001F6D1 hot path halted: {blocked}", key="hot-killswitch")
         return []
 
     _ds = time.perf_counter()
@@ -952,7 +952,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         store.log_action(market_id=r["market_id"], borrower=r["borrower"], mode=cfg.mode,
                          tx_hash=r.get("hash"), net_usd=r.get("net_usd", 0.0), gas_usd=r.get("gas_usd", 0.0), status=status)
         log.info("HOT ACTIONABLE %s/%s status=%s tx=%s", r["market_id"][:10], r["borrower"][:10], status, r.get("hash"))
-        alerter.send(f"\U0001F525 HOT {cfg.mode} {r['borrower'][:10]} {status}", key=f"hot:{r['market_id']}:{r['borrower']}")
+        alerter.send_async(f"\U0001F525 HOT {cfg.mode} {r['borrower'][:10]} {status}", key=f"hot:{r['market_id']}:{r['borrower']}")
     return results
 
 
@@ -1016,7 +1016,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         if fb_windows >= 3 and time.monotonic() - last_fb_alert > 1800:
                             last_fb_alert = time.monotonic()
                             try:
-                                alerter.send("preconf degraded %dx windows: polling on LATEST (detection alive, "
+                                alerter.send_async("preconf degraded %dx windows: polling on LATEST (detection alive, "
                                              "but WITHOUT the ~1.8s lead -> contested races lost). check preconf RPC." % fb_windows)
                             except Exception:
                                 pass
@@ -1096,6 +1096,6 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
             recon_ts = [t for t in recon_ts if _now - t <= 180.0] + [_now]   # окно 180с
             if len(recon_ts) >= 3 and _now - last_recon_alert > 600.0:       # серия -> реальная проблема
                 last_recon_alert = _now
-                alerter.send("\U0001F6A8 hot-path %d реконнектов за 3 мин — check journalctl" % len(recon_ts),
+                alerter.send_async("\U0001F6A8 hot-path %d реконнектов за 3 мин — check journalctl" % len(recon_ts),
                              key="hot-wsserr")
             await asyncio.sleep(3)

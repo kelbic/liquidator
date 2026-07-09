@@ -114,7 +114,7 @@ def _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, gu
                          net_usd=net, gas_usd=gas, status=status)
         log.info("ACTIONABLE %s/%s HF=%.4f net=$%.2f mode=%s status=%s",
                  mid[:10], borrower[:10], hr.hf, net, cfg.mode, status)
-        alerter.send(f"\U0001F4B0 {cfg.mode} liquidation {borrower[:10]} "
+        alerter.send_async(f"\U0001F4B0 {cfg.mode} liquidation {borrower[:10]} "
                      f"net ${net:.2f} HF={hr.hf:.4f}", key=f"act:{mid}:{borrower}")
 
     if not actionable:
@@ -435,7 +435,7 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     if blocked and cfg.mode == "execute":
                         if time.time() - last_hb >= HEARTBEAT_SEC:
                             log.error("kill switch engaged: %s", blocked)
-                            alerter.send(f"\U0001F6D1 liquidator halted: {blocked}", key="killswitch")
+                            alerter.send_async(f"\U0001F6D1 liquidator halted: {blocked}", key="killswitch")
                             last_hb = time.time()
                         continue
                     if not groups:
@@ -460,13 +460,13 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                  s["profitable"], mh, time.time() - t0)
         except Exception as e:
             log.warning("block source=%s error (%s) — reconnecting in 3s", active, type(e).__name__)
-            alerter.send("\U0001F6A8 block-loop reconnect — check journalctl", key="wsserr")
+            alerter.send_async("\U0001F6A8 block-loop reconnect — check journalctl", key="wsserr")
             if active == "flashblocks":
                 fails += 1
                 if fails >= _FLASHBLOCK_FALLBACK_AFTER:
                     active = "newheads"; fails = 0
                     log.error("flashblocks feed unstable — FALLING BACK to newHeads")
-                    alerter.send("\U0001F504 flashblocks -> newHeads fallback", key="fbfallback")
+                    alerter.send_async("\U0001F504 flashblocks -> newHeads fallback", key="fbfallback")
             await asyncio.sleep(3)
 
 
@@ -508,7 +508,7 @@ def main():
             blocked = guard.blocked_reason(st)
             if blocked and cfg.mode == "execute":
                 log.error("kill switch engaged: %s", blocked)
-                alerter.send(f"\U0001F6D1 liquidator halted: {blocked}", key="killswitch")
+                alerter.send_async(f"\U0001F6D1 liquidator halted: {blocked}", key="killswitch")
             s = scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) if markets else _empty_summary(0)
             now = time.time()
             if (s["liquidatable"] or s["profitable"]) or (now - last_hb >= HEARTBEAT_SEC):
@@ -519,7 +519,7 @@ def main():
                          s["profitable"], mh, time.time() - t0)
         except Exception:
             log.exception("loop error")
-            alerter.send("\U0001F6A8 liquidator loop error — check journalctl", key="looperr")
+            alerter.send_async("\U0001F6A8 liquidator loop error — check journalctl", key="looperr")
         time.sleep(cfg.poll_interval_sec)
 
 

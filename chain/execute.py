@@ -574,6 +574,13 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
             results.append(row)
         except Exception as e:
             # outcome unknown -> conservatively book estimated cost as a LOSS, never a phantom profit
+            # HIGH-фикс: tx могла быть ДРОПНУТА из мемпула (не замайнена за timeout). Локальный nonce
+            # стоит на base+len(sent), но чейн всё ещё ждёт дропнутый nonce -> следующий dispatch слал
+            # бы В ДЫРУ (queued-пул навсегда) -> бот молча перестаёт майнить. _reconcile_nonce не спасает
+            # (max-only отказывается откатывать вниз). Инвалидируем -> следующий dispatch пере-читает RPC:
+            # дропнута -> pending=N -> пере-отправка в N закрывает дыру; просто медленная -> pending=N+1 -> верно.
+            with _SEND_LOCK:
+                _LOCAL_NONCE.pop(bot, None)
             results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
                             "status": None, "gas_used": None,
                             "net_usd": -prep["cost_usd"], "gas_usd": prep["cost_usd"],

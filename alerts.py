@@ -1,5 +1,6 @@
 """Telegram admin alerts with antiflood (mirrors essayist's infra_error alerting)."""
 from __future__ import annotations
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -11,6 +12,14 @@ class Alerter:
         self.admin_id = admin_id
         self.antiflood_sec = antiflood_sec
         self._last: dict[str, float] = {}
+
+    def send_async(self, text: str, key: str = "default") -> None:
+        """Fire-and-forget в daemon-треде — НИКОГДА не блокирует вызывающего (горячий путь / луп).
+        Синхронный send делает urlopen(timeout=10): в блок-лупе / hot-воркере это до 10с блокировки
+        на выстреле/каскаде -> пропуск блоков. Здесь доставка+antiflood уходят с потока, возврат
+        отбрасывается. Гонка на self._last безобидна (изредка дубль-алерт). Скрипты (daily_summary)
+        зовут sync send ради возврата — их не трогаем."""
+        threading.Thread(target=self.send, args=(text, key), daemon=True).start()
 
     def send(self, text: str, key: str = "default") -> bool:
         """Send to admin. Antiflood: at most one message per `key` per window."""

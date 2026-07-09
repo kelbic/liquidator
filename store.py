@@ -45,8 +45,15 @@ class Store:
             c.commit()
 
     def _conn(self):
-        conn = sqlite3.connect(self.path)
+        # WAL: читатели (realized_today — пред-send kill-switch чек в горячем пути) НЕ блокируются
+        # писателями и наоборот -> под каскадом (hot-path воркеры + блок-луп пишут разом) нет
+        # `database is locked`, который раньше всплывал в блок-луп → wss-реконнект РОВНО в каскад.
+        # busy_timeout: писатель ждёт лок до 5с вместо мгновенного отказа. journal_mode персистентен
+        # в файле БД (повторная установка — дешёвый no-op). Диск локальный (Charlotte) — WAL применим.
+        conn = sqlite3.connect(self.path, timeout=5.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     def upsert_position(self, market_id: str, borrower: str, hf: float):
