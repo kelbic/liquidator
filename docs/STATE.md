@@ -26,64 +26,46 @@ Gap мерить ТОЛЬКО по tx-index внутри блока (`txgap`). �
 
 ## ⭐ ТЕКУЩАЯ ПРАВДА — самодостаточно, читать первой
 
-**Бот ВООРУЖЁН** (`MODE=execute`, `LOOP_MODE=block`, `HOT_PATH=1`, `PRICE_FROM_FEED=1`), ARM 2026-06-23.
-Прод-`.env`: `TIP_GWEI=6.0`, `HOT_MIN_REPAID_USD=450`, `MIN_PROFIT_USD=5`, `MAX_INFLIGHT=5`.
-Kill-switch $60 loss / $100 gas / день — честный (`715d3f5`), доказан в бою. Контракт
-`0x54730EE13f10C073772f25ee475EE13f2252Fb82` (`liquidate()` = onlyOwner). Кошелёк `0xE2Aca8e…`,
-рантвей ~$44 (≈29 ревертов при 6 gwei = потолок риска). Соседи VPS (twidgest/essayist) не задеты.
+**Бот ВООРУЖЁН И ПОЛНОСТЬЮ РАЗВЁРНУТ** (конец 07-09). Флаги живого процесса (проверять ТОЛЬКО через
+`/proc/$(systemctl show -p MainPID --value liquidator-bot)/environ`): `MODE=execute LOOP_MODE=block
+HOT_PATH=1 PRICE_FROM_FEED=1 POSITIONS_FROM_CACHE=1 FAST_LANE=1`. Прод-`.env`: `TIP_GWEI=6.0`,
+`HOT_MIN_REPAID_USD=450`, `MIN_PROFIT_USD=5`, `MAX_INFLIGHT=5`, `SEQUENCER_RPC=…sequencer.base.org`.
+Kill-switch $60 loss / $100 gas / день. Контракт `0x54730EE13f10C073772f25ee475EE13f2252Fb82`
+(`liquidate()` onlyOwner). Кошелёк/owner `0xE2Aca8e68Ae3b7EfCfCe4fD82aBDFc2a9D7908Fe`.
 
-**P0-ПАКЕТ СОБРАН (07-08, `a254462`, НЕ ЗАДЕПЛОЕН на VPS):** аудит с каноническим Morpho.liquidate
-показал: сквозной горячий путь был ~2.5–3с ПОСЛЕДОВАТЕЛЬНЫХ RTT (8–9 обращений × ~343мс) — больше
-блока Base, reaction-класс был недостижим НЕЗАВИСИМО от рынка. Тезис «победа ждёт рынка» ПЕРЕСМОТРЕН:
-ждала кода. P0 срезает до ~0.9с: (а) feed-gate fix — px_hint теперь ЦЕНА цикла, gate не читает preconf
-(раньше слой 1 давал ранний триггер, но НЕ раннюю цену: gate перезаписывал хинт, а при preconf-лаге
-убивал feed-спавн при уже дедупнутом poll — триггер терялся на блок); (б) prepare_hot без rp_state-дубля
-(state от read_positions), DIAG-read в тред, guard-read удалён (дублировал sim), gas per-market кэш;
-(в) локальный nonce (0 RTT) + SEND-3 raw в секвенсер параллельно Alchemy (SEQUENCER_RPC, "off"=выкл);
-(г) warm-start кандидатов с диска (снапшот 60с, age≤1ч) — слепые окна рестартов закрыты; (д) времена
-рестартов в missed.py + daily_summary + liquidator-daily.timer; (е) inflight-гейт kill-switch ОЖИЛ
-(был хардкод GuardState(inflight=0) в 4 местах). 23 юнит-смоука зелёные (venv-песочница).
-**ДЕПЛОЙ (владелец):** git pull на VPS → restart → в journal ждать `warm-start:` строку; таймер:
-`cp liquidator-daily.{service,timer} /etc/systemd/system/ && systemctl daemon-reload && systemctl
-enable --now liquidator-daily.timer`. `.env` менять НЕ нужно (SEQUENCER_RPC дефолтом включён).
-Watch: `DIAG seq-send` (ошибки секвенсера), `dispatch: sent .. nonce=` (nonce-кэш), hot stats.
+**ГДЕ ЖИВЁТ:** прод — **Charlotte NC `root@185.173.146.134`** `/root/liquidator` (US-East, TZ=UTC).
+Вена `root@138.124.90.144` = **выключенный бэкап** (НЕ включать — nonce-крах с одним кошельком) +
+origin с ssh-кредами (`git push` идёт отсюда). Деплой на Charlotte: git-bundle+scp с сандбокса ЛИБО
+`git pull origin`. Foundry на Charlotte (форк-тесты). Ассистент: root-ssh на обе + read-only journalctl.
 
-**P0+P1 ЗАДЕПЛОЕНЫ НА VPS 07-08 18:41 (git pull 75ef31a→8dee451, рестарт чистый).** Post-deploy
-по журналу: 0 ошибок; hot stats poll=60/none=0/fb=0; shadow-map теперь 4 рынка (+cbLTC
-0x5bf848b4); position-cache markets=5 (+cbBTC/EURC, +cbLTC через ROUTE_COLLATERALS), dt=2.0-2.5с
-(сустейн в норме, busy-skip единичный); **cache-divergence уже пишет mism=0 tba_eq=True** —
-калибровка слоя 2 пошла. Ассистент имеет read-only журнал (systemd-journal) с этой сессии;
-/root и systemctl — только владелец. Владельцу осталось: (1) установить daily-таймер;
-(2) `ls -la /root/liquidator/candidates_snapshot.json` (файл должен обновляться ~60с) — строка
-`warm-start:` подтвердится на СЛЕДУЮЩЕМ рестарте (на деплойном снапшота ещё не было).
+**СКВОЗНОЙ ПУТЬ ПРИ ФЛИПЕ СОБРАН И ИЗМЕРЕН ВЖИВУЮ:** ~0мс цена (слой 1, фид) + ~1мс позиции (слой 2,
+кэш — медиана 1мс vs preconf 136мс) + fast-lane без sim ~50–100мс до send-ack, из Charlotte 30мс до
+секвенсера. Было 2.5–3с (недостижимо для reaction) → теперь суб-флэшблок. **Тезис «первая победа
+ждёт кода» ЗАКРЫТ — теперь ждём РЫНКА** (это правда, а не отговорка: код на пределе архитектуры).
 
-**P1-ПАКЕТ СОБРАН (07-08, `6669137`; два флага OFF до калибровки):**
-- **Слой 2 потребление — ГОТОВО за флагом `POSITIONS_FROM_CACHE` (OFF).** Гейт включения:
-  `DIAG cache-divergence` (значения кэша vs живое чтение на том же транзите) должен показывать
-  mism=0 на потоке ≥ суток → тогда флаг ON. Рынки вне кэша падают в живой read без изменений.
-- **Кап repaidShares (глубокие позиции) — ВКЛЮЧЁН безусловно.** Раньше полный долг на глубокой
-  позиции давал Panic 0x11 → skip (главные призы каскадов). Кап ДО сайзинга свопа (запрет «НЕ
-  капаем» касался пост-хок капа); весь залог, остаток спишет Morpho (bad debt). seized теперь
-  ТОЧНО по канону (toAssetsDown), не оценкой сверху. Fuzz 2000 состояний: 0 нарушений
-  seized≤collateral. cast-форк-сверка НЕВОЗМОЖНА: в журнале (30д) НОЛЬ sim-revert panic-кейсов
-  (согласуется с «Panic был лог-призраком») — реального кейса не существует. Страховка капа =
-  прод-sim (остаётся гейтом каждого сенда): неверный кап → sim-revert → skip, деньги не рискуют.
-- **Маршруты: cbBTC/EURC и cbLTC/USDC открыты через Aerodrome Slipstream** (см. «Закрыто» — UniV3
-  для них МЁРТВ, это проверено). direct_swap: token_out — честный ключ (был хардкод USDC-выхода:
-  EURC-рынок упал бы CannotRepay). Scope слоя 2 → ROUTE_COLLATERALS (5 коллатералей). Первый
-  живой sim на Slipstream-маршруте — вотч-пойнт (bucket=swapfailed → смотреть путь/ликвидность).
-- **Fast-lane — ГОТОВ за флагом `FAST_LANE` (OFF).** Без sim/estimate: fee из fb-хедера, gas из
-  кэша, только direct-маршруты, minProfit=50% бонуса; исход гарантируют контракты, промах = газ
-  реверта под kill-switch. **РЕШЕНИЕ ВЛАДЕЛЬЦА 07-08: включать ВМЕСТЕ с POSITIONS_FROM_CACHE по
-  чистому гейту калибровки (mism=0 за сутки), НЕ дожидаясь живых выстрелов обычного пути.**
-  Watch после включения: `HOT ready FAST` и серии liquidate revert (одиночные реверты = норма
-  fast-lane, цена ~центы; серия = стоп и разбор).
-- **ДЕДУП ДВОЙНОЙ ОТПРАВКИ — В БОЮ с 07-09 02:45 (`357b73e`), гейт FAST_LANE.** Один transmit-tx
-  виден в неск. флэшблок-суб-кадрах → shadow-декод спавнил 2 `_process_transmit` (dt=3мс,
-  наблюдалось 07-08 20:18). Слой 1: `_feed_spawn_gate` — один feed-спавн на (oracle,bn). Слой 2:
-  `_RECENT_SENDS` TTL=12с по (mid,borrower) в dispatch под _SEND_LOCK — ловит feed×feed/×bare/×poll
-  и дубли в батче; разные борроверы проходят (каскад цел). Без sim (FAST_LANE) двойной спавн иначе
-  = 2-3 слепые tx/флип. Watch: `dispatch: dedup-skip` (норма — дедуп работает).
+**ВСЁ НИЖЕПЕРЕЧИСЛЕННОЕ В БОЮ** (детали и коммиты — git log, разделы ниже):
+- **P0 латентность** (`a254462`): feed-gate fix (слой 1 снимает ценовой RTT), prepare_hot −3 RTT,
+  локальный nonce, SEND-3 секвенсер, warm-start, inflight-гейт kill-switch ожил.
+- **P1**: слой 2 потребление (`POSITIONS_FROM_CACHE=1`, гейт был 393/0 mism, включён 07-09 12:53);
+  кап repaidShares (глубокие позиции, канон toAssetsDown); маршруты cbBTC/EURC+cbLTC (Slipstream);
+  fast-lane (`FAST_LANE=1`, тот же гейт).
+- **Дедуп двойной отправки** (`357b73e`): `_feed_spawn_gate` + `_RECENT_SENDS` TTL=12с — гейт FAST_LANE.
+- **cbBTC/USDC в контесте** (`ab1393f`): крупнейший рынок $1.23B, 482 ликв/$15.8M/30д; bounded
+  mega-fetch, INCLUDE_MARKETS, маршрут, shadow 1e26. shadow live match=True.
+- **Money-path валидирован на форке** (07-09): liquidate майнится, профит списывается. Эконом-находки
+  перепроверены QuoterV2 — целевой $450-30k безопасен (слиппаж <0.11%); >$1.3M убыточны через
+  одиночный UniV3 (backlog: FAST_LANE_MAX_REPAID_USD~$500k, Slipstream-сплит).
+- **P2**: гео-переезд US-East (−90мс/вызов), submit-side телеметрия tx-index. P2-10 (standing-спам) — план.
+- **Гигиена 07-09**: TG-алерты чинены (был пустой TG_ADMIN_ID — алертинг мёртв); reconnect-алерт только
+  на серию; `_query_page` ретраит ConnectionError (инцидент 15:41 самовосстановился).
+
+**7.5ч под флагами (чек-ин 07-09 20:23):** кэш потреблён 70% чтений (327/464), read медиана 1мс,
+divergence mism=0, опасный confirmed-fallback 0, stale-skip 1 (шум). 0 выстрелов/ревертов/kill-switch
+(рынок тихий, ближайший HF 1.0026). Флаги работают штатно.
+
+**ЖДЁМ:** первое reaction-СОБЫТИЕ рынка (флип HF<1 на money-рынке ≥$450). На нём — `HOT ready`/
+`HOT ready FAST` → dispatch → `submit-xray` дельта = ПЕРВЫЙ живой ответ «выигрываем ли гонку».
+Монитор журнала + TG разбудят. **ЖИВОЙ WIN-RATE ретроспективно невычислим — только огонь.**
 
 **ПЕРЕЕХАЛИ: БОТ В БОЮ НА CHARLOTTE С 07-08 19:52 UTC.** Cutover чистый (Вена stop+DISABLE =
 выключенный бэкап, НЕ включать — nonce; db с дневными тоталами и snapshot перенесены; warm-start
