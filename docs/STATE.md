@@ -78,6 +78,12 @@ Watch: `DIAG seq-send` (ошибки секвенсера), `dispatch: sent .. n
   чистому гейту калибровки (mism=0 за сутки), НЕ дожидаясь живых выстрелов обычного пути.**
   Watch после включения: `HOT ready FAST` и серии liquidate revert (одиночные реверты = норма
   fast-lane, цена ~центы; серия = стоп и разбор).
+- **ДЕДУП ДВОЙНОЙ ОТПРАВКИ — В БОЮ с 07-09 02:45 (`357b73e`), гейт FAST_LANE.** Один transmit-tx
+  виден в неск. флэшблок-суб-кадрах → shadow-декод спавнил 2 `_process_transmit` (dt=3мс,
+  наблюдалось 07-08 20:18). Слой 1: `_feed_spawn_gate` — один feed-спавн на (oracle,bn). Слой 2:
+  `_RECENT_SENDS` TTL=12с по (mid,borrower) в dispatch под _SEND_LOCK — ловит feed×feed/×bare/×poll
+  и дубли в батче; разные борроверы проходят (каскад цел). Без sim (FAST_LANE) двойной спавн иначе
+  = 2-3 слепые tx/флип. Watch: `dispatch: dedup-skip` (норма — дедуп работает).
 
 **ПЕРЕЕХАЛИ: БОТ В БОЮ НА CHARLOTTE С 07-08 19:52 UTC.** Cutover чистый (Вена stop+DISABLE =
 выключенный бэкап, НЕ включать — nonce; db с дневными тоталами и snapshot перенесены; warm-start
