@@ -158,6 +158,18 @@ def _shadow_feed_check(*, sym, agg, answer, scale, oracle, preconf_rpc, price_fn
              px_pre is not None and px_pre == px_feed, (time.perf_counter() - t0) * 1000.0)
 
 
+def _feed_spawn_gate(oracle, bn, feed_handled):
+    """PURE (юнит): ровно ОДИН feed-спавн на (oracle, bn). Тот же transmit-tx появляется в
+    нескольких флэшблок-суб-кадрах -> shadow-декод раньше спавнил _process_transmit на каждом
+    (наблюдалось 2 спавна с dt=3мс, 07-08 20:18). До fast-lane это смягчал sim; без sim каждый
+    реальный флип давал бы 2-3 слепые отправки. Возврат True = спавнить (и (oracle,bn) помечен);
+    False = дубль, не спавнить. feed_handled чистится на смене блока (как раньше)."""
+    if (oracle, bn) in feed_handled:
+        return False
+    feed_handled.add((oracle, bn))
+    return True
+
+
 def _price_moved(agg, px, last_price):
     """True if px differs from the last preconf price seen for agg (or first sighting); updates
     last_price. The bare aggregator match also fires on price-READ txs, so this gates the heavy
@@ -1035,10 +1047,11 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             _dec = decode_forward_answer(_raw)
                             if _dec and _dec[0] in shadow_map:
                                 _sym, _scale, _oracle = shadow_map[_dec[0]]
-                                if cfg.price_from_feed:       # Layer1 LIVE: feed price triggers _process_transmit + dedups poll
+                                if cfg.price_from_feed and _feed_spawn_gate(_oracle, bn, feed_handled):
+                                    # Layer1 LIVE: feed price triggers _process_transmit + dedups poll;
+                                    # gate = один спавн на (oracle,bn) — transmit виден в неск. суб-кадрах
                                     log.info("DIAG feed-spawn mkt=%s oracle=%s bn=%s px_hint=%d",
                                              _sym, _oracle[:10], bn, _dec[1] * _scale)
-                                    feed_handled.add((_oracle, bn))
                                     threading.Thread(target=_process_transmit,
                                                      args=(_dec[0], bn, "feed", time.time()),
                                                      kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,

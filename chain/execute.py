@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 import urllib.request
 from urllib.parse import urlencode
 
@@ -23,6 +24,17 @@ _SEND_LOCK = threading.Lock()   # serialize dispatch nonce-fetch+send across the
 # dropped-tx лечится веткой инвалидации, вниз reconcile НЕ опускает — иначе гонка с только что
 # отправленным батчем, который RPC ещё не видит).
 _LOCAL_NONCE: dict = {}         # bot address -> next unused nonce
+
+# Дедуп двойной отправки (страховка под FAST_LANE): один и тот же (mid, borrower) может прийти в
+# dispatch из нескольких параллельных _process_transmit (feed×feed / feed×bare / feed×poll на одном
+# transmit). Первый успешный ликвидирует; повторные Morpho ревертит (HEALTHY_POSITION/нет долга) =
+# лишний газ, записанный как loss. С sim-гейтом это было редко; FAST_LANE шлёт без sim -> каждый
+# реальный флип давал бы 2-3 слепые tx. Здесь: (mid,borrower), отправленный за последние TTL сек,
+# второй раз НЕ уходит. Пишется/читается ТОЛЬКО под _SEND_LOCK (как _LOCAL_NONCE). TTL с запасом на
+# несколько блоков — реальная ПОВТОРНАЯ ликвидация того же заёмщика в это окно неправдоподобна
+# (Morpho всё равно ревертнёт), а следующий блок после TTL повтор разрешит.
+_RECENT_SENDS: dict = {}        # (mid, borrower) -> monotonic ts последней отправки
+_RECENT_SEND_TTL = 12.0
 
 # P0: живой inflight для kill-switch (был хардкод GuardState(inflight=0) -> гейт мёртв).
 # +1 на каждый принятый send, -1 при получении receipt/timeout (или сразу при wait_receipts=False).
@@ -464,11 +476,32 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
     _seq = str(getattr(cfg, "sequencer_rpc", "") or "")
     _bcast = [_seq] if (_seq and _seq.lower() not in ("off", "none", "0")) else None
     with _SEND_LOCK:                                         # serialize nonce-fetch+send across senders (block loop + hot path)
+        # дедуп двойной отправки (см. _RECENT_SENDS): выкидываем (mid,borrower), отправленные за
+        # последние TTL сек, ПЕРЕД раздачей nonce — чтобы дубль не съел nonce и газ реверта.
+        _now = time.monotonic()
+        for _k in [_k for _k, _t in _RECENT_SENDS.items() if _now - _t > _RECENT_SEND_TTL]:
+            _RECENT_SENDS.pop(_k, None)
+        _deduped = []
+        _seen_this_call = set()      # дубли ВНУТРИ одного prepared (два спавна в один батч), не только межвызовные
+        for _row in prepared:
+            _key = (_row[0], _row[1])
+            if _key in _RECENT_SENDS or _key in _seen_this_call:
+                results.append({"market_id": _row[0], "borrower": _row[1], "sent": False,
+                                "reason": "dedup: recent send (двойной transmit-спавн)",
+                                "net_usd": _row[2].get("net_usd", 0.0)})
+                if log:
+                    log.info("dispatch: dedup-skip %s/%s (уже отправлен <%.0fs назад или дубль в батче)",
+                             _row[0][:10], _row[1][:10], _RECENT_SEND_TTL)
+            else:
+                _seen_this_call.add(_key)
+                _deduped.append(_row)
+        if not _deduped:
+            return results
         base_nonce = _LOCAL_NONCE.get(bot)                   # P0-4: локальный nonce (0 RTT); RPC только на холодном
         if base_nonce is None:                               # кэше/после инвалидации (см. инварианты у _LOCAL_NONCE)
             base_nonce = int(w3.eth.get_transaction_count(bot, "pending"))
         tip = int(cfg.tip_gwei * 1e9)
-        batch = prepared[:max_inflight]
+        batch = _deduped[:max_inflight]
 
         sent = []
         _send_failed = False
@@ -486,6 +519,7 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                 else:
                     res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip)
                 sent.append((mid, borrower, prep, res["hash"]))
+                _RECENT_SENDS[(mid, borrower)] = time.monotonic()   # дедуп: этот заёмщик отправлен
                 _inflight_add(1)
                 if log:
                     log.info("dispatch: sent %s/%s nonce=%d tx=%s net~$%.2f",
