@@ -377,6 +377,12 @@ def _hot_subset(groups, hf_cache):
 
 _FLASHBLOCK_URL = "wss://mainnet.flashblocks.base.org/ws"
 _FLASHBLOCK_FALLBACK_AFTER = 3   # consecutive flashblocks failures (no blocks) -> fall back to newHeads
+# TG-гигиена 07-10 (решение владельца): одиночный ws-обрыв block-лупа самолечится за 3с и является
+# фоном Base-эндпоинта (~раз в 1-3ч) — БОЛЬШЕ НЕ ПЕЙДЖИТ, только журнал. TG получает СЕРИЮ
+# (флаппинг: >=_RECON_SERIES_N за окно — эндпоинт болен, но до fallback не дошло) и сам fallback
+# (key=fbfallback, реальная деградация). Философия = hot-path (серии, не блипы).
+_RECON_SERIES_N = 3
+_RECON_SERIES_WINDOW_SEC = 1800
 
 
 def _source_params(cfg, active):
@@ -420,6 +426,7 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
     hf_cache = {}
     active = cfg.block_source if cfg.block_source in ("flashblocks", "newheads") else "newheads"
     fails = 0
+    recon_ts: list[float] = []   # моменты ws-обрывов для серия-гейта TG (см. _RECON_SERIES_N)
     while True:
         url, conn_kw, gen = _source_params(cfg, active)
         try:
@@ -460,7 +467,11 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                  s["profitable"], mh, time.time() - t0)
         except Exception as e:
             log.warning("block source=%s error (%s) — reconnecting in 3s", active, type(e).__name__)
-            alerter.send_async("\U0001F6A8 block-loop reconnect — check journalctl", key="wsserr")
+            _now = time.monotonic()
+            recon_ts[:] = [t for t in recon_ts if _now - t < _RECON_SERIES_WINDOW_SEC] + [_now]
+            if len(recon_ts) >= _RECON_SERIES_N:     # одиночный блип — только журнал (TG-гигиена 07-10)
+                alerter.send_async("\U0001F6A8 block-loop: %d reconnects/%dm — flapping, check journalctl"
+                                   % (len(recon_ts), _RECON_SERIES_WINDOW_SEC // 60), key="wsserr")
             if active == "flashblocks":
                 fails += 1
                 if fails >= _FLASHBLOCK_FALLBACK_AFTER:
