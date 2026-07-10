@@ -49,6 +49,17 @@ Watch-item «DIAG mega-fetch cap» разобран drift-probe'ом и ЗАКР
 - Ассистент имеет root-ssh на ОБЕ машины (дан владельцем 07-08). Секреты (WALLET_KEY/RPC_URL/
   TG_BOT_TOKEN) в `.env` — их вписывал ВЛАДЕЛЕЦ, ассистент не трогает.
 
+## TG-МОСТ ДЛЯ ОБЩЕНИЯ С АССИСТЕНТОМ (настраивается 07-10, НЕ путать с прод-алертингом)
+- Бот владельца **@ClaudeLiquidator_bot** = канал «человек ↔ Claude-сессия» (Channels-плагин).
+  Прод-алертинг @essayist_bot (TG_BOT_TOKEN в .env бота) — ОТДЕЛЬНЫЙ, не трогаем.
+- Сделано в сандбоксе Вены: `telegram@claude-plugins-official` установлен (user-scope), bun 1.3.14
+  (+симлинк в ~/.local/bin), каталог `~/.claude/channels/telegram/` (700) готов.
+- Токен НЕ в чат/транскрипт: владелец пишет `~/.claude/channels/telegram/.env`
+  (`TELEGRAM_BOT_TOKEN=...`, chmod 600, owner claude-agent) сам — руками или по ssh.
+- Запуск канала: сессия должна стартовать как `claude --channels plugin:telegram@claude-plugins-official`;
+  затем DM боту -> код -> `/telegram:access pair <код>`. НОВОЙ СЕССИИ: перезавести журнальный
+  монитор Charlotte (важное-только) — вотчеры не переживают конец сессии.
+
 ## ГИГИЕНА (закрытое)
 - **TG-спам «block-loop reconnect» убран 07-10** (решение владельца: 3 пейджа за ночь на одиночные
   3с-блипы Base-эндпоинта — шум). Теперь: одиночный обрыв -> только журнал; СЕРИЯ >=3/30мин
