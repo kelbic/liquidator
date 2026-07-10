@@ -42,6 +42,20 @@ MEGA_MARKETS = frozenset({
 })
 MEGA_FETCH_MAX_PAGES = 3   # top-3000 по долгу; при упоре в кап пишется предупреждение в лог
 
+# HF-ДОПОЛНЕНИЕ к bounded-fetch (07-10, measured-переоткрытие по образцу cbBTC): серверный
+# where healthFactor_lte РАБОТАЕТ (CBBTC_PLAN пробовал только orderBy: HealthFactor -> 400).
+# Закрывает ранговую слепоту капа: top-3000 режет по ДОЛГУ (rank-3000 = $82.5k на 07-10) и был бы
+# НАВСЕГДА слеп к near-risk ниже капа И за API-skip-лимитом 10000 (замер 07-10: в рангах 3001-10000
+# ноль позиций HF<=1.10, но 57 с HF<=1.12 и 186 с HF<=1.15 при долгах $11k-82k — в BTC-краш они
+# уходят под 1.0 невидимыми). Порог = клиентский потолок 1.10 (main.HF_API_CEILING) + запас 0.05
+# на расхождение server-HF (оракул) vs USD-approx (loan=USDC -> в норме <1%). Объём 07-10:
+# hf<=1.15 = 1368 строк (1.20 -> 3196, 1.25 -> 4898). Ordered by BorrowShares desc -> упор в
+# кап/бюджет режет ПЫЛЬ, не китов. Сбой добавки НЕ роняет refresh (try/except в positions_at_risk).
+# Серверного пола по долгу НЕТ (borrowAssetsUsd_gte -> 400, проверено) — пол клиентский (parse).
+MEGA_HF_FILTER = 1.15
+MEGA_HF_MAX_PAGES = 3      # 3000 строк ~ 2.2x сегодняшнего набора; упор в кап логируется
+MEGA_HF_BUDGET_SEC = 8.0   # мягкий бюджет добавки: API-затык не должен раздувать refresh-цикл
+
 # marketUniqueKey is keccak(loanToken,collateralToken,oracle,irm,lltv); token/oracle
 # addresses differ per chain, so Base keys can't collide with other chains -> no chainId
 # filter needed. `market { marketId }` is the position's market id (== the key we filter
@@ -58,6 +72,12 @@ query Positions($keys: [String!], $first: Int!, $skip: Int!) {
   }
 }
 """
+
+# Тот же запрос + серверный HF-фильтр (только для MEGA_MARKETS — см. MEGA_HF_FILTER выше).
+_POSITIONS_HF_QUERY = _POSITIONS_QUERY.replace(
+    "where: { marketUniqueKey_in: $keys }",
+    "where: { marketUniqueKey_in: $keys, healthFactor_lte: %.2f }" % MEGA_HF_FILTER)
+assert _POSITIONS_HF_QUERY != _POSITIONS_QUERY, "HF-query: where-анкор не найден (изменился _POSITIONS_QUERY?)"
 
 
 @dataclass
@@ -124,14 +144,15 @@ _RETRYABLE_HTTP = (429, 500, 502, 503, 504)
 
 
 def _query_page(keys: list[str], skip: int, first: int, api_url: str, timeout: int,
-                retries: int = 3) -> list:
-    """One page of marketPositions (ordered by borrowShares desc). I/O with retry-on-transient
+                retries: int = 3, query: str = _POSITIONS_QUERY) -> list:
+    """One page of marketPositions (ordered by borrowShares desc; query подменяем для
+    HF-фильтрованной формы — тело/ретраи общие). I/O with retry-on-transient
     (timeout / URLError / ConnectionError / 429 / 5xx) so a single API hiccup doesn't drop a whole
     scan cycle. Non-transient (HTTP 4xx, GraphQL errors) propagate immediately.
     ConnectionError (вкл. ConnectionResetError [Errno 104] — обрыв TLS в ssl.read, инцидент 07-09)
     — подкласс OSError, НЕ URLError, и urllib пробрасывает его голым мимо URLError-ветки; ловим
     явно. Запрос идемпотентен (read-only GraphQL) -> повтор безопасен."""
-    body = json.dumps({"query": _POSITIONS_QUERY,
+    body = json.dumps({"query": query,
                        "variables": {"keys": keys, "first": first, "skip": skip}}).encode()
     last_exc = None
     for attempt in range(retries):
@@ -203,6 +224,34 @@ def _fetch_market_bounded(key: str, api_url: str, max_pages: int = MEGA_FETCH_MA
     return out
 
 
+def _fetch_market_hf_filtered(key: str, api_url: str, max_pages: int = MEGA_HF_MAX_PAGES,
+                              page: int = 1000, timeout: int = 15,
+                              budget_sec: float = MEGA_HF_BUDGET_SEC) -> list:
+    """HF-дополнение ОДНОГО мега-рынка: ВСЕ позиции с server-HF<=MEGA_HF_FILTER, БЕЗ ранговой
+    слепоты (where-фильтр видит и ранги за API-skip-лимитом 10000, недоступные bounded-пути).
+    Ordered by BorrowShares desc -> упор в кап/бюджет теряет пыль, не китов. Пол по долгу —
+    клиентский (parse_positions): серверного нет (400)."""
+    out: list = []
+    skip = 0
+    _t0 = time.monotonic()
+    for _ in range(max_pages):
+        batch = _query_page([key], skip, page, api_url, timeout, query=_POSITIONS_HF_QUERY)
+        for it in batch:
+            if _int((it.get("state") or {}).get("borrowShares")) == 0:
+                return out
+            out.append(it)
+        if len(batch) < page:
+            return out
+        skip += page
+        if time.monotonic() - _t0 > budget_sec:
+            log.info("DIAG mega-HF budget market=%s %.0fs исчерпан на %d строках — хвост (пыль) отрезан",
+                     key[:10], budget_sec, len(out))
+            return out
+    log.info("DIAG mega-HF cap market=%s top-%d исчерпан — хвост (пыль) отрезан",
+             key[:10], max_pages * page)
+    return out
+
+
 def positions_at_risk(markets: list[Market], hf_ceiling: float = 1.0, min_debt_usd: float = MIN_DEBT_USD,
                       api_url: str = MORPHO_API_URL) -> list[Position]:
     """At-risk positions across covered markets, via the Morpho API. Мега-рынки (MEGA_MARKETS)
@@ -217,5 +266,16 @@ def positions_at_risk(markets: list[Market], hf_ceiling: float = 1.0, min_debt_u
     mega = [k for k in keys if k.lower() in mega_lc]
     items = _fetch_borrower_positions(normal, api_url) if normal else []
     for mk in mega:
-        items = items + _fetch_market_bounded(mk, api_url)
+        bounded = _fetch_market_bounded(mk, api_url)
+        items = items + bounded
+        try:    # аддитивная HF-добавка: любой её сбой -> предупреждение, bounded-набор уже в items
+            extra = _fetch_market_hf_filtered(mk, api_url)
+        except Exception as e:
+            log.warning("mega HF-supplement сбой market=%s (%s) — цикл на bounded-наборе", mk[:10], e)
+            continue
+        seen = {((it.get("user") or {}).get("address") or "").lower() for it in bounded}
+        added = [it for it in extra if ((it.get("user") or {}).get("address") or "").lower() not in seen]
+        items = items + added
+        log.info("DIAG mega HF-supplement market=%s fetched=%d added=%d (мимо top-%d)",
+                 mk[:10], len(extra), len(added), MEGA_FETCH_MAX_PAGES * 1000)
     return parse_positions({"data": {"marketPositions": {"items": items}}}, lltv_by_key, hf_ceiling, min_debt_usd)
