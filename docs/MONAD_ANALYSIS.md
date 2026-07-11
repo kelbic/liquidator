@@ -246,6 +246,12 @@ Chronicle. Какой оракул у КАЖДОГО Morpho-рынка Monad —
 ## 5. Предложения по улучшению
 
 ### 5.1 Баги боевого Base-бота (чинить независимо от Monad; два — high)
+> **СТАТУС 07-11: пункты 1 и 2 ИСПРАВЛЕНЫ коммитом `78171cb` (07-09, в проде с 22:07).**
+> П.1 — `_LOCAL_NONCE.pop` в timeout-ветке (execute.py:582); поведение ДОКАЗАНО смоуком 07-11
+> (timeout → инвалидация → loss → inflight-слот освобождён → следующий dispatch пере-читает RPC
+> и закрывает дыру). Остаточный кейс — путь `wait_receipts=False` (fire-and-forget, СЕЙЧАС НЕ
+> ИСПОЛЬЗУЕТСЯ): там receipt-loop нет и pop не сработает — закрывается receipt-коллектором,
+> пункт 6 P210_CONTROL_PLAN. П.2 — WAL+busy_timeout в store.py:55-56. П.3 (MED SEND-3 race) — ОТКРЫТ.
 1. **[HIGH] Необратимый nonce-gap** (`chain/execute.py:575`): ветка receipt-timeout не
    инвалидирует `_LOCAL_NONCE`, а `_reconcile_nonce` берёт `max(rpc, local)` и никогда не
    опускает. Дропнутая из мемпула tx (base-fee спайк выше `fb*2+tip`, evict) → локальный nonce
