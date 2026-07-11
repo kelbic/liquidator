@@ -271,11 +271,27 @@ def send_tx(rpc, key: str, tx: dict, wait: bool = True, timeout: int = 120,
         t["gas"] = int(w3.eth.estimate_gas(t) * 12 // 10)
     signed = acct.sign_transaction(t)
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+    _relayed = False
     if broadcast_raw_urls:
         raw_hex = "0x" + bytes(raw).hex()
         for _u in broadcast_raw_urls:
             threading.Thread(target=_post_raw_tx, args=(_u, raw_hex), daemon=True).start()
-    h = w3.eth.send_raw_transaction(raw)
+        _relayed = True
+    try:
+        h = w3.eth.send_raw_transaction(raw)
+    except Exception:
+        # SEND-3 race: raw уже роздан в секвенсер (реальный ордерер Base) daemon-тредами ВЫШЕ, ДО
+        # этого send'а -> tx МОЖЕТ замайниться, даже если Alchemy-путь бросил. hash детерминирован
+        # (keccak подписи == тот же, что вернул бы send_raw_transaction), поэтому возвращаем его +
+        # uncertain=True: вызывающий ЗАПИШЕТ отправку (дедуп + ожидание receipt), а не сочтёт «не
+        # отправлено» -> не будет ни дубля того же заёмщика, ни неучтённого kill-switch'ем газа.
+        # Без SEND-3 (_relayed=False) ничего не ушло -> пробрасываем как раньше (nonce не съеден).
+        if not _relayed:
+            raise
+        _hh = getattr(signed, "hash", None)
+        if _hh is None:
+            raise
+        return {"hash": _hh.hex(), "status": None, "gas_used": None, "receipt": None, "uncertain": True}
     out = {"hash": h.hex(), "status": None, "gas_used": None, "receipt": None}
     if wait:
         rcpt = w3.eth.wait_for_transaction_receipt(h, timeout=timeout)
@@ -528,6 +544,14 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                 if log:
                     log.info("dispatch: sent %s/%s nonce=%d tx=%s net~$%.2f",
                              mid[:10], borrower[:10], base_nonce + i, res["hash"], prep["net_usd"])
+                if res.get("uncertain"):     # SEND-3 race: Alchemy-send бросил, raw уже в секвенсере ->
+                    if log:                  # tx МОЖЕТ сесть в base_nonce+i. Записан выше как sent (дедуп
+                        log.warning("dispatch: SEND-3 uncertain %s/%s nonce=%d — Alchemy бросил, raw в "
+                                    "секвенсере; учтён как sent (дедуп+receipt), стоп батча + инвалидация nonce",
+                                    mid[:10], borrower[:10], base_nonce + i)
+                    _send_failed = True      # + receipt-ждётся -> исход/газ учтётся, дубль исключён).
+                    _LOCAL_NONCE.pop(bot, None)   # неизвестно, сел ли base+i -> следующий dispatch пере-читает RPC
+                    break                    # не шлём хвост в возможную дыру nonce (как при send-ошибке)
             except Exception as e:
                 if log:
                     log.warning("dispatch: send FAILED at nonce %d (%s/%s): %s — stopping batch to avoid gap",
