@@ -145,6 +145,7 @@ _UNIV3_USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 _EURC = "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42"
 _CBBTC = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
 _CBLTC = "0xcb17c9db87b595717c857a08468793f5bab6445f"
+_LBTC = "0xecac9c5f704e954931349da37f60e39f515c11c1"   # из Morpho idToMarketParams(0x4944a116) 07-12
 _UNIV3_WETH_USDC_FEE = 500
 _UNIV3_EXACT_INPUT_SEL = "b858183f"    # exactInput((bytes,address,uint256,uint256)) verified cast sig
 _AERO_EXACT_INPUT_SEL = "c04b8d59"     # exactInput((bytes,address,uint256,uint256,uint256)) verified bytecode
@@ -173,6 +174,13 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     # на обоих хопах чуть лучше 3000 (пулы верифицированы 07-08: cbBTC/WETH 500 liq>0, WETH/USDC 500).
     (_CBBTC, _UNIV3_USDC): {"router": UNIV3_SWAP_ROUTER, "style": "02",
                             "path": _pack_path(_CBBTC, 500, _UNIV3_WETH, 500, _UNIV3_USDC)},
+    # LBTC/cbBTC 07-12 (нож $350.8k долга, BTC-пег пара — профиль «мгновенный флип на ноже»):
+    # UniV3 ПУСТ на всех тирах (QuoterV2-проба impact~99.6%, analysis/lbtc_route_probe.py);
+    # Slipstream ts=1 ЖИВОЙ (router.factory()->getPool, liquidity=125.6B, 07-12); Kyber-глубина
+    # $380k ratio=1.00038 (паритет) — эконом чистая, вопрос был в скорости (Kyber RTT ~0.4-0.9с
+    # vs fast-lane ~0.1с). Маршрут даёт fast-lane + кэш слоя 2 (ROUTE_COLLATERALS авто).
+    (_LBTC, _CBBTC): {"router": AERO_CL_ROUTER, "style": "v1",
+                      "path": _pack_path(_LBTC, 1, _CBBTC)},
 }
 for _coll, _fee in UNIV3_PATHS.items():   # существующие UniV3-пути -> та же таблица (loan=USDC)
     _SWAP_ROUTES[(_coll, _UNIV3_USDC)] = {"router": UNIV3_SWAP_ROUTER, "style": "02",
