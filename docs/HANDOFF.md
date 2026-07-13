@@ -230,7 +230,8 @@ HTTPError, а `ConnectionResetError`(OSError, НЕ URLError) всплывает 
   устаревший MONAD_ANALYSIS без сверки с кодом (урок 26). Для P2-10 предусловие ОСТАЁТСЯ в узкой форме:
   fire-and-forget (`wait_receipts=False`) идёт МИМО receipt-loop и pop не сработает — нужен
   receipt-коллектор (пункт 6 P210_CONTROL_PLAN) до любого стендинг-спама. Второй HIGH (SQLite WAL)
-  тоже закрыт `78171cb` (store.py:55-56). Открытым из того списка остаётся MED SEND-3 race.
+  тоже закрыт `78171cb` (store.py:55-56). MED SEND-3 race ТОЖЕ ЗАКРЫТ `74c29dc` (07-12). Все 3 бага
+  MONAD_ANALYSIS 5.1 закрыты.
 
 ## СЛЕДУЮЩИЕ ШАГИ (по порядку)
 1. Вечерний гейт (cron сам, см. выше).
