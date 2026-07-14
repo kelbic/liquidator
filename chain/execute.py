@@ -146,6 +146,7 @@ _EURC = "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42"
 _CBBTC = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
 _CBLTC = "0xcb17c9db87b595717c857a08468793f5bab6445f"
 _LBTC = "0xecac9c5f704e954931349da37f60e39f515c11c1"   # из Morpho idToMarketParams(0x4944a116) 07-12
+_WSTETH = "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452" # из idToMarketParams(wstETH/WETH) 07-14
 _UNIV3_WETH_USDC_FEE = 500
 _UNIV3_EXACT_INPUT_SEL = "b858183f"    # exactInput((bytes,address,uint256,uint256)) verified cast sig
 _AERO_EXACT_INPUT_SEL = "c04b8d59"     # exactInput((bytes,address,uint256,uint256,uint256)) verified bytecode
@@ -181,6 +182,12 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     # vs fast-lane ~0.1с). Маршрут даёт fast-lane + кэш слоя 2 (ROUTE_COLLATERALS авто).
     (_LBTC, _CBBTC): {"router": AERO_CL_ROUTER, "style": "v1",
                       "path": _pack_path(_LBTC, 1, _CBBTC)},
+    # wstETH/WETH 07-14 (нож $180.2k @ HF 1.0056, LST-пег — профиль «мгновенного флипа на тике»):
+    # UniV3 тонкий (fee=100 imp@60wstETH=57%, fee=500 пусто), Slipstream ts=1 живой+глубокий
+    # (Kyber агрегирует Slipstream: 10/40/80 wstETH ratio 1.2391 flat = 0% слиппажа до ~$360k).
+    # loan=WETH -> single-hop wstETH->WETH; fast-lane + кэш слоя-2 (ROUTE_COLLATERALS авто).
+    (_WSTETH, _UNIV3_WETH): {"router": AERO_CL_ROUTER, "style": "v1",
+                             "path": _pack_path(_WSTETH, 1, _UNIV3_WETH)},
 }
 for _coll, _fee in UNIV3_PATHS.items():   # существующие UniV3-пути -> та же таблица (loan=USDC)
     _SWAP_ROUTES[(_coll, _UNIV3_USDC)] = {"router": UNIV3_SWAP_ROUTER, "style": "02",
