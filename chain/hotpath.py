@@ -810,9 +810,13 @@ def _canary_measure(rpc, canary_hash, agg, transmit_block, cfg, log):
         if _ANSWER_UPDATED_SIG is None:
             from eth_utils import keccak
             _ANSWER_UPDATED_SIG = "0x" + keccak(text="AnswerUpdated(int256,uint256,uint256)").hex()
-        logs = w3.eth.get_logs({"fromBlock": transmit_block, "toBlock": transmit_block,
-                                "address": Web3.to_checksum_address(agg), "topics": [_ANSWER_UPDATED_SIG]})
-        tidx = logs[0].get("transactionIndex") if logs else None
+        tidx = None
+        for _att in range(4):                  # getLogs отстаёт от receipt (лаг пропагации логов) -> ретрай
+            logs = w3.eth.get_logs({"fromBlock": transmit_block, "toBlock": transmit_block,
+                                    "address": Web3.to_checksum_address(agg), "topics": [_ANSWER_UPDATED_SIG]})
+            if logs:
+                tidx = logs[0].get("transactionIndex"); break
+            time.sleep(2.0)
         probes, spent = canary_stats()
         if tidx is not None and cblk == transmit_block:
             log.info("DIAG canary DELTA delta=%d canary_idx=%d transmit_idx=%d block=%d gas$=%.3f probe=%d spent$=%.2f",
