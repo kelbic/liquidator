@@ -99,6 +99,69 @@ def _fl_record(is_fast: bool, status, threshold: int, log=None):
                           _FL_CONSEC_REVERTS)
 
 
+# ⭐ CANARY (замер inclusion-гонки, Вариант B: in-process, ОБЩИЙ кошелёк/nonce). Состояние под
+# _INFLIGHT_LOCK. Газ канарейки — в СВОЙ бакет (_CANARY_GAS_USD), НЕ в kill-switch realized_today.
+_CANARY_PROBES = 0
+_CANARY_GAS_USD = 0.0
+_CANARY_LAST_TS = 0.0
+
+
+def canary_stats() -> tuple:
+    with _INFLIGHT_LOCK:
+        return (_CANARY_PROBES, _CANARY_GAS_USD)
+
+
+def canary_record_gas(gas_usd: float):
+    global _CANARY_GAS_USD
+    with _INFLIGHT_LOCK:
+        _CANARY_GAS_USD += max(0.0, gas_usd)
+
+
+def send_canary(rpc, cfg, log=None):
+    """⭐ Минимальная 0-value self-transfer от БОЕВОГО кошелька под ОБЩИМ _SEND_LOCK/_LOCAL_NONCE
+    (единый nonce -> ноль nonce-краха; single-slot). Гейты (кап проб / газ-кап / интервал) проверяются
+    АТОМАРНО под локом ПЕРЕД раздачей nonce. Возвращает hash или None (гейт закрыт/ошибка). Позиция
+    tx в блоке = прокси позиции ликвидации при равном tip -> замер гонки. НЕ считается в kill-switch."""
+    global _CANARY_PROBES, _CANARY_LAST_TS
+    _now = time.monotonic()
+    with _SEND_LOCK:
+        with _INFLIGHT_LOCK:
+            if (_CANARY_PROBES >= getattr(cfg, "canary_max_probes", 100)
+                    or _CANARY_GAS_USD >= getattr(cfg, "canary_max_gas_usd", 25.0)
+                    or _now - _CANARY_LAST_TS < getattr(cfg, "canary_min_interval_sec", 120.0)):
+                return None
+        w3 = rpc._web3()
+        bot = w3.eth.account.from_key(cfg.wallet_key).address
+        base_nonce = _LOCAL_NONCE.get(bot)
+        if base_nonce is None:
+            base_nonce = int(w3.eth.get_transaction_count(bot, "pending"))
+        tip = int(cfg.tip_gwei * 1e9)
+        try:
+            res = send_tx(rpc, cfg.wallet_key, {"to": bot, "value": 0, "nonce": base_nonce, "gas": 21000},
+                          wait=False, min_tip_wei=tip)
+        except Exception as e:
+            _LOCAL_NONCE.pop(bot, None)   # не знаем, съелся ли nonce -> следующий dispatch пере-читает RPC
+            if log:
+                log.info("DIAG canary send fail: %s", type(e).__name__)
+            return None
+        _LOCAL_NONCE[bot] = base_nonce + 1
+        with _INFLIGHT_LOCK:
+            _CANARY_PROBES += 1
+            _CANARY_LAST_TS = _now
+        return res["hash"]
+
+
+def canary_invalidate_nonce(rpc, cfg):
+    """Канарейка не замайнилась за timeout (возможно дропнута) -> _LOCAL_NONCE впереди чейна ->
+    следующая tx уйдёт в дыру. Инвалидируем (как timeout-ветка dispatch, II нонс-фикс)."""
+    try:
+        bot = rpc._web3().eth.account.from_key(cfg.wallet_key).address
+        with _SEND_LOCK:
+            _LOCAL_NONCE.pop(bot, None)
+    except Exception:
+        pass
+
+
 def _post_raw_tx(url: str, raw_hex: str, timeout: int = 5):
     """SEND-3: eth_sendRawTransaction напрямую в секвенсер Base ПАРАЛЛЕЛЬНО с Alchemy-путём.
     Best-effort в daemon-треде: дубль безвреден (второй приём = 'already known'), ошибка здесь

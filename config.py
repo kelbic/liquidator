@@ -38,6 +38,10 @@ class Config:
     fast_lane: bool = False               # P1-9: fast-lane без sim (OFF; контракт гарантирует исход)
     fast_lane_min_repaid_usd: float = 1000.0  # fast-lane только на призах >= этого repaid USD
     fast_lane_max_consec_reverts: int = 3     # II.6 circuit breaker: N подряд ревертов fast-lane -> off ТОЛЬКО fast-lane (фолбэк sim)
+    canary_probe: bool = False                # ⭐ canary: замер inclusion-гонки минимальной tx (OFF; ARM на кампанию)
+    canary_max_probes: int = 100              # стоп кампании после N проб
+    canary_min_interval_sec: float = 120.0    # не чаще 1 пробы / N сек (разброс по условиям)
+    canary_max_gas_usd: float = 25.0          # СВОЙ газ-кап канарейки (НЕ в kill-switch) -> стоп кампании
     preconf_rpc: str = "https://mainnet-preconf.base.org"   # pre-confirmed price source for the hot path
     sequencer_rpc: str = "https://mainnet-sequencer.base.org"  # SEND-3: параллельный raw-broadcast; "off" = выкл
     candidates_snapshot_path: str = "candidates_snapshot.json"  # warm-start: последний candidate set (P0-1)
@@ -92,6 +96,10 @@ class Config:
             fast_lane=(s("FAST_LANE", "").lower() in ("1", "true", "yes", "on")),
             fast_lane_min_repaid_usd=f("FAST_LANE_MIN_REPAID_USD", 1000.0),
             fast_lane_max_consec_reverts=int(f("FAST_LANE_MAX_CONSEC_REVERTS", 3)),
+            canary_probe=(s("CANARY_PROBE", "").lower() in ("1", "true", "yes", "on")),
+            canary_max_probes=int(f("CANARY_MAX_PROBES", 100)),
+            canary_min_interval_sec=f("CANARY_MIN_INTERVAL_SEC", 120.0),
+            canary_max_gas_usd=f("CANARY_MAX_GAS_USD", 25.0),
             preconf_rpc=s("PRECONF_RPC", "https://mainnet-preconf.base.org"),
             sequencer_rpc=s("SEQUENCER_RPC", "https://mainnet-sequencer.base.org"),
             candidates_snapshot_path=s("CANDIDATES_SNAPSHOT_PATH", "candidates_snapshot.json"),

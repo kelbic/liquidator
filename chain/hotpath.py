@@ -786,6 +786,60 @@ def hot_min_repaid(cfg):
     return float(getattr(cfg, "hot_min_repaid_usd", 2000.0))
 
 
+_ANSWER_UPDATED_SIG = None   # keccak(AnswerUpdated(int256,uint256,uint256)); лениво
+
+
+def _canary_measure(rpc, canary_hash, agg, transmit_block, cfg, log):
+    """⭐ Bg: дождаться receipt канарейки -> учесть газ в СВОЙ бакет -> найти tx-index транслята
+    (AnswerUpdated на agg в transmit_block, узкий getLogs) -> ДЕЛЬТА canary_idx - transmit_idx.
+    Малая/отриц. дельта = попадаем в блок первыми = выигрываем гонку. Read-only после отправки."""
+    global _ANSWER_UPDATED_SIG
+    from chain.execute import canary_record_gas, canary_invalidate_nonce, canary_stats
+    from web3 import Web3
+    try:
+        w3 = rpc._web3()
+        try:
+            rcpt = w3.eth.wait_for_transaction_receipt(canary_hash, timeout=45)
+        except Exception:
+            canary_invalidate_nonce(rpc, cfg)   # дропнута -> _LOCAL_NONCE впереди чейна -> инвалидировать (money-safety)
+            log.info("DIAG canary NO-RECEIPT (dropped?) -> nonce invalidated")
+            return
+        cblk, cidx = rcpt.get("blockNumber"), rcpt.get("transactionIndex")
+        gas_usd = int(rcpt.get("gasUsed") or 0) * int(rcpt.get("effectiveGasPrice") or 0) * cfg.eth_price_usd / 1e18
+        canary_record_gas(gas_usd)
+        if _ANSWER_UPDATED_SIG is None:
+            from eth_utils import keccak
+            _ANSWER_UPDATED_SIG = "0x" + keccak(text="AnswerUpdated(int256,uint256,uint256)").hex()
+        logs = w3.eth.get_logs({"fromBlock": transmit_block, "toBlock": transmit_block,
+                                "address": Web3.to_checksum_address(agg), "topics": [_ANSWER_UPDATED_SIG]})
+        tidx = logs[0].get("transactionIndex") if logs else None
+        probes, spent = canary_stats()
+        if tidx is not None and cblk == transmit_block:
+            log.info("DIAG canary DELTA delta=%d canary_idx=%d transmit_idx=%d block=%d gas$=%.3f probe=%d spent$=%.2f",
+                     cidx - tidx, cidx, tidx, transmit_block, gas_usd, probes, spent)
+        elif tidx is not None:
+            log.info("DIAG canary MISSED-BLOCK canary_blk=%d transmit_blk=%d (+%d поздно) canary_idx=%d gas$=%.3f probe=%d",
+                     cblk, transmit_block, cblk - transmit_block, cidx, gas_usd, probes)
+        else:
+            log.info("DIAG canary no-AnswerUpdated agg=%s blk=%d canary_idx=%d gas$=%.3f probe=%d",
+                     agg[:10], transmit_block, cidx, gas_usd, probes)
+    except Exception as e:
+        log.info("DIAG canary measure fail: %s", type(e).__name__)
+
+
+def _maybe_canary(agg, block, rpc, cfg, log):
+    """⭐ Пробить канарейку, ЕСЛИ флаг ON и в этом цикле НЕТ ликвидации/inflight (ноль помех боевому
+    пути). Гейты кап/интервал/газ — атомарно в send_canary. Замер в фоне -> не тормозит hot-путь."""
+    if not getattr(cfg, "canary_probe", False):
+        return
+    from chain.execute import send_canary, current_inflight
+    if current_inflight() > 0:                    # боевая tx в полёте -> не соревноваться за nonce
+        return
+    h = send_canary(rpc, cfg, log)
+    if h:
+        threading.Thread(target=_canary_measure, args=(rpc, h, agg, block, cfg, log), daemon=True).start()
+
+
 def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, meta, shared,
                       store, guard, alerter, log, last_price=None, stats=None,
                       price_fn=read_preconf_price, reads_fn=read_positions,
@@ -929,6 +983,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                 log.info("HOT skip %s/%s: %s", mid[:10], b[:10], str(prep.get("reason"))[:80])
 
     if not ready:
+        _maybe_canary(agg, block, rpc, cfg, log)   # ⭐ нет ликвидации в цикле -> безопасно пробить гонку
         return []
 
     from chain.execute import current_inflight
