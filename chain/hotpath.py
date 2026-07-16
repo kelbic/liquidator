@@ -831,10 +831,11 @@ def _canary_measure(rpc, canary_hash, agg, transmit_block, cfg, log):
         log.info("DIAG canary measure fail: %s", type(e).__name__)
 
 
-def _maybe_canary(agg, block, rpc, cfg, log):
-    """⭐ Пробить канарейку, ЕСЛИ флаг ON и в этом цикле НЕТ ликвидации/inflight (ноль помех боевому
-    пути). Гейты кап/интервал/газ — атомарно в send_canary. Замер в фоне -> не тормозит hot-путь."""
-    if not getattr(cfg, "canary_probe", False):
+def _maybe_canary(agg, block, subidx, rpc, cfg, log):
+    """⭐ Пробить канарейку, ЕСЛИ флаг ON, это РЕАЛЬНЫЙ транслят (не периодический poll — у того нет
+    AnswerUpdated в блоке, дельту мерить не против чего) и в цикле НЕТ ликвидации/inflight (ноль помех).
+    Гейты кап/интервал/газ — атомарно в send_canary. Замер в фоне -> не тормозит hot-путь."""
+    if not getattr(cfg, "canary_probe", False) or subidx == "poll":
         return
     from chain.execute import send_canary, current_inflight
     if current_inflight() > 0:                    # боевая tx в полёте -> не соревноваться за nonce
@@ -987,7 +988,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                 log.info("HOT skip %s/%s: %s", mid[:10], b[:10], str(prep.get("reason"))[:80])
 
     if not ready:
-        _maybe_canary(agg, block, rpc, cfg, log)   # ⭐ нет ликвидации в цикле -> безопасно пробить гонку
+        _maybe_canary(agg, block, subidx, rpc, cfg, log)   # ⭐ нет ликвидации -> пробить гонку (только реальный транслят)
         return []
 
     from chain.execute import current_inflight
