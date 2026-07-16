@@ -37,6 +37,7 @@ class Config:
     positions_from_cache: bool = False    # P1-6: слой 2 потребление (OFF до калибровки cache-divergence)
     fast_lane: bool = False               # P1-9: fast-lane без sim (OFF; контракт гарантирует исход)
     fast_lane_min_repaid_usd: float = 1000.0  # fast-lane только на призах >= этого repaid USD
+    fast_lane_max_consec_reverts: int = 3     # II.6 circuit breaker: N подряд ревертов fast-lane -> off ТОЛЬКО fast-lane (фолбэк sim)
     preconf_rpc: str = "https://mainnet-preconf.base.org"   # pre-confirmed price source for the hot path
     sequencer_rpc: str = "https://mainnet-sequencer.base.org"  # SEND-3: параллельный raw-broadcast; "off" = выкл
     candidates_snapshot_path: str = "candidates_snapshot.json"  # warm-start: последний candidate set (P0-1)
@@ -90,6 +91,7 @@ class Config:
             positions_from_cache=(s("POSITIONS_FROM_CACHE", "").lower() in ("1", "true", "yes", "on")),
             fast_lane=(s("FAST_LANE", "").lower() in ("1", "true", "yes", "on")),
             fast_lane_min_repaid_usd=f("FAST_LANE_MIN_REPAID_USD", 1000.0),
+            fast_lane_max_consec_reverts=int(f("FAST_LANE_MAX_CONSEC_REVERTS", 3)),
             preconf_rpc=s("PRECONF_RPC", "https://mainnet-preconf.base.org"),
             sequencer_rpc=s("SEQUENCER_RPC", "https://mainnet-sequencer.base.org"),
             candidates_snapshot_path=s("CANDIDATES_SNAPSHOT_PATH", "candidates_snapshot.json"),

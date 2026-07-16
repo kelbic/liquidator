@@ -53,6 +53,52 @@ def _inflight_add(n: int):
         _INFLIGHT = max(0, _INFLIGHT + n)
 
 
+# II.6 circuit breaker: N ПОДРЯД ревертов fast-lane -> отключить ТОЛЬКО fast-lane (фолбэк в sim,
+# бот жив). Без него реверт-шторм fast-lane (напр. от stale-flip) выбивает дневной loss-кап и
+# останавливает ВЕСЬ бот ровно в каскад (богатейшее окно). Считаем ПОДРЯД: успешный fast-lane send
+# сбрасывает серию -> срабатывает только устойчивый шторм, не разовый lost-race. disabled держится
+# ДО рестарта (шторм = разбираться, не авто-переармить). Состояние под _INFLIGHT_LOCK.
+_FL_CONSEC_REVERTS = 0
+_FL_DISABLED = False
+_FL_TRIP_MSG = None        # one-shot TG-сообщение в момент срабатывания (забирает caller с alerter'ом)
+
+
+def fast_lane_disabled() -> bool:
+    with _INFLIGHT_LOCK:
+        return _FL_DISABLED
+
+
+def pop_fast_lane_trip() -> str | None:
+    """One-shot: сообщение о срабатывании breaker'а для TG, затем очистка. Зовёт caller с alerter'ом."""
+    global _FL_TRIP_MSG
+    with _INFLIGHT_LOCK:
+        m = _FL_TRIP_MSG
+        _FL_TRIP_MSG = None
+        return m
+
+
+def _fl_record(is_fast: bool, status, threshold: int, log=None):
+    """Учёт исхода ЗАМАЙНЕННОЙ fast-lane tx для breaker'а. status==1 -> сброс серии; status!=1 (реверт)
+    -> инкремент; при достижении порога -> disable + one-shot TG-msg. status is None (timeout, исход
+    неизвестен) НЕ считаем. Idempotent после disable (флаг уже стоит)."""
+    global _FL_CONSEC_REVERTS, _FL_DISABLED, _FL_TRIP_MSG
+    if not is_fast or status is None:
+        return
+    with _INFLIGHT_LOCK:
+        if status == 1:
+            _FL_CONSEC_REVERTS = 0
+            return
+        _FL_CONSEC_REVERTS += 1
+        if _FL_CONSEC_REVERTS >= threshold and not _FL_DISABLED:
+            _FL_DISABLED = True
+            _FL_TRIP_MSG = ("\U0001F6D1 CIRCUIT BREAKER: fast-lane ОТКЛЮЧЁН после %d подряд ревертов "
+                            "-> фолбэк в sim-путь (бот жив). Разобрать причину, вернуть рестартом."
+                            % _FL_CONSEC_REVERTS)
+            if log:
+                log.error("II.6 breaker: fast-lane DISABLED after %d consecutive reverts -> sim fallback",
+                          _FL_CONSEC_REVERTS)
+
+
 def _post_raw_tx(url: str, raw_hex: str, timeout: int = 5):
     """SEND-3: eth_sendRawTransaction напрямую в секвенсер Base ПАРАЛЛЕЛЬНО с Alchemy-путём.
     Best-effort в daemon-треде: дубль безвреден (второй приём = 'already known'), ошибка здесь
@@ -610,6 +656,8 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                                 mid[:10], borrower[:10], reason, h)
                 _submit_xray(rpc, borrower, rcpt.get("blockNumber"),
                              rcpt.get("transactionIndex"), log)   # P2-12: кто взял и с какой дельтой
+            _fl_record(prep.get("fast"), status,               # II.6: учёт серии ревертов fast-lane
+                       getattr(cfg, "fast_lane_max_consec_reverts", 3), log)
             results.append(row)
         except Exception as e:
             # outcome unknown -> conservatively book estimated cost as a LOSS, never a phantom profit

@@ -796,6 +796,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     the passers. Injectable seams (price_fn/reads_fn/prepare_fn/dispatch_fn) for unit tests. Returns the
     dispatch results (list) for logging/tests."""
     from strategy.guard import GuardState
+    from chain.execute import fast_lane_disabled, pop_fast_lane_trip   # II.6 circuit breaker
     if dispatch_fn is None:
         from chain.execute import dispatch_liquidations as dispatch_fn  # noqa: F811
     if reads_fn is read_positions and getattr(cfg, "positions_from_cache", False):
@@ -901,8 +902,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                 continue
             if stats is not None: stats["f_prep"] += 1
             _bc = pos_by.get(b)
-            if (getattr(cfg, "fast_lane", False) and _bc
-                    and du >= getattr(cfg, "fast_lane_min_repaid_usd", 1000.0)):
+            if (getattr(cfg, "fast_lane", False) and not fast_lane_disabled()   # II.6: breaker -> фолбэк sim
+                    and _bc and du >= getattr(cfg, "fast_lane_min_repaid_usd", 1000.0)):
                 _fs = time.perf_counter()                    # P1-9: fast-lane БЕЗ sim; при ok обычный
                 fprep = prepare_fast(rpc, preconf_rpc, cfg, mid, b, du,   # prepare НЕ дублируем (2-я tx
                                      debt_assets_by.get((mid, b), 0), price,   # сожгла бы nonce+газ)
@@ -943,6 +944,9 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     _ds = time.perf_counter()
     results = dispatch_fn(rpc, cfg, ready, log=log, max_inflight=cfg.max_inflight)
     _t_send = (time.perf_counter() - _ds) * 1000.0
+    _fl_trip = pop_fast_lane_trip()                # II.6: breaker сработал в receipt-цикле dispatch -> TG-пейдж
+    if _fl_trip:
+        alerter.send_async(_fl_trip, key="fastlane-breaker")
     log.info("DIAG timing read=%.0fms sim=%.0fms send=%.0fms n_ready=%d",
              _t_read_total, _t_prep_total, _t_send, len(ready))
     for r in results:
