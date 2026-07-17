@@ -870,8 +870,11 @@ def _maybe_canary(agg, block, subidx, rpc, cfg, log, t0=None):
                     max_fee=(_fb * 2 + _tip) if _fb is not None else None, tip=_tip,
                     broadcast_raw_urls=_bcast)
     if h:
-        log.info("DIAG canary sent block=%d dt_spawn=%s ack=%.0fms fees=%s seq=%s",
-                 block, ("%.0fms" % ((time.time() - t0) * 1000.0)) if t0 is not None else "?",
+        # trig=feed (money-путь, price=0ms) vs bare-match idx (в dt_spawn сидит gate-RTT ~110-130мс) —
+        # без атрибуции кампания несравнима: медиану надо считать ПО feed-пробам отдельно.
+        log.info("DIAG canary sent block=%d trig=%s agg=%s dt_spawn=%s ack=%.0fms fees=%s seq=%s",
+                 block, subidx, agg[:10],
+                 ("%.0fms" % ((time.time() - t0) * 1000.0)) if t0 is not None else "?",
                  (time.perf_counter() - _ss) * 1000.0,
                  "fb" if _fb is not None else "alchemy", "on" if _bcast else "off")
         threading.Thread(target=_canary_measure, args=(rpc, h, agg, block, cfg, log), daemon=True).start()
