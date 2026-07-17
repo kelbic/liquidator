@@ -577,14 +577,14 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         from chain.multicall import (aggregate3, encode_id_to_market_params_call, decode_id_to_market_params,
             encode_market_call, decode_market, encode_position_call, decode_position)
         from chain.simulate import to_assets_up
-        from chain.execute import kyber_swap, direct_swap, encode_liquidate, simulate_tx
+        from chain.execute import kyber_swap, direct_swap, encode_liquidate, simulate_tx, account_for
         from strategy.pnl import lif_from_lltv
 
         liq = cfg.liquidator_address
         if not liq:
             return {"ok": False, "reason": "LIQUIDATOR_ADDRESS unset"}
         w3 = rpc._web3()
-        bot = w3.eth.account.from_key(cfg.wallet_key).address
+        bot = account_for(w3, cfg.wallet_key).address
         mid = rpc.to_bytes32(market_id)
 
         # market-PARAMS (статичные адреса рынка, иммутабельны) — из кэша resolve_meta (2a), без RTT.
@@ -788,12 +788,19 @@ def hot_min_repaid(cfg):
 
 _ANSWER_UPDATED_SIG = None   # keccak(AnswerUpdated(int256,uint256,uint256)); лениво
 
+# Поправка 07-17 п.1: медиана «+46» считалась ТОЛЬКО по попаданиям в блок; 37% MISSED-BLOCK
+# (+1 блок = полный проигрыш) в неё не входили. Копим ОБА исхода за кампанию + tx-count блока
+# (перевод «позиции -> мс» раньше был не обоснован кодом). Под своим локом (пишут bg-треды).
+_CANARY_STATS_LOCK = threading.Lock()
+_CANARY_HIT_DELTAS: list = []   # in-block дельты
+_CANARY_MISSES = 0              # canary_blk > transmit_blk
+
 
 def _canary_measure(rpc, canary_hash, agg, transmit_block, cfg, log):
     """⭐ Bg: дождаться receipt канарейки -> учесть газ в СВОЙ бакет -> найти tx-index транслята
     (AnswerUpdated на agg в transmit_block, узкий getLogs) -> ДЕЛЬТА canary_idx - transmit_idx.
     Малая/отриц. дельта = попадаем в блок первыми = выигрываем гонку. Read-only после отправки."""
-    global _ANSWER_UPDATED_SIG
+    global _ANSWER_UPDATED_SIG, _CANARY_MISSES
     from chain.execute import canary_record_gas, canary_invalidate_nonce, canary_stats
     from web3 import Web3
     try:
@@ -819,11 +826,22 @@ def _canary_measure(rpc, canary_hash, agg, transmit_block, cfg, log):
             time.sleep(2.0)
         probes, spent = canary_stats()
         if tidx is not None and cblk == transmit_block:
-            log.info("DIAG canary DELTA delta=%d canary_idx=%d transmit_idx=%d block=%d gas$=%.3f probe=%d spent$=%.2f",
-                     cidx - tidx, cidx, tidx, transmit_block, gas_usd, probes, spent)
+            try:                                   # tx-count блока: «позиции -> мс» с опорой, не на глаз
+                _blk_txs = int(w3.eth.get_block_transaction_count(transmit_block))
+            except Exception:
+                _blk_txs = -1
+            with _CANARY_STATS_LOCK:
+                _CANARY_HIT_DELTAS.append(cidx - tidx)
+                _hits = sorted(_CANARY_HIT_DELTAS); _miss = _CANARY_MISSES
+            log.info("DIAG canary DELTA delta=%d canary_idx=%d transmit_idx=%d block=%d blk_txs=%d gas$=%.3f probe=%d spent$=%.2f | run: hits=%d miss=%d med_hit=%d",
+                     cidx - tidx, cidx, tidx, transmit_block, _blk_txs, gas_usd, probes, spent,
+                     len(_hits), _miss, _hits[len(_hits) // 2])
         elif tidx is not None:
-            log.info("DIAG canary MISSED-BLOCK canary_blk=%d transmit_blk=%d (+%d поздно) canary_idx=%d gas$=%.3f probe=%d",
-                     cblk, transmit_block, cblk - transmit_block, cidx, gas_usd, probes)
+            with _CANARY_STATS_LOCK:
+                _CANARY_MISSES += 1
+                _hits_n = len(_CANARY_HIT_DELTAS); _miss = _CANARY_MISSES
+            log.info("DIAG canary MISSED-BLOCK canary_blk=%d transmit_blk=%d (+%d поздно) canary_idx=%d gas$=%.3f probe=%d | run: hits=%d miss=%d",
+                     cblk, transmit_block, cblk - transmit_block, cidx, gas_usd, probes, _hits_n, _miss)
         else:
             log.info("DIAG canary no-AnswerUpdated agg=%s blk=%d canary_idx=%d gas$=%.3f probe=%d",
                      agg[:10], transmit_block, cidx, gas_usd, probes)
@@ -831,17 +849,31 @@ def _canary_measure(rpc, canary_hash, agg, transmit_block, cfg, log):
         log.info("DIAG canary measure fail: %s", type(e).__name__)
 
 
-def _maybe_canary(agg, block, subidx, rpc, cfg, log):
+def _maybe_canary(agg, block, subidx, rpc, cfg, log, t0=None):
     """⭐ Пробить канарейку, ЕСЛИ флаг ON, это РЕАЛЬНЫЙ транслят (не периодический poll — у того нет
     AnswerUpdated в блоке, дельту мерить не против чего) и в цикле НЕТ ликвидации/inflight (ноль помех).
-    Гейты кап/интервал/газ — атомарно в send_canary. Замер в фоне -> не тормозит hot-путь."""
+    Гейты кап/интервал/газ — атомарно в send_canary. Замер в фоне -> не тормозит hot-путь.
+    Поправка 07-17: канарейка летит БОЕВЫМ send-путём (fee из fb-хедера + SEND-3 raw в секвенсер) —
+    пробы 1-100 шли Alchemy-путём с 2 fee-RTT и без секвенсера, т.е. мерили оверхед, которого у
+    реальной ликвидации нет. dt_spawn (t0=спавн транзита) + ack в логе = разложение мс по п.1 поправки."""
     if not getattr(cfg, "canary_probe", False) or subidx == "poll":
         return
     from chain.execute import send_canary, current_inflight
     if current_inflight() > 0:                    # боевая tx в полёте -> не соревноваться за nonce
         return
-    h = send_canary(rpc, cfg, log)
+    _fb = _fresh_basefee()
+    _tip = int(cfg.tip_gwei * 1e9)
+    _seq = str(getattr(cfg, "sequencer_rpc", "") or "")
+    _bcast = [_seq] if (_seq and _seq.lower() not in ("off", "none", "0")) else None
+    _ss = time.perf_counter()
+    h = send_canary(rpc, cfg, log,
+                    max_fee=(_fb * 2 + _tip) if _fb is not None else None, tip=_tip,
+                    broadcast_raw_urls=_bcast)
     if h:
+        log.info("DIAG canary sent block=%d dt_spawn=%s ack=%.0fms fees=%s seq=%s",
+                 block, ("%.0fms" % ((time.time() - t0) * 1000.0)) if t0 is not None else "?",
+                 (time.perf_counter() - _ss) * 1000.0,
+                 "fb" if _fb is not None else "alchemy", "on" if _bcast else "off")
         threading.Thread(target=_canary_measure, args=(rpc, h, agg, block, cfg, log), daemon=True).start()
 
 
@@ -893,8 +925,34 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     with shared.lock:
         groups = dict(shared.groups); debt_by = dict(shared.debt_by); debt_assets_by = dict(shared.debt_assets_by)
 
+    # Поправка 07-17 п.2 (остаточный preconf-RTT): оракулы рынков этого agg вне _gate_px читались
+    # ПОСЛЕДОВАТЕЛЬНО внутри цикла (~110мс каждый из Charlotte) -> рынок №2/№3 ждал СУММУ чужих RTT
+    # (наблюдалось в журнале: price=0ms -> 114ms -> 110ms), и канарейка стреляла после всех. Теперь
+    # все недостающие цены стартуют параллельно ЗДЕСЬ; цикл ждёт только СВОЙ оракул (Event).
+    # Hint-рынок не ждёт ничего (цена уже в _gate_px).
+    _px_prefetch = {}                            # oracle -> (Event, [px|None])
+    for _mid_pf in feeds.get(agg, []):
+        _om_pf = meta.get(_mid_pf)
+        if not _om_pf or not groups.get(_mid_pf):
+            continue
+        _o_pf = _om_pf[0]
+        if _o_pf in _gate_px or _o_pf in _px_prefetch:
+            continue
+        _ev_pf, _box_pf = threading.Event(), []
+        _px_prefetch[_o_pf] = (_ev_pf, _box_pf)
+
+        def _pf_read(_o=_o_pf, _ev=_ev_pf, _box=_box_pf):
+            try:
+                _box.append(price_fn(preconf_rpc, _o))
+            except Exception:
+                pass
+            finally:
+                _ev.set()
+        threading.Thread(target=_pf_read, daemon=True).start()
+
     ready, meta_by = [], {}
-    _t_read_total = 0.0; _t_prep_total = 0.0   # DIAG latency: read=340-call, sim=prepare_hot
+    _canary_fired = False                        # ранний выстрел на hint-рынке (см. ниже) — один на транзит
+    _t_read_total = 0.0; _t_prep_total = 0.0; _t_flips_total = 0.0   # DIAG latency: read=340-call, sim=prepare_hot
     for mid in feeds.get(agg, []):
         om = meta.get(mid)
         borrowers = groups.get(mid, [])
@@ -905,7 +963,11 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         _pxs = time.perf_counter()
         if oracle in _gate_px:                               # 2b: gate уже прочитал этот оракул -> без 2-го RTT
             price = _gate_px[oracle]
-        else:
+        elif oracle in _px_prefetch:                         # 07-17: параллельный префетч стартовал до цикла
+            _ev_w, _box_w = _px_prefetch[oracle]
+            _ev_w.wait(timeout=5.0)
+            price = _box_w[0] if _box_w else None
+        else:                                                # страховка (префетч покрывает штатно)
             price = price_fn(preconf_rpc, oracle)
         _t_price_last = (time.perf_counter() - _pxs) * 1000.0
         if price is None:
@@ -944,7 +1006,9 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         log.info("DIAG hotset mid=%s src=%s trig=%s n=%d block=%d", mid[:10], _rsrc, subidx, len(pos), block)  # full set on disk
         positions = [(b, bs, col, debt_by.get((mid, b), 0.0)) for (b, bs, col) in pos]
         pos_by = {b: (bs, col) for (b, bs, col) in pos}      # P0-4: state для prepare_hot без повторного RTT
+        _fls = time.perf_counter()                           # 07-17 п.1: CPU _flips по непруненному набору — мерить
         flipped = _flips(price, lltv_wad, tba, tbs, positions)
+        _t_flips_last = (time.perf_counter() - _fls) * 1000.0; _t_flips_total += _t_flips_last
         if not flipped:
             if stats is not None: stats["f_noflip"] += 1
             if positions:                                    # DIAG: what state did we read? (preconf-source check)
@@ -953,8 +1017,9 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                            total_borrow_assets=int(tba), total_borrow_shares=int(tbs))
                 _c = [(bb, bs, _hf(_ctx, bs, col).hf) for (bb, bs, col, _du) in positions]
                 _bb, _bs, _hv = min(_c, key=lambda x: x[2])
-                log.info("DIAG noflip %s/%s minHF=%.4f bshares=%d px=%d n=%d src=%s trig=%s price=%.0fms read=%.0fms",
-                         mid[:10], _bb[:10], _hv, _bs, int(price), len(_c), _rsrc, subidx, _t_price_last, _t_read_last)
+                log.info("DIAG noflip %s/%s minHF=%.4f bshares=%d px=%d n=%d src=%s trig=%s price=%.0fms read=%.0fms flips=%.1fms e2e=%.0fms",
+                         mid[:10], _bb[:10], _hv, _bs, int(price), len(_c), _rsrc, subidx, _t_price_last, _t_read_last,
+                         _t_flips_last, (time.time() - t) * 1000.0)
         for (b, hr, du) in flipped:
             if du < floor:                                   # reaction filter: $2k+ only
                 if stats is not None: stats["f_floor"] += 1
@@ -987,8 +1052,15 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             else:
                 log.info("HOT skip %s/%s: %s", mid[:10], b[:10], str(prep.get("reason"))[:80])
 
+        if hint_oracle is not None and oracle == hint_oracle and not ready and not _canary_fired:
+            # 07-17: канарейка стреляет В ТОЧКЕ, где fast-lane отправил бы hint-рынок, а не после
+            # обработки всех соседей agg (пробы 1-100 включали до ~220мс чужих preconf-RTT).
+            _canary_fired = True
+            _maybe_canary(agg, block, subidx, rpc, cfg, log, t0=t)
+
     if not ready:
-        _maybe_canary(agg, block, subidx, rpc, cfg, log)   # ⭐ нет ликвидации -> пробить гонку (только реальный транслят)
+        if not _canary_fired:                              # bare-match транзиты (без hint) — как раньше, после цикла
+            _maybe_canary(agg, block, subidx, rpc, cfg, log, t0=t)   # ⭐ нет ликвидации -> пробить гонку
         return []
 
     from chain.execute import current_inflight
@@ -1007,8 +1079,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     _fl_trip = pop_fast_lane_trip()                # II.6: breaker сработал в receipt-цикле dispatch -> TG-пейдж
     if _fl_trip:
         alerter.send_async(_fl_trip, key="fastlane-breaker")
-    log.info("DIAG timing read=%.0fms sim=%.0fms send=%.0fms n_ready=%d",
-             _t_read_total, _t_prep_total, _t_send, len(ready))
+    log.info("DIAG timing read=%.0fms flips=%.0fms sim=%.0fms send=%.0fms e2e=%.0fms n_ready=%d",
+             _t_read_total, _t_flips_total, _t_prep_total, _t_send, (time.time() - t) * 1000.0, len(ready))
     for r in results:
         hr, du = meta_by.get((r["market_id"], r["borrower"]), (None, 0.0))
         status = (f"submitted:{r.get('status')} net${r.get('net_usd',0):.2f}" if r["sent"]
@@ -1045,6 +1117,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     last_resolve = time.monotonic()
     log.info("hot path: %d aggregators / %d markets (preconf=%s, tip=%.1f gwei, floor repaid $%.0f)",
              len(agg_set), len(meta), preconf_rpc.rpc_url, cfg.tip_gwei, hot_min_repaid(cfg))
+    _seq_url = str(getattr(cfg, "sequencer_rpc", "") or "")   # 07-17: тёплый keep-alive к секвенсеру ДО
+    if _seq_url and _seq_url.lower() not in ("off", "none", "0"):   # первого выстрела (холодный TLS ~2-3 RTT)
+        from chain.execute import warm_broadcast
+        warm_broadcast([_seq_url])
 
     last_spawn: dict = {}        # agg -> last spawn time.time() (throttle; survives ws reconnects)
     last_price: dict = {}        # agg -> last preconf price of representative oracle (change-gate)

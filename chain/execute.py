@@ -25,6 +25,60 @@ _SEND_LOCK = threading.Lock()   # serialize dispatch nonce-fetch+send across the
 # отправленным батчем, который RPC ещё не видит).
 _LOCAL_NONCE: dict = {}         # bot address -> next unused nonce
 
+# Поправка 07-17 (CANARY_0717_CORRECTION п.2): from_key = secp256k1-деривация ~1-3мс на КАЖДЫЙ send
+# (send_tx, dispatch, canary, prepare_hot) — чистый CPU в горячем пути. LocalAccount иммутабелен ->
+# кэш на всю жизнь процесса. Ключ НЕ логировать (dict живёт только в памяти).
+_ACCT_CACHE: dict = {}          # wallet_key -> LocalAccount
+
+
+def account_for(w3, key: str):
+    a = _ACCT_CACHE.get(key)
+    if a is None:
+        a = w3.eth.account.from_key(key)
+        _ACCT_CACHE[key] = a
+    return a
+
+
+# Поправка 07-17: _post_raw_tx через urllib открывал ХОЛОДНОЕ TCP+TLS на КАЖДЫЙ raw-броадкаст в
+# секвенсер (~2-3 RTT ≈ 60-90мс из Charlotte) — ровно на пути гонки за включение («sequencer
+# warm=30ms» мерился keep-alive'ом). requests.Session (urllib3-пул, web3 его уже тянет) держит
+# соединение открытым; фоновый пинг eth_chainId раз в 15с не даёт idle-таймауту его закрыть.
+try:
+    import requests as _requests
+except Exception:               # requests нет -> фолбэк на старый urllib-путь (холодный, но рабочий)
+    _requests = None
+
+_SEQ_SESSIONS: dict = {}        # url -> requests.Session (тёплый keep-alive)
+_SEQ_LOCK = threading.Lock()
+
+
+def _seq_keepalive(url: str, s, interval: float = 15.0):
+    body = {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}
+    while True:
+        try:
+            s.post(url, json=body, timeout=5)
+        except Exception:
+            pass                # разрыв лечится пулом на следующем post (одна холодная отправка)
+        time.sleep(interval)
+
+
+def _seq_session(url: str):
+    if _requests is None:
+        return None
+    with _SEQ_LOCK:
+        s = _SEQ_SESSIONS.get(url)
+        if s is None:
+            s = _requests.Session()
+            _SEQ_SESSIONS[url] = s
+            threading.Thread(target=_seq_keepalive, args=(url, s), daemon=True).start()
+        return s
+
+
+def warm_broadcast(urls: list):
+    """Прогреть keep-alive сессии broadcast-endpoints на старте (до первого выстрела/канарейки)."""
+    for u in urls or []:
+        _seq_session(u)
+
 # Дедуп двойной отправки (страховка под FAST_LANE): один и тот же (mid, borrower) может прийти в
 # dispatch из нескольких параллельных _process_transmit (feed×feed / feed×bare / feed×poll на одном
 # transmit). Первый успешный ликвидирует; повторные Morpho ревертит (HEALTHY_POSITION/нет долга) =
@@ -117,11 +171,14 @@ def canary_record_gas(gas_usd: float):
         _CANARY_GAS_USD += max(0.0, gas_usd)
 
 
-def send_canary(rpc, cfg, log=None):
+def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=None):
     """⭐ Минимальная 0-value self-transfer от БОЕВОГО кошелька под ОБЩИМ _SEND_LOCK/_LOCAL_NONCE
     (единый nonce -> ноль nonce-краха; single-slot). Гейты (кап проб / газ-кап / интервал) проверяются
     АТОМАРНО под локом ПЕРЕД раздачей nonce. Возвращает hash или None (гейт закрыт/ошибка). Позиция
-    tx в блоке = прокси позиции ликвидации при равном tip -> замер гонки. НЕ считается в kill-switch."""
+    tx в блоке = прокси позиции ликвидации при равном tip -> замер гонки. НЕ считается в kill-switch.
+    Поправка 07-17: канарейка должна лететь БОЕВЫМ send-путём — max_fee/tip из fb-хедера (иначе
+    send_tx жжёт 2 Alchemy-RTT на fee) и broadcast_raw_urls=[секвенсер] (SEND-3; иначе только
+    Alchemy-прокси-хоп, которого у реальной ликвидации нет) — пробы 1-100 мерили ИМЕННО этот оверхед."""
     global _CANARY_PROBES, _CANARY_LAST_TS
     _now = time.monotonic()
     with _SEND_LOCK:
@@ -131,14 +188,18 @@ def send_canary(rpc, cfg, log=None):
                     or _now - _CANARY_LAST_TS < getattr(cfg, "canary_min_interval_sec", 120.0)):
                 return None
         w3 = rpc._web3()
-        bot = w3.eth.account.from_key(cfg.wallet_key).address
+        bot = account_for(w3, cfg.wallet_key).address
         base_nonce = _LOCAL_NONCE.get(bot)
         if base_nonce is None:
             base_nonce = int(w3.eth.get_transaction_count(bot, "pending"))
-        tip = int(cfg.tip_gwei * 1e9)
+        tip_wei = int(cfg.tip_gwei * 1e9)
+        _tx = {"to": bot, "value": 0, "nonce": base_nonce, "gas": 21000}
+        if max_fee is not None:                  # боевой fee-путь (fb-хедер) -> send_tx без fee-RTT
+            _tx["maxFeePerGas"] = int(max_fee)
+            _tx["maxPriorityFeePerGas"] = int(tip) if tip else tip_wei
         try:
-            res = send_tx(rpc, cfg.wallet_key, {"to": bot, "value": 0, "nonce": base_nonce, "gas": 21000},
-                          wait=False, min_tip_wei=tip)
+            res = send_tx(rpc, cfg.wallet_key, _tx,
+                          wait=False, min_tip_wei=tip_wei, broadcast_raw_urls=broadcast_raw_urls)
         except Exception as e:
             _LOCAL_NONCE.pop(bot, None)   # не знаем, съелся ли nonce -> следующий dispatch пере-читает RPC
             if log:
@@ -155,7 +216,7 @@ def canary_invalidate_nonce(rpc, cfg):
     """Канарейка не замайнилась за timeout (возможно дропнута) -> _LOCAL_NONCE впереди чейна ->
     следующая tx уйдёт в дыру. Инвалидируем (как timeout-ветка dispatch, II нонс-фикс)."""
     try:
-        bot = rpc._web3().eth.account.from_key(cfg.wallet_key).address
+        bot = account_for(rpc._web3(), cfg.wallet_key).address
         with _SEND_LOCK:
             _LOCAL_NONCE.pop(bot, None)
     except Exception:
@@ -165,13 +226,18 @@ def canary_invalidate_nonce(rpc, cfg):
 def _post_raw_tx(url: str, raw_hex: str, timeout: int = 5):
     """SEND-3: eth_sendRawTransaction напрямую в секвенсер Base ПАРАЛЛЕЛЬНО с Alchemy-путём.
     Best-effort в daemon-треде: дубль безвреден (второй приём = 'already known'), ошибка здесь
-    НЕ роняет send-путь. Смысл: убрать Alchemy-прокси-хоп из гонки за включение."""
+    НЕ роняет send-путь. Смысл: убрать Alchemy-прокси-хоп из гонки за включение.
+    Поправка 07-17: тёплая keep-alive сессия (_seq_session) вместо холодного TCP+TLS на каждый вызов."""
     try:
-        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
-                           "params": [raw_hex]}).encode()
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            resp = json.loads(r.read())
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [raw_hex]}
+        s = _seq_session(url)
+        if s is not None:
+            resp = s.post(url, json=payload, timeout=timeout).json()
+        else:
+            body = json.dumps(payload).encode()
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                resp = json.loads(r.read())
         err = resp.get("error")
         if err and "already known" not in str(err.get("message", "")).lower():
             log.info("DIAG seq-send %s err=%s", url, str(err)[:120])
@@ -380,7 +446,7 @@ def send_tx(rpc, key: str, tx: dict, wait: bool = True, timeout: int = 120,
     broadcast_raw_urls (SEND-3): доп. endpoints (секвенсер) для параллельного raw-broadcast —
     треды стартуют ДО Alchemy-сенда, hash детерминирован от подписи, дубль безвреден."""
     w3 = rpc._web3()
-    acct = w3.eth.account.from_key(key)
+    acct = account_for(w3, key)
     t = dict(tx)
     t.setdefault("from", acct.address)
     t.setdefault("chainId", rpc.chain_id)
@@ -616,7 +682,7 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
     if not prepared:
         return results
     w3 = rpc._web3()
-    bot = w3.eth.account.from_key(cfg.wallet_key).address
+    bot = account_for(w3, cfg.wallet_key).address
     _seq = str(getattr(cfg, "sequencer_rpc", "") or "")
     _bcast = [_seq] if (_seq and _seq.lower() not in ("off", "none", "0")) else None
     with _SEND_LOCK:                                         # serialize nonce-fetch+send across senders (block loop + hot path)
