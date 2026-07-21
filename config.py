@@ -27,6 +27,7 @@ class Config:
     tg_bot_token: str = ""
     tg_admin_id: int = 0
     alert_antiflood_sec: int = 600
+    bot_tag: str = ""                     # префикс алертов в общем TG-чате флота ("[base] ...") — LIQ_BOT_TAG
     poll_interval_sec: float = 2.0
     loop_mode: str = "poll"
     block_source: str = "flashblocks"   # block trigger: flashblocks (~2s earlier) | newheads (fallback)
@@ -85,6 +86,7 @@ class Config:
             tg_bot_token=s("TG_BOT_TOKEN"),
             tg_admin_id=i("TG_ADMIN_ID", 0),
             alert_antiflood_sec=i("ALERT_ANTIFLOOD_SEC", 600),
+            bot_tag=s("LIQ_BOT_TAG", ""),
             poll_interval_sec=f("POLL_INTERVAL_SEC", 2.0),
             loop_mode=s("LOOP_MODE", "poll"),
             block_source=s("BLOCK_SOURCE", "flashblocks"),

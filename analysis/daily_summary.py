@@ -79,5 +79,5 @@ except Exception as e:
 
 msg = "\n".join(lines)[:3900]
 print(msg)
-ok = Alerter(cfg.tg_bot_token, cfg.tg_admin_id, antiflood_sec=0).send(msg, key=f"daily:{dt.date.today()}")
+ok = Alerter(cfg.tg_bot_token, cfg.tg_admin_id, antiflood_sec=0, tag=cfg.bot_tag).send(msg, key=f"daily:{dt.date.today()}")
 print(f"\n[tg sent={ok}]")

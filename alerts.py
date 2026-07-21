@@ -7,10 +7,11 @@ import urllib.request
 
 
 class Alerter:
-    def __init__(self, bot_token: str, admin_id: int, antiflood_sec: int = 600):
+    def __init__(self, bot_token: str, admin_id: int, antiflood_sec: int = 600, tag: str = ""):
         self.token = bot_token
         self.admin_id = admin_id
         self.antiflood_sec = antiflood_sec
+        self.tag = tag              # префикс отправителя в ОБЩЕМ чате флота (напр. "base") -> "[base] ..."
         self._last: dict[str, float] = {}
 
     def send_async(self, text: str, key: str = "default") -> None:
@@ -29,6 +30,8 @@ class Alerter:
         self._last[key] = now
         if not self.token or not self.admin_id:
             return False
+        if self.tag:
+            text = f"[{self.tag}] {text}"
         try:
             data = urllib.parse.urlencode({"chat_id": self.admin_id, "text": text}).encode()
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
