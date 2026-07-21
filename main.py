@@ -426,6 +426,7 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
     hf_cache = {}
     active = cfg.block_source if cfg.block_source in ("flashblocks", "newheads") else "newheads"
     fails = 0
+    last_blockerr_log = 0.0      # троттл лога «блок пропущен»: транзиентная RPC-ошибка НЕ роняет WS
     recon_ts: list[float] = []   # моменты ws-обрывов для серия-гейта TG (см. _RECON_SERIES_N)
     while True:
         url, conn_kw, gen = _source_params(cfg, active)
@@ -456,8 +457,19 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     else:
                         groups = _hot_subset(groups, hf_cache)    # per block: only near-threshold
                     t0 = time.time()
-                    s = process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg,
-                                           guard, alerter, log, ctx_cache, ncand, hf_cache=hf_cache)
+                    try:
+                        s = process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg,
+                                               guard, alerter, log, ctx_cache, ncand, hf_cache=hf_cache)
+                    except Exception as e:
+                        # RPC-split (07-21): per-block process_candidates ходит по общей ноде (сейчас
+                        # публичная, лимитированная) — её транзиентный HTTPError/429 НЕ должен ронять WS
+                        # (иначе реконнект-флап). Пропускаем ЭТОТ блок, WS живёт; следующий блок повторит.
+                        # Троттл-лог 1/30с, чтобы реальная поломка (постоянный скип) была видна.
+                        _bnow = time.monotonic()
+                        if _bnow - last_blockerr_log >= 30.0:
+                            log.warning("block %s assess skipped (%s) — WS сохранён (RPC hiccup)", blk, type(e).__name__)
+                            last_blockerr_log = _bnow
+                        continue
                     if s["liquidatable"] or s["profitable"] or (time.time() - last_hb >= HEARTBEAT_SEC):
                         last_hb = time.time()
                         tag = "full" if do_full else "hot"
