@@ -423,13 +423,19 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
         def _run_hot():
             import asyncio as _a
             time.sleep(HOT_LOOP_START_STAGGER_SEC)     # размазать залп: дать cold-start mega-fetch/refresh block-loop схлынуть
+            _heal_n = 0
             while not stop.is_set():                   # self-heal: init-429/крах НЕ должен молча убивать fast-путь (инцидент 07-21)
+                _t0 = time.monotonic()
                 try:
                     _a.run(hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, stop, markets))
                     break                              # чистый выход (stop выставлен)
                 except Exception:
-                    log.exception("hot_loop упал — self-heal перезапуск через 5с")
-                    time.sleep(5)
+                    # прожил >120с = разовый сбой (сброс); быстрый повтор = крэш-цикл (dRPC 429 на init-залпе)
+                    # -> backoff, чтобы рестарты НЕ долбили dRPC init и он восстановился (5→10→20→40→60с)
+                    _heal_n = 0 if (time.monotonic() - _t0) > 120 else _heal_n + 1
+                    _hw = min(5 * (2 ** _heal_n), 60)
+                    log.exception("hot_loop упал — self-heal перезапуск через %.0fс (backoff #%d)" % (_hw, _heal_n))
+                    time.sleep(_hw)
         threading.Thread(target=_run_hot, daemon=True).start()
         log.warning("HOT PATH ENABLED — preconf trigger live (tip=%.1f gwei, daily-loss<=$%.0f, repaid>=$%.0f)",
                     cfg.tip_gwei, cfg.max_daily_loss_usd, getattr(cfg, "hot_min_repaid_usd", 2000.0))
