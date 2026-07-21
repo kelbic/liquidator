@@ -289,18 +289,22 @@ def _cache_coverage_stats(borrowers, cached_positions, now):
     return in_cache, len(borrowers), avg_age, max_age, missing[:10]
 
 
-def refresh_position_cache(preconf_rpc, mid, borrowers):
+def refresh_position_cache(cache_rpc, mid, borrowers):
     """Background per-block refresh for ONE money-market. A borrower whose position() call in the
     batch comes back ok=False/empty is logged (refresh-miss) but their PREVIOUS cache entry (if any)
     is left untouched — not wiped, not refreshed. Freshness is enforced downstream by age at read
-    time (read_positions_cached), not by dropping on a single missed cycle."""
+    time (read_positions_cached), not by dropping on a single missed cycle.
+    RPC-split (07-21): positions are slow-moving, so this bulk refresh runs on the general/confirmed
+    `cache_rpc` (RPC_URL) at block='latest' — NOT on preconf. The preconf per-IP compute cap only
+    tolerates ~1 heavy call/s; keeping the ~5-20/s refresh off preconf leaves that budget for the
+    price poll (read_preconf_prices, ~0.5/s) which is the one thing that actually needs the ~1.8s lead."""
     from chain.multicall import aggregate3, encode_market_call, decode_market, encode_position_call, decode_position
     if not borrowers:
         return
-    b32 = preconf_rpc.to_bytes32(mid)
+    b32 = cache_rpc.to_bytes32(mid)
     calls = [(MORPHO_BLUE, encode_market_call(b32))] + [(MORPHO_BLUE, encode_position_call(b32, b)) for b in borrowers]
     try:
-        res = aggregate3(preconf_rpc, calls, block_identifier="pending")
+        res = aggregate3(cache_rpc, calls, block_identifier="latest")
     except Exception as e:
         log.info("DIAG position-cache refresh-fail market=%s err=%s", mid[:10], str(e)[:80])
         return
@@ -360,7 +364,7 @@ _CACHE_SKIP_N = 0                 # skip'ов с последнего лога (
 _CACHE_SKIP_LOG_TS = 0.0
 
 
-def _spawn_cache_refresh(*, preconf_rpc, shared, bn):
+def _spawn_cache_refresh(*, cache_rpc, shared, bn):
     """Re-entrancy guard for the Layer-2 driver (plan #3). The driver used to be spawned as a NEW
     thread EVERY block while one cycle takes 1.9-2.4s ~= block time: any RTT degradation =>
     overlapping cycles => thread pile-up => self-load on the battle preconf exactly at cascade
@@ -381,11 +385,11 @@ def _spawn_cache_refresh(*, preconf_rpc, shared, bn):
         return
     _CACHE_REFRESH_STARTED = time.monotonic()
     _CACHE_REFRESH_THREAD = threading.Thread(target=_refresh_position_caches, daemon=True,
-                                             kwargs=dict(preconf_rpc=preconf_rpc, shared=shared, bn=bn))
+                                             kwargs=dict(cache_rpc=cache_rpc, shared=shared, bn=bn))
     _CACHE_REFRESH_THREAD.start()
 
 
-def _refresh_position_caches(*, preconf_rpc, shared, bn):
+def _refresh_position_caches(*, cache_rpc, shared, bn):
     """Per-block driver (Layer 2, measurement phase — see STATE.md 'C temporary'). Refreshes
     _POSITION_CACHE for every money-market (UNIV3_PATHS collateral) via refresh_position_cache.
     PURE MEASUREMENT: writes _POSITION_CACHE and logs refresh-miss/-fail + cycle timing, but does
@@ -405,7 +409,7 @@ def _refresh_position_caches(*, preconf_rpc, shared, bn):
         if coll.lower() not in ROUTE_COLLATERALS:    # P1-8: +cbLTC/cbBTC (Slipstream-маршруты)
             continue
         try:
-            refresh_position_cache(preconf_rpc, mid, borrowers)
+            refresh_position_cache(cache_rpc, mid, borrowers)
             n_markets += 1
         except Exception:
             log.exception("position-cache refresh error market=%s", mid[:10])
@@ -1195,7 +1199,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         # Layer 2, measurement phase (C temporary — see STATE.md): fills _POSITION_CACHE +
                         # logs refresh-miss/cycle timing. Does NOT touch reads_fn — read_positions_cached
                         # is not wired into _process_transmit yet, so this has zero effect on hot-path behavior.
-                        _spawn_cache_refresh(preconf_rpc=preconf_rpc, shared=shared, bn=bn)
+                        _spawn_cache_refresh(cache_rpc=rpc, shared=shared, bn=bn)   # RPC-split: рефреш на общий rpc (confirmed), НЕ на preconf
                     idx = d.get("index"); txs = extract_txs(d); now = time.time()
                     for _raw, _to in txs:                        # SHADOW слоя 1: декод transmit из фида (log-only)
                         if _raw and FORWARD_SEL in _raw:
