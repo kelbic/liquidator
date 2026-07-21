@@ -1101,6 +1101,25 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
 
 # ---- async flashblock subscriber (detect + spawn) ----
 
+def _init_resolve_retry(fn, *args, what="", tries=6, base=0.5, log=None):
+    """Init-резолв hot_loop на keyed-RPC с rate-лимитом (напр. dRPC Free = 100 req/s): при старте бот
+    выстреливает залп разом (candidate refresh + mega-fetch из block-loop + resolve) — на миг >лимита →
+    429. Ретраим с экспоненциальным backoff (0.5→16с): залп схлынет и повтор пройдёт, поток hot_loop
+    НЕ умирает. Это одновременно «ретрай» и «размазать залп» — backoff разносит нагрузку во времени.
+    На Alchemy (500 req/s) 429 не приходил, потому хрупкость не вылезала (инцидент 07-21)."""
+    for i in range(tries):
+        try:
+            return fn(*args)
+        except Exception as e:
+            if i == tries - 1:
+                raise
+            wait = base * (2 ** i)
+            if log is not None:
+                log.warning("hot_loop init %s: %s — retry %d/%d через %.1fс (rate-limit burst)",
+                            what, type(e).__name__, i + 1, tries, wait)
+            time.sleep(wait)
+
+
 async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, stop, markets,
                    ws_factory=None):
     """Subscribe to Flashblocks; on a PRECISE transmit to one of our aggregators, spawn a worker thread
@@ -1116,8 +1135,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
         return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
     ws_factory = ws_factory or _default_ws
 
-    feeds = resolve_feeds(rpc, markets)
-    meta = resolve_meta(rpc, markets)
+    feeds = _init_resolve_retry(resolve_feeds, rpc, markets, what="feeds", log=log)
+    meta = _init_resolve_retry(resolve_meta, rpc, markets, what="meta", log=log)
     agg_set = set(feeds)
     shadow_map = _build_shadow_map(feeds, meta, markets)         # SHADOW слоя 1 (план п.4, log-only)
     log.info("DIAG shadow-feed map %s", {a[:10]: s for a, (s, _sc, _o) in shadow_map.items()})

@@ -362,6 +362,7 @@ async def _flashblock_heads(ws):
 
 HOT_HF_CEILING = 1.02          # block mode: per block, assess only candidates with last HF < this
 HOT_FULL_REFRESH_SEC = 30.0    # block mode: re-assess the FULL candidate set at least this often
+HOT_LOOP_START_STAGGER_SEC = 8.0  # разнести старт hot_loop от cold-start залпа block-loop (keyed-RPC rate-limit)
 
 
 def _hot_subset(groups, hf_cache):
@@ -417,7 +418,14 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
 
         def _run_hot():
             import asyncio as _a
-            _a.run(hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, stop, markets))
+            time.sleep(HOT_LOOP_START_STAGGER_SEC)     # размазать залп: дать cold-start mega-fetch/refresh block-loop схлынуть
+            while not stop.is_set():                   # self-heal: init-429/крах НЕ должен молча убивать fast-путь (инцидент 07-21)
+                try:
+                    _a.run(hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, stop, markets))
+                    break                              # чистый выход (stop выставлен)
+                except Exception:
+                    log.exception("hot_loop упал — self-heal перезапуск через 5с")
+                    time.sleep(5)
         threading.Thread(target=_run_hot, daemon=True).start()
         log.warning("HOT PATH ENABLED — preconf trigger live (tip=%.1f gwei, daily-loss<=$%.0f, repaid>=$%.0f)",
                     cfg.tip_gwei, cfg.max_daily_loss_usd, getattr(cfg, "hot_min_repaid_usd", 2000.0))
