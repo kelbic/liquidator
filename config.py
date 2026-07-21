@@ -31,6 +31,7 @@ class Config:
     poll_interval_sec: float = 2.0
     loop_mode: str = "poll"
     block_source: str = "flashblocks"   # block trigger: flashblocks (~2s earlier) | newheads (fallback)
+    block_wss_url: str = ""             # явный WSS для newheads-fallback (пусто = https→wss от rpc_url); BLOCK_WSS_URL
     candidate_refresh_sec: float = 60.0
     hot_path: bool = False                # preconf-triggered hot path ON/OFF (OFF until ARM)
     price_from_feed: bool = False         # Layer1: feed-decoded price triggers _process_transmit (OFF until measured)
@@ -90,6 +91,7 @@ class Config:
             poll_interval_sec=f("POLL_INTERVAL_SEC", 2.0),
             loop_mode=s("LOOP_MODE", "poll"),
             block_source=s("BLOCK_SOURCE", "flashblocks"),
+            block_wss_url=s("BLOCK_WSS_URL", ""),
             candidate_refresh_sec=f("CANDIDATE_REFRESH_SEC", 60.0),
             hot_path=(s("HOT_PATH", "").lower() in ("1", "true", "yes", "on")),
             price_from_feed=(s("PRICE_FROM_FEED", "").lower() in ("1", "true", "yes", "on")),

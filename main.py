@@ -393,7 +393,11 @@ def _source_params(cfg, active):
         return (_FLASHBLOCK_URL,
                 {"open_timeout": 20, "ping_interval": 20, "max_size": None},
                 _flashblock_heads)
-    wss = cfg.rpc_url.replace("https://", "wss://").replace("http://", "ws://")
+    # newheads-fallback WSS: явный BLOCK_WSS_URL (иначе наивная https→wss от rpc_url). НУЖЕН, когда у
+    # keyed-RPC WSS на ДРУГОМ пути, чем HTTPS (dRPC: HTTPS .../base/<key>, а WSS .../ogws?...&dkey=<key>
+    # → наивная замена даёт битый URL → newheads RuntimeError). Инцидент 07-21: переезд на dRPC сломал
+    # fallback; publicnode WSS (кап-фри) или dRPC ogws — рабочие. Пусто = старое поведение (Alchemy-совместимо).
+    wss = cfg.block_wss_url or cfg.rpc_url.replace("https://", "wss://").replace("http://", "ws://")
     return (wss, {"open_timeout": 20, "ping_interval": 20}, _new_heads)
 
 
