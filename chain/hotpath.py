@@ -1101,19 +1101,20 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
 
 # ---- async flashblock subscriber (detect + spawn) ----
 
-def _init_resolve_retry(fn, *args, what="", tries=6, base=0.5, log=None):
+def _init_resolve_retry(fn, *args, what="", tries=14, base=0.5, cap=10.0, log=None):
     """Init-резолв hot_loop на keyed-RPC с rate-лимитом (напр. dRPC Free = 100 req/s): при старте бот
     выстреливает залп разом (candidate refresh + mega-fetch из block-loop + resolve) — на миг >лимита →
-    429. Ретраим с экспоненциальным backoff (0.5→16с): залп схлынет и повтор пройдёт, поток hot_loop
-    НЕ умирает. Это одновременно «ретрай» и «размазать залп» — backoff разносит нагрузку во времени.
-    На Alchemy (500 req/s) 429 не приходил, потому хрупкость не вылезала (инцидент 07-21)."""
+    429. Ретраим с backoff (капнут cap): залп схлынет и повтор пройдёт, поток hot_loop НЕ умирает.
+    tries×cap подобраны пережить mega-fetch залп (~8с, но повторяется каждые ~30с) — 14 попыток,
+    backoff 0.5→10с ≈ до ~110с суммарно. При живом dRPC резолв проходит с 1-й попытки (нулевая задержка).
+    На Alchemy (500 req/s) 429 не приходил, потому хрупкость не вылезала (инцидент 07-21/22)."""
     for i in range(tries):
         try:
             return fn(*args)
         except Exception as e:
             if i == tries - 1:
                 raise
-            wait = base * (2 ** i)
+            wait = min(base * (2 ** i), cap)
             if log is not None:
                 log.warning("hot_loop init %s: %s — retry %d/%d через %.1fс (rate-limit burst)",
                             what, type(e).__name__, i + 1, tries, wait)
