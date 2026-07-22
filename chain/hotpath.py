@@ -1182,7 +1182,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
                                  stats["proceed"], stats["skip"], stats["none"], stats["poll_none"], stats["poll_fb"],
                                  stats["f_nocand"], stats["f_noprice"], stats["f_norp"], stats["f_noflip"], stats["f_floor"], stats["f_prep"])
-                        fb_windows = fb_windows + 1 if stats["poll_fb"] > 0 else 0
+                        # порог: >3 фолбэка/поллинг ≈ >8% чтений цены потеряли фору = РЕАЛЬНАЯ cap-деградация
+                        # (исходный preconf-кап был 1457/окно=67%); микро-остаток спайков фида (≤2%, ~48/окно)
+                        # НЕ будит — иначе ложно «мелькает» в норме (07-22, poll_fb калибр. на катастрофу, не на 1-2 оракула)
+                        fb_windows = fb_windows + 1 if stats["poll_fb"] > stats["poll"] * 3 else 0
                         if fb_windows >= 3 and time.monotonic() - last_fb_alert > 1800:
                             last_fb_alert = time.monotonic()
                             try:
