@@ -717,7 +717,10 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
                 _gas_limit = max(_est, cfg.gas_limit_est)
             else:
                 _gas_limit = cfg.gas_limit_est
-        _prep = {"ok": True, "calldata": cd1, "gas": _gas_limit, "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd}
+        _prep = {"ok": True, "calldata": cd1, "gas": _gas_limit, "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd,
+                 # сырые компоненты для batch-энкодера + debt для per-item USD в receipt-цикле (prep["calldata"] = одиночный вызов)
+                 "mp": mp, "borrower": borrower, "repaid_shares": repaid_shares, "swap_target": swap["router"],
+                 "swap_calldata": swap["calldata"], "min_profit": min_profit_final, "debt_usd": debt_usd, "debt_assets": debt_assets}
         _fb = _fresh_basefee()
         if _fb is not None:                                   # SEND-2: fee из fb-хедера (0 Alchemy-RTT в send)
             _tip = int(cfg.tip_gwei * 1e9)
@@ -779,7 +782,10 @@ def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asse
         _tip = int(cfg.tip_gwei * 1e9)
         return {"ok": True, "calldata": cd, "gas": max(_GAS_CACHE.get(market_id, 0), cfg.gas_limit_est),
                 "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd,
-                "max_fee": _fb * 2 + _tip, "tip": _tip, "fast": True}
+                "max_fee": _fb * 2 + _tip, "tip": _tip, "fast": True,
+                # сырые компоненты для batch-энкодера + debt для per-item USD в receipt-цикле
+                "mp": mp, "borrower": borrower, "repaid_shares": repaid_shares, "swap_target": swap["router"],
+                "swap_calldata": swap["calldata"], "min_profit": min_profit, "debt_usd": debt_usd, "debt_assets": debt_assets}
     except Exception as e:
         return {"ok": False, "reason": f"fast error: {type(e).__name__}: {str(e)[:80]}"}
 
@@ -1086,6 +1092,10 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     _fl_trip = pop_fast_lane_trip()                # II.6: breaker сработал в receipt-цикле dispatch -> TG-пейдж
     if _fl_trip:
         alerter.send_async(_fl_trip, key="fastlane-breaker")
+    from chain.execute import pop_batch_empty_trip
+    _be_trip = pop_batch_empty_trip()              # мультибатч: серия пустых батчей (nOk=0) -> TG-пейдж
+    if _be_trip:
+        alerter.send_async(_be_trip, key="batch-empty")
     log.info("DIAG timing read=%.0fms flips=%.0fms sim=%.0fms send=%.0fms e2e=%.0fms n_ready=%d",
              _t_read_total, _t_flips_total, _t_prep_total, _t_send, (time.time() - t) * 1000.0, len(ready))
     for r in results:

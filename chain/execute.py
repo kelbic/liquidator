@@ -153,6 +153,38 @@ def _fl_record(is_fast: bool, status, threshold: int, log=None):
                           _FL_CONSEC_REVERTS)
 
 
+# Мультибатч-предохранитель: батч с nOk=0 (ВСЕ items провалились) — tx УСПЕШНА (status==1), потому
+# невидим realized-loss-гейту как реверт. Отдельный счётчик серии пустых батчей -> one-shot TG-пейдж
+# (как fast-lane trip). Состояние под _INFLIGHT_LOCK.
+_BATCH_EMPTY_STREAK = 0
+_BATCH_TRIP_MSG = None
+_BATCH_EMPTY_THRESHOLD = 3
+
+
+def pop_batch_empty_trip() -> str | None:
+    """One-shot: сообщение о серии пустых батчей для TG. Зовёт caller с alerter'ом."""
+    global _BATCH_TRIP_MSG
+    with _INFLIGHT_LOCK:
+        m = _BATCH_TRIP_MSG
+        _BATCH_TRIP_MSG = None
+        return m
+
+
+def _batch_record(n_win: int, n_items: int, tx_hash, log=None):
+    """Серия пустых батчей: n_win>0 -> сброс; n_win==0 -> инкремент; при пороге -> one-shot TG."""
+    global _BATCH_EMPTY_STREAK, _BATCH_TRIP_MSG
+    with _INFLIGHT_LOCK:
+        if n_win > 0:
+            _BATCH_EMPTY_STREAK = 0
+            return
+        _BATCH_EMPTY_STREAK += 1
+        if log:
+            log.warning("batch ПУСТОЙ (nOk=0, tx успешна) n=%d streak=%d tx=%s", n_items, _BATCH_EMPTY_STREAK, tx_hash)
+        if _BATCH_EMPTY_STREAK >= _BATCH_EMPTY_THRESHOLD and _BATCH_TRIP_MSG is None:
+            _BATCH_TRIP_MSG = ("\U0001F6A8 %d подряд ПУСТЫХ батчей (nOk=0, tx успешны, 0 взято) — "
+                               "проверить маршрут/minProfit/газ: батч льёт газ без добычи." % _BATCH_EMPTY_STREAK)
+
+
 # ⭐ CANARY (замер inclusion-гонки, Вариант B: in-process, ОБЩИЙ кошелёк/nonce). Состояние под
 # _INFLIGHT_LOCK. Газ канарейки — в СВОЙ бакет (_CANARY_GAS_USD), НЕ в kill-switch realized_today.
 _CANARY_PROBES = 0
@@ -422,6 +454,72 @@ def encode_liquidate(mp: dict, borrower: str, repaid_shares: int, swap_target: s
          borrower, int(repaid_shares), swap_target, cd, int(min_profit)],
     )
     return "0x" + (selector + args).hex()
+
+
+# --- batch: N targets in ONE tx (cascade capture). Контракт: batchLiquidate(LiquidationItem[]) ---
+_BATCH_LIQUIDATE_SIG = ("batchLiquidate(((address,address,address,address,uint256),"
+                        "address,uint256,address,bytes,uint256)[])")
+_ITEM_TYPE = "((address,address,address,address,uint256),address,uint256,address,bytes,uint256)"
+
+
+def _prep_to_item_tuple(prep: dict):
+    """Из prep (сырые компоненты, положенные prepare_hot/fast) -> ABI-tuple LiquidationItem."""
+    mp = prep["mp"]
+    cd = prep["swap_calldata"]
+    cd = bytes.fromhex(cd[2:] if cd.startswith("0x") else cd) if isinstance(cd, str) else bytes(cd)
+    return ((mp["loanToken"], mp["collateralToken"], mp["oracle"], mp["irm"], int(mp["lltv"])),
+            prep["borrower"], int(prep["repaid_shares"]), prep["swap_target"], cd, int(prep["min_profit"]))
+
+
+def encode_batch_liquidate(preps: list) -> str:
+    """ABI-encode Liquidator.batchLiquidate([LiquidationItem...]) из списка prep-словарей, у каждого
+    из которых есть сырые компоненты (mp/borrower/repaid_shares/swap_target/swap_calldata/min_profit)."""
+    from eth_abi import encode
+    from eth_utils import keccak
+    selector = keccak(text=_BATCH_LIQUIDATE_SIG)[:4]
+    args = encode([_ITEM_TYPE + "[]"], [[_prep_to_item_tuple(p) for p in preps]])
+    return "0x" + (selector + args).hex()
+
+
+# события НАШЕГО контракта для per-item разбора receipt батча (лениво, нужен eth_utils)
+_OUR_LIQUIDATED_SIG = None    # Liquidated(address indexed borrower, address indexed loanToken, uint256 profit)
+_BATCH_ITEM_FAILED_SIG = None # BatchItemFailed(uint256 indexed i, address indexed borrower, bytes4 reason)
+
+
+def parse_batch_receipt(receipt, liquidator_addr: str):
+    """Per-item исход батча ТОЛЬКО из событий НАШЕГО контракта (фантомная прибыль запрещена: status==1
+    НЕ значит «все сели»). Возвращает: {(borrower_lc, loan_lc): profit_wei} по Liquidated + set
+    провалившихся borrower_lc по BatchItemFailed. Матч по (borrower,loanToken) — устойчив к двум item
+    одного заёмщика в разных рынках. Никогда не бросает."""
+    global _OUR_LIQUIDATED_SIG, _BATCH_ITEM_FAILED_SIG
+    wins: dict = {}     # (borrower_lc, loan_lc) -> profit_wei
+    fails: set = set()  # borrower_lc, у кого был BatchItemFailed
+    try:
+        from eth_utils import keccak
+        if _OUR_LIQUIDATED_SIG is None:
+            _OUR_LIQUIDATED_SIG = "0x" + keccak(text="Liquidated(address,address,uint256)").hex()
+            _BATCH_ITEM_FAILED_SIG = "0x" + keccak(text="BatchItemFailed(uint256,address,bytes4)").hex()
+        liq_lc = (liquidator_addr or "").lower()
+        for lg in (receipt.get("logs") or []):
+            if (lg.get("address") or "").lower() != liq_lc:
+                continue
+            topics = [t.hex() if hasattr(t, "hex") else str(t) for t in (lg.get("topics") or [])]
+            if not topics:
+                continue
+            t0 = topics[0] if topics[0].startswith("0x") else "0x" + topics[0]
+            if t0.lower() == _OUR_LIQUIDATED_SIG and len(topics) >= 3:
+                borrower_lc = "0x" + topics[1][-40:]
+                loan_lc = "0x" + topics[2][-40:]
+                data = lg.get("data")
+                data = bytes.fromhex(data[2:]) if isinstance(data, str) else bytes(data or b"")
+                profit = int.from_bytes(data[:32], "big") if len(data) >= 32 else 0
+                wins[(borrower_lc.lower(), loan_lc.lower())] = profit
+            elif t0.lower() == _BATCH_ITEM_FAILED_SIG and len(topics) >= 3:
+                borrower_lc = "0x" + topics[2][-40:]
+                fails.add(borrower_lc.lower())
+    except Exception:
+        pass
+    return wins, fails
 
 
 def simulate_tx(rpc, liquidator_addr: str, from_addr: str, calldata: str,
@@ -711,96 +809,156 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
         if base_nonce is None:                               # кэше/после инвалидации (см. инварианты у _LOCAL_NONCE)
             base_nonce = int(w3.eth.get_transaction_count(bot, "pending"))
         tip = int(cfg.tip_gwei * 1e9)
-        batch = _deduped[:max_inflight]
+        # ЮНИТЫ: батч ON и >1 жертвы -> группы по batch_max_items (сорт по net desc, ПОСЛЕ дедупа —
+        # иначе fee-источник может быть выкинут); хвост = следующими tx в пределах max_inflight. Иначе
+        # каждая жертва = свой юнит (путь бит-в-бит старый). Юнит из 1 item шлётся ОДИНОЧНЫМ вызовом.
+        if getattr(cfg, "batch_liquidate", False) and len(_deduped) > 1:
+            _sorted = sorted(_deduped, key=lambda r: r[2].get("net_usd", 0.0), reverse=True)
+            _bmax = max(1, int(getattr(cfg, "batch_max_items", 5)))
+            units = [_sorted[i:i + _bmax] for i in range(0, len(_sorted), _bmax)][:max_inflight]
+        else:
+            units = [[row] for row in _deduped[:max_inflight]]
 
-        sent = []
+        sent = []                                             # (unit, hash)
         _send_failed = False
-        for i, (mid, borrower, prep) in enumerate(batch):
+        for u, unit in enumerate(units):
             try:
-                _txd = {"to": cfg.liquidator_address, "data": prep["calldata"], "nonce": base_nonce + i}
-                if prep.get("gas"):                          # explicit gas from prep (hot path: estimated on preconf)
-                    _txd["gas"] = prep["gas"]                # -> send_tx skips its stale-Alchemy estimate_gas
-                if prep.get("max_fee"):                      # SEND-2: fees from fb-header via prep (hot path)
-                    _txd["maxFeePerGas"] = prep["max_fee"]   # -> send_tx skips BOTH Alchemy fee-RTTs
-                    _txd["maxPriorityFeePerGas"] = prep["tip"]
-                if send_fn is None:                          # SEND-3 только через штатный send_tx (инжектированный
-                    res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip,   # send_fn тестов не знает kwarg)
-                               broadcast_raw_urls=_bcast)
+                if len(unit) == 1:
+                    _prep = unit[0][2]
+                    _data = _prep["calldata"]; _gas = _prep.get("gas")
+                    _mf = _prep.get("max_fee"); _tp = _prep.get("tip")
+                else:                                         # батч-tx
+                    _preps = [p for _, _, p in unit]
+                    _data = encode_batch_liquidate(_preps)
+                    # 63/64-мина C3c: голодный хвост молча морится -> запас газа обязателен (×1.25)
+                    _gas = int((sum(p.get("gas", cfg.gas_limit_est) for p in _preps) + 30_000 * len(_preps)) * 1.25)
+                    _fee_src = next((p for p in _preps if p.get("max_fee")), None)   # у блок-лупа max_fee нет
+                    _mf = _fee_src.get("max_fee") if _fee_src else None
+                    _tp = _fee_src.get("tip") if _fee_src else None
+                _txd = {"to": cfg.liquidator_address, "data": _data, "nonce": base_nonce + u}
+                if _gas:
+                    _txd["gas"] = _gas
+                if _mf:                                       # SEND-2: fee из fb-хедера; иначе send_tx доберёт сам
+                    _txd["maxFeePerGas"] = _mf; _txd["maxPriorityFeePerGas"] = _tp
+                if send_fn is None:                           # SEND-3 только через штатный send_tx
+                    res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip, broadcast_raw_urls=_bcast)
                 else:
                     res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip)
-                sent.append((mid, borrower, prep, res["hash"]))
-                _RECENT_SENDS[(mid, borrower)] = time.monotonic()   # дедуп: этот заёмщик отправлен
-                _inflight_add(1)
+                sent.append((unit, res["hash"]))
+                for _mid, _b, _p in unit:                     # дедуп: ВСЕ жертвы юнита помечены отправленными
+                    _RECENT_SENDS[(_mid, _b)] = time.monotonic()
+                _inflight_add(1)                              # ОДИН inflight на tx (не на item)
                 if log:
-                    log.info("dispatch: sent %s/%s nonce=%d tx=%s net~$%.2f",
-                             mid[:10], borrower[:10], base_nonce + i, res["hash"], prep["net_usd"])
-                if res.get("uncertain"):     # SEND-3 race: Alchemy-send бросил, raw уже в секвенсере ->
-                    if log:                  # tx МОЖЕТ сесть в base_nonce+i. Записан выше как sent (дедуп
-                        log.warning("dispatch: SEND-3 uncertain %s/%s nonce=%d — Alchemy бросил, raw в "
-                                    "секвенсере; учтён как sent (дедуп+receipt), стоп батча + инвалидация nonce",
-                                    mid[:10], borrower[:10], base_nonce + i)
-                    _send_failed = True      # + receipt-ждётся -> исход/газ учтётся, дубль исключён).
-                    _LOCAL_NONCE.pop(bot, None)   # неизвестно, сел ли base+i -> следующий dispatch пере-читает RPC
-                    break                    # не шлём хвост в возможную дыру nonce (как при send-ошибке)
+                    log.info("dispatch: sent nonce=%d n=%d %s tx=%s",
+                             base_nonce + u, len(unit), "batch" if len(unit) > 1 else "single", res["hash"])
+                if res.get("uncertain"):     # SEND-3 race: raw в секвенсере -> tx МОЖЕТ сесть; стоп хвоста
+                    if log:
+                        log.warning("dispatch: SEND-3 uncertain nonce=%d — Alchemy бросил, raw в секвенсере; "
+                                    "учтён как sent (дедуп+receipt), стоп + инвалидация nonce", base_nonce + u)
+                    _send_failed = True
+                    _LOCAL_NONCE.pop(bot, None)
+                    break
             except Exception as e:
                 if log:
-                    log.warning("dispatch: send FAILED at nonce %d (%s/%s): %s — stopping batch to avoid gap",
-                                base_nonce + i, mid[:10], borrower[:10], type(e).__name__)
-                results.append({"market_id": mid, "borrower": borrower, "sent": False,
-                                "reason": f"send error: {type(e).__name__}: {str(e)[:80]}",
-                                "net_usd": prep["net_usd"]})
+                    log.warning("dispatch: send FAILED at nonce %d (n=%d): %s — stopping to avoid gap",
+                                base_nonce + u, len(unit), type(e).__name__)
+                for _mid, _b, _p in unit:
+                    results.append({"market_id": _mid, "borrower": _b, "sent": False,
+                                    "reason": f"send error: {type(e).__name__}: {str(e)[:80]}",
+                                    "net_usd": _p["net_usd"]})
                 _send_failed = True
-                _LOCAL_NONCE.pop(bot, None)  # не знаем, съелся ли nonce -> следующий dispatch пере-читает RPC
-                break   # nonce gap -> later txs would be stuck; next block re-derives the base nonce
+                _LOCAL_NONCE.pop(bot, None)
+                break
         if not _send_failed:
             _LOCAL_NONCE[bot] = base_nonce + len(sent)
     if sent:                                                 # фоновая сверка nonce с RPC (вне лока)
         threading.Thread(target=_reconcile_nonce, args=(w3, bot), daemon=True).start()
 
     if not wait_receipts:
-        _inflight_add(-len(sent))    # receipts здесь не отслеживаются -> не копим фантомный inflight
-        for mid, borrower, prep, h in sent:
-            results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
-                            "status": None, "gas_used": None, "net_usd": prep["net_usd"]})
+        _inflight_add(-len(sent))    # -1 на tx (юнит); receipts не отслеживаются -> не копим фантомный inflight
+        for unit, h in sent:
+            for mid, borrower, prep in unit:
+                results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
+                                "status": None, "gas_used": None, "net_usd": prep["net_usd"]})
         return results
 
-    for mid, borrower, prep, h in sent:
+    for unit, h in sent:
         try:
             rcpt = w3.eth.wait_for_transaction_receipt(h, timeout=timeout)
             status = rcpt.get("status")
-            net_usd, gas_usd = realized_econ(prep["profit_usd"], int(rcpt.get("gasUsed") or 0),
-                                             int(rcpt.get("effectiveGasPrice") or 0), status, cfg.eth_price_usd)
-            row = {"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
-                   "status": status, "gas_used": rcpt.get("gasUsed"),
-                   "net_usd": net_usd, "gas_usd": gas_usd,
-                   "tx_index": rcpt.get("transactionIndex")}   # P2-12: submit-side позиция в блоке
-            if status == 1 and log:
-                log.info("submit-xray: WIN idx=%s block=%s tx=%s",
-                         rcpt.get("transactionIndex"), rcpt.get("blockNumber"), h)
-            if status != 1:                                  # diagnose the revert (lost race vs structural)
-                reason = _revert_reason(rpc, h, rcpt.get("blockNumber"))
-                row["revert_reason"] = reason
-                if log:
-                    log.warning("liquidate revert %s/%s reason=%s tx=%s",
-                                mid[:10], borrower[:10], reason, h)
-                _submit_xray(rpc, borrower, rcpt.get("blockNumber"),
-                             rcpt.get("transactionIndex"), log)   # P2-12: кто взял и с какой дельтой
-            _fl_record(prep.get("fast"), status,               # II.6: учёт серии ревертов fast-lane
-                       getattr(cfg, "fast_lane_max_consec_reverts", 3), log)
-            results.append(row)
+            _blk = rcpt.get("blockNumber"); _txi = rcpt.get("transactionIndex")
+            if len(unit) == 1:                                # --- одиночный путь: бит-в-бит старый ---
+                mid, borrower, prep = unit[0]
+                net_usd, gas_usd = realized_econ(prep["profit_usd"], int(rcpt.get("gasUsed") or 0),
+                                                 int(rcpt.get("effectiveGasPrice") or 0), status, cfg.eth_price_usd)
+                row = {"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
+                       "status": status, "gas_used": rcpt.get("gasUsed"),
+                       "net_usd": net_usd, "gas_usd": gas_usd, "tx_index": _txi}
+                if status == 1 and log:
+                    log.info("submit-xray: WIN idx=%s block=%s tx=%s", _txi, _blk, h)
+                if status != 1:
+                    reason = _revert_reason(rpc, h, _blk)
+                    row["revert_reason"] = reason
+                    if log:
+                        log.warning("liquidate revert %s/%s reason=%s tx=%s", mid[:10], borrower[:10], reason, h)
+                    _submit_xray(rpc, borrower, _blk, _txi, log)
+                _fl_record(prep.get("fast"), status, getattr(cfg, "fast_lane_max_consec_reverts", 3), log)
+                results.append(row)
+            else:                                             # --- батч: per-item ТОЛЬКО из событий ---
+                gas_total = int(rcpt.get("gasUsed") or 0) * int(rcpt.get("effectiveGasPrice") or 0) * cfg.eth_price_usd / 1e18
+                if status != 1:                               # top-level revert (OOG/onlyOwner) -> ВСЕ провалились
+                    reason = _revert_reason(rpc, h, _blk)
+                    if log:
+                        log.warning("batch revert (top-level) n=%d reason=%s tx=%s", len(unit), reason, h)
+                    for j, (mid, borrower, prep) in enumerate(unit):
+                        _submit_xray(rpc, borrower, _blk, _txi, log)
+                        results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h, "status": 0,
+                                        "gas_used": rcpt.get("gasUsed") if j == 0 else 0,     # газ ОДНОЙ строкой (сумма/день точна)
+                                        "net_usd": (-gas_total if j == 0 else 0.0),
+                                        "gas_usd": (gas_total if j == 0 else 0.0),
+                                        "revert_reason": reason, "tx_index": _txi})
+                    _fl_record(all(p.get("fast") for _, _, p in unit), 0,
+                               getattr(cfg, "fast_lane_max_consec_reverts", 3), log)
+                    _batch_record(0, len(unit), h, log)
+                else:                                         # status==1: разбор по Liquidated/BatchItemFailed
+                    wins, _fails = parse_batch_receipt(rcpt, cfg.liquidator_address)
+                    n_win = 0
+                    for j, (mid, borrower, prep) in enumerate(unit):
+                        _key = (str(borrower).lower(), str(prep["mp"]["loanToken"]).lower())
+                        _g = gas_total if j == 0 else 0.0     # газ батча книжим на ПЕРВУЮ строку
+                        _gu = rcpt.get("gasUsed") if j == 0 else 0
+                        if _key in wins:                      # Liquidated(borrower,loan,profit) = взято
+                            n_win += 1
+                            profit_usd_i = (wins[_key] * prep["debt_usd"] / prep["debt_assets"]
+                                            if prep.get("debt_assets") else 0.0)   # арифметика _net_gate
+                            results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
+                                            "status": 1, "gas_used": _gu, "net_usd": profit_usd_i - _g,
+                                            "gas_usd": _g, "tx_index": _txi})
+                        else:                                 # BatchItemFailed или просто нет Liquidated
+                            _submit_xray(rpc, borrower, _blk, _txi, log)
+                            results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
+                                            "status": 0, "gas_used": _gu, "net_usd": -_g, "gas_usd": _g,
+                                            "tx_index": _txi, "revert_reason": "batch item failed (no Liquidated)"})
+                    # весь батч провалился (nOk=0) = как реверт для fast-lane breaker + счётчик пустых батчей
+                    _fl_record(all(p.get("fast") for _, _, p in unit), 1 if n_win > 0 else 0,
+                               getattr(cfg, "fast_lane_max_consec_reverts", 3), log)
+                    _batch_record(n_win, len(unit), h, log)
+                    if log:
+                        log.info("batch receipt tx=%s n=%d win=%d block=%s idx=%s", h, len(unit), n_win, _blk, _txi)
         except Exception as e:
             # outcome unknown -> conservatively book estimated cost as a LOSS, never a phantom profit
-            # HIGH-фикс: tx могла быть ДРОПНУТА из мемпула (не замайнена за timeout). Локальный nonce
-            # стоит на base+len(sent), но чейн всё ещё ждёт дропнутый nonce -> следующий dispatch слал
-            # бы В ДЫРУ (queued-пул навсегда) -> бот молча перестаёт майнить. _reconcile_nonce не спасает
-            # (max-only отказывается откатывать вниз). Инвалидируем -> следующий dispatch пере-читает RPC:
-            # дропнута -> pending=N -> пере-отправка в N закрывает дыру; просто медленная -> pending=N+1 -> верно.
+            # HIGH-фикс: tx могла быть ДРОПНУТА из мемпула (не замайнена за timeout) -> инвалидация nonce
+            # (следующий dispatch пере-читает RPC и закрывает возможную дыру). Timeout-ветка: суммарный
+            # est-cost ОДИН раз (на первую строку юнита), остальные строки нулевые -> сумма/день точна.
             with _SEND_LOCK:
                 _LOCAL_NONCE.pop(bot, None)
-            results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
-                            "status": None, "gas_used": None,
-                            "net_usd": -prep["cost_usd"], "gas_usd": prep["cost_usd"],
-                            "reason": f"receipt timeout: {type(e).__name__}"})
+            for j, (mid, borrower, prep) in enumerate(unit):
+                _first = (j == 0)
+                results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
+                                "status": None, "gas_used": None,
+                                "net_usd": (-prep["cost_usd"] if _first else 0.0),
+                                "gas_usd": (prep["cost_usd"] if _first else 0.0),
+                                "reason": f"receipt timeout: {type(e).__name__}"})
         finally:
-            _inflight_add(-1)        # receipt получен либо timeout -> tx больше не «в полёте»
+            _inflight_add(-1)        # -1 на tx (юнит): receipt получен либо timeout
     return results

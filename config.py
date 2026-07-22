@@ -40,6 +40,8 @@ class Config:
     fast_lane: bool = False               # P1-9: fast-lane без sim (OFF; контракт гарантирует исход)
     fast_lane_min_repaid_usd: float = 1000.0  # fast-lane только на призах >= этого repaid USD
     fast_lane_max_consec_reverts: int = 3     # II.6 circuit breaker: N подряд ревертов fast-lane -> off ТОЛЬКО fast-lane (фолбэк sim)
+    batch_liquidate: bool = False             # мультибатч: N жертв в ОДНОЙ tx (каскад). OFF -> путь бит-в-бит старый
+    batch_max_items: int = 5                  # макс items в одной batch-tx (хвост -> следующими tx в пределах max_inflight)
     canary_probe: bool = False                # ⭐ canary: замер inclusion-гонки минимальной tx (OFF; ARM на кампанию)
     canary_max_probes: int = 100              # стоп кампании после N проб
     canary_min_interval_sec: float = 120.0    # не чаще 1 пробы / N сек (разброс по условиям)
@@ -100,6 +102,8 @@ class Config:
             fast_lane=(s("FAST_LANE", "").lower() in ("1", "true", "yes", "on")),
             fast_lane_min_repaid_usd=f("FAST_LANE_MIN_REPAID_USD", 1000.0),
             fast_lane_max_consec_reverts=int(f("FAST_LANE_MAX_CONSEC_REVERTS", 3)),
+            batch_liquidate=(s("BATCH_LIQUIDATE", "").lower() in ("1", "true", "yes", "on")),
+            batch_max_items=int(f("BATCH_MAX_ITEMS", 5)),
             canary_probe=(s("CANARY_PROBE", "").lower() in ("1", "true", "yes", "on")),
             canary_max_probes=int(f("CANARY_MAX_PROBES", 100)),
             canary_min_interval_sec=f("CANARY_MIN_INTERVAL_SEC", 120.0),
