@@ -195,6 +195,39 @@ dRPC 429 ~0.3/с (mega-fetch бурсты, терпимы). Всё стабил�
 
 ---
 
+## 🚀 МУЛЬТИБАТЧ В БОЮ — 07-22 (гейт «первая победа» снят владельцем, соак снят: месяц без выстрелов = наблюдать нечего)
+
+Владелец: «не ждать гейт, включать сейчас»; «соак не поможет» (соак валидирует одиночный путь только
+живым выстрелом, которого ~месяц нет). Валидация — не ожидание, а активные проверки, все пройдены:
+
+- **Контракт** `5eb4b01`: `batchLiquidate(LiquidationItem[])` `onlyOwner`, per-item `try this.liquidate`
+  БЕЗ `nonReentrant` (guard убил бы все items через self-call) → `BatchItemFailed(i,borrower,reason4)`.
+  Тесты `test/Batch.t.sol` **11/11** (auth, single-регресс, self-call, реентранси-роутер, Error(string),
+  OOG 63/64, тесный-газ C3c морит хвост, 2-item учёт, allowance-leak, кастомный селектор) — И в песочнице,
+  И на foundry Charlotte. Форк-тест на живом Base 2/2.
+- **Бот-обвязка** `04aebfa` (фаза 2, за `BATCH_LIQUIDATE`, OFF=бит-в-бит старый путь): `encode_batch_liquidate`
+  (селектор `ebd25bf8`), `parse_batch_receipt` (per-item ТОЛЬКО из событий контракта — фантомная прибыль
+  запрещена), dispatch→ЮНИТЫ (сорт net desc, группы по `BATCH_MAX_ITEMS=5`, юнит из 1 = одиночный вызов),
+  газ `(Σ+30k·n)·1.25` (C3c-мина), один nonce/inflight на batch-tx, предохранитель пустого батча
+  (`pop_batch_empty_trip`). Юнит-тесты `test_batch_dispatch.py` **4/4**.
+- **Деплой** (`forge create`, ключ владельца из env Charlotte, публичный Base RPC — dRPC отбивал 429):
+  новый **`0x839B66867286eAfbc93Ced8e8519B97686d1B120`** (tx `0x0085c7e1…`). Верификация on-chain:
+  `owner`=наш кошелёк, `MORPHO`=`0xBBBB…FFCb`, codesize 4691. Старый `0x54730EE1…` остаётся нашим = ОТКАТ.
+- **Канарейка батча** (замена соака): `batchLiquidate` с 1 item по заёмщику БЕЗ позиции (`0x…dEaD`) на
+  реальном рынке cbBTC/USDC → Morpho ревертит «healthy» до колбэка → `BatchItemFailed`, tx **status=1**,
+  gasUsed 116684, `parse_batch_receipt` прочитал fail (wins пусто). Валидирует ВЕСЬ on-chain batch-путь
+  живьём (encode бота → контракт принял → событие → парсер бота). tx `0x65e433d5…`.
+- **Свитч 07-22 18:31 UTC**: `.env` Charlotte+Вена → новый `LIQUIDATOR_ADDRESS` (старый в комментарий =
+  откат) + `BATCH_LIQUIDATE=1`; `.bak-before-batch-0722` на обеих. Charlotte рестарт → active, live-env
+  подтверждён через `/proc/PID/environ`. Вена: код 04aebfa, `.env` синхронизирован, бот **inactive+disabled**
+  (shared-wallet защита цела — НЕ запускать). Рестарт НЕ регресс: 429-паттерн идентичен до/после
+  (~230/10мин — pre-existing dRPC free-tier rate, ~6% block-assess skip; стартовый mega-fetch всплеск улёгся).
+- **Откат** (если понадобится): `.env` → раскомментировать старый адрес, убрать/0 `BATCH_LIQUIDATE`,
+  `systemctl restart`. Кошелёк-нюанс: batch upfront-check `balance≥gas_total×maxFee` (~0.023 ETH при n=5);
+  сейчас 0.037 ETH хватает на n≤5, для запаса при конкурентных батчах лучше ≥0.05.
+
+---
+
 ## ⭐ ТЕКУЩАЯ ПРАВДА — самодостаточно, читать первой
 
 **Бот ВООРУЖЁН И ПОЛНОСТЬЮ РАЗВЁРНУТ** (конец 07-09). Флаги живого процесса (проверять ТОЛЬКО через
