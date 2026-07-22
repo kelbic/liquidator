@@ -10,6 +10,16 @@ struct MarketParams {
     uint256 lltv;
 }
 
+/// @notice One target of a batchLiquidate call (same arguments as liquidate(), packed).
+struct LiquidationItem {
+    MarketParams mp;
+    address borrower;
+    uint256 repaidShares;
+    address swapTarget;
+    bytes swapCallData;
+    uint256 minProfit;
+}
+
 interface IMorpho {
     function liquidate(
         MarketParams memory marketParams,
@@ -58,9 +68,18 @@ contract Liquidator {
 
     event Liquidated(address indexed borrower, address indexed loanToken, uint256 profit);
     event OwnerChanged(address indexed from, address indexed to);
+    /// @notice A batch item that reverted (reason = first 4 bytes of the revert data).
+    event BatchItemFailed(uint256 indexed i, address indexed borrower, bytes4 reason);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    /// @dev batchLiquidate calls liquidate() via `this.` (external self-call) so each item gets its
+    /// own revert frame (try/catch isolation). The self-call must pass auth: owner OR the contract.
+    modifier onlyOwnerOrSelf() {
+        if (msg.sender != owner && msg.sender != address(this)) revert NotOwner();
         _;
     }
 
@@ -91,7 +110,7 @@ contract Liquidator {
         address swapTarget,
         bytes calldata swapCallData,
         uint256 minProfit
-    ) external onlyOwner nonReentrant returns (uint256 profit) {
+    ) external onlyOwnerOrSelf nonReentrant returns (uint256 profit) {
         bytes memory data = abi.encode(
             SwapData({
                 swapTarget: swapTarget,
@@ -110,6 +129,27 @@ contract Liquidator {
         if (profit < minProfit) revert ProfitTooLow(profit, minProfit);
         _safeTransfer(mp.loanToken, owner, balAfter); // sweep everything (incl. any prior dust)
         emit Liquidated(borrower, mp.loanToken, profit);
+    }
+
+    /// @notice Liquidate up to N targets in ONE tx (cascade capture: every prize lands on the same
+    /// tx-index instead of consecutive nonces). Deliberately NO nonReentrant here: each item runs
+    /// through the external self-call `this.liquidate(...)` which takes the lock itself — a guard on
+    /// the batch would make every item revert Reentrant (proven by prototype test C2). Reentrancy
+    /// stays closed: every entry point is onlyOwnerOrSelf / onlyOwner / onlyMorpho (prototype C2b).
+    /// A failed item emits BatchItemFailed and the loop continues (per-item try/catch); gas must be
+    /// budgeted by the caller with headroom — a starved tail fails SILENTLY inside the same
+    /// successful tx (prototype C3c), so outcomes must be read from receipt events only.
+    function batchLiquidate(LiquidationItem[] calldata items) external onlyOwner returns (uint256 nOk) {
+        for (uint256 i = 0; i < items.length; i++) {
+            try this.liquidate(
+                items[i].mp, items[i].borrower, items[i].repaidShares,
+                items[i].swapTarget, items[i].swapCallData, items[i].minProfit
+            ) returns (uint256) {
+                nOk++;
+            } catch (bytes memory reason) {
+                emit BatchItemFailed(i, items[i].borrower, bytes4(reason));
+            }
+        }
     }
 
     /// @notice Morpho callback: collateral already received; swap it to loanToken and make sure
