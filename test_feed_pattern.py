@@ -249,16 +249,16 @@ def test_read_positions_fallback_swallows_transport():
         def to_bytes32(self, x):
             return bytes.fromhex(x[2:])
 
-    orig = mc.aggregate3
-
     def _boom(*a, **kw):
         raise RuntimeError("429 Too Many Requests")
 
-    mc.aggregate3 = _boom
+    # энкодеры стабим тоже: тест не должен требовать web3/eth_abi в окружении
+    orig = (mc.aggregate3, mc.encode_market_call, mc.encode_position_call)
+    mc.aggregate3, mc.encode_market_call, mc.encode_position_call = _boom, lambda b32: b"", lambda b32, b: b""
     try:
         assert hp.read_positions(_Rpc(), "0x" + "ab" * 32, ["0x" + "cd" * 20]) is None
     finally:
-        mc.aggregate3 = orig
+        mc.aggregate3, mc.encode_market_call, mc.encode_position_call = orig
 
 
 if __name__ == "__main__":
@@ -268,7 +268,7 @@ if __name__ == "__main__":
             try:
                 fn()
                 print("PASS", name)
-            except AssertionError as e:
+            except Exception as e:                      # не только Assert: упавший импорт/тип = FAIL, не смерть раннера
                 fails += 1
-                print("FAIL", name, e)
+                print("FAIL", name, "%s: %s" % (type(e).__name__, e))
     sys.exit(1 if fails else 0)
