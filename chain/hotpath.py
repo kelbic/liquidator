@@ -1252,12 +1252,20 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             and not (_re_thread is not None and _re_thread.is_alive())):
                         _re_box = {}
 
-                        def _bg_resolve(box=_re_box):
+                        def _bg_resolve(box=_re_box, cur_meta=meta):
                             try:
-                                box["res"] = (resolve_feeds(rpc, markets, _fb_resolve_rpc),
-                                              resolve_meta(rpc, markets))
+                                nf = resolve_feeds(rpc, markets, _fb_resolve_rpc)
                             except Exception:
                                 box["res"] = None
+                                return
+                            try:
+                                nm = resolve_meta(rpc, markets)
+                            except Exception:
+                                # meta иммутабельна per market (idToMarketParams) — 429 на одном
+                                # aggregate3 рескана не должен блокировать коммит карты ног
+                                # (17:33 23.07: час тихих ретраев именно из-за этого)
+                                nm = cur_meta
+                            box["res"] = (nf, nm)
                         _re_thread = threading.Thread(target=_bg_resolve, daemon=True)
                         _re_thread.start()
                     if _re_thread is not None and not _re_thread.is_alive() and _re_box is not None:
@@ -1278,6 +1286,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         else:
                             # резолв упал целиком (исключение в bg): повтор через ~120с, не через 6ч
                             last_resolve = time.monotonic() - max(0.0, _rescan_iv - 120.0)
+                            log.warning("re-resolve упал (шторм) — повтор ~120с, карта прежняя (%d aggs)", len(agg_set))
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
                         log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
