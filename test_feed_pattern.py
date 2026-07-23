@@ -20,14 +20,24 @@ class _Mkt:
         self.market_id = mid
 
 
+def _norm_legs(v):
+    """Значение mapping: скаляр (одноногий рынок, primary=нога), кортеж (primary, legs) для
+    multi-leg, None (вне карты) — в форму _resolve_legs."""
+    if v is None:
+        return None, []
+    if isinstance(v, tuple):
+        return v
+    return v, [v]
+
+
 def _patched_resolve(mapping):
-    """resolve_feeds поверх замоканного _resolve_one (I/O-шов из docstring)."""
-    orig = feeds._resolve_one
-    feeds._resolve_one = lambda rpc, mid: mapping.get(mid)
+    """resolve_feeds поверх замоканного _resolve_legs (I/O-шов из docstring)."""
+    orig = feeds._resolve_legs
+    feeds._resolve_legs = lambda rpc, mid: _norm_legs(mapping.get(mid))
     try:
         return feeds.resolve_feeds(None, [_Mkt(m) for m in mapping])
     finally:
-        feeds._resolve_one = orig
+        feeds._resolve_legs = orig
 
 
 REDSTONE_FEED = "0x5c4c8d6f6bf79b718f3e8399aabdfed01cb7e48f"
@@ -80,12 +90,12 @@ def test_resolve_feeds_groups_under_pattern():
 
 
 def test_resolve_feeds_fallback_rpc():
-    # (F) шторм на основном RPC (все None) -> пер-рыночный повтор через fallback_rpc;
-    # легитимный None (не-Chainlink) остаётся None и на фолбэке
+    # (F) шторм на основном RPC (все пусто) -> пер-рыночный повтор через fallback_rpc;
+    # легитимно пустой (не-Chainlink) остаётся пустым и на фолбэке
     MAIN, FB = object(), object()
-    table = {(FB, MID): PATTERN, (FB, "0x" + "cd" * 32): PLAIN_AGG}   # main отдаёт None по всем
-    orig = feeds._resolve_one
-    feeds._resolve_one = lambda rpc, mid: table.get((rpc, mid))
+    table = {(FB, MID): PATTERN, (FB, "0x" + "cd" * 32): PLAIN_AGG}   # main отдаёт пусто по всем
+    orig = feeds._resolve_legs
+    feeds._resolve_legs = lambda rpc, mid: _norm_legs(table.get((rpc, mid)))
     try:
         blind = feeds.resolve_feeds(MAIN, [_Mkt(MID), _Mkt("0x" + "cd" * 32), _Mkt("0x" + "ee" * 32)])
         assert blind == {}                                            # без фолбэка — слепота (инцидент 07-23)
@@ -94,7 +104,7 @@ def test_resolve_feeds_fallback_rpc():
         assert out[PATTERN] == [MID] and out[PLAIN_AGG] == ["0x" + "cd" * 32]
         assert len(out) == 2                                          # 0xee-рынок легитимно вне карты
     finally:
-        feeds._resolve_one = orig
+        feeds._resolve_legs = orig
 
 
 def test_init_resolve_retry_empty_ok():
@@ -113,6 +123,120 @@ def test_init_resolve_retry_empty_ok():
     seq = iter([{}, {"0xa": ["m"]}])
     out = hp._init_resolve_retry(lambda: next(seq), what="t", tries=3, base=0.0, cap=0.0, empty_ok=False)
     assert out == {"0xa": ["m"]}
+
+
+class _FakeRpc:
+    """rpc.contract(addr, abi).functions.<name>(*args).call() по таблице {(addr_lower, fn): value};
+    отсутствие ключа = Exception (как живой revert/нет функции). args игнорируются (один рынок)."""
+    def __init__(self, table):
+        self._t = table
+
+    def to_bytes32(self, x):
+        return x
+
+    def contract(self, addr, abi):
+        table, key = self._t, addr.lower()
+
+        class _Fns:
+            def __getattr__(self, name):
+                def _fn(*a):
+                    class _Call:
+                        def call(_self, **kw):
+                            if (key, name) not in table:
+                                raise Exception("no %s on %s" % (name, key))
+                            return table[(key, name)]
+                    return _Call()
+                return _fn
+
+        class _Ct:
+            functions = _Fns()
+        return _Ct()
+
+
+ORACLE2 = "0x" + "0a" * 20
+BF1_PROXY, BF1_AGG = "0x" + "b1" * 20, "0x" + "a1" * 20
+BF2_PROXY, BF2_AGG = "0x" + "b2" * 20, "0x" + "a2" * 20
+QF1_PROXY, QF1_AGG = "0x" + "c1" * 20, "0x" + "d1" * 20
+QF2_PROXY = "0x" + "c2" * 20
+
+
+def _morpho_key():
+    from chain.morpho import MORPHO_BLUE_ADDRESS
+    return MORPHO_BLUE_ADDRESS.lower()
+
+
+def test_resolve_legs_multileg_age_filter():
+    # (H) BF1 = primary БЕЗ возраст-фильтра (стейбл-BF1 не выпадает из watch — статус-кво);
+    # BF2 стейбл (age 25ч) -> отсев; QF1 живая (age 60с) -> в watch; QF2 hardcoded
+    # (нет aggregator/latestTimestamp) -> отсев
+    import time as _t
+    now = _t.time()
+    rpc = _FakeRpc({
+        (_morpho_key(), "idToMarketParams"): ("L", "C", ORACLE2, "I", 0),
+        (ORACLE2, "BASE_FEED_1"): BF1_PROXY,
+        (ORACLE2, "BASE_FEED_2"): BF2_PROXY,
+        (ORACLE2, "QUOTE_FEED_1"): QF1_PROXY,
+        (ORACLE2, "QUOTE_FEED_2"): QF2_PROXY,
+        (BF1_PROXY, "aggregator"): BF1_AGG,
+        (BF2_PROXY, "aggregator"): BF2_AGG,
+        (QF1_PROXY, "aggregator"): QF1_AGG,
+        (BF1_AGG, "latestTimestamp"): int(now - 25 * 3600),   # primary всё равно остаётся
+        (BF2_AGG, "latestTimestamp"): int(now - 25 * 3600),   # стейбл/мёртвая -> мимо
+        (QF1_AGG, "latestTimestamp"): int(now - 60),          # market-нога -> в watch
+    })
+    primary, legs = feeds._resolve_legs(rpc, MID)
+    assert primary == BF1_AGG
+    assert legs == [BF1_AGG, QF1_AGG]
+
+
+def test_resolve_legs_dedup_and_no_bf1():
+    # (H2) QF1 резолвится в ТОТ ЖЕ агрегатор, что BF1 -> без дубля; нет BF1, но есть живая QF1 ->
+    # рынок получает watch-ногу (primary=None)
+    import time as _t
+    now = _t.time()
+    rpc = _FakeRpc({
+        (_morpho_key(), "idToMarketParams"): ("L", "C", ORACLE2, "I", 0),
+        (ORACLE2, "BASE_FEED_1"): BF1_PROXY,
+        (ORACLE2, "QUOTE_FEED_1"): QF1_PROXY,
+        (BF1_PROXY, "aggregator"): BF1_AGG,
+        (QF1_PROXY, "aggregator"): BF1_AGG,                   # та же нога с двух геттеров
+        (BF1_AGG, "latestTimestamp"): int(now - 60),
+    })
+    assert feeds._resolve_legs(rpc, MID) == (BF1_AGG, [BF1_AGG])
+    rpc2 = _FakeRpc({
+        (_morpho_key(), "idToMarketParams"): ("L", "C", ORACLE2, "I", 0),
+        (ORACLE2, "QUOTE_FEED_1"): QF1_PROXY,                 # BASE_FEED_1 отсутствует
+        (QF1_PROXY, "aggregator"): QF1_AGG,
+        (QF1_AGG, "latestTimestamp"): int(now - 60),
+    })
+    assert feeds._resolve_legs(rpc2, MID) == (None, [QF1_AGG])
+
+
+def test_multileg_groups_and_primary_map():
+    # (I) рынок числится под КАЖДОЙ ногой; primary_map отдаёт только BF1-ноги последнего резолва
+    out = _patched_resolve({MID: (PLAIN_AGG, [PLAIN_AGG, QF1_AGG]), MID2: (QF1_AGG, [QF1_AGG])})
+    assert sorted(out[QF1_AGG]) == sorted([MID, MID2])
+    assert out[PLAIN_AGG] == [MID]
+    pm = feeds.primary_map()
+    assert pm == {MID: PLAIN_AGG, MID2: QF1_AGG}
+
+
+def test_shadow_map_primary_guard():
+    # (J) shadow-scale садится ТОЛЬКО на primary(BF1)-membership: cb-рынок под чужой ногой
+    # (ожившая стейбл-нога в депег) НЕ должен получить свой scale на чужом агрегаторе;
+    # primary=None = поведение до multi-leg (оба, как раньше)
+    import chain.hotpath as hp
+
+    class _M:
+        def __init__(self, mid):
+            self.market_id, self.loan_token, self.collateral_token = mid, "USDC", "cbBTC"
+
+    fm = {BF1_AGG: [MID], QF1_AGG: [MID]}
+    meta = {MID: ("0x" + "0e" * 20, 860000000000000000)}
+    sm = hp._build_shadow_map(fm, meta, [_M(MID)], primary={MID: BF1_AGG})
+    assert BF1_AGG in sm and QF1_AGG not in sm
+    sm2 = hp._build_shadow_map(fm, meta, [_M(MID)])
+    assert BF1_AGG in sm2 and QF1_AGG in sm2
 
 
 if __name__ == "__main__":

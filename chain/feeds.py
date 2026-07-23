@@ -1,6 +1,7 @@
 """Feed map + sub-block oracle-update reader (rotation-aware). HOT-BUILD STAGE 1: DETECT ONLY.
-resolve_feeds(rpc, markets) -> {aggregator_lower: [market_id]} via idToMarketParams(id).oracle ->
-oracle.BASE_FEED_1() -> proxy.aggregator(); rebuilt from CURRENT covered (follows rotation).
+resolve_feeds(rpc, markets) -> {watch_key_lower: [market_id]} via idToMarketParams(id).oracle ->
+все Chainlink-ноги оракула (BASE_FEED_1 + живые BASE_FEED_2/QUOTE_FEED_1/QUOTE_FEED_2) ->
+proxy.aggregator(); rebuilt from CURRENT covered (follows rotation).
 watch_feeds(...) subscribes to Flashblocks, parses diff/transactions for `transmit` to those
 aggregators, calls on_update(market_ids, info) — NOTHING ELSE. No price, no assess, no send.
 Import-clean: websockets/brotli/Morpho ABIs imported lazily.
@@ -16,6 +17,11 @@ ZERO = "0x0000000000000000000000000000000000000000"
 def _addr_abi(n):
     return [{"name": n, "type": "function", "stateMutability": "view", "inputs": [],
              "outputs": [{"name": "", "type": "address"}]}]
+
+
+def _uint_abi(n):
+    return [{"name": n, "type": "function", "stateMutability": "view", "inputs": [],
+             "outputs": [{"name": "", "type": "uint256"}]}]
 
 
 def _try_addr(rpc, addr, getter):
@@ -43,9 +49,53 @@ WATCH_PATTERN_OVERRIDES = {
 }
 
 
+# Не-primary ноги оракула (двуногая база и quote-сторона): транзит ЛЮБОЙ ноги меняет price()
+# композита, но до 07-23 watch держал только BASE_FEED_1 — апдейт ETH/USD-ноги cbBTC/WETH не
+# армил рынок суб-блочно (детекцию давал только per-block poll, без форы). Ноги ниже идут в watch
+# через возраст-фильтр _leg_live: медленные стейбл-ноги (USDC/USD hb 24ч, age ~23ч — шум) и
+# мёртвые/hardcoded фантомы классификации 07-23 в hot-set не попадают.
+EXTRA_LEG_GETTERS = ("BASE_FEED_2", "QUOTE_FEED_1", "QUOTE_FEED_2")
+EXTRA_LEG_MAX_AGE_SEC = 3 * 3600.0   # market-ноги (ETH/USD hb 20мин) всегда моложе; стейблы (hb 24ч) — старше
+
+_PRIMARY_AGG: dict = {}   # {market_id: BF1 watch-key} последнего resolve_feeds (см. primary_map)
+
+
+def primary_map():
+    """{market_id: primary(BF1) watch-key} последнего resolve_feeds. Гард shadow-карты hotpath:
+    рынок теперь числится и под extra-ногами, а _SHADOW_SCALE выведен для СВОЕГО BF1-фида —
+    посадить его на чужую ногу (cbBTC-scale на USDC/USD, когда стейбл-нога в депег оживает и
+    проходит возраст-фильтр) = ложный px_hint в feed-спавн."""
+    return dict(_PRIMARY_AGG)
+
+
+def _leg_agg(rpc, oracle, getter):
+    """Одна нога оракула: getter -> proxy -> aggregator (lower), с подменой watch-паттерна;
+    None если ноги нет (getter отсутствует/ZERO). I/O."""
+    proxy = _try_addr(rpc, oracle, getter)
+    if not proxy:
+        return None
+    agg = (_try_addr(rpc, proxy, "aggregator") or proxy).lower()
+    return WATCH_PATTERN_OVERRIDES.get(agg, agg)
+
+
+def _leg_live(rpc, agg):
+    """Возраст-фильтр extra-ноги: latestTimestamp агрегатора не старше EXTRA_LEG_MAX_AGE_SEC.
+    Watch-паттерны (len != 42) на чейне не читаемы — проверены вручную, пропускаем. Нет
+    latestTimestamp (hardcoded/не-Chainlink) или старый — нога мёртвая/стейбл, в watch не идёт. I/O."""
+    if len(agg) != 42:
+        return True
+    try:
+        ts = rpc.contract(agg, _uint_abi("latestTimestamp")).functions.latestTimestamp().call()
+    except Exception:
+        return False
+    return bool(ts) and (time.time() - int(ts)) <= EXTRA_LEG_MAX_AGE_SEC
+
+
 def _resolve_one(rpc, market_id):
     """market_id -> OCR aggregator (lower), watch-паттерн из WATCH_PATTERN_OVERRIDES для read-time
-    композитов, или None (non-Chainlink wrapper). I/O; patched in tests."""
+    композитов, или None (non-Chainlink wrapper). ТОЛЬКО BF1-нога — дешёвый резолв для офлайн-
+    аналитики (replay_winners/reachable_money/gap_profile/net_after_fee); боевой multi-leg
+    резолв — _resolve_legs. I/O."""
     from chain.morpho import MORPHO_BLUE_ADDRESS
     from chain.simulate import MORPHO_READ_ABI
     morpho = rpc.contract(MORPHO_BLUE_ADDRESS, MORPHO_READ_ABI)
@@ -53,28 +103,54 @@ def _resolve_one(rpc, market_id):
         oracle = morpho.functions.idToMarketParams(rpc.to_bytes32(market_id)).call()[2]
     except Exception:
         return None
-    proxy = _try_addr(rpc, oracle, "BASE_FEED_1")
-    if not proxy:
-        return None
-    agg = _try_addr(rpc, proxy, "aggregator") or proxy
-    agg = agg.lower() if agg else None
-    return WATCH_PATTERN_OVERRIDES.get(agg, agg)
+    return _leg_agg(rpc, oracle, "BASE_FEED_1")
+
+
+def _resolve_legs(rpc, market_id):
+    """market_id -> (primary, legs): primary = BF1-нога (исторический одноногий watch, БЕЗ
+    возраст-фильтра — поведение primary не меняем) или None; legs = все watch-ноги рынка
+    (primary первой + живые BF2/QF1/QF2 через _leg_live, без дублей). (None, []) = non-Chainlink
+    wrapper ЛИБО транспортный шторм — различает fallback_rpc в resolve_feeds. I/O; patched in tests."""
+    from chain.morpho import MORPHO_BLUE_ADDRESS
+    from chain.simulate import MORPHO_READ_ABI
+    morpho = rpc.contract(MORPHO_BLUE_ADDRESS, MORPHO_READ_ABI)
+    try:
+        oracle = morpho.functions.idToMarketParams(rpc.to_bytes32(market_id)).call()[2]
+    except Exception:
+        return None, []
+    legs = []
+    primary = _leg_agg(rpc, oracle, "BASE_FEED_1")
+    if primary:
+        legs.append(primary)
+    for getter in EXTRA_LEG_GETTERS:
+        agg = _leg_agg(rpc, oracle, getter)
+        if agg and agg not in legs and _leg_live(rpc, agg):
+            legs.append(agg)
+    return primary, legs
 
 
 def resolve_feeds(rpc, markets, fallback_rpc=None):
-    """{aggregator_lower: [market_id,...]} for covered markets (grouping over _resolve_one).
-    Non-Chainlink markets (no BASE_FEED_1) omitted — separate reader branch.
-    fallback_rpc: _resolve_one глотает транспортные ошибки (None), поэтому шторм 408/429 на основном
-    RPC давал МОЛЧА пустую карту — рестарт/ре-резолв в шторм слепил hot-path (инцидент 07-23:
-    «hot path: 0 aggregators / 40 markets» на 6ч rescan-интервала). None от основного повторяем
-    через запасной эндпоинт; легитимные None (не-Chainlink рынки) просто станут None второй раз."""
+    """{watch_key_lower: [market_id,...]} for covered markets (grouping over _resolve_legs).
+    07-23 multi-leg: рынок числится под КАЖДОЙ своей ногой (BF1 + живые BF2/QF1/QF2) — транзит
+    любой ноги меняет price() композита и должен армить рынок; раньше ETH/USD-нога cbBTC/WETH
+    была вне watch. Primary-ноги последнего резолва — через primary_map() (гард shadow-карты).
+    Non-Chainlink markets (ни одной Chainlink-ноги) omitted — separate reader branch.
+    fallback_rpc: _resolve_legs глотает транспортные ошибки (пусто), поэтому шторм 408/429 на
+    основном RPC давал МОЛЧА пустую карту — рестарт/ре-резолв в шторм слепил hot-path (инцидент
+    07-23: «hot path: 0 aggregators / 40 markets» на 6ч rescan-интервала). Пустоту от основного
+    повторяем через запасной эндпоинт; легитимно пустые (не-Chainlink) просто пусты дважды."""
     aggs = defaultdict(list)
+    prim = {}
     for m in markets:
-        agg = _resolve_one(rpc, m.market_id)
-        if agg is None and fallback_rpc is not None:
-            agg = _resolve_one(fallback_rpc, m.market_id)
-        if agg:
+        primary, legs = _resolve_legs(rpc, m.market_id)
+        if not legs and fallback_rpc is not None:
+            primary, legs = _resolve_legs(fallback_rpc, m.market_id)
+        if primary:
+            prim[m.market_id] = primary
+        for agg in legs:
             aggs[agg].append(m.market_id)
+    _PRIMARY_AGG.clear()
+    _PRIMARY_AGG.update(prim)
     return dict(aggs)
 
 

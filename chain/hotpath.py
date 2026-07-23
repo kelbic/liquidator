@@ -127,18 +127,24 @@ _SHADOW_SCALE = {"cbXRP": 10**28, "cbDOGE": 10**26, "cbADA": 10**28,   # immutab
                                     # match=False -> убрать строку немедленно (poll-путь безопасен без неё).
 
 
-def _build_shadow_map(feeds, meta, markets):
+def _build_shadow_map(feeds, meta, markets, primary=None):
     """{aggregator_lower: (symbol, scale, oracle)} ТОЛЬКО для одно-фид money-маркетов (SCALE известен).
     Чистая (юнит). Ротацию агрегатора закрывает часовой re-resolve, пересобирающий карту вместе с
     feeds/meta; между ротацией и пересборкой shadow просто перестаёт матчить (log-only, безвредно).
     CBBTC_PLAN: ТОЛЬКО loan=USDC — _SHADOW_SCALE выведен для USD-quote (answer*scale==price
     USD-оракула); один агрегатор могут делить рынки с РАЗНЫМ quote (cbBTC/USDC и cbBTC/EURC оба
     резолвятся в cbBTC/USD-фид), и посадить USD-scale на EURC-оракул = неверный px_hint +
-    вечный match=False. Не-USDC рынки остаются на poll-детекции (как и было)."""
+    вечный match=False. Не-USDC рынки остаются на poll-детекции (как и было).
+    07-23 multi-leg: рынок числится и под extra-ногами (BF2/QF1/QF2) — membership под ЧУЖИМ agg
+    не должен получать наш _SHADOW_SCALE (cbBTC-scale на ожившей USDC/USD-ноге в депег = ложный
+    px_hint в feed-спавн). primary = feeds.primary_map() ({mid: BF1-agg}); None = до-multi-leg
+    поведение (тесты/офлайн)."""
     out = {}
     by_id = {m.market_id: m for m in markets}
     for agg, mids in feeds.items():
         for mid in mids:
+            if primary is not None and primary.get(mid) != agg:
+                continue                     # extra-нога: scale чужого BF1-фида сюда не сажаем
             m = by_id.get(mid); om = meta.get(mid)
             if not m or not om:
                 continue
@@ -1179,7 +1185,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     import json
     import websockets
     import brotli
-    from chain.feeds import resolve_feeds, extract_txs, block_number_of, decode_forward_answer, FORWARD_SEL, basefee_of
+    from chain.feeds import (resolve_feeds, extract_txs, block_number_of, decode_forward_answer,
+                             FORWARD_SEL, basefee_of, primary_map)
 
     def _default_ws():
         return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
@@ -1192,7 +1199,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                 what="feeds", log=log, empty_ok=False)
     meta = _init_resolve_retry(resolve_meta, rpc, markets, what="meta", log=log)
     agg_set = set(feeds)
-    shadow_map = _build_shadow_map(feeds, meta, markets)         # SHADOW слоя 1 (план п.4, log-only)
+    shadow_map = _build_shadow_map(feeds, meta, markets, primary=primary_map())   # SHADOW слоя 1 (log-only спавн-гейт)
     log.info("DIAG shadow-feed map %s", {a[:10]: s for a, (s, _sc, _o) in shadow_map.items()})
     last_resolve = time.monotonic()
     log.info("hot path: %d aggregators / %d markets (preconf=%s, tip=%.1f gwei, floor repaid $%.0f)",
@@ -1233,7 +1240,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             last_resolve = time.monotonic()
                             if (new_feeds or not feeds) and (new_meta or not meta):
                                 feeds = new_feeds; meta = new_meta; agg_set = set(feeds)
-                                shadow_map = _build_shadow_map(feeds, meta, markets)   # ротация агрегатора
+                                shadow_map = _build_shadow_map(feeds, meta, markets, primary=primary_map())   # ротация агрегатора
                             else:
                                 # шторм на обоих эндпоинтах: пустой картой ЖИВУЮ не затираем
                                 log.warning("re-resolve пуст (feeds=%d meta=%d) — держу старую карту (%d aggs)",
