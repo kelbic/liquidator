@@ -42,7 +42,13 @@ class Config:
     predict_shadow: bool = False          # PREDICT-слой (Binance WS + anchor/return, порт Katana v5):
                                           # SHADOW меряет lead/FP, ничего не стреляет (23.07)
     price_from_feed: bool = False         # Layer1: feed-decoded price triggers _process_transmit (OFF until measured)
-    hot_min_repaid_usd: float = 450.0    # hot path fires only on reaction prizes >= this (repaid USD)
+    hot_min_repaid_usd: float = 75.0     # hot path fires on reaction prizes >= this (repaid USD).
+                                         # 23.07: 450->75 — при tip 0.05 выстрел стоит ~$0.1, пыль $50-100
+                                         # с бонусом $4-10 стала +EV (в паре с MIN_PROFIT_USD=2)
+    tip_mid_repaid_usd: float = 2000.0   # динамический tip (fee-сортировка ВНУТРИ фб-кадра в давку —
+    tip_mid_gwei: float = 2.0            # фэт-разведка 45д): приз >= mid -> страховой tip_mid_gwei,
+    tip_big_repaid_usd: float = 20000.0  # >= big -> tip_big_gwei (каскадные короли бидят 22-59);
+    tip_big_gwei: float = 30.0           # рутина остаётся на tip_gwei (канарейка: позиция не страдает)
     positions_from_cache: bool = False    # P1-6: слой 2 потребление (OFF до калибровки cache-divergence)
     fast_lane: bool = False               # P1-9: fast-lane без sim (OFF; контракт гарантирует исход)
     fast_lane_min_repaid_usd: float = 1000.0  # fast-lane только на призах >= этого repaid USD
@@ -105,7 +111,11 @@ class Config:
             hot_path=(s("HOT_PATH", "").lower() in ("1", "true", "yes", "on")),
             predict_shadow=(s("PREDICT_SHADOW", "").lower() in ("1", "true", "yes", "on")),
             price_from_feed=(s("PRICE_FROM_FEED", "").lower() in ("1", "true", "yes", "on")),
-            hot_min_repaid_usd=f("HOT_MIN_REPAID_USD", 450.0),
+            hot_min_repaid_usd=f("HOT_MIN_REPAID_USD", 75.0),
+            tip_mid_repaid_usd=f("TIP_MID_REPAID_USD", 2000.0),
+            tip_mid_gwei=f("TIP_MID_GWEI", 2.0),
+            tip_big_repaid_usd=f("TIP_BIG_REPAID_USD", 20000.0),
+            tip_big_gwei=f("TIP_BIG_GWEI", 30.0),
             positions_from_cache=(s("POSITIONS_FROM_CACHE", "").lower() in ("1", "true", "yes", "on")),
             fast_lane=(s("FAST_LANE", "").lower() in ("1", "true", "yes", "on")),
             fast_lane_min_repaid_usd=f("FAST_LANE_MIN_REPAID_USD", 1000.0),

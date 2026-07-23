@@ -330,6 +330,33 @@ def test_get_logs_fallback():
         R._LOGS_FB = orig
 
 
+def test_dynamic_tip_and_net_gate():
+    # (M) ступени tip по призу + net-гейт видит цену страхового tip
+    import chain.hotpath as hp
+
+    class _Cfg:
+        tip_gwei = 0.05
+        tip_mid_repaid_usd = 2000.0
+        tip_mid_gwei = 2.0
+        tip_big_repaid_usd = 20000.0
+        tip_big_gwei = 30.0
+        gas_limit_est = 500000
+        eth_price_usd = 3800.0
+
+    c = _Cfg()
+    assert hp.dynamic_tip_gwei(c, 100) == 0.05
+    assert hp.dynamic_tip_gwei(c, 1999) == 0.05
+    assert hp.dynamic_tip_gwei(c, 2000) == 2.0
+    assert hp.dynamic_tip_gwei(c, 19999) == 2.0
+    assert hp.dynamic_tip_gwei(c, 20000) == 30.0
+    assert hp.dynamic_tip_gwei(c, None) == 0.05
+    # cost в гейте: рутина ~$0.095, big ~$57 — крупный приз платит страховку и гейт это видит
+    _, cost_small, _ = hp._net_gate(0, 100, 1, c)
+    _, cost_big, _ = hp._net_gate(0, 50000, 1, c)
+    assert abs(cost_small - 0.095) < 0.001
+    assert abs(cost_big - 57.0) < 0.1
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

@@ -212,10 +212,25 @@ def _flips(price, lltv_wad, tba, tbs, positions):
     return out
 
 
+def dynamic_tip_gwei(cfg, debt_usd):
+    """PURE (юнит): tip по размеру приза. FCFS-рутина позицией за tip не платится (канарейка
+    23.07: +7..+36 in-block на 0.05 gwei), но в каскадную ДАВКУ победители бидят 22-59 gwei
+    (фэт-разведка 45д, блоки 47803xxx: один оператор 56.7 gwei -> idx 1154 против своих же
+    0.0125 -> idx 1171) — похоже на fee-сортировку ВНУТРИ флешблок-кадра при заторе. Страховка
+    стоит ~$1.9/gwei на 500k газа — окупается только на крупном призе, отсюда ступени."""
+    du = float(debt_usd or 0.0)
+    if du >= getattr(cfg, "tip_big_repaid_usd", 20000.0):
+        return float(getattr(cfg, "tip_big_gwei", 30.0))
+    if du >= getattr(cfg, "tip_mid_repaid_usd", 2000.0):
+        return float(getattr(cfg, "tip_mid_gwei", 2.0))
+    return float(cfg.tip_gwei)
+
+
 def _net_gate(profit_wei, debt_usd, debt_assets, cfg):
-    """PURE: profit/cost/net in USD — same arithmetic as prepare_liquidation's floor."""
+    """PURE: profit/cost/net in USD — как floor в prepare_liquidation, но cost по ДИНАМИЧЕСКОМУ
+    tip: крупный приз платит страховой tip, и гейт обязан видеть эту цену."""
     profit_usd = profit_wei * debt_usd / debt_assets if debt_assets else 0.0
-    cost_usd = cfg.gas_limit_est * cfg.tip_gwei * cfg.eth_price_usd / 1e9
+    cost_usd = cfg.gas_limit_est * dynamic_tip_gwei(cfg, debt_usd) * cfg.eth_price_usd / 1e9
     return profit_usd, cost_usd, profit_usd - cost_usd
 
 
@@ -765,7 +780,7 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
                  "swap_calldata": swap["calldata"], "min_profit": min_profit_final, "debt_usd": debt_usd, "debt_assets": debt_assets}
         _fb = _fresh_basefee()
         if _fb is not None:                                   # SEND-2: fee из fb-хедера (0 Alchemy-RTT в send)
-            _tip = int(cfg.tip_gwei * 1e9)
+            _tip = int(dynamic_tip_gwei(cfg, debt_usd) * 1e9)   # каскадная страховка по призу
             _prep["max_fee"] = _fb * 2 + _tip                 # та же формула base*2+tip, но base = pending-блок из фида
             _prep["tip"] = _tip
         return _prep
@@ -821,7 +836,7 @@ def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asse
             return {"ok": False, "reason": f"fast: net ${net_usd:.2f} < min (analytic floor)"}
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
         cd = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit)
-        _tip = int(cfg.tip_gwei * 1e9)
+        _tip = int(dynamic_tip_gwei(cfg, debt_usd) * 1e9)     # каскадная страховка по призу
         return {"ok": True, "calldata": cd, "gas": max(_GAS_CACHE.get(market_id, 0), cfg.gas_limit_est),
                 "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd,
                 "max_fee": _fb * 2 + _tip, "tip": _tip, "fast": True,
