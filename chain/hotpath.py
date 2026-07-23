@@ -245,6 +245,40 @@ def read_preconf_price(preconf_rpc, oracle):
         return None
 
 
+_PX_HEDGE_SEC = float(os.environ.get("PX_HEDGE_TIMEOUT_SEC", "0.4"))
+
+
+def read_price_hedged(preconf_rpc, rpc, oracle, price_fn=read_preconf_price):
+    """Хедж-чтение цены оракула: preconf-pending (лид ~1.8с) и confirmed стартуют ПАРАЛЛЕЛЬНО,
+    preconf ждём не дольше _PX_HEDGE_SEC. Штатно preconf отвечает ~100мс -> берём его значение,
+    поведение прежнее. В деградацию (429-trickle ~2.05с; канарейка 23.07 probe dt_spawn=2267мс
+    БЕЗ hotset-строк = гейт/префетч висели на цене, все рынки в f_noprice) отдаём confirmed:
+    лид теряем, детект/гонку/тред — нет. Старая цена с confirmed безопасна: нет флипа -> skip
+    (как раньше при None), флип и по старой -> жертва легитимна. Оба легга через price_fn."""
+    if rpc is None:
+        return price_fn(preconf_rpc, oracle)
+    ev_p, box_p = threading.Event(), []
+    ev_c, box_c = threading.Event(), []
+
+    def _leg(r, ev, box):
+        try:
+            box.append(price_fn(r, oracle))
+        except Exception:
+            pass
+        finally:
+            ev.set()
+
+    threading.Thread(target=_leg, args=(preconf_rpc, ev_p, box_p), daemon=True).start()
+    threading.Thread(target=_leg, args=(rpc, ev_c, box_c), daemon=True).start()
+    ev_p.wait(timeout=_PX_HEDGE_SEC)
+    if box_p and box_p[0] is not None:
+        return box_p[0]
+    ev_c.wait(timeout=2.0)
+    if box_c and box_c[0] is not None:
+        return box_c[0]
+    return box_p[0] if box_p else None      # confirmed молчит -> preconf мог дозреть после капа
+
+
 def read_positions(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
     """market totals + each position -> (tba, tbs, [(borrower, bs, col)]). ONE aggregate3.
     Reads on preconf-pending (same source as the flip price + sim) when preconf_rpc is given, so the
@@ -988,7 +1022,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         rep = next((meta[m][0] for m in feeds.get(agg, []) if meta.get(m)), None)
         if rep is None:
             return []
-        px = price_fn(preconf_rpc, rep)
+        px = read_price_hedged(preconf_rpc, rpc, rep, price_fn=price_fn)
         if px is not None:
             _gate_px[rep] = px                               # 2b: рынок с этим оракулом не будет читать 2-й раз
         moved = _price_moved(agg, px, last_price)
@@ -1017,7 +1051,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
 
         def _pf_read(_o=_o_pf, _ev=_ev_pf, _box=_box_pf):
             try:
-                _box.append(price_fn(preconf_rpc, _o))
+                _box.append(read_price_hedged(preconf_rpc, rpc, _o, price_fn=price_fn))
             except Exception:
                 pass
             finally:
@@ -1042,7 +1076,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             _ev_w.wait(timeout=5.0)
             price = _box_w[0] if _box_w else None
         else:                                                # страховка (префетч покрывает штатно)
-            price = price_fn(preconf_rpc, oracle)
+            price = read_price_hedged(preconf_rpc, rpc, oracle, price_fn=price_fn)
         _t_price_last = (time.perf_counter() - _pxs) * 1000.0
         if price is None:
             if stats is not None: stats["f_noprice"] += 1
