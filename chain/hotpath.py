@@ -869,9 +869,10 @@ def _canary_measure(rpc, canary_hash, agg, transmit_block, cfg, log):
         if _ANSWER_UPDATED_SIG is None:
             from eth_utils import keccak
             _ANSWER_UPDATED_SIG = "0x" + keccak(text="AnswerUpdated(int256,uint256,uint256)").hex()
+        from chain.rpc import get_logs_fb
         tidx = None
         for _att in range(4):                  # getLogs отстаёт от receipt (лаг пропагации логов) -> ретрай
-            logs = w3.eth.get_logs({"fromBlock": transmit_block, "toBlock": transmit_block,
+            logs = get_logs_fb(w3, {"fromBlock": transmit_block, "toBlock": transmit_block,
                                     "address": Web3.to_checksum_address(agg), "topics": [_ANSWER_UPDATED_SIG]})
             if logs:
                 tidx = logs[0].get("transactionIndex"); break

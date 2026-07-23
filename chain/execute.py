@@ -768,9 +768,10 @@ def _submit_xray(rpc, borrower, block_number, our_index, log):
         if _LIQUIDATE_EVENT_SIG is None:
             _LIQUIDATE_EVENT_SIG = "0x" + keccak(
                 text="Liquidate(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)").hex()
+        from chain.rpc import get_logs_fb
         w3 = rpc._web3()
         topic_b = "0x" + borrower[2:].lower().rjust(64, "0")
-        logs = w3.eth.get_logs({"fromBlock": block_number, "toBlock": block_number,
+        logs = get_logs_fb(w3, {"fromBlock": block_number, "toBlock": block_number,
                                 "address": _MORPHO_BLUE,
                                 "topics": [_LIQUIDATE_EVENT_SIG, None, None, topic_b]})
         if not logs:

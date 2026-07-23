@@ -42,5 +42,32 @@ class BaseRpc:
     def block_number(self) -> int:
         return self._web3().eth.block_number
 
+
+_LOGS_FB: list = []   # ленивые Web3-фолбэки get_logs_fb (создаются на первом отказе primary)
+
+
+def get_logs_fb(primary_w3, params):
+    """eth_getLogs с фолбэком по LOGS_FALLBACK_RPCS (csv, дефолт mainnet.base.org): Alchemy-ключ
+    №2 (23.07) отдаёт 400 на ЛЮБОЙ getLogs — диагностические чтения (canary DELTA, submit-xray)
+    не должны слепнуть из-за одного провайдера. Порядок: primary -> фолбэки; последняя ошибка
+    пробрасывается (вызыватели уже обёрнуты в try)."""
+    try:
+        return primary_w3.eth.get_logs(params)
+    except Exception as e:
+        last = e
+    global _LOGS_FB
+    if not _LOGS_FB:
+        import os
+        from web3 import Web3
+        urls = [u.strip() for u in
+                os.environ.get("LOGS_FALLBACK_RPCS", "https://mainnet.base.org").split(",") if u.strip()]
+        _LOGS_FB = [Web3(Web3.HTTPProvider(u, request_kwargs={"timeout": 10})) for u in urls]
+    for w3 in _LOGS_FB:
+        try:
+            return w3.eth.get_logs(params)
+        except Exception as e:
+            last = e
+    raise last
+
     # TODO(phase1): subscribe to new blocks / oracle updates (wss),
     #   batch eth_call for health factors, read base fee for tip accounting.

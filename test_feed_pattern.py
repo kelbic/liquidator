@@ -300,6 +300,36 @@ def test_read_positions_fallback_swallows_transport():
         mc.aggregate3, mc.encode_market_call, mc.encode_position_call = orig
 
 
+def test_get_logs_fallback():
+    # (L) 400 на primary (Alchemy-ключ №2 без getLogs) -> фолбэк-эндпоинт отвечает;
+    # живой primary фолбэк не дёргает; отказ ВСЕХ -> проброс последней ошибки
+    import chain.rpc as R
+
+    class _W3:
+        def __init__(self, fail, tag):
+            self.fail, self.tag = fail, tag
+            self.eth = self
+
+        def get_logs(self, params):
+            if self.fail:
+                raise RuntimeError("400 Bad Request")
+            return [{"src": self.tag}]
+
+    orig = R._LOGS_FB
+    R._LOGS_FB = [_W3(False, "fb")]
+    try:
+        assert R.get_logs_fb(_W3(True, "primary"), {})[0]["src"] == "fb"
+        assert R.get_logs_fb(_W3(False, "primary"), {})[0]["src"] == "primary"
+        R._LOGS_FB = [_W3(True, "fb")]
+        try:
+            R.get_logs_fb(_W3(True, "p"), {})
+            raise AssertionError("должен был пробросить")
+        except RuntimeError:
+            pass
+    finally:
+        R._LOGS_FB = orig
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
