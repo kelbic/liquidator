@@ -20,7 +20,10 @@ import os
 import threading
 import time
 
-WS_URL = os.environ.get("PREDICT_WS_URL", "wss://stream.binance.com:9443/ws")
+WS_URL = os.environ.get("PREDICT_WS_URL", "wss://data-stream.binance.vision/ws")
+# data-stream.binance.vision = публичный market-data домен Binance БЕЗ гео-блока: основной
+# stream.binance.com отдаёт HTTP 451 с US-IP (Charlotte, живой отказ 23.07 19:01). Протокол
+# и стримы идентичны. Фолбэк при недоступности vision: Coinbase/OKX (другой формат — адаптер).
 # bookTicker идёт много раз в секунду; такая тишина = поток заклинил = реконнект.
 STALE_SEC = float(os.environ.get("PREDICT_WS_STALE_SEC", "10.0"))
 BACKOFF_MAX_SEC = float(os.environ.get("PREDICT_WS_BACKOFF_MAX", "30.0"))
