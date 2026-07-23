@@ -250,7 +250,14 @@ def read_positions(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
         except Exception:
             res = None
     if res is None:
-        res = aggregate3(rpc, calls)                          # A': silent confirmed-fallback (src=confirmed below)
+        try:
+            res = aggregate3(rpc, calls)                      # A': silent confirmed-fallback (src=confirmed below)
+        except Exception as e:
+            # 07-23: 429-шторм на confirmed убивал ВЕСЬ transmit-воркер необработанным HTTPError
+            # (preconf-ветка выше обёрнута, фолбэк — не был) = потерянные рынки транзита в каскад.
+            # None -> вызывающий считает f_norp и продолжает соседей (как при пустом ответе).
+            log.info("DIAG read_positions fallback-fail market=%s err=%s", mid[:10], str(e)[:60])
+            return None
     if src_out is not None:
         src_out["src"] = _src
     if not res or not res[0][0] or not res[0][1]:

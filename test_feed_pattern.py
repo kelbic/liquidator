@@ -239,6 +239,28 @@ def test_shadow_map_primary_guard():
     assert BF1_AGG in sm2 and QF1_AGG in sm2
 
 
+def test_read_positions_fallback_swallows_transport():
+    # (K) 429-шторм на confirmed-фолбэке НЕ убивает transmit-воркер (инцидент 15:06 23.07):
+    # транспортная ошибка -> None (= f_norp у вызывающего), не исключение в треде
+    import chain.hotpath as hp
+    import chain.multicall as mc
+
+    class _Rpc:
+        def to_bytes32(self, x):
+            return bytes.fromhex(x[2:])
+
+    orig = mc.aggregate3
+
+    def _boom(*a, **kw):
+        raise RuntimeError("429 Too Many Requests")
+
+    mc.aggregate3 = _boom
+    try:
+        assert hp.read_positions(_Rpc(), "0x" + "ab" * 32, ["0x" + "cd" * 20]) is None
+    finally:
+        mc.aggregate3 = orig
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
