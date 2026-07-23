@@ -1015,21 +1015,6 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             _price_moved(agg, px_hint, last_price)           # baseline для последующих bare-match gate'ов
         if stats is not None:
             stats["proceed"] += 1
-    # price-change gate: the bare match also fires on price-READ txs. Read ONE representative oracle
-    # preconf price; if it has not moved since last sighting this was a reader, not a transmit -> skip
-    # the 340-call multicall + flips. This is what makes the bare match viable on the hot path.
-    elif last_price is not None:
-        rep = next((meta[m][0] for m in feeds.get(agg, []) if meta.get(m)), None)
-        if rep is None:
-            return []
-        px = read_price_hedged(preconf_rpc, rpc, rep, price_fn=price_fn)
-        if px is not None:
-            _gate_px[rep] = px                               # 2b: рынок с этим оракулом не будет читать 2-й раз
-        moved = _price_moved(agg, px, last_price)
-        if stats is not None:                                # health buckets (none=preconf unreadable)
-            stats["none" if px is None else ("proceed" if moved else "skip")] += 1
-        if not moved:
-            return []
     with shared.lock:
         groups = dict(shared.groups); debt_by = dict(shared.debt_by); debt_assets_by = dict(shared.debt_assets_by)
 
@@ -1037,7 +1022,10 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     # ПОСЛЕДОВАТЕЛЬНО внутри цикла (~110мс каждый из Charlotte) -> рынок №2/№3 ждал СУММУ чужих RTT
     # (наблюдалось в журнале: price=0ms -> 114ms -> 110ms), и канарейка стреляла после всех. Теперь
     # все недостающие цены стартуют параллельно ЗДЕСЬ; цикл ждёт только СВОЙ оракул (Event).
-    # Hint-рынок не ждёт ничего (цена уже в _gate_px).
+    # Hint-рынок не ждёт ничего (цена уже в _gate_px). 07-23: префетч поднят ВЫШЕ гейта — гейт
+    # потребляет префетч rep-оракула вместо собственного RTT (было последовательно: в деградацию
+    # preconf гейт 0.4с-кап + префетч 0.4с-кап = dt_spawn 867мс; параллельно = один кап ~0.5с,
+    # в норме ~100мс вместо ~200). Цена: reader-tx (гейт скопирует) тратит спавн лёгких чтений.
     _px_prefetch = {}                            # oracle -> (Event, [px|None])
     for _mid_pf in feeds.get(agg, []):
         _om_pf = meta.get(_mid_pf)
@@ -1057,6 +1045,29 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             finally:
                 _ev.set()
         threading.Thread(target=_pf_read, daemon=True).start()
+
+    # price-change gate: the bare match also fires on price-READ txs. Read ONE representative oracle
+    # preconf price; if it has not moved since last sighting this was a reader, not a transmit -> skip
+    # the 340-call multicall + flips. This is what makes the bare match viable on the hot path.
+    # 07-23: rep берётся из УЖЕ летящего префетча (гейт ‖ префетч, см. коммент выше); свой
+    # хедж-RTT — только если rep-рынок без кандидатов (не префетчится).
+    if not (px_hint is not None and hint_oracle is not None) and last_price is not None:
+        rep = next((meta[m][0] for m in feeds.get(agg, []) if meta.get(m)), None)
+        if rep is None:
+            return []
+        if rep in _px_prefetch:
+            _ev_g, _box_g = _px_prefetch[rep]
+            _ev_g.wait(timeout=3.0)                          # хедж внутри префетча сам капит (0.4с+confirmed)
+            px = _box_g[0] if _box_g else None
+        else:
+            px = read_price_hedged(preconf_rpc, rpc, rep, price_fn=price_fn)
+        if px is not None:
+            _gate_px[rep] = px                               # 2b: рынок с этим оракулом не будет читать 2-й раз
+        moved = _price_moved(agg, px, last_price)
+        if stats is not None:                                # health buckets (none=preconf unreadable)
+            stats["none" if px is None else ("proceed" if moved else "skip")] += 1
+        if not moved:
+            return []
 
     ready, meta_by = [], {}
     _canary_fired = False                        # ранний выстрел на hint-рынке (см. ниже) — один на транзит
