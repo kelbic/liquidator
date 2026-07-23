@@ -1267,6 +1267,27 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                     len(agg_set))
                         _re_thread = None; _re_box = None
                         last_resolve = time.monotonic() - max(0.0, _rescan_iv - 120.0)
+                    if _re_thread is not None and not _re_thread.is_alive() and _re_box is not None:
+                        _res = _re_box.get("res")
+                        log.info("DIAG re-resolve commit res=%s dt=%.0fs",
+                                 "ok" if _res else "none", time.monotonic() - _re_started)
+                        _re_thread = None; _re_box = None
+                        if _res:
+                            new_feeds, new_meta = _res
+                            last_resolve = time.monotonic()
+                            if (new_feeds or not feeds) and (new_meta or not meta):
+                                feeds = new_feeds; meta = new_meta; agg_set = set(feeds)
+                                shadow_map = _build_shadow_map(feeds, meta, markets, primary=primary_map())   # ротация агрегатора
+                                log.info("re-resolve: %d watch keys / %d market-legs",
+                                         len(agg_set), sum(len(v) for v in feeds.values()))
+                            else:
+                                # шторм на обоих эндпоинтах: пустой картой ЖИВУЮ не затираем
+                                log.warning("re-resolve пуст (feeds=%d meta=%d) — держу старую карту (%d aggs)",
+                                            len(new_feeds), len(new_meta), len(agg_set))
+                        else:
+                            # резолв упал целиком (исключение в bg): повтор через ~120с, не через 6ч
+                            last_resolve = time.monotonic() - max(0.0, _rescan_iv - 120.0)
+                            log.warning("re-resolve упал (шторм) — повтор ~120с, карта прежняя (%d aggs)", len(agg_set))
                     if (time.monotonic() - last_resolve >= _rescan_iv
                             and not (_re_thread is not None and _re_thread.is_alive())):
                         _re_box = {}
@@ -1293,27 +1314,6 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             box["res"] = (nf, nm)
                         _re_thread = threading.Thread(target=_bg_resolve, daemon=True)
                         _re_thread.start()
-                    if _re_thread is not None and not _re_thread.is_alive() and _re_box is not None:
-                        _res = _re_box.get("res")
-                        log.info("DIAG re-resolve commit res=%s dt=%.0fs",
-                                 "ok" if _res else "none", time.monotonic() - _re_started)
-                        _re_thread = None; _re_box = None
-                        if _res:
-                            new_feeds, new_meta = _res
-                            last_resolve = time.monotonic()
-                            if (new_feeds or not feeds) and (new_meta or not meta):
-                                feeds = new_feeds; meta = new_meta; agg_set = set(feeds)
-                                shadow_map = _build_shadow_map(feeds, meta, markets, primary=primary_map())   # ротация агрегатора
-                                log.info("re-resolve: %d watch keys / %d market-legs",
-                                         len(agg_set), sum(len(v) for v in feeds.values()))
-                            else:
-                                # шторм на обоих эндпоинтах: пустой картой ЖИВУЮ не затираем
-                                log.warning("re-resolve пуст (feeds=%d meta=%d) — держу старую карту (%d aggs)",
-                                            len(new_feeds), len(new_meta), len(agg_set))
-                        else:
-                            # резолв упал целиком (исключение в bg): повтор через ~120с, не через 6ч
-                            last_resolve = time.monotonic() - max(0.0, _rescan_iv - 120.0)
-                            log.warning("re-resolve упал (шторм) — повтор ~120с, карта прежняя (%d aggs)", len(agg_set))
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
                         log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
