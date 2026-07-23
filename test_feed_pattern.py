@@ -33,7 +33,7 @@ def _norm_legs(v):
 def _patched_resolve(mapping):
     """resolve_feeds поверх замоканного _resolve_legs (I/O-шов из docstring)."""
     orig = feeds._resolve_legs
-    feeds._resolve_legs = lambda rpc, mid: _norm_legs(mapping.get(mid))
+    feeds._resolve_legs = lambda rpc, mid, fb=None: _norm_legs(mapping.get(mid))
     try:
         return feeds.resolve_feeds(None, [_Mkt(m) for m in mapping])
     finally:
@@ -95,7 +95,7 @@ def test_resolve_feeds_fallback_rpc():
     MAIN, FB = object(), object()
     table = {(FB, MID): PATTERN, (FB, "0x" + "cd" * 32): PLAIN_AGG}   # main отдаёт пусто по всем
     orig = feeds._resolve_legs
-    feeds._resolve_legs = lambda rpc, mid: _norm_legs(table.get((rpc, mid)))
+    feeds._resolve_legs = lambda rpc, mid, fb=None: _norm_legs(table.get((rpc, mid)))
     try:
         blind = feeds.resolve_feeds(MAIN, [_Mkt(MID), _Mkt("0x" + "cd" * 32), _Mkt("0x" + "ee" * 32)])
         assert blind == {}                                            # без фолбэка — слепота (инцидент 07-23)
@@ -210,6 +210,31 @@ def test_resolve_legs_dedup_and_no_bf1():
         (QF1_AGG, "latestTimestamp"): int(now - 60),
     })
     assert feeds._resolve_legs(rpc2, MID) == (None, [QF1_AGG])
+
+
+def test_per_leg_fallback_rpc():
+    # (H3) 429/транспорт на ОДНОЙ ноге при живом остальном: вызов ретраится через fallback_rpc,
+    # нога НЕ выпадает молча (дрейф карты 23<->25 ключей 07-23). Легитимное отсутствие
+    # функции падает и на фолбэке -> None (поведение прежнее)
+    import time as _t
+    now = _t.time()
+    full = {
+        (_morpho_key(), "idToMarketParams"): ("L", "C", ORACLE2, "I", 0),
+        (ORACLE2, "BASE_FEED_1"): BF1_PROXY,
+        (ORACLE2, "QUOTE_FEED_1"): QF1_PROXY,
+        (BF1_PROXY, "aggregator"): BF1_AGG,
+        (QF1_PROXY, "aggregator"): QF1_AGG,
+        (BF1_AGG, "latestTimestamp"): int(now - 60),
+        (QF1_AGG, "latestTimestamp"): int(now - 60),
+    }
+    # main знает только morpho+BASE_FEED_1-цепочку; QF1-цепочка и liveness падают -> фолбэк
+    main = _FakeRpc({k: v for k, v in full.items()
+                     if k[1] in ("idToMarketParams",) or k[0] in (ORACLE2.replace("QUOTE", "X"),)
+                     or k in ((ORACLE2, "BASE_FEED_1"), (BF1_PROXY, "aggregator"))})
+    fb = _FakeRpc(full)
+    assert feeds._resolve_legs(main, MID, fallback_rpc=fb) == (BF1_AGG, [BF1_AGG, QF1_AGG])
+    # без фолбэка та же деградация роняет QF1-ногу (и это единственное отличие)
+    assert feeds._resolve_legs(main, MID) == (BF1_AGG, [BF1_AGG])
 
 
 def test_multileg_groups_and_primary_map():

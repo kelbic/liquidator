@@ -24,12 +24,19 @@ def _uint_abi(n):
              "outputs": [{"name": "", "type": "uint256"}]}]
 
 
-def _try_addr(rpc, addr, getter):
+def _try_addr(rpc, addr, getter, fallback_rpc=None):
+    """Адрес-геттер с проглотом ошибок; ЛЮБОЕ исключение (транспорт ИЛИ отсутствие функции)
+    ретраится один раз через fallback_rpc — иначе стартовый залп бота жжёт rate-бакет основного
+    RPC ровно во время резолва, пер-ножные 429 глотались МОЛЧА и ноги выпадали из карты
+    (наблюдалось: 23↔25 ключей между рестартами 07-23). Легитимное отсутствие функции на
+    фолбэке просто ревертнёт второй раз -> None (цена: 1 лишний вызов на отсутствующую ногу)."""
     try:
         v = getattr(rpc.contract(addr, _addr_abi(getter)).functions, getter)().call()
-        return v if v and v != ZERO else None
     except Exception:
+        if fallback_rpc is not None:
+            return _try_addr(fallback_rpc, addr, getter)
         return None
+    return v if v and v != ZERO else None
 
 
 # Read-time композит-оракулы: BASE_FEED_1 без aggregator() — сам композит НИКОГДА не получает tx
@@ -68,25 +75,31 @@ def primary_map():
     return dict(_PRIMARY_AGG)
 
 
-def _leg_agg(rpc, oracle, getter):
+def _leg_agg(rpc, oracle, getter, fallback_rpc=None):
     """Одна нога оракула: getter -> proxy -> aggregator (lower), с подменой watch-паттерна;
-    None если ноги нет (getter отсутствует/ZERO). I/O."""
-    proxy = _try_addr(rpc, oracle, getter)
+    None если ноги нет (getter отсутствует/ZERO). Фолбэк-ретрай на каждом вызове (см. _try_addr):
+    без него транспорт-фейл aggregator() подставлял ПРОКСИ как watch-ключ (`or proxy` ниже
+    легитимен только для фидов без агрегатора, напр. прямой RedStone) = мёртвый ключ. I/O."""
+    proxy = _try_addr(rpc, oracle, getter, fallback_rpc)
     if not proxy:
         return None
-    agg = (_try_addr(rpc, proxy, "aggregator") or proxy).lower()
+    agg = (_try_addr(rpc, proxy, "aggregator", fallback_rpc) or proxy).lower()
     return WATCH_PATTERN_OVERRIDES.get(agg, agg)
 
 
-def _leg_live(rpc, agg):
+def _leg_live(rpc, agg, fallback_rpc=None):
     """Возраст-фильтр extra-ноги: latestTimestamp агрегатора не старше EXTRA_LEG_MAX_AGE_SEC.
     Watch-паттерны (len != 42) на чейне не читаемы — проверены вручную, пропускаем. Нет
-    latestTimestamp (hardcoded/не-Chainlink) или старый — нога мёртвая/стейбл, в watch не идёт. I/O."""
+    latestTimestamp (hardcoded/не-Chainlink) или старый — нога мёртвая/стейбл, в watch не идёт.
+    Исключение (транспорт) — ретрай через fallback_rpc, иначе 429 в старт-залп молча ронял
+    живую ногу. I/O."""
     if len(agg) != 42:
         return True
     try:
         ts = rpc.contract(agg, _uint_abi("latestTimestamp")).functions.latestTimestamp().call()
     except Exception:
+        if fallback_rpc is not None:
+            return _leg_live(fallback_rpc, agg)
         return False
     return bool(ts) and (time.time() - int(ts)) <= EXTRA_LEG_MAX_AGE_SEC
 
@@ -106,11 +119,12 @@ def _resolve_one(rpc, market_id):
     return _leg_agg(rpc, oracle, "BASE_FEED_1")
 
 
-def _resolve_legs(rpc, market_id):
+def _resolve_legs(rpc, market_id, fallback_rpc=None):
     """market_id -> (primary, legs): primary = BF1-нога (исторический одноногий watch, БЕЗ
     возраст-фильтра — поведение primary не меняем) или None; legs = все watch-ноги рынка
     (primary первой + живые BF2/QF1/QF2 через _leg_live, без дублей). (None, []) = non-Chainlink
-    wrapper ЛИБО транспортный шторм — различает fallback_rpc в resolve_feeds. I/O; patched in tests."""
+    wrapper ЛИБО транспортный шторм — различает пер-рыночный повтор в resolve_feeds.
+    fallback_rpc пробрасывается до КАЖДОГО вызова ноги (пер-ножный ретрай). I/O; patched in tests."""
     from chain.morpho import MORPHO_BLUE_ADDRESS
     from chain.simulate import MORPHO_READ_ABI
     morpho = rpc.contract(MORPHO_BLUE_ADDRESS, MORPHO_READ_ABI)
@@ -119,12 +133,12 @@ def _resolve_legs(rpc, market_id):
     except Exception:
         return None, []
     legs = []
-    primary = _leg_agg(rpc, oracle, "BASE_FEED_1")
+    primary = _leg_agg(rpc, oracle, "BASE_FEED_1", fallback_rpc)
     if primary:
         legs.append(primary)
     for getter in EXTRA_LEG_GETTERS:
-        agg = _leg_agg(rpc, oracle, getter)
-        if agg and agg not in legs and _leg_live(rpc, agg):
+        agg = _leg_agg(rpc, oracle, getter, fallback_rpc)
+        if agg and agg not in legs and _leg_live(rpc, agg, fallback_rpc):
             legs.append(agg)
     return primary, legs
 
@@ -142,7 +156,7 @@ def resolve_feeds(rpc, markets, fallback_rpc=None):
     aggs = defaultdict(list)
     prim = {}
     for m in markets:
-        primary, legs = _resolve_legs(rpc, m.market_id)
+        primary, legs = _resolve_legs(rpc, m.market_id, fallback_rpc)
         if not legs and fallback_rpc is not None:
             primary, legs = _resolve_legs(fallback_rpc, m.market_id)
         if primary:
