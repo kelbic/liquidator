@@ -433,10 +433,11 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
                       "path": _pack_path(_CBBTC, 100, _EURC)},
     (_CBLTC, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_CBLTC, 200, _UNIV3_WETH, 100, _UNIV3_USDC)},
-    # CBBTC_PLAN 07-09: cbBTC/USDC — QuoterV2 live: $2k->$2009, $30k->$30103 (~0.3% impact); fee 500
-    # на обоих хопах чуть лучше 3000 (пулы верифицированы 07-08: cbBTC/WETH 500 liq>0, WETH/USDC 500).
+    # cbBTC/USDC: ПРЯМОЙ пул fee=500 (0xfbb6eed8, liq 2.1e12) доминирует 2-hop через WETH на ВСЕХ
+    # размерах — QuoterV2 23.07: $30k imp 0.01% vs 0.10%, $500k 0.95% vs 1.68%, $1M 2.02% vs 3.48%
+    # (при LIF 4.4% профит жив и на $1M). fee=100/3000 хуже на порядок/в разы.
     (_CBBTC, _UNIV3_USDC): {"router": UNIV3_SWAP_ROUTER, "style": "02",
-                            "path": _pack_path(_CBBTC, 500, _UNIV3_WETH, 500, _UNIV3_USDC)},
+                            "path": _pack_path(_CBBTC, 500, _UNIV3_USDC)},
     # LBTC/cbBTC 07-12 (нож $350.8k долга, BTC-пег пара — профиль «мгновенный флип на ноже»):
     # UniV3 ПУСТ на всех тирах (QuoterV2-проба impact~99.6%, analysis/lbtc_route_probe.py);
     # Slipstream ts=1 ЖИВОЙ (router.factory()->getPool, liquidity=125.6B, 07-12); Kyber-глубина

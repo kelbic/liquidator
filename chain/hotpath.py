@@ -1171,7 +1171,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             if stats is not None: stats["f_prep"] += 1
             _bc = pos_by.get(b)
             if (getattr(cfg, "fast_lane", False) and not fast_lane_disabled()   # II.6: breaker -> фолбэк sim
-                    and _bc and du >= getattr(cfg, "fast_lane_min_repaid_usd", 1000.0)):
+                    and _bc and du >= getattr(cfg, "fast_lane_min_repaid_usd", 1000.0)
+                    and du <= getattr(cfg, "fast_lane_max_repaid_usd", 500000.0)):  # мега-сайз -> sim
                 _fs = time.perf_counter()                    # P1-9: fast-lane БЕЗ sim; при ok обычный
                 fprep = prepare_fast(rpc, preconf_rpc, cfg, mid, b, du,   # prepare НЕ дублируем (2-я tx
                                      debt_assets_by.get((mid, b), 0), price,   # сожгла бы nonce+газ)

@@ -52,6 +52,9 @@ class Config:
     positions_from_cache: bool = False    # P1-6: слой 2 потребление (OFF до калибровки cache-divergence)
     fast_lane: bool = False               # P1-9: fast-lane без sim (OFF; контракт гарантирует исход)
     fast_lane_min_repaid_usd: float = 1000.0  # fast-lane только на призах >= этого repaid USD
+    fast_lane_max_repaid_usd: float = 500000.0  # ...и <= этого: выше — sim-путь (импакт выхода
+                                                # на мега-сайзе должен считаться, не угадываться;
+                                                # direct cbBTC(500) @$500k imp 0.95% < LIF 4.4%)
     fast_lane_max_consec_reverts: int = 3     # II.6 circuit breaker: N подряд ревертов fast-lane -> off ТОЛЬКО fast-lane (фолбэк sim)
     batch_liquidate: bool = False             # мультибатч: N жертв в ОДНОЙ tx (каскад). OFF -> путь бит-в-бит старый
     batch_max_items: int = 5                  # макс items в одной batch-tx (хвост -> следующими tx в пределах max_inflight)
@@ -126,6 +129,7 @@ class Config:
             positions_from_cache=b("POSITIONS_FROM_CACHE"),
             fast_lane=b("FAST_LANE"),
             fast_lane_min_repaid_usd=f("FAST_LANE_MIN_REPAID_USD", d.fast_lane_min_repaid_usd),
+            fast_lane_max_repaid_usd=f("FAST_LANE_MAX_REPAID_USD", d.fast_lane_max_repaid_usd),
             fast_lane_max_consec_reverts=i("FAST_LANE_MAX_CONSEC_REVERTS", d.fast_lane_max_consec_reverts),
             batch_liquidate=b("BATCH_LIQUIDATE"),
             batch_max_items=i("BATCH_MAX_ITEMS", d.batch_max_items),
