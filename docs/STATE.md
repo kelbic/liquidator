@@ -306,8 +306,9 @@ shadow+замер, боевой путь не тронут.
 
 **Бот ВООРУЖЁН И ПОЛНОСТЬЮ РАЗВЁРНУТ** (конец 07-09). Флаги живого процесса (проверять ТОЛЬКО через
 `/proc/$(systemctl show -p MainPID --value liquidator-bot)/environ`): `MODE=execute LOOP_MODE=block
-HOT_PATH=1 PRICE_FROM_FEED=1 POSITIONS_FROM_CACHE=1 FAST_LANE=1`. Прод-`.env`: `TIP_GWEI=6.0`,
-`HOT_MIN_REPAID_USD=450`, `MIN_PROFIT_USD=5`, `MAX_INFLIGHT=5`, `SEQUENCER_RPC=…sequencer.base.org`.
+HOT_PATH=1 PRICE_FROM_FEED=1 POSITIONS_FROM_CACHE=1 FAST_LANE=1`. Прод-`.env` (после 30dc13c 23.07):
+`TIP_GWEI=0.05` (динамические ступени mid/big поверх), `HOT_MIN_REPAID_USD=75`, `MIN_PROFIT_USD=2`,
+`MAX_INFLIGHT=5`, `SEQUENCER_RPC=…sequencer.base.org`, `PREDICT_SPEC_CANARY=1`.
 Kill-switch $60 loss / $100 gas / день. Контракт `0x54730EE13f10C073772f25ee475EE13f2252Fb82`
 (`liquidate()` onlyOwner). Кошелёк/owner `0xE2Aca8e68Ae3b7EfCfCe4fD82aBDFc2a9D7908Fe`.
 

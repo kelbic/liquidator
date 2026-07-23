@@ -67,7 +67,11 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # Один источник правды по дефолтам — поля dataclass выше (рассинхрон 23.07:
+        # f("TIP_GWEI", 3.0) против tip_gwei=0.05 — выпадение ключа из .env молча
+        # вернуло бы устаревший литерал). Здесь только маппинг ENV-ключ -> поле.
         g = os.environ.get
+        d = cls()
 
         def s(key, default=""):
             v = g(key)
@@ -75,60 +79,63 @@ class Config:
 
         def i(key, default):
             v = g(key)
-            return int(v) if v not in (None, "") else int(default)
+            return int(float(v)) if v not in (None, "") else int(default)
 
         def f(key, default):
             v = g(key)
             return float(v) if v not in (None, "") else float(default)
 
+        def b(key):
+            return (g(key) or "").lower() in ("1", "true", "yes", "on")
+
         return cls(
             rpc_url=s("RPC_URL"),
-            chain=s("CHAIN", "base"),
-            chain_id=i("CHAIN_ID", 8453),
+            chain=s("CHAIN", d.chain),
+            chain_id=i("CHAIN_ID", d.chain_id),
             wallet_address=s("WALLET_ADDRESS"),
             wallet_key=s("WALLET_KEY"),
             liquidator_address=s("LIQUIDATOR_ADDRESS"),
-            mode=s("MODE", "monitor"),
-            covered_markets_path=s("COVERED_MARKETS_PATH", "covered_markets.json"),
-            rescan_interval_sec=f("RESCAN_INTERVAL_SEC", 21600.0),
+            mode=s("MODE", d.mode),
+            covered_markets_path=s("COVERED_MARKETS_PATH", d.covered_markets_path),
+            rescan_interval_sec=f("RESCAN_INTERVAL_SEC", d.rescan_interval_sec),
             exclude_oracles=s("EXCLUDE_ORACLES"),
-            min_profit_usd=f("MIN_PROFIT_USD", 5.0),
-            tip_gwei=f("TIP_GWEI", 3.0),
-            gas_limit_est=i("GAS_LIMIT_EST", 500000),
-            eth_price_usd=f("ETH_PRICE_USD", 1730.0),
-            max_daily_loss_usd=f("MAX_DAILY_LOSS_USD", 50.0),
-            max_daily_gas_usd=f("MAX_DAILY_GAS_USD", 100.0),
-            max_inflight=i("MAX_INFLIGHT", 5),
+            min_profit_usd=f("MIN_PROFIT_USD", d.min_profit_usd),
+            tip_gwei=f("TIP_GWEI", d.tip_gwei),
+            gas_limit_est=i("GAS_LIMIT_EST", d.gas_limit_est),
+            eth_price_usd=f("ETH_PRICE_USD", d.eth_price_usd),
+            max_daily_loss_usd=f("MAX_DAILY_LOSS_USD", d.max_daily_loss_usd),
+            max_daily_gas_usd=f("MAX_DAILY_GAS_USD", d.max_daily_gas_usd),
+            max_inflight=i("MAX_INFLIGHT", d.max_inflight),
             tg_bot_token=s("TG_BOT_TOKEN"),
-            tg_admin_id=i("TG_ADMIN_ID", 0),
-            alert_antiflood_sec=i("ALERT_ANTIFLOOD_SEC", 600),
-            bot_tag=s("LIQ_BOT_TAG", ""),
-            poll_interval_sec=f("POLL_INTERVAL_SEC", 2.0),
-            loop_mode=s("LOOP_MODE", "poll"),
-            block_source=s("BLOCK_SOURCE", "flashblocks"),
-            block_wss_url=s("BLOCK_WSS_URL", ""),
-            candidate_refresh_sec=f("CANDIDATE_REFRESH_SEC", 60.0),
-            hot_path=(s("HOT_PATH", "").lower() in ("1", "true", "yes", "on")),
-            predict_shadow=(s("PREDICT_SHADOW", "").lower() in ("1", "true", "yes", "on")),
-            price_from_feed=(s("PRICE_FROM_FEED", "").lower() in ("1", "true", "yes", "on")),
-            hot_min_repaid_usd=f("HOT_MIN_REPAID_USD", 75.0),
-            tip_mid_repaid_usd=f("TIP_MID_REPAID_USD", 2000.0),
-            tip_mid_gwei=f("TIP_MID_GWEI", 2.0),
-            tip_big_repaid_usd=f("TIP_BIG_REPAID_USD", 20000.0),
-            tip_big_gwei=f("TIP_BIG_GWEI", 30.0),
-            positions_from_cache=(s("POSITIONS_FROM_CACHE", "").lower() in ("1", "true", "yes", "on")),
-            fast_lane=(s("FAST_LANE", "").lower() in ("1", "true", "yes", "on")),
-            fast_lane_min_repaid_usd=f("FAST_LANE_MIN_REPAID_USD", 1000.0),
-            fast_lane_max_consec_reverts=int(f("FAST_LANE_MAX_CONSEC_REVERTS", 3)),
-            batch_liquidate=(s("BATCH_LIQUIDATE", "").lower() in ("1", "true", "yes", "on")),
-            batch_max_items=int(f("BATCH_MAX_ITEMS", 5)),
-            canary_probe=(s("CANARY_PROBE", "").lower() in ("1", "true", "yes", "on")),
-            canary_max_probes=int(f("CANARY_MAX_PROBES", 100)),
-            canary_min_interval_sec=f("CANARY_MIN_INTERVAL_SEC", 120.0),
-            canary_max_gas_usd=f("CANARY_MAX_GAS_USD", 25.0),
-            preconf_rpc=s("PRECONF_RPC", "https://mainnet-preconf.base.org"),
-            sequencer_rpc=s("SEQUENCER_RPC", "https://mainnet-sequencer.base.org"),
-            candidates_snapshot_path=s("CANDIDATES_SNAPSHOT_PATH", "candidates_snapshot.json"),
-            db_path=s("DB_PATH", "liquidator.db"),
-            log_level=s("LOG_LEVEL", "INFO"),
+            tg_admin_id=i("TG_ADMIN_ID", d.tg_admin_id),
+            alert_antiflood_sec=i("ALERT_ANTIFLOOD_SEC", d.alert_antiflood_sec),
+            bot_tag=s("LIQ_BOT_TAG", d.bot_tag),
+            poll_interval_sec=f("POLL_INTERVAL_SEC", d.poll_interval_sec),
+            loop_mode=s("LOOP_MODE", d.loop_mode),
+            block_source=s("BLOCK_SOURCE", d.block_source),
+            block_wss_url=s("BLOCK_WSS_URL", d.block_wss_url),
+            candidate_refresh_sec=f("CANDIDATE_REFRESH_SEC", d.candidate_refresh_sec),
+            hot_path=b("HOT_PATH"),
+            predict_shadow=b("PREDICT_SHADOW"),
+            price_from_feed=b("PRICE_FROM_FEED"),
+            hot_min_repaid_usd=f("HOT_MIN_REPAID_USD", d.hot_min_repaid_usd),
+            tip_mid_repaid_usd=f("TIP_MID_REPAID_USD", d.tip_mid_repaid_usd),
+            tip_mid_gwei=f("TIP_MID_GWEI", d.tip_mid_gwei),
+            tip_big_repaid_usd=f("TIP_BIG_REPAID_USD", d.tip_big_repaid_usd),
+            tip_big_gwei=f("TIP_BIG_GWEI", d.tip_big_gwei),
+            positions_from_cache=b("POSITIONS_FROM_CACHE"),
+            fast_lane=b("FAST_LANE"),
+            fast_lane_min_repaid_usd=f("FAST_LANE_MIN_REPAID_USD", d.fast_lane_min_repaid_usd),
+            fast_lane_max_consec_reverts=i("FAST_LANE_MAX_CONSEC_REVERTS", d.fast_lane_max_consec_reverts),
+            batch_liquidate=b("BATCH_LIQUIDATE"),
+            batch_max_items=i("BATCH_MAX_ITEMS", d.batch_max_items),
+            canary_probe=b("CANARY_PROBE"),
+            canary_max_probes=i("CANARY_MAX_PROBES", d.canary_max_probes),
+            canary_min_interval_sec=f("CANARY_MIN_INTERVAL_SEC", d.canary_min_interval_sec),
+            canary_max_gas_usd=f("CANARY_MAX_GAS_USD", d.canary_max_gas_usd),
+            preconf_rpc=s("PRECONF_RPC", d.preconf_rpc),
+            sequencer_rpc=s("SEQUENCER_RPC", d.sequencer_rpc),
+            candidates_snapshot_path=s("CANDIDATES_SNAPSHOT_PATH", d.candidates_snapshot_path),
+            db_path=s("DB_PATH", d.db_path),
+            log_level=s("LOG_LEVEL", d.log_level),
         )
