@@ -1058,7 +1058,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             log.info("DIAG cache-divergence market=%s same=%d mism=%d tba_eq=%s tbs_eq=%s bad=%s",
                      mid[:10], _same, len(_mm), _cached[0] == tba, _cached[1] == tbs,
                      ",".join(_mm[:5]) if _mm else "-")
-        log.info("DIAG hotset mid=%s src=%s trig=%s n=%d block=%d", mid[:10], _rsrc, subidx, len(pos), block)  # full set on disk
+        log.info("DIAG hotset mid=%s src=%s trig=%s agg=%s n=%d block=%d",   # agg= атрибуция ноги-триггера (multi-leg 07-23)
+                 mid[:10], _rsrc, subidx, agg[:10], len(pos), block)  # full set on disk
         positions = [(b, bs, col, debt_by.get((mid, b), 0.0)) for (b, bs, col) in pos]
         pos_by = {b: (bs, col) for (b, bs, col) in pos}      # P0-4: state для prepare_hot без повторного RTT
         _fls = time.perf_counter()                           # 07-17 п.1: CPU _flips по непруненному набору — мерить
