@@ -1209,7 +1209,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     agg_set = set(feeds)
     shadow_map = _build_shadow_map(feeds, meta, markets, primary=primary_map())   # SHADOW слоя 1 (log-only спавн-гейт)
     log.info("DIAG shadow-feed map %s", {a[:10]: s for a, (s, _sc, _o) in shadow_map.items()})
-    last_resolve = time.monotonic()
+    # 07-23: init-резолв конкурирует со стартовым залпом (mega-fetch жжёт оба эндпоинта) и приходит
+    # ЧАСТИЧНЫМ (23 ключа против 27 в спокойный замер) — первый ре-резолв назначаем через 180с
+    # (залп улёгся, ноги добираются), дальше обычный каденс. Guard «пусто не затирает» стоит ниже.
+    last_resolve = time.monotonic() - max(0.0, cfg.rescan_interval_sec - 180.0)
     log.info("hot path: %d aggregators / %d markets (preconf=%s, tip=%.1f gwei, floor repaid $%.0f)",
              len(agg_set), len(meta), preconf_rpc.rpc_url, cfg.tip_gwei, hot_min_repaid(cfg))
     _seq_url = str(getattr(cfg, "sequencer_rpc", "") or "")   # 07-17: тёплый keep-alive к секвенсеру ДО
@@ -1234,6 +1237,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     recon_ts = []                # monotonic'ы реконнектов hot-path ws; одиночный разрыв публичного
     last_recon_alert = 0.0       # Flashblocks-WS = НОРМА (роняет соединение раз в час-два) -> TG молчит,
                                  # алерт ТОЛЬКО на серию (3+ за 180с = реальная нестабильность фида/сети)
+    _re_thread = None            # 07-23: ре-резолв УШЁЛ ИЗ recv-петли — inline-резолв глушил hot-path
+    _re_box = None               # на всю длительность (спокойный замер multi-leg: 184с петля не читает
+                                 # WS -> триггеры мертвы). Фоновый тред кладёт результат в box,
+                                 # петля коммитит готовое; один резолв за раз (как _spawn_cache_refresh).
     while not stop.is_set():
         try:
             async with ws_factory() as ws:
@@ -1241,20 +1248,36 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                 while not stop.is_set():
                     # слепой старт (feeds пуст) ре-резолвится ускоренно (120с), не через 6ч rescan
                     _rescan_iv = cfg.rescan_interval_sec if feeds else min(cfg.rescan_interval_sec, 120.0)
-                    if time.monotonic() - last_resolve >= _rescan_iv:
-                        try:
-                            new_feeds = resolve_feeds(rpc, markets, _fb_resolve_rpc)
-                            new_meta = resolve_meta(rpc, markets)
+                    if (time.monotonic() - last_resolve >= _rescan_iv
+                            and not (_re_thread is not None and _re_thread.is_alive())):
+                        _re_box = {}
+
+                        def _bg_resolve(box=_re_box):
+                            try:
+                                box["res"] = (resolve_feeds(rpc, markets, _fb_resolve_rpc),
+                                              resolve_meta(rpc, markets))
+                            except Exception:
+                                box["res"] = None
+                        _re_thread = threading.Thread(target=_bg_resolve, daemon=True)
+                        _re_thread.start()
+                    if _re_thread is not None and not _re_thread.is_alive() and _re_box is not None:
+                        _res = _re_box.get("res")
+                        _re_thread = None; _re_box = None
+                        if _res:
+                            new_feeds, new_meta = _res
                             last_resolve = time.monotonic()
                             if (new_feeds or not feeds) and (new_meta or not meta):
                                 feeds = new_feeds; meta = new_meta; agg_set = set(feeds)
                                 shadow_map = _build_shadow_map(feeds, meta, markets, primary=primary_map())   # ротация агрегатора
+                                log.info("re-resolve: %d watch keys / %d market-legs",
+                                         len(agg_set), sum(len(v) for v in feeds.values()))
                             else:
                                 # шторм на обоих эндпоинтах: пустой картой ЖИВУЮ не затираем
                                 log.warning("re-resolve пуст (feeds=%d meta=%d) — держу старую карту (%d aggs)",
                                             len(new_feeds), len(new_meta), len(agg_set))
-                        except Exception:
-                            pass
+                        else:
+                            # резолв упал целиком (исключение в bg): повтор через ~120с, не через 6ч
+                            last_resolve = time.monotonic() - max(0.0, _rescan_iv - 120.0)
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
                         log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
