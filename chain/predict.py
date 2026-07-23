@@ -19,6 +19,7 @@ falsepos|stale|recovered — грамматика 1:1 с Katana (анализа�
 FP = (disarm+falsepos)/arm; recall = confirmed/(confirmed+push); lead_s по confirmed."""
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -36,7 +37,10 @@ FEEDS_BASE: dict = {
     "SOLUSDT":  {"label": "SOL",  "dev": 0.0050, "collateral": "SOL"},
 }
 HOLD_SEC = 600.0        # falsepos-кап: релиз таймером только если цена отклонена, а пуша всё нет
-MID_STALE_SEC = 10.0    # mid старше -> фид заморожен (обрыв WS не генерит фантомные arm/falsepos)
+MID_STALE_SEC = float(os.environ.get("PREDICT_MID_STALE_SEC", "30.0"))
+# mid старше -> фид заморожен (обрыв WS не генерит фантомные arm/falsepos). 30с, не 10: bookTicker
+# тихих альтов (ADA) легитимно молчит >10с без смены best-bid/ask — 10с давало stale/recovered-чёрн
+# (2 эпизода за первые 7 мин shadow). Реальный клин WS ловит транспорт (recv-таймаут 10с -> реконнект).
 
 _LATEST_ROUND_SEL = bytes.fromhex("feaf968c")     # latestRoundData()
 
