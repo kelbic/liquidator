@@ -36,6 +36,10 @@ WATCH_PATTERN_OVERRIDES = {
     # Moonwell Bounded Composite (LBTC/cbBTC 0x4944a116…): форвардит RedStone LBTC_FUNDAMENTAL из
     # MultiFeedAdapter 0xb81131b6…; ловим ASCII-hex feedId — он есть ТОЛЬКО в апдейтах этого фида.
     "0x31d099c106cd73e731972fdf1390cab77f59dade": "0x" + "LBTC_FUNDAMENTAL".encode().hex(),
+    # Тот же RedStone-фид НАПРЯМУЮ как BASE_FEED_1 (LBTC/cbBTC lltv 0.945, 0x30767836…, найден
+    # классификацией 07-23): значение из того же адаптера — тот же паттерн; рынки группируются
+    # под одним ключом и ассессятся одним триггером.
+    "0x5c4c8d6f6bf79b718f3e8399aabdfed01cb7e48f": "0x" + "LBTC_FUNDAMENTAL".encode().hex(),
 }
 
 

@@ -30,10 +30,23 @@ def _patched_resolve(mapping):
         feeds._resolve_one = orig
 
 
+REDSTONE_FEED = "0x5c4c8d6f6bf79b718f3e8399aabdfed01cb7e48f"
+MID2 = "0x30767836635facec1282e6ef4a5981406ed4e72727b3a63a3a72c74e8279a8d7"
+
+
 def test_override_substitutes_pattern():
-    # (A) прямой вызов таблицы: композит -> паттерн, обычный адрес -> сам себя
+    # (A) прямой вызов таблицы: композит и прямой RedStone-фид -> ОДИН паттерн, обычный адрес -> сам себя
     assert feeds.WATCH_PATTERN_OVERRIDES[COMPOSITE] == PATTERN
+    assert feeds.WATCH_PATTERN_OVERRIDES[REDSTONE_FEED] == PATTERN
     assert feeds.WATCH_PATTERN_OVERRIDES.get(PLAIN_AGG, PLAIN_AGG) == PLAIN_AGG
+
+
+def test_two_lbtc_markets_group_under_one_pattern():
+    # (A2) оба LBTC-рынка (0.915 через композит, 0.945 напрямую через фид) под одним ключом ->
+    # один триггер ассессит оба (feeds.get(pattern) в _process_transmit)
+    out = _patched_resolve({MID: PATTERN, MID2: PATTERN})
+    assert sorted(out[PATTERN]) == sorted([MID, MID2])
+    assert len(out) == 1
 
 
 def test_pattern_key_shape():
