@@ -344,18 +344,38 @@ def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
         src_out["src"] = "cache"
     now = time.time()
     pos = []
+    stale = []
+    # 07-23: при refresh-гейте 1/30с (см. _CACHE_REFRESH_MIN_INTERVAL) запись старше 6с — НОРМА,
+    # а не исключение; исключать заёмщика из transmit-кандидатов = пропущенная жертва в гонке.
+    # Свежие отдаём из кэша (~1мс), stale/missing дочитываем ЖИВЬЁМ одним aggregate3 (preconf,
+    # ~100мс — путь и лид, верифицированные до Layer-2). Только если живое чтение упало —
+    # старое поведение (stale-skip), чтобы не действовать по протухшим данным.
     for b in borrowers:
         p = positions.get(b)
         if p is None:
-            log.info("DIAG position-cache stale-skip market=%s borrower=%s reason=never-seen", mid[:10], b[:10])
+            stale.append(b)
             continue
         bs, col, last_ok_ts = p
-        age = now - last_ok_ts
-        if age <= _POSITION_CACHE_MAX_AGE_SEC:
+        if now - last_ok_ts <= _POSITION_CACHE_MAX_AGE_SEC:
             pos.append((b, bs, col))
         else:
-            log.info("DIAG position-cache stale-skip market=%s borrower=%s reason=too-old age=%.1fs",
-                     mid[:10], b[:10], age)
+            stale.append(b)
+    if stale:
+        try:
+            live = read_positions(rpc, mid, stale, preconf_rpc=preconf_rpc, src_out=src_out)
+        except Exception as e:
+            live = None
+            log.info("DIAG position-cache live-subset fail market=%s n=%d err=%s",
+                     mid[:10], len(stale), str(e)[:60])
+        if live is not None:
+            tba, tbs, live_pos = live                        # живые totals свежее кэшевых
+            pos.extend(live_pos)
+            if src_out is not None:
+                src_out["src"] = "cache+" + str(src_out.get("src") or "live")
+        else:
+            for b in stale:
+                log.info("DIAG position-cache stale-skip market=%s borrower=%s reason=live-fail",
+                         mid[:10], b[:10])
     return tba, tbs, pos
 
 
@@ -363,9 +383,10 @@ _CACHE_REFRESH_THREAD = None      # re-entrancy guard (план п.3): один 
 _CACHE_REFRESH_STARTED = 0.0      # monotonic старт живого цикла (для busy-skip running=)
 _CACHE_SKIP_N = 0                 # skip'ов с последнего лога (троттл 60с)
 _CACHE_SKIP_LOG_TS = 0.0
-# 07-23: measurement-фаза кэша (reads_fn НЕ переключён — потребителей нет) выжигала burst-бакет
-# RPC_URL тяжёлыми aggregate3 каждые ~2с -> 429-шторм душил block-assess (~2% блоков) и nonce-fetch.
-# 1 цикл/30с сохраняет измерение и возвращает бакет боевым путям. 0 = старое поведение (каждый блок).
+# 07-23: refresh каждые ~2с тяжёлыми aggregate3 выжигал burst-бакет RPC_URL -> 429-шторм душил
+# block-assess (~2% блоков) и nonce-fetch. 1 цикл/30с возвращает бакет боевым путям; потребитель
+# кэша (POSITIONS_FROM_CACHE=1) при stale-записи дочитывает живьём (см. read_positions_cached),
+# так что редкий refresh НЕ теряет жертв. 0 = старое поведение (каждый блок).
 _CACHE_REFRESH_MIN_INTERVAL = float(os.environ.get("POSITION_CACHE_MIN_INTERVAL_SEC", "30"))
 
 
@@ -400,10 +421,10 @@ def _spawn_cache_refresh(*, cache_rpc, shared, bn):
 def _refresh_position_caches(*, cache_rpc, shared, bn):
     """Per-block driver (Layer 2, measurement phase — see STATE.md 'C temporary'). Refreshes
     _POSITION_CACHE for every money-market (UNIV3_PATHS collateral) via refresh_position_cache.
-    PURE MEASUREMENT: writes _POSITION_CACHE and logs refresh-miss/-fail + cycle timing, but does
-    NOT touch reads_fn/_process_transmit — the armed hot path keeps reading via the original live
-    read_positions, completely unchanged, until reads_fn is explicitly swapped (deliberately not
-    done yet). One market's decode/network hiccup does not stop the cycle for the others."""
+    Writes _POSITION_CACHE and logs refresh-miss/-fail + cycle timing. NOTE 07-23: the cache IS
+    consumed when POSITIONS_FROM_CACHE=1 (P1-6, live in prod) — read_positions_cached serves fresh
+    entries and live-reads stale ones. One market's decode/network hiccup does not stop the cycle
+    for the others."""
     from chain.execute import ROUTE_COLLATERALS
     with shared.lock:
         groups = dict(shared.groups)
