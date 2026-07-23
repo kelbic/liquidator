@@ -24,16 +24,28 @@ def _uint_abi(n):
              "outputs": [{"name": "", "type": "uint256"}]}]
 
 
+_TRANSPORT_ERRS = ("HTTPError", "ConnectionError", "ConnectTimeout", "ReadTimeout", "Timeout",
+                   "SSLError", "RequestException", "ChunkedEncodingError", "ProtocolError")
+
+
+def _is_transport(e):
+    """Транспортная ошибка (429/сеть/таймаут) vs легитимный ответ ноды (revert «нет функции» =
+    ContractLogicError, пустой return = BadFunctionCallOutput). По имени типа — без импорта
+    requests в import-clean модуль; ретраить через фолбэк имеет смысл ТОЛЬКО транспорт: ретрай
+    легитимных ревертов (~60-80 отсутствующих ног на резолв) на медленном публичном фолбэке
+    раздувал резолв с ~80с до 6+ мин (наблюдалось 17:56-18:02 23.07)."""
+    return type(e).__name__ in _TRANSPORT_ERRS
+
+
 def _try_addr(rpc, addr, getter, fallback_rpc=None):
-    """Адрес-геттер с проглотом ошибок; ЛЮБОЕ исключение (транспорт ИЛИ отсутствие функции)
-    ретраится один раз через fallback_rpc — иначе стартовый залп бота жжёт rate-бакет основного
-    RPC ровно во время резолва, пер-ножные 429 глотались МОЛЧА и ноги выпадали из карты
-    (наблюдалось: 23↔25 ключей между рестартами 07-23). Легитимное отсутствие функции на
-    фолбэке просто ревертнёт второй раз -> None (цена: 1 лишний вызов на отсутствующую ногу)."""
+    """Адрес-геттер с проглотом ошибок; ТРАНСПОРТНОЕ исключение ретраится один раз через
+    fallback_rpc — иначе стартовый залп бота жжёт rate-бакет основного RPC ровно во время
+    резолва, пер-ножные 429 глотались МОЛЧА и ноги выпадали из карты (23↔25 ключей между
+    рестартами 07-23). Легитимный revert/пустой return -> None сразу, без фолбэка."""
     try:
         v = getattr(rpc.contract(addr, _addr_abi(getter)).functions, getter)().call()
-    except Exception:
-        if fallback_rpc is not None:
+    except Exception as e:
+        if fallback_rpc is not None and _is_transport(e):
             return _try_addr(fallback_rpc, addr, getter)
         return None
     return v if v and v != ZERO else None
@@ -97,8 +109,8 @@ def _leg_live(rpc, agg, fallback_rpc=None):
         return True
     try:
         ts = rpc.contract(agg, _uint_abi("latestTimestamp")).functions.latestTimestamp().call()
-    except Exception:
-        if fallback_rpc is not None:
+    except Exception as e:
+        if fallback_rpc is not None and _is_transport(e):
             return _leg_live(fallback_rpc, agg)
         return False
     return bool(ts) and (time.time() - int(ts)) <= EXTRA_LEG_MAX_AGE_SEC

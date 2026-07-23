@@ -125,17 +125,23 @@ def test_init_resolve_retry_empty_ok():
     assert out == {"0xa": ["m"]}
 
 
+class HTTPError(Exception):
+    """Имя типа = транспорт-класс из feeds._TRANSPORT_ERRS (классификация по имени)."""
+
+
 class _FakeRpc:
     """rpc.contract(addr, abi).functions.<name>(*args).call() по таблице {(addr_lower, fn): value};
-    отсутствие ключа = Exception (как живой revert/нет функции). args игнорируются (один рынок)."""
-    def __init__(self, table):
+    отсутствие ключа = Exception (как живой revert/нет функции) либо HTTPError при
+    transport_fail=True (как 429/сеть). args игнорируются (один рынок)."""
+    def __init__(self, table, transport_fail=False):
         self._t = table
+        self._transport = transport_fail
 
     def to_bytes32(self, x):
         return x
 
     def contract(self, addr, abi):
-        table, key = self._t, addr.lower()
+        table, key, transport = self._t, addr.lower(), self._transport
 
         class _Fns:
             def __getattr__(self, name):
@@ -143,6 +149,8 @@ class _FakeRpc:
                     class _Call:
                         def call(_self, **kw):
                             if (key, name) not in table:
+                                if transport:
+                                    raise HTTPError("429 Too Many Requests")
                                 raise Exception("no %s on %s" % (name, key))
                             return table[(key, name)]
                     return _Call()
@@ -214,8 +222,9 @@ def test_resolve_legs_dedup_and_no_bf1():
 
 def test_per_leg_fallback_rpc():
     # (H3) 429/транспорт на ОДНОЙ ноге при живом остальном: вызов ретраится через fallback_rpc,
-    # нога НЕ выпадает молча (дрейф карты 23<->25 ключей 07-23). Легитимное отсутствие
-    # функции падает и на фолбэке -> None (поведение прежнее)
+    # нога НЕ выпадает молча (дрейф карты 23<->25 ключей 07-23). Легитимный revert («нет
+    # функции») фолбэк НЕ дёргает — ретрай ~60-80 отсутствующих ног на медленном публичном
+    # эндпоинте раздувал резолв с ~80с до 6+ мин
     import time as _t
     now = _t.time()
     full = {
@@ -227,14 +236,19 @@ def test_per_leg_fallback_rpc():
         (BF1_AGG, "latestTimestamp"): int(now - 60),
         (QF1_AGG, "latestTimestamp"): int(now - 60),
     }
-    # main знает только morpho+BASE_FEED_1-цепочку; QF1-цепочка и liveness падают -> фолбэк
-    main = _FakeRpc({k: v for k, v in full.items()
-                     if k[1] in ("idToMarketParams",) or k[0] in (ORACLE2.replace("QUOTE", "X"),)
-                     or k in ((ORACLE2, "BASE_FEED_1"), (BF1_PROXY, "aggregator"))})
+    partial = {k: v for k, v in full.items()
+               if k in ((_morpho_key(), "idToMarketParams"), (ORACLE2, "BASE_FEED_1"), (BF1_PROXY, "aggregator"))}
+    # 429-шторм (транспорт): QF1-цепочка и liveness падают HTTPError -> фолбэк добирает
+    main = _FakeRpc(partial, transport_fail=True)
     fb = _FakeRpc(full)
     assert feeds._resolve_legs(main, MID, fallback_rpc=fb) == (BF1_AGG, [BF1_AGG, QF1_AGG])
-    # без фолбэка та же деградация роняет QF1-ногу (и это единственное отличие)
+    # без фолбэка та же деградация роняет QF1-ногу
     assert feeds._resolve_legs(main, MID) == (BF1_AGG, [BF1_AGG])
+    # легитимный revert (не транспорт): фолбэк НЕ дёргается, нога честно отсутствует
+    legit = _FakeRpc(partial, transport_fail=False)
+    assert feeds._resolve_legs(legit, MID, fallback_rpc=fb) == (BF1_AGG, [BF1_AGG])
+    # классификатор: транспорт по имени типа, revert - нет
+    assert feeds._is_transport(HTTPError("429")) and not feeds._is_transport(Exception("execution reverted"))
 
 
 def test_multileg_groups_and_primary_map():
