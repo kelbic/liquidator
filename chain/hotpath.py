@@ -246,6 +246,7 @@ def read_preconf_price(preconf_rpc, oracle):
 
 
 _PX_HEDGE_SEC = float(os.environ.get("PX_HEDGE_TIMEOUT_SEC", "0.4"))
+_POS_HEDGE_SEC = float(os.environ.get("POS_HEDGE_TIMEOUT_SEC", "0.5"))
 
 
 def read_price_hedged(preconf_rpc, rpc, oracle, price_fn=read_preconf_price):
@@ -292,19 +293,42 @@ def read_positions(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
         calls.append((MORPHO_BLUE, encode_position_call(b32, b)))
     res = None; _src = "confirmed"
     if preconf_rpc is not None:
+        # 07-23 хедж (как у цены, см. read_price_hedged): preconf-aggregate3 под троттлом отбивается
+        # ~2.05с (429-trickle) — до хеджа это был реактивный столл для рынков ВНЕ кэша позиций
+        # (0x84662b4f, 112 канд. minHF=1.0001: trig=poll read=2342мс). Обе ноги параллельно,
+        # preconf ждём <=_POS_HEDGE_SEC (штатно тяжёлый read ~145мс -> его значение, поведение
+        # прежнее); не успел/невалиден -> confirmed (позиции медленные, confirmed-latest ~= pending).
+        _ev_p, _box_p = threading.Event(), []
+        _ev_c, _box_c = threading.Event(), []
+
+        def _leg(_r, _bid, _ev, _box):
+            try:
+                _box.append(aggregate3(_r, calls, block_identifier=_bid))
+            except Exception as _e:
+                _box.append(_e)                              # исключение в бокс: отличать fail от «ещё летит»
+            finally:
+                _ev.set()
+        threading.Thread(target=_leg, args=(preconf_rpc, "pending", _ev_p, _box_p), daemon=True).start()
+        threading.Thread(target=_leg, args=(rpc, None, _ev_c, _box_c), daemon=True).start()
+        _ev_p.wait(timeout=_POS_HEDGE_SEC)
+        _rp = _box_p[0] if _box_p else None
+        if isinstance(_rp, list) and _rp and _rp[0][0] and _rp[0][1]:
+            res = _rp; _src = "preconf"
+        else:
+            _ev_c.wait(timeout=10.0)
+            _rc = _box_c[0] if _box_c else None
+            if not isinstance(_rc, list):                    # A': confirmed-нога упала/молчит -> как fallback-fail
+                # 07-23: 429-шторм на confirmed убивал ВЕСЬ transmit-воркер необработанным HTTPError
+                # (preconf-ветка была обёрнута, фолбэк — нет) = потерянные рынки транзита в каскад.
+                # None -> вызывающий считает f_norp и продолжает соседей (как при пустом ответе).
+                log.info("DIAG read_positions fallback-fail market=%s err=%s", mid[:10],
+                         str(_rc)[:60] if _rc is not None else "timeout")
+                return None
+            res = _rc
+    else:
         try:
-            r = aggregate3(preconf_rpc, calls, block_identifier="pending")
-            if r and r[0][0] and r[0][1]:
-                res = r; _src = "preconf"
-        except Exception:
-            res = None
-    if res is None:
-        try:
-            res = aggregate3(rpc, calls)                      # A': silent confirmed-fallback (src=confirmed below)
+            res = aggregate3(rpc, calls)                     # confirmed-only путь (stale-дочитка кэша и тесты)
         except Exception as e:
-            # 07-23: 429-шторм на confirmed убивал ВЕСЬ transmit-воркер необработанным HTTPError
-            # (preconf-ветка выше обёрнута, фолбэк — не был) = потерянные рынки транзита в каскад.
-            # None -> вызывающий считает f_norp и продолжает соседей (как при пустом ответе).
             log.info("DIAG read_positions fallback-fail market=%s err=%s", mid[:10], str(e)[:60])
             return None
     if src_out is not None:
