@@ -1205,7 +1205,16 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                               getattr(rpc, "chain_id", 8453))
     feeds = _init_resolve_retry(resolve_feeds, rpc, markets, _fb_resolve_rpc,
                                 what="feeds", log=log, empty_ok=False)
-    meta = _init_resolve_retry(resolve_meta, rpc, markets, what="meta", log=log)
+
+    def _resolve_meta_fb():
+        # 17:44 23.07: init-meta исчерпала 14 ретраев за ~8.4мин шторма и УРОНИЛА hot_loop
+        # (self-heal рестартил его циклом). Симметрия с f96854d: фолбэк-эндпоинт + empty_ok=False
+        # ниже = слепой старт вместо смерти; слепая meta ре-резолвится ускоренно (120с, bg).
+        try:
+            return resolve_meta(rpc, markets)
+        except Exception:
+            return resolve_meta(_fb_resolve_rpc, markets)
+    meta = _init_resolve_retry(_resolve_meta_fb, what="meta", log=log, empty_ok=False)
     agg_set = set(feeds)
     shadow_map = _build_shadow_map(feeds, meta, markets, primary=primary_map())   # SHADOW слоя 1 (log-only спавн-гейт)
     log.info("DIAG shadow-feed map %s", {a[:10]: s for a, (s, _sc, _o) in shadow_map.items()})
@@ -1246,8 +1255,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
             async with ws_factory() as ws:
                 _fb_backoff_n = 0            # коннект установлен -> сброс backoff
                 while not stop.is_set():
-                    # слепой старт (feeds пуст) ре-резолвится ускоренно (120с), не через 6ч rescan
-                    _rescan_iv = cfg.rescan_interval_sec if feeds else min(cfg.rescan_interval_sec, 120.0)
+                    # слепой старт (feeds ИЛИ meta пусты) ре-резолвится ускоренно (120с), не через 6ч rescan
+                    _rescan_iv = cfg.rescan_interval_sec if (feeds and meta) else min(cfg.rescan_interval_sec, 120.0)
                     if (time.monotonic() - last_resolve >= _rescan_iv
                             and not (_re_thread is not None and _re_thread.is_alive())):
                         _re_box = {}
@@ -1264,7 +1273,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                 # meta иммутабельна per market (idToMarketParams) — 429 на одном
                                 # aggregate3 рескана не должен блокировать коммит карты ног
                                 # (17:33 23.07: час тихих ретраев именно из-за этого)
-                                nm = cur_meta
+                                try:
+                                    nm = resolve_meta(_fb_resolve_rpc, markets)
+                                except Exception:
+                                    nm = cur_meta
                             box["res"] = (nf, nm)
                         _re_thread = threading.Thread(target=_bg_resolve, daemon=True)
                         _re_thread.start()
