@@ -1140,7 +1140,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
 
 # ---- async flashblock subscriber (detect + spawn) ----
 
-def _init_resolve_retry(fn, *args, what="", tries=14, base=0.5, cap=10.0, log=None):
+def _init_resolve_retry(fn, *args, what="", tries=14, base=0.5, cap=10.0, log=None, empty_ok=True):
     """Init-резолв hot_loop на keyed-RPC с rate-лимитом (напр. dRPC Free = 100 req/s): при старте бот
     выстреливает залп разом (candidate refresh + mega-fetch из block-loop + resolve) — на миг >лимита →
     429. Ретраим с backoff (капнут cap): залп схлынет и повтор пройдёт, поток hot_loop НЕ умирает.
@@ -1149,9 +1149,19 @@ def _init_resolve_retry(fn, *args, what="", tries=14, base=0.5, cap=10.0, log=No
     На Alchemy (500 req/s) 429 не приходил, потому хрупкость не вылезала (инцидент 07-21/22)."""
     for i in range(tries):
         try:
-            return fn(*args)
+            out = fn(*args)
+            if out or empty_ok:
+                return out
+            # empty_ok=False: resolve_feeds глотает пер-рыночные ошибки и в шторм отдаёт {} БЕЗ
+            # исключения (07-23: «0 aggregators») — считаем пустоту отказом и ретраим как 429.
+            raise RuntimeError("empty resolve result")
         except Exception as e:
             if i == tries - 1:
+                if not empty_ok:
+                    if log is not None:
+                        log.warning("hot_loop init %s: пусто после %d попыток (%s) — стартую слепым, "
+                                    "ре-резолв подберёт ускоренным циклом", what, tries, type(e).__name__)
+                    return {}
                 raise
             wait = min(base * (2 ** i), cap)
             if log is not None:
@@ -1175,7 +1185,11 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
         return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
     ws_factory = ws_factory or _default_ws
 
-    feeds = _init_resolve_retry(resolve_feeds, rpc, markets, what="feeds", log=log)
+    from chain.rpc import BaseRpc
+    _fb_resolve_rpc = BaseRpc(os.environ.get("FEEDS_FALLBACK_RPC", "https://mainnet.base.org"),
+                              getattr(rpc, "chain_id", 8453))
+    feeds = _init_resolve_retry(resolve_feeds, rpc, markets, _fb_resolve_rpc,
+                                what="feeds", log=log, empty_ok=False)
     meta = _init_resolve_retry(resolve_meta, rpc, markets, what="meta", log=log)
     agg_set = set(feeds)
     shadow_map = _build_shadow_map(feeds, meta, markets)         # SHADOW слоя 1 (план п.4, log-only)
@@ -1210,11 +1224,20 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
             async with ws_factory() as ws:
                 _fb_backoff_n = 0            # коннект установлен -> сброс backoff
                 while not stop.is_set():
-                    if time.monotonic() - last_resolve >= cfg.rescan_interval_sec:
+                    # слепой старт (feeds пуст) ре-резолвится ускоренно (120с), не через 6ч rescan
+                    _rescan_iv = cfg.rescan_interval_sec if feeds else min(cfg.rescan_interval_sec, 120.0)
+                    if time.monotonic() - last_resolve >= _rescan_iv:
                         try:
-                            feeds = resolve_feeds(rpc, markets); meta = resolve_meta(rpc, markets)
-                            agg_set = set(feeds); last_resolve = time.monotonic()
-                            shadow_map = _build_shadow_map(feeds, meta, markets)   # ротация агрегатора
+                            new_feeds = resolve_feeds(rpc, markets, _fb_resolve_rpc)
+                            new_meta = resolve_meta(rpc, markets)
+                            last_resolve = time.monotonic()
+                            if (new_feeds or not feeds) and (new_meta or not meta):
+                                feeds = new_feeds; meta = new_meta; agg_set = set(feeds)
+                                shadow_map = _build_shadow_map(feeds, meta, markets)   # ротация агрегатора
+                            else:
+                                # шторм на обоих эндпоинтах: пустой картой ЖИВУЮ не затираем
+                                log.warning("re-resolve пуст (feeds=%d meta=%d) — держу старую карту (%d aggs)",
+                                            len(new_feeds), len(new_meta), len(agg_set))
                         except Exception:
                             pass
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:

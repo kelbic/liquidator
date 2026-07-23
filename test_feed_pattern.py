@@ -66,6 +66,42 @@ def test_resolve_feeds_groups_under_pattern():
     assert out[PLAIN_AGG] == ["0x" + "cd" * 32]
 
 
+def test_resolve_feeds_fallback_rpc():
+    # (F) шторм на основном RPC (все None) -> пер-рыночный повтор через fallback_rpc;
+    # легитимный None (не-Chainlink) остаётся None и на фолбэке
+    MAIN, FB = object(), object()
+    table = {(FB, MID): PATTERN, (FB, "0x" + "cd" * 32): PLAIN_AGG}   # main отдаёт None по всем
+    orig = feeds._resolve_one
+    feeds._resolve_one = lambda rpc, mid: table.get((rpc, mid))
+    try:
+        blind = feeds.resolve_feeds(MAIN, [_Mkt(MID), _Mkt("0x" + "cd" * 32), _Mkt("0x" + "ee" * 32)])
+        assert blind == {}                                            # без фолбэка — слепота (инцидент 07-23)
+        out = feeds.resolve_feeds(MAIN, [_Mkt(MID), _Mkt("0x" + "cd" * 32), _Mkt("0x" + "ee" * 32)],
+                                  fallback_rpc=FB)
+        assert out[PATTERN] == [MID] and out[PLAIN_AGG] == ["0x" + "cd" * 32]
+        assert len(out) == 2                                          # 0xee-рынок легитимно вне карты
+    finally:
+        feeds._resolve_one = orig
+
+
+def test_init_resolve_retry_empty_ok():
+    # (G) empty_ok=False: {} = отказ -> ретраи; после исчерпания -> {} (слепой старт, не смерть треда);
+    # empty_ok=True (meta-путь): {} возвращается сразу, поведение не изменилось
+    import chain.hotpath as hp
+    calls = {"n": 0}
+    def _empty():
+        calls["n"] += 1
+        return {}
+    out = hp._init_resolve_retry(_empty, what="t", tries=3, base=0.0, cap=0.0, empty_ok=False)
+    assert out == {} and calls["n"] == 3
+    calls["n"] = 0
+    out = hp._init_resolve_retry(_empty, what="t", tries=3, base=0.0, cap=0.0, empty_ok=True)
+    assert out == {} and calls["n"] == 1
+    seq = iter([{}, {"0xa": ["m"]}])
+    out = hp._init_resolve_retry(lambda: next(seq), what="t", tries=3, base=0.0, cap=0.0, empty_ok=False)
+    assert out == {"0xa": ["m"]}
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

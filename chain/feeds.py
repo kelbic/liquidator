@@ -57,12 +57,18 @@ def _resolve_one(rpc, market_id):
     return WATCH_PATTERN_OVERRIDES.get(agg, agg)
 
 
-def resolve_feeds(rpc, markets):
+def resolve_feeds(rpc, markets, fallback_rpc=None):
     """{aggregator_lower: [market_id,...]} for covered markets (grouping over _resolve_one).
-    Non-Chainlink markets (no BASE_FEED_1) omitted — separate reader branch."""
+    Non-Chainlink markets (no BASE_FEED_1) omitted — separate reader branch.
+    fallback_rpc: _resolve_one глотает транспортные ошибки (None), поэтому шторм 408/429 на основном
+    RPC давал МОЛЧА пустую карту — рестарт/ре-резолв в шторм слепил hot-path (инцидент 07-23:
+    «hot path: 0 aggregators / 40 markets» на 6ч rescan-интервала). None от основного повторяем
+    через запасной эндпоинт; легитимные None (не-Chainlink рынки) просто станут None второй раз."""
     aggs = defaultdict(list)
     for m in markets:
         agg = _resolve_one(rpc, m.market_id)
+        if agg is None and fallback_rpc is not None:
+            agg = _resolve_one(fallback_rpc, m.market_id)
         if agg:
             aggs[agg].append(m.market_id)
     return dict(aggs)
