@@ -39,6 +39,8 @@ class Config:
     block_wss_url: str = ""             # явный WSS для newheads-fallback (пусто = https→wss от rpc_url); BLOCK_WSS_URL
     candidate_refresh_sec: float = 60.0
     hot_path: bool = False                # preconf-triggered hot path ON/OFF (OFF until ARM)
+    predict_shadow: bool = False          # PREDICT-слой (Binance WS + anchor/return, порт Katana v5):
+                                          # SHADOW меряет lead/FP, ничего не стреляет (23.07)
     price_from_feed: bool = False         # Layer1: feed-decoded price triggers _process_transmit (OFF until measured)
     hot_min_repaid_usd: float = 450.0    # hot path fires only on reaction prizes >= this (repaid USD)
     positions_from_cache: bool = False    # P1-6: слой 2 потребление (OFF до калибровки cache-divergence)
@@ -101,6 +103,7 @@ class Config:
             block_wss_url=s("BLOCK_WSS_URL", ""),
             candidate_refresh_sec=f("CANDIDATE_REFRESH_SEC", 60.0),
             hot_path=(s("HOT_PATH", "").lower() in ("1", "true", "yes", "on")),
+            predict_shadow=(s("PREDICT_SHADOW", "").lower() in ("1", "true", "yes", "on")),
             price_from_feed=(s("PRICE_FROM_FEED", "").lower() in ("1", "true", "yes", "on")),
             hot_min_repaid_usd=f("HOT_MIN_REPAID_USD", 450.0),
             positions_from_cache=(s("POSITIONS_FROM_CACHE", "").lower() in ("1", "true", "yes", "on")),

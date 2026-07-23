@@ -439,6 +439,29 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
         threading.Thread(target=_run_hot, daemon=True).start()
         log.warning("HOT PATH ENABLED — preconf trigger live (tip=%.1f gwei, daily-loss<=$%.0f, repaid>=$%.0f)",
                     cfg.tip_gwei, cfg.max_daily_loss_usd, getattr(cfg, "hot_min_repaid_usd", 2000.0))
+    if getattr(cfg, "predict_shadow", False):
+        # PREDICT-слой (порт Katana v5), SHADOW: Binance WS + anchor/return-движок меряет lead/FP
+        # на живом потоке (PREDICT-строки в лог), НИЧЕГО не стреляет и fire-путь не трогает.
+        # Резолв прокси и старт — в фоне: старт бота не ждёт сеть предикта.
+        def _run_predict():
+            try:
+                from chain.pricefeed import PriceFeed
+                from chain.predict import PredictEngine, PredictDriver, resolve_feed_proxies, make_poll_fn
+                proxies = resolve_feed_proxies(rpc, markets)
+                if not proxies:
+                    log.warning("predict-shadow: прокси не разрезолвились — слой не стартует")
+                    return
+                engine = PredictEngine()
+                pf = PriceFeed(symbols=list(proxies), log=lambda m: log.info("%s", m))
+                pf.start()
+                drv = PredictDriver(engine, mid_fn=pf.mid, poll_fn=make_poll_fn(rpc, proxies),
+                                    log=lambda m: log.info("%s", m))
+                drv.start()
+                log.warning("PREDICT SHADOW ENABLED — %d feeds (%s), меряет lead/FP, не стреляет",
+                            len(proxies), ",".join(sorted(proxies)))
+            except Exception:
+                log.exception("predict-shadow не стартовал (слой опционален, бот не задет)")
+        threading.Thread(target=_run_predict, daemon=True).start()
     last_hb = 0.0
     last_full = 0.0
     hf_cache = {}
