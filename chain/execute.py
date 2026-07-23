@@ -772,12 +772,12 @@ def _revert_bucket(err_str: str) -> str:
 _LIQUIDATE_EVENT_SIG = None   # keccak сигнатуры события Morpho.Liquidate (лениво, нужен eth_utils)
 
 
-def _submit_xray(rpc, borrower, block_number, our_index, log):
-    """P2-12 submit-side телеметрия: наш выстрел замайнился — кто взял жертву в ЭТОМ блоке и с
-    каким tx-index. Узкий getLogs fromBlock==toBlock (урок 30: обходит range-limit), фильтр по
-    topic3=borrower (неоспоримый источник жертвы). Дельта=our-winner: на сколько позиций в блоке
-    нас обошли — ЕДИНСТВЕННАЯ честная метрика submit-side проигрыша (gap-запрет не задет: это
-    наши собственные выстрелы, не пере-мер чужих). Диагностика, не роняет receipt-путь."""
+def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4):
+    """P2-12 submit-side телеметрия v2. Окно [наш−lookback .. наш]: транзит всегда <= нашего блока
+    (реакция летит ПОСЛЕ него), а прежний одноблочный поиск давал ложное «реверт НЕ гонка», когда
+    победитель сидел в блоке транзита, а мы приземлялись в +1..+2 (разбор 15:10 23.07). Победитель
+    обогащается from/to/tip -> строка `race-winner` копит ЭМПИРИЧЕСКУЮ tip-функцию конкурентов
+    (grep 'race-winner' по журналу) вместо слепых ступеней. Диагностика, не роняет receipt-путь."""
     global _LIQUIDATE_EVENT_SIG
     try:
         from eth_utils import keccak
@@ -787,22 +787,36 @@ def _submit_xray(rpc, borrower, block_number, our_index, log):
         from chain.rpc import get_logs_fb
         w3 = rpc._web3()
         topic_b = "0x" + borrower[2:].lower().rjust(64, "0")
-        logs = get_logs_fb(w3, {"fromBlock": block_number, "toBlock": block_number,
+        frm = max(0, int(block_number) - int(lookback))
+        logs = get_logs_fb(w3, {"fromBlock": frm, "toBlock": block_number,
                                 "address": _MORPHO_BLUE,
                                 "topics": [_LIQUIDATE_EVENT_SIG, None, None, topic_b]})
         if not logs:
             if log:
-                log.info("submit-xray: borrower %s НЕ ликвидирован в блоке %d (наш idx=%s) — "
-                         "реверт НЕ гонка за жертву (смотреть reason)", borrower[:10], block_number, our_index)
+                log.info("submit-xray: borrower %s НЕ ликвидирован в [%d..%d] (наш idx=%s) — "
+                         "реверт НЕ гонка за жертву (смотреть reason)",
+                         borrower[:10], frm, block_number, our_index)
             return
-        w = logs[0]
-        widx = w.get("transactionIndex")
+        w = logs[0]                                     # самый ранний Liquidate = победитель
+        wblk, widx = w.get("blockNumber"), w.get("transactionIndex")
+        wtx = w.get("transactionHash")
+        wtx_hex = wtx.hex() if wtx is not None and not isinstance(wtx, str) else (wtx or "?")
+        waddr = wto = tip_s = "?"
+        try:                                            # обогащение: кто и с каким tip (2 RPC, реверты редки)
+            tx = w3.eth.get_transaction(wtx)
+            waddr, wto = str(tx.get("from") or "?"), str(tx.get("to") or "?")
+            tip = tx.get("maxPriorityFeePerGas")
+            if tip is None:                             # legacy-tx: tip = gasPrice - baseFee блока
+                bf = int(w3.eth.get_block(wblk).get("baseFeePerGas") or 0)
+                tip = max(0, int(tx.get("gasPrice") or 0) - bf)
+            tip_s = "%.4f" % (int(tip) / 1e9)
+        except Exception:
+            pass
+        blk_off = (int(block_number) - int(wblk)) if isinstance(wblk, int) else "?"
         if log:
-            log.info("submit-xray: победитель idx=%s наш idx=%s дельта=%s tx=%s block=%d",
-                     widx, our_index,
-                     (our_index - widx) if isinstance(our_index, int) and isinstance(widx, int) else "?",
-                     w.get("transactionHash").hex() if w.get("transactionHash") is not None else "?",
-                     block_number)
+            log.info("submit-xray: победитель blk=%s idx=%s (наш blk=%s idx=%s, отстали блоков=%s) "
+                     "tx=%s | race-winner addr=%s to=%s tip_gwei=%s",
+                     wblk, widx, block_number, our_index, blk_off, wtx_hex, waddr, wto, tip_s)
     except Exception as e:
         if log:
             log.info("submit-xray fail: %s", type(e).__name__)
