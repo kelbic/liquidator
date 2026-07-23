@@ -454,7 +454,17 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                 engine = PredictEngine()
                 pf = PriceFeed(symbols=list(proxies), log=lambda m: log.info("%s", m))
                 pf.start()
+                _on_event = None
+                if os.environ.get("PREDICT_SPEC_CANARY", "").lower() in ("1", "true", "yes", "on"):
+                    # SPEC-канарейка: замер достижимости предочереди (delta 0..5) спам-пробами
+                    # в predict-окнах. Копеечные self-tx, общий канареечный газ-кап, ликвидаций нет.
+                    from chain.spec_canary import SpecCanary
+                    _sc = SpecCanary(rpc, cfg, proxies)
+                    _on_event = _sc.handle_event
+                    log.warning("SPEC-CANARY ENABLED — predict-окна пробивают предочередь (кап %s окон)",
+                                os.environ.get("SPEC_CANARY_MAX_WINDOWS", "60"))
                 drv = PredictDriver(engine, mid_fn=pf.mid, poll_fn=make_poll_fn(rpc, proxies),
+                                    on_event=_on_event,
                                     log=lambda m: log.info("%s", m))
                 drv.start()
                 log.warning("PREDICT SHADOW ENABLED — %d feeds (%s), меряет lead/FP, не стреляет",

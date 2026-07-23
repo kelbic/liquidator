@@ -255,13 +255,14 @@ class PredictDriver:
     публикует armed-сет через on_arm. Каждый шаг обёрнут — ошибка = «нет предсказания на шаге»,
     не клин. mid_fn(sym)->(mid,ts)|None; poll_fn()->{sym:(updatedAt,price)}; on_arm(set)|None."""
 
-    def __init__(self, engine: PredictEngine, mid_fn, poll_fn, on_arm=None,
+    def __init__(self, engine: PredictEngine, mid_fn, poll_fn, on_arm=None, on_event=None,
                  log=print, interval: float = 0.5, poll_interval: float = 2.0,
                  stale_sec: float = MID_STALE_SEC,
                  now=time.monotonic, sleep=time.sleep, wall=time.time):
         self.engine = engine
         self.mid_fn, self.poll_fn = mid_fn, poll_fn
         self.on_arm = on_arm
+        self.on_event = on_event      # шов потребителей событий (spec-канарейка, позже pre-arm)
         self.log = log
         self.interval, self.poll_interval = interval, poll_interval
         self.stale_sec = stale_sec
@@ -336,6 +337,11 @@ class PredictDriver:
                 self.stats["confirmed"] += 1
             elif ev["event"] == "falsepos":
                 self.stats["falsepos"] += 1
+            if self.on_event is not None:
+                try:
+                    self.on_event(ev)
+                except Exception as e:            # потребитель не роняет драйвер
+                    self.log("[predict] on_event error: %s" % str(e)[:120])
         self._publish()
 
     def _poll(self, wall, stale: set | None = None) -> list:

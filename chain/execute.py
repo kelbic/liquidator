@@ -225,6 +225,8 @@ def _batch_record(n_win: int, n_items: int, tx_hash, log=None):
 _CANARY_PROBES = 0
 _CANARY_GAS_USD = 0.0
 _CANARY_LAST_TS = 0.0
+_SPEC_PROBES = 0          # spec-канарейка (predict-окна): свой счётчик/интервал, ОБЩИЙ газ-кап
+_SPEC_LAST_TS = 0.0
 
 
 def canary_stats() -> tuple:
@@ -238,7 +240,8 @@ def canary_record_gas(gas_usd: float):
         _CANARY_GAS_USD += max(0.0, gas_usd)
 
 
-def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=None):
+def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=None,
+                spec_interval_sec=None, spec_max_probes=None):
     """⭐ Минимальная 0-value self-transfer от БОЕВОГО кошелька под ОБЩИМ _SEND_LOCK/_LOCAL_NONCE
     (единый nonce -> ноль nonce-краха; single-slot). Гейты (кап проб / газ-кап / интервал) проверяются
     АТОМАРНО под локом ПЕРЕД раздачей nonce. Возвращает hash или None (гейт закрыт/ошибка). Позиция
@@ -246,11 +249,19 @@ def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=N
     Поправка 07-17: канарейка должна лететь БОЕВЫМ send-путём — max_fee/tip из fb-хедера (иначе
     send_tx жжёт 2 Alchemy-RTT на fee) и broadcast_raw_urls=[секвенсер] (SEND-3; иначе только
     Alchemy-прокси-хоп, которого у реальной ликвидации нет) — пробы 1-100 мерили ИМЕННО этот оверхед."""
-    global _CANARY_PROBES, _CANARY_LAST_TS
+    global _CANARY_PROBES, _CANARY_LAST_TS, _SPEC_PROBES, _SPEC_LAST_TS
     _now = time.monotonic()
+    _spec = spec_interval_sec is not None
     with _SEND_LOCK:
         with _INFLIGHT_LOCK:
-            if (_CANARY_PROBES >= getattr(cfg, "canary_max_probes", 100)
+            if _spec:
+                # spec-режим (predict-окна): свой интервал/кап проб — НЕ двигает гейты реактивной
+                # кампании; газ-кап ОБЩИЙ (один бюджет на все пробы, включая spec-спам).
+                if (_SPEC_PROBES >= (spec_max_probes if spec_max_probes is not None else 500)
+                        or _CANARY_GAS_USD >= getattr(cfg, "canary_max_gas_usd", 25.0)
+                        or _now - _SPEC_LAST_TS < float(spec_interval_sec)):
+                    return None
+            elif (_CANARY_PROBES >= getattr(cfg, "canary_max_probes", 100)
                     or _CANARY_GAS_USD >= getattr(cfg, "canary_max_gas_usd", 25.0)
                     or _now - _CANARY_LAST_TS < getattr(cfg, "canary_min_interval_sec", 120.0)):
                 return None
@@ -274,8 +285,12 @@ def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=N
             return None
         _LOCAL_NONCE[bot] = base_nonce + 1
         with _INFLIGHT_LOCK:
-            _CANARY_PROBES += 1
-            _CANARY_LAST_TS = _now
+            if _spec:
+                _SPEC_PROBES += 1
+                _SPEC_LAST_TS = _now
+            else:
+                _CANARY_PROBES += 1
+                _CANARY_LAST_TS = _now
         return res["hash"]
 
 
