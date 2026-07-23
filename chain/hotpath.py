@@ -1271,6 +1271,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             and not (_re_thread is not None and _re_thread.is_alive())):
                         _re_box = {}
                         _re_started = time.monotonic()
+                        log.info("DIAG re-resolve spawn iv=%.0f since_last=%.0fs",
+                                 _rescan_iv, time.monotonic() - last_resolve)
 
                         def _bg_resolve(box=_re_box, cur_meta=meta):
                             try:
@@ -1293,6 +1295,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         _re_thread.start()
                     if _re_thread is not None and not _re_thread.is_alive() and _re_box is not None:
                         _res = _re_box.get("res")
+                        log.info("DIAG re-resolve commit res=%s dt=%.0fs",
+                                 "ok" if _res else "none", time.monotonic() - _re_started)
                         _re_thread = None; _re_box = None
                         if _res:
                             new_feeds, new_meta = _res
