@@ -14,11 +14,12 @@ import logging
 
 log = logging.getLogger("liq.spec_canary")
 
-SPEC_INTERVAL_SEC = float(os.environ.get("SPEC_CANARY_INTERVAL_SEC", "4.0"))
-SPEC_MAX_PER_WINDOW = int(os.environ.get("SPEC_CANARY_MAX_PER_WINDOW", "30"))
+SPEC_INTERVAL_SEC = float(os.environ.get("SPEC_CANARY_INTERVAL_SEC", "2.0"))    # ~= block time: не пропустить блок пуша
+SPEC_MAX_PER_WINDOW = int(os.environ.get("SPEC_CANARY_MAX_PER_WINDOW", "90"))    # ~180с окна при 2с; длинные lead частично
 SPEC_MAX_WINDOWS = int(os.environ.get("SPEC_CANARY_MAX_WINDOWS", "60"))
-SPEC_MAX_PROBES = int(os.environ.get("SPEC_CANARY_MAX_PROBES", "500"))
-SPEC_WINDOW_CAP_SEC = float(os.environ.get("SPEC_CANARY_WINDOW_CAP_SEC", "420"))
+SPEC_MAX_PROBES = int(os.environ.get("SPEC_CANARY_MAX_PROBES", "1500"))
+SPEC_WINDOW_CAP_SEC = float(os.environ.get("SPEC_CANARY_WINDOW_CAP_SEC", "300"))
+SPEC_LOGS_SPAN = int(os.environ.get("SPEC_CANARY_LOGS_SPAN", "20"))              # блоков назад для AnswerUpdated
 
 _ANSWER_UPDATED_SIG = None
 
@@ -36,10 +37,23 @@ class SpecCanary:
 
     def __init__(self, rpc, cfg, proxies: dict,
                  send_fn=None, receipt_fn=None, logs_fn=None, agg_fn=None, bn_fn=None,
-                 inflight_fn=None, gas_fn=None,
+                 inflight_fn=None, gas_fn=None, label2sym=None,
                  now=time.monotonic, sleep=time.sleep):
         self.rpc, self.cfg = rpc, cfg
         self.proxies = {k.upper(): v for k, v in (proxies or {}).items()}
+        # события драйвера несут feed=LABEL ("BTC"), а proxies ключуются символом ("BTCUSDT").
+        # label2sym из FEEDS_BASE переводит; дефолт строится лениво. Также кладём label прямо в
+        # proxies (label->proxy), чтобы _transmit_of работал по любому ключу.
+        if label2sym is None:
+            try:
+                from chain.predict import FEEDS_BASE
+                label2sym = {row["label"].upper(): sym.upper() for sym, row in FEEDS_BASE.items()}
+            except Exception:
+                label2sym = {}
+        self._label2sym = label2sym
+        for lbl, sym in label2sym.items():
+            if sym in self.proxies and lbl not in self.proxies:
+                self.proxies[lbl] = self.proxies[sym]      # label -> proxy (алиас)
         self._now, self._sleep = now, sleep
         self._lock = threading.Lock()
         self._windows: dict = {}          # sym -> {stop: Event, hashes: [(hash, mono)], started: mono}
@@ -95,7 +109,7 @@ class SpecCanary:
                                          "outputs": [{"type": "address"}],
                                          "stateMutability": "view"}]).functions.aggregator().call())
             bn = self._bn_fn() if self._bn_fn is not None else int(w3.eth.block_number)
-            logs = get_logs_fb(w3, {"fromBlock": bn - 6, "toBlock": bn,
+            logs = get_logs_fb(w3, {"fromBlock": bn - SPEC_LOGS_SPAN, "toBlock": bn,
                                     "address": Web3.to_checksum_address(agg), "topics": [_sig()]})
             if not logs:
                 return None
@@ -132,7 +146,9 @@ class SpecCanary:
 
     def _start_window(self, sym):
         with self._lock:
-            if sym in self._windows or self.windows_done >= SPEC_MAX_WINDOWS:
+            # ОДНО активное окно за раз: глобальный spec-интервал (2с) всё равно сериализует send'ы
+            # через один nonce -> два окна голодали бы друг друга; одно окно = чистый per-feed каденс.
+            if self._windows or self.windows_done >= SPEC_MAX_WINDOWS:
                 return
             w = {"stop": threading.Event(), "hashes": [], "started": self._now()}
             self._windows[sym] = w
@@ -141,17 +157,28 @@ class SpecCanary:
                  SPEC_INTERVAL_SEC, SPEC_MAX_PER_WINDOW)
 
     def _window_loop(self, sym, w):
+        # шлём пробы каждые SPEC_INTERVAL_SEC пока: не пришёл finish-event (stop), не выбран кап проб,
+        # не истёк window-cap. Когда пробить больше нельзя, но finish ещё не пришёл — держим слот до
+        # дедлайна, затем САМОЗАКРЫТИЕ (иначе одно окно заняло бы single-slot навечно, если пуша нет).
+        deadline = w["started"] + SPEC_WINDOW_CAP_SEC
         while not w["stop"].is_set():
-            if self._now() - w["started"] > SPEC_WINDOW_CAP_SEC or len(w["hashes"]) >= SPEC_MAX_PER_WINDOW:
-                break
-            if self._inflight() == 0:            # боевая tx в полёте -> не соревноваться за nonce
+            now = self._now()
+            if now < deadline and len(w["hashes"]) < SPEC_MAX_PER_WINDOW and self._inflight() == 0:
                 try:
                     h = self._send()
-                except Exception as e:
+                except Exception:
                     h = None
-                    log.info("DIAG spec-canary send fail feed=%s err=%s", sym, type(e).__name__)
+                    log.info("DIAG spec-canary send fail feed=%s", sym)
                 if h:
-                    w["hashes"].append((h, self._now()))
+                    w["hashes"].append((h, now))
+            if now >= deadline and not w["stop"].is_set():
+                with self._lock:
+                    gone = self._windows.pop(sym, None) is not None
+                if gone:
+                    self.windows_done += 1
+                    log.info("DIAG spec-canary window-timeout feed=%s probes=%d (пуша не дождались %ds)",
+                             sym, len(w["hashes"]), int(SPEC_WINDOW_CAP_SEC))
+                return
             w["stop"].wait(timeout=SPEC_INTERVAL_SEC)
 
     def _finish_window(self, sym, pushed: bool):
