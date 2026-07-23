@@ -8,6 +8,7 @@ stdlib HTTP (urllib) like morpho.py — runs on `python3`; only the eth_call pat
 from __future__ import annotations
 import json
 import logging
+import os
 import threading
 import time
 import urllib.request
@@ -24,6 +25,40 @@ _SEND_LOCK = threading.Lock()   # serialize dispatch nonce-fetch+send across the
 # dropped-tx лечится веткой инвалидации, вниз reconcile НЕ опускает — иначе гонка с только что
 # отправленным батчем, который RPC ещё не видит).
 _LOCAL_NONCE: dict = {}         # bot address -> next unused nonce
+
+# 07-23: холодный nonce-fetch шёл ТОЛЬКО через RPC_URL, без ретраев — burst-429 основной ноды в
+# момент залпа терял ВЕСЬ выстрел (fetch до подписи, SEND-3 ещё не в игре). Фолбэк не гоночный
+# путь: срабатывает только когда основная нода уже бросила; тёплую сессию не держим.
+_NONCE_FALLBACK_RPC = os.environ.get("NONCE_FALLBACK_RPC", "https://mainnet.base.org")
+
+
+def _pending_nonce(w3, addr: str) -> int:
+    try:
+        return int(w3.eth.get_transaction_count(addr, "pending"))
+    except Exception:
+        from web3 import Web3   # локальный импорт: модуль обязан грузиться без web3 (см. док-стринг)
+        w3f = Web3(Web3.HTTPProvider(_NONCE_FALLBACK_RPC, request_kwargs={"timeout": 5}))
+        n = int(w3f.eth.get_transaction_count(addr, "pending"))
+        log.warning("nonce via fallback %s (основная нода бросила)", _NONCE_FALLBACK_RPC)
+        return n
+
+
+def prewarm_local_nonce(rpc, wallet_key: str) -> bool:
+    """Однократный best-effort прогрев _LOCAL_NONCE на старте (наших in-flight tx на старте нет):
+    убирает обязательный RPC-hop из ПЕРВОГО залпа после рестарта. Ошибку глотает — боевой путь
+    имеет собственный фолбэк (_pending_nonce)."""
+    try:
+        w3 = rpc._web3()
+        bot = account_for(w3, wallet_key).address
+        with _SEND_LOCK:
+            if _LOCAL_NONCE.get(bot) is None:
+                _LOCAL_NONCE[bot] = _pending_nonce(w3, bot)
+            base = _LOCAL_NONCE[bot]
+        log.info("nonce prewarm: base=%d", base)
+        return True
+    except Exception as e:
+        log.warning("nonce prewarm failed (%s) — первый залп возьмёт фолбэк сам", type(e).__name__)
+        return False
 
 # Поправка 07-17 (CANARY_0717_CORRECTION п.2): from_key = secp256k1-деривация ~1-3мс на КАЖДЫЙ send
 # (send_tx, dispatch, canary, prepare_hot) — чистый CPU в горячем пути. LocalAccount иммутабелен ->
@@ -223,7 +258,7 @@ def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=N
         bot = account_for(w3, cfg.wallet_key).address
         base_nonce = _LOCAL_NONCE.get(bot)
         if base_nonce is None:
-            base_nonce = int(w3.eth.get_transaction_count(bot, "pending"))
+            base_nonce = _pending_nonce(w3, bot)
         tip_wei = int(cfg.tip_gwei * 1e9)
         _tx = {"to": bot, "value": 0, "nonce": base_nonce, "gas": 21000}
         if max_fee is not None:                  # боевой fee-путь (fb-хедер) -> send_tx без fee-RTT
@@ -549,7 +584,7 @@ def send_tx(rpc, key: str, tx: dict, wait: bool = True, timeout: int = 120,
     t.setdefault("from", acct.address)
     t.setdefault("chainId", rpc.chain_id)
     if "nonce" not in t:
-        t["nonce"] = w3.eth.get_transaction_count(acct.address, "pending")
+        t["nonce"] = _pending_nonce(w3, acct.address)
     if "maxFeePerGas" not in t and "gasPrice" not in t:
         base = w3.eth.get_block("latest").get("baseFeePerGas") or 0
         tip = max(int(w3.eth.max_priority_fee), int(min_tip_wei))
@@ -807,7 +842,7 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
             return results
         base_nonce = _LOCAL_NONCE.get(bot)                   # P0-4: локальный nonce (0 RTT); RPC только на холодном
         if base_nonce is None:                               # кэше/после инвалидации (см. инварианты у _LOCAL_NONCE)
-            base_nonce = int(w3.eth.get_transaction_count(bot, "pending"))
+            base_nonce = _pending_nonce(w3, bot)
         tip = int(cfg.tip_gwei * 1e9)
         # ЮНИТЫ: батч ON и >1 жертвы -> группы по batch_max_items (сорт по net desc, ПОСЛЕ дедупа —
         # иначе fee-источник может быть выкинут); хвост = следующими tx в пределах max_inflight. Иначе

@@ -15,6 +15,7 @@ DORMANT until wired into block_driven_loop behind cfg.hot_path. No behavior chan
 """
 from __future__ import annotations
 import logging
+import os
 import threading
 import time
 
@@ -362,6 +363,10 @@ _CACHE_REFRESH_THREAD = None      # re-entrancy guard (план п.3): один 
 _CACHE_REFRESH_STARTED = 0.0      # monotonic старт живого цикла (для busy-skip running=)
 _CACHE_SKIP_N = 0                 # skip'ов с последнего лога (троттл 60с)
 _CACHE_SKIP_LOG_TS = 0.0
+# 07-23: measurement-фаза кэша (reads_fn НЕ переключён — потребителей нет) выжигала burst-бакет
+# RPC_URL тяжёлыми aggregate3 каждые ~2с -> 429-шторм душил block-assess (~2% блоков) и nonce-fetch.
+# 1 цикл/30с сохраняет измерение и возвращает бакет боевым путям. 0 = старое поведение (каждый блок).
+_CACHE_REFRESH_MIN_INTERVAL = float(os.environ.get("POSITION_CACHE_MIN_INTERVAL_SEC", "30"))
 
 
 def _spawn_cache_refresh(*, cache_rpc, shared, bn):
@@ -373,6 +378,9 @@ def _spawn_cache_refresh(*, cache_rpc, shared, bn):
     accumulated count — n/running are the live signal of preconf strain (correlate with
     src=confirmed). Called only from the single feed-loop thread => no lock around check-then-set."""
     global _CACHE_REFRESH_THREAD, _CACHE_REFRESH_STARTED, _CACHE_SKIP_N, _CACHE_SKIP_LOG_TS
+    if (_CACHE_REFRESH_MIN_INTERVAL > 0 and _CACHE_REFRESH_STARTED
+            and time.monotonic() - _CACHE_REFRESH_STARTED < _CACHE_REFRESH_MIN_INTERVAL):
+        return                                    # интервал-гейт (см. _CACHE_REFRESH_MIN_INTERVAL): тихий skip
     t = _CACHE_REFRESH_THREAD
     if t is not None and t.is_alive():
         _CACHE_SKIP_N += 1
