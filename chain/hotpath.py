@@ -375,9 +375,12 @@ def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
     stale = []
     # 07-23: при refresh-гейте 1/30с (см. _CACHE_REFRESH_MIN_INTERVAL) запись старше 6с — НОРМА,
     # а не исключение; исключать заёмщика из transmit-кандидатов = пропущенная жертва в гонке.
-    # Свежие отдаём из кэша (~1мс), stale/missing дочитываем ЖИВЬЁМ одним aggregate3 (preconf,
-    # ~100мс — путь и лид, верифицированные до Layer-2). Только если живое чтение упало —
-    # старое поведение (stale-skip), чтобы не действовать по протухшим данным.
+    # Свежие отдаём из кэша (~1мс), stale/missing дочитываем ЖИВЬЁМ одним aggregate3 на
+    # CONFIRMED (~70-130мс): preconf-компьют-кап на тяжёлый multicall отдаёт 429 за ~2.05с
+    # (замер 23.07; канарейка tip=0.05: 6 промахов из 7 = ровно этот столл, dt_spawn 2.2-2.55с
+    # при ack 55-69мс -> мимо блока на КАЖДОМ транзите с жертвой). Preconf-лид остаётся у цены
+    # (~0-124мс, лёгкий вызов) — флип двигает цена, позиции медленные. Только если живое
+    # чтение упало — старое поведение (stale-skip), чтобы не действовать по протухшим данным.
     for b in borrowers:
         p = positions.get(b)
         if p is None:
@@ -390,7 +393,7 @@ def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
             stale.append(b)
     if stale:
         try:
-            live = read_positions(rpc, mid, stale, preconf_rpc=preconf_rpc, src_out=src_out)
+            live = read_positions(rpc, mid, stale, preconf_rpc=None, src_out=src_out)
         except Exception as e:
             live = None
             log.info("DIAG position-cache live-subset fail market=%s n=%d err=%s",
