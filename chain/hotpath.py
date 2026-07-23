@@ -212,18 +212,84 @@ def _flips(price, lltv_wad, tba, tbs, positions):
     return out
 
 
-def dynamic_tip_gwei(cfg, debt_usd):
-    """PURE (юнит): tip по размеру приза. FCFS-рутина позицией за tip не платится (канарейка
-    23.07: +7..+36 in-block на 0.05 gwei), но в каскадную ДАВКУ победители бидят 22-59 gwei
-    (фэт-разведка 45д, блоки 47803xxx: один оператор 56.7 gwei -> idx 1154 против своих же
-    0.0125 -> idx 1171) — похоже на fee-сортировку ВНУТРИ флешблок-кадра при заторе. Страховка
-    стоит ~$1.9/gwei на 500k газа — окупается только на крупном призе, отсюда ступени."""
+# ---- каскадный tip-режим (авто-подъём ступени в ДАВКУ) ----
+# FCFS-рутина позицией за tip не платит (канарейка 23.07: +7..+36 in-block на 0.05 gwei), НО в
+# каскадную давку победители бидят 22-59 gwei (фэт-разведка 45д, блоки 47803xxx: оператор 56.7 gwei
+# -> idx 1154 против своих же 0.0125 -> idx 1171) = fee-сортировка ВНУТРИ флешблок-кадра при заторе.
+# Держать высокий tip постоянно = жечь ~$26/выстрел зря (страховка ~$0.87/gwei на 500k*1730). Поэтому
+# ступени поднимаются на ОДНУ ВРЕМЕННО, когда давка реальна СЕЙЧАС: (а) >=CASCADE_MIN_XMITS разных
+# агрегаторов транслировали в одном блоке (широкое движение) ИЛИ (б) submit-xray зафиксировал проигрыш
+# победителю с tip ВЫШЕ нашего (fee-сортировка наблюдалась). Оба армят TTL-окно эскалации.
+CASCADE_TTL_SEC = float(os.environ.get("CASCADE_TTL_SEC", "45"))       # окно эскалации после сигнала давки
+CASCADE_MIN_XMITS = int(os.environ.get("CASCADE_MIN_XMITS", "2"))       # разных агрегаторов в блоке = давка
+_CASCADE_LOCK = threading.Lock()
+_CASCADE_UNTIL = 0.0            # monotonic-дедлайн: пока now < него — поднимаем ступень на одну
+_CASCADE_REASON = ""
+_XMIT_BLOCK = None             # блок, для которого считаем распределённые транзиты
+_XMIT_AGGS: set = set()        # разные агрегаторы-транзиты в _XMIT_BLOCK
+
+
+def note_transmit_for_cascade(agg, block, now=None, log=None):
+    """Вызывается на КАЖДЫЙ реальный транзит. >=CASCADE_MIN_XMITS разных агрегаторов в ОДНОМ блоке =
+    широкая давка -> взвести эскалацию на CASCADE_TTL_SEC. Возврат True = давка взведена этим вызовом."""
+    global _XMIT_BLOCK, _XMIT_AGGS, _CASCADE_UNTIL, _CASCADE_REASON
+    now = time.monotonic() if now is None else now
+    with _CASCADE_LOCK:
+        if block != _XMIT_BLOCK:
+            _XMIT_BLOCK, _XMIT_AGGS = block, set()
+        _XMIT_AGGS.add(agg)
+        if len(_XMIT_AGGS) >= CASCADE_MIN_XMITS and now >= _CASCADE_UNTIL - CASCADE_TTL_SEC + 1.0:
+            _CASCADE_UNTIL = now + CASCADE_TTL_SEC
+            _CASCADE_REASON = "%d транзитов в блоке %s" % (len(_XMIT_AGGS), block)
+            if log:
+                log.info("DIAG cascade ARM (%s) -> tip +1 ступень на %.0fс", _CASCADE_REASON, CASCADE_TTL_SEC)
+            return True
+    return False
+
+
+def note_race_loss_for_cascade(winner_tip_gwei, our_tip_gwei, now=None, log=None):
+    """submit-xray нашёл победителя. Если его tip ВЫШЕ нашего — fee-сортировка реальна сейчас ->
+    взвести эскалацию. tip'ы в gwei (float). Возврат True = давка взведена."""
+    global _CASCADE_UNTIL, _CASCADE_REASON
+    try:
+        wt, ot = float(winner_tip_gwei), float(our_tip_gwei)
+    except (TypeError, ValueError):
+        return False
+    if wt <= ot:
+        return False
+    now = time.monotonic() if now is None else now
+    with _CASCADE_LOCK:
+        _CASCADE_UNTIL = now + CASCADE_TTL_SEC
+        _CASCADE_REASON = "проигрыш tip=%.4f>%.4f" % (wt, ot)
+        if log:
+            log.info("DIAG cascade ARM (%s) -> tip +1 ступень на %.0fс", _CASCADE_REASON, CASCADE_TTL_SEC)
+    return True
+
+
+def cascade_active(now=None):
+    """True, пока живо TTL-окно эскалации."""
+    now = time.monotonic() if now is None else now
+    with _CASCADE_LOCK:
+        return now < _CASCADE_UNTIL
+
+
+def dynamic_tip_gwei(cfg, debt_usd, now=None):
+    """PURE-ish (now инжектируем): tip по размеру приза, +1 ступень в активную каскад-давку. Лестница
+    (base, mid, big) монотонна; давка поднимает на одну и капается big — держим цену страховки
+    ограниченной ($26 на big=30 при 500k*1730), но в затор перебиваем толпу fee-сортировкой."""
     du = float(debt_usd or 0.0)
+    base = float(cfg.tip_gwei)
+    mid = float(getattr(cfg, "tip_mid_gwei", 2.0))
+    big = float(getattr(cfg, "tip_big_gwei", 30.0))
     if du >= getattr(cfg, "tip_big_repaid_usd", 20000.0):
-        return float(getattr(cfg, "tip_big_gwei", 30.0))
-    if du >= getattr(cfg, "tip_mid_repaid_usd", 2000.0):
-        return float(getattr(cfg, "tip_mid_gwei", 2.0))
-    return float(cfg.tip_gwei)
+        stage = 2
+    elif du >= getattr(cfg, "tip_mid_repaid_usd", 2000.0):
+        stage = 1
+    else:
+        stage = 0
+    if cascade_active(now):
+        stage = min(stage + 1, 2)
+    return (base, mid, big)[stage]
 
 
 def _net_gate(profit_wei, debt_usd, debt_assets, cfg):
@@ -1039,6 +1105,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             _price_moved(agg, px_hint, last_price)           # baseline для последующих bare-match gate'ов
         if stats is not None:
             stats["proceed"] += 1
+    note_transmit_for_cascade(agg, block, log=log)   # давка: >=2 агрегаторов в блоке -> tip +1 ступень
     with shared.lock:
         groups = dict(shared.groups); debt_by = dict(shared.debt_by); debt_assets_by = dict(shared.debt_assets_by)
 

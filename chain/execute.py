@@ -772,12 +772,13 @@ def _revert_bucket(err_str: str) -> str:
 _LIQUIDATE_EVENT_SIG = None   # keccak сигнатуры события Morpho.Liquidate (лениво, нужен eth_utils)
 
 
-def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4):
+def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4, cfg=None, our_debt_usd=None):
     """P2-12 submit-side телеметрия v2. Окно [наш−lookback .. наш]: транзит всегда <= нашего блока
     (реакция летит ПОСЛЕ него), а прежний одноблочный поиск давал ложное «реверт НЕ гонка», когда
     победитель сидел в блоке транзита, а мы приземлялись в +1..+2 (разбор 15:10 23.07). Победитель
     обогащается from/to/tip -> строка `race-winner` копит ЭМПИРИЧЕСКУЮ tip-функцию конкурентов
-    (grep 'race-winner' по журналу) вместо слепых ступеней. Диагностика, не роняет receipt-путь."""
+    (grep 'race-winner' по журналу) вместо слепых ступеней. Если tip победителя ВЫШЕ нашего (fee-
+    сортировка была) -> взводит каскадную эскалацию tip. Диагностика, не роняет receipt-путь."""
     global _LIQUIDATE_EVENT_SIG
     try:
         from eth_utils import keccak
@@ -817,6 +818,13 @@ def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4):
             log.info("submit-xray: победитель blk=%s idx=%s (наш blk=%s idx=%s, отстали блоков=%s) "
                      "tx=%s | race-winner addr=%s to=%s tip_gwei=%s",
                      wblk, widx, block_number, our_index, blk_off, wtx_hex, waddr, wto, tip_s)
+        if cfg is not None and tip_s != "?":            # tip победителя > нашего -> взвести каскад
+            try:
+                from chain.hotpath import dynamic_tip_gwei, note_race_loss_for_cascade
+                our_tip = dynamic_tip_gwei(cfg, our_debt_usd)
+                note_race_loss_for_cascade(float(tip_s), our_tip, log=log)
+            except Exception:
+                pass
     except Exception as e:
         if log:
             log.info("submit-xray fail: %s", type(e).__name__)
@@ -980,7 +988,7 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                     row["revert_reason"] = reason
                     if log:
                         log.warning("liquidate revert %s/%s reason=%s tx=%s", mid[:10], borrower[:10], reason, h)
-                    _submit_xray(rpc, borrower, _blk, _txi, log)
+                    _submit_xray(rpc, borrower, _blk, _txi, log, cfg=cfg, our_debt_usd=prep.get("debt_usd"))
                 _fl_record(prep.get("fast"), status, getattr(cfg, "fast_lane_max_consec_reverts", 3), log)
                 results.append(row)
             else:                                             # --- батч: per-item ТОЛЬКО из событий ---
@@ -990,7 +998,7 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                     if log:
                         log.warning("batch revert (top-level) n=%d reason=%s tx=%s", len(unit), reason, h)
                     for j, (mid, borrower, prep) in enumerate(unit):
-                        _submit_xray(rpc, borrower, _blk, _txi, log)
+                        _submit_xray(rpc, borrower, _blk, _txi, log, cfg=cfg, our_debt_usd=prep.get("debt_usd"))
                         results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h, "status": 0,
                                         "gas_used": rcpt.get("gasUsed") if j == 0 else 0,     # газ ОДНОЙ строкой (сумма/день точна)
                                         "net_usd": (-gas_total if j == 0 else 0.0),
@@ -1014,7 +1022,7 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                                             "status": 1, "gas_used": _gu, "net_usd": profit_usd_i - _g,
                                             "gas_usd": _g, "tx_index": _txi})
                         else:                                 # BatchItemFailed или просто нет Liquidated
-                            _submit_xray(rpc, borrower, _blk, _txi, log)
+                            _submit_xray(rpc, borrower, _blk, _txi, log, cfg=cfg, our_debt_usd=prep.get("debt_usd"))
                             results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
                                             "status": 0, "gas_used": _gu, "net_usd": -_g, "gas_usd": _g,
                                             "tx_index": _txi, "revert_reason": "batch item failed (no Liquidated)"})
