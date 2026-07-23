@@ -4,15 +4,22 @@ from __future__ import annotations
 
 
 class BaseRpc:
-    def __init__(self, rpc_url: str, chain_id: int):
+    def __init__(self, rpc_url: str, chain_id: int, request_timeout: float | None = None):
+        """request_timeout: пер-запросный timeout для HTTPProvider. None = web3-дефолт (прежнее
+        поведение, все существующие вызыватели не задеты). Явный таймаут ставят пути, где
+        зависший эндпоинт хуже потерянного вызова (fallback-резолвер фидов: mainnet.base.org
+        чёрнодырил 23.07, bg-резолв висел 7+ мин на одном вызове)."""
         self.rpc_url = rpc_url
         self.chain_id = chain_id
+        self.request_timeout = request_timeout
         self._w3 = None
 
     def _web3(self):
         if self._w3 is None:
             from web3 import Web3                 # lazy: keeps `import main` clean
-            self._w3 = Web3(Web3.HTTPProvider(self.rpc_url))
+            kw = {"timeout": self.request_timeout} if self.request_timeout else None
+            self._w3 = Web3(Web3.HTTPProvider(self.rpc_url, request_kwargs=kw) if kw
+                            else Web3.HTTPProvider(self.rpc_url))
         return self._w3
 
     def contract(self, address: str, abi: list):

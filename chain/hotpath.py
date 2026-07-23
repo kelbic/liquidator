@@ -1202,7 +1202,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
 
     from chain.rpc import BaseRpc
     _fb_resolve_rpc = BaseRpc(os.environ.get("FEEDS_FALLBACK_RPC", "https://mainnet.base.org"),
-                              getattr(rpc, "chain_id", 8453))
+                              getattr(rpc, "chain_id", 8453), request_timeout=8.0)
     feeds = _init_resolve_retry(resolve_feeds, rpc, markets, _fb_resolve_rpc,
                                 what="feeds", log=log, empty_ok=False)
 
@@ -1248,8 +1248,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                  # алерт ТОЛЬКО на серию (3+ за 180с = реальная нестабильность фида/сети)
     _re_thread = None            # 07-23: ре-резолв УШЁЛ ИЗ recv-петли — inline-резолв глушил hot-path
     _re_box = None               # на всю длительность (спокойный замер multi-leg: 184с петля не читает
-                                 # WS -> триггеры мертвы). Фоновый тред кладёт результат в box,
+    _re_started = 0.0            # WS -> триггеры мертвы). Фоновый тред кладёт результат в box,
                                  # петля коммитит готовое; один резолв за раз (как _spawn_cache_refresh).
+                                 # _re_started: orphan-гард — Thread-245 висел 7+ мин на чёрнодырном
+                                 # эндпоинте (per-recv timeout переживает trickle), блокируя рескан.
     while not stop.is_set():
         try:
             async with ws_factory() as ws:
@@ -1257,9 +1259,18 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                 while not stop.is_set():
                     # слепой старт (feeds ИЛИ meta пусты) ре-резолвится ускоренно (120с), не через 6ч rescan
                     _rescan_iv = cfg.rescan_interval_sec if (feeds and meta) else min(cfg.rescan_interval_sec, 120.0)
+                    if (_re_thread is not None and _re_thread.is_alive()
+                            and time.monotonic() - _re_started > 300.0):
+                        # висящий резолв (чёрная дыра эндпоинта) не должен блокировать рескан:
+                        # бросаем daemon-тред (его box осиротел — коммит его не прочтёт), повтор ~120с
+                        log.warning("re-resolve завис >300с — бросаю тред, повтор ~120с (карта прежняя, %d aggs)",
+                                    len(agg_set))
+                        _re_thread = None; _re_box = None
+                        last_resolve = time.monotonic() - max(0.0, _rescan_iv - 120.0)
                     if (time.monotonic() - last_resolve >= _rescan_iv
                             and not (_re_thread is not None and _re_thread.is_alive())):
                         _re_box = {}
+                        _re_started = time.monotonic()
 
                         def _bg_resolve(box=_re_box, cur_meta=meta):
                             try:
