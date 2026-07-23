@@ -1297,6 +1297,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         if any(raw_ and (agg[2:] in raw_) for raw_, _ in txs):
                             last_spawn[agg] = now
                             stats["spawn"] += 1
+                            if len(agg) != 42:               # watch-паттерн (не адрес): спавны редкие по построению
+                                log.info("DIAG pattern-spawn %s bn=%s", agg, bn)
                             threading.Thread(target=_process_transmit, args=(agg, bn, idx, now),
                                              kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,
                                                          feeds=feeds, meta=meta, shared=shared, store=store,

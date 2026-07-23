@@ -26,8 +26,22 @@ def _try_addr(rpc, addr, getter):
         return None
 
 
+# Read-time композит-оракулы: BASE_FEED_1 без aggregator() — сам композит НИКОГДА не получает tx
+# (значение он форвардит из стороннего push-адаптера при чтении), т.е. как watch-ключ он мёртв и
+# trig=feed для рынка невозможен. Вместо адреса ставим hex-ПОДСТРОКУ update-tx: bare-match в hotpath
+# ищет agg[2:] по всему raw флешблока, так что подстрока calldata работает как и адрес. Ключ такого
+# паттерна короче 42 символов — по этому признаку hotpath его отличает в DIAG. Пары ниже проверены
+# on-chain (accessList latestRoundData -> адаптер; calldata апдейта содержит feedId ASCII).
+WATCH_PATTERN_OVERRIDES = {
+    # Moonwell Bounded Composite (LBTC/cbBTC 0x4944a116…): форвардит RedStone LBTC_FUNDAMENTAL из
+    # MultiFeedAdapter 0xb81131b6…; ловим ASCII-hex feedId — он есть ТОЛЬКО в апдейтах этого фида.
+    "0x31d099c106cd73e731972fdf1390cab77f59dade": "0x" + "LBTC_FUNDAMENTAL".encode().hex(),
+}
+
+
 def _resolve_one(rpc, market_id):
-    """market_id -> OCR aggregator (lower) or None (non-Chainlink wrapper). I/O; patched in tests."""
+    """market_id -> OCR aggregator (lower), watch-паттерн из WATCH_PATTERN_OVERRIDES для read-time
+    композитов, или None (non-Chainlink wrapper). I/O; patched in tests."""
     from chain.morpho import MORPHO_BLUE_ADDRESS
     from chain.simulate import MORPHO_READ_ABI
     morpho = rpc.contract(MORPHO_BLUE_ADDRESS, MORPHO_READ_ABI)
@@ -39,7 +53,8 @@ def _resolve_one(rpc, market_id):
     if not proxy:
         return None
     agg = _try_addr(rpc, proxy, "aggregator") or proxy
-    return agg.lower() if agg else None
+    agg = agg.lower() if agg else None
+    return WATCH_PATTERN_OVERRIDES.get(agg, agg)
 
 
 def resolve_feeds(rpc, markets):
