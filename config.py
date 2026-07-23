@@ -18,7 +18,12 @@ class Config:
     rescan_interval_sec: float = 21600.0
     exclude_oracles: str = ""
     min_profit_usd: float = 5.0          # floor on NET (profit - gas/tip cost) before sending
-    tip_gwei: float = 3.0                # competitive priority fee we bid (beats observed ~2.0 cap)
+    tip_gwei: float = 0.05               # Base-секвенсер = FCFS (разбор блока 49015040 23.07: победители
+                                         # 0.003 gwei на idx+2 от транзита, 10 gwei — на idx 5255; тот же
+                                         # вывод у WC 18.07) — tip НЕ покупает позицию, только жжёт газ:
+                                         # промах-реверт при 6 gwei стоил $1.31, при 0.05 — ~$0.01, и это
+                                         # открывает спекулятивный огонь. 0.05 = запас над толпой 0.003
+                                         # на случай fee-сортировки ВНУТРИ флешблок-кадра (op-rbuilder).
     gas_limit_est: int = 500000          # ~gas used per liquidation, for the net-cost estimate
     eth_price_usd: float = 1730.0        # ETH/USD to value gas/tip cost (keep ~current; tip dominates)
     max_daily_loss_usd: float = 50.0

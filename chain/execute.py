@@ -296,6 +296,7 @@ def _post_raw_tx(url: str, raw_hex: str, timeout: int = 5):
     НЕ роняет send-путь. Смысл: убрать Alchemy-прокси-хоп из гонки за включение.
     Поправка 07-17: тёплая keep-alive сессия (_seq_session) вместо холодного TCP+TLS на каждый вызов."""
     try:
+        _ss = time.perf_counter()
         payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [raw_hex]}
         s = _seq_session(url)
         if s is not None:
@@ -308,6 +309,10 @@ def _post_raw_tx(url: str, raw_hex: str, timeout: int = 5):
         err = resp.get("error")
         if err and "already known" not in str(err.get("message", "")).lower():
             log.info("DIAG seq-send %s err=%s", url, str(err)[:120])
+        else:
+            # ГОНОЧНАЯ метрика: ack секвенсера = момент, когда наша raw В ОЧЕРЕДИ ордерера.
+            # «dispatch: sent» в логе — это Alchemy-нога ПОСЛЕ, гонку она не отражает (23.07).
+            log.info("DIAG seq-send ack=%.0fms %s", (time.perf_counter() - _ss) * 1000.0, url.split("/")[2])
     except Exception as e:
         log.info("DIAG seq-send %s fail=%s", url, type(e).__name__)
 
@@ -592,14 +597,17 @@ def send_tx(rpc, key: str, tx: dict, wait: bool = True, timeout: int = 120,
         t["maxFeePerGas"] = int(base) * 2 + tip
     if "gas" not in t:
         t["gas"] = int(w3.eth.estimate_gas(t) * 12 // 10)
+    _t0 = time.perf_counter()
     signed = acct.sign_transaction(t)
     raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+    _t_sign = time.perf_counter()
     _relayed = False
     if broadcast_raw_urls:
         raw_hex = "0x" + bytes(raw).hex()
         for _u in broadcast_raw_urls:
             threading.Thread(target=_post_raw_tx, args=(_u, raw_hex), daemon=True).start()
         _relayed = True
+    _t_relay = time.perf_counter()
     try:
         h = w3.eth.send_raw_transaction(raw)
     except Exception:
@@ -615,6 +623,11 @@ def send_tx(rpc, key: str, tx: dict, wait: bool = True, timeout: int = 120,
         if _hh is None:
             raise
         return {"hash": _hh.hex(), "status": None, "gas_used": None, "receipt": None, "uncertain": True}
+    # Разложение send-пути (23.07): подпись CPU-мс; relay-спавн ~0 (треды в секвенсер уже летят);
+    # alch = синхронная Alchemy-нога — журнал/дедуп, НЕ гонка (raw в секвенсере с _t_relay).
+    log.info("DIAG send-stages sign=%.0fms relay_spawn=%.0fms alch=%.0fms relayed=%s",
+             (_t_sign - _t0) * 1000.0, (_t_relay - _t_sign) * 1000.0,
+             (time.perf_counter() - _t_relay) * 1000.0, _relayed)
     out = {"hash": h.hex(), "status": None, "gas_used": None, "receipt": None}
     if wait:
         rcpt = w3.eth.wait_for_transaction_receipt(h, timeout=timeout)
