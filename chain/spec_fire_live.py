@@ -31,12 +31,25 @@ SPEC_FIRE_MIN_REPAID_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_USD", "500
 SPEC_FIRE_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_INTERVAL_SEC", "0.7"))
 SPEC_FIRE_MAX_PROBES_WINDOW = int(os.environ.get("SPEC_FIRE_MAX_PROBES_WINDOW", "10"))
 SPEC_FIRE_THRESHOLD = float(os.environ.get("SPEC_FIRE_THRESHOLD", "1.0"))     # ×dev
-# Reach-гейт (24.07, по первым live-данным): стрелять только если дистанция цели до флипа
-# достижима ТЕКУЩИМ движением: dist <= |ret| × REACH. Первый живой огонь жёг кап по киту
-# dist=8.25% на ret=-0.11% (досягаемость 0.33%) — шанс WIN ~0, бакет-то накопительный.
-# REACH=3 — запас на лаг HF-кэша (~60с refresh) и овершут транзита в каскаде.
-# Откат без кода: SPEC_FIRE_REACH=1e9 (гейт всегда открыт). HF цели неизвестен -> fail-open.
-SPEC_FIRE_REACH = float(os.environ.get("SPEC_FIRE_REACH", "3.0"))
+# Predicted-HF гейт (24.07, ревью + live-данные): цена на транзите ~= текущий Binance mid,
+# значит проба имеет смысл ТОЛЬКО если этот транзит способен флипнуть цель:
+#   dist_to_flip <= |ret| + MARGIN_DEVS × dev   (аддитивный запас на лаг HF-кэша ~60с,
+# USD-approx HF и следующий dev-шаг; НЕ мультипликативный — reach×3 на ret −3% открывал бы
+# огонь по цели в 9%, которую ЭТОТ транзит не флипнет). Первый живой день: 6 окон × 10 проб
+# по киту dist=8.25% на ret −0.11% — гейт отсёк бы всё ($0.59 и бакет целы).
+# Арм-гейт: окно вовсе не стартует, если ближайший жир дальше ARM_MAX_DIST (нет ни петли,
+# ни ончейн-фингерпринта по заведомо мёртвым окнам); в настоящий каскад HF-refresh (~60с)
+# подтянет dist под потолок — последующие армы окно запустят.
+# Откат без кода: SPEC_FIRE_DIST_MARGIN_DEVS=1e9 / SPEC_FIRE_ARM_MAX_DIST=1e9.
+# HF цели неизвестен -> fail-open.
+SPEC_FIRE_DIST_MARGIN_DEVS = float(os.environ.get("SPEC_FIRE_DIST_MARGIN_DEVS", "2.0"))
+SPEC_FIRE_ARM_MAX_DIST = float(os.environ.get("SPEC_FIRE_ARM_MAX_DIST", "0.03"))
+# Двухфазный каденс (по замеру 24.07: транзит приходит через 22-31с ПОСЛЕ пробития dev —
+# OCR-раунд оракула; старый каденс 0.7с выжигал кап за ~7с, за 22с до транзита): первые
+# BURST проб быстро (страховка от мгновенного/heartbeat-транзита), дальше медленно — кап 10
+# растягивается на ~0.7+8×3.5 ~= 29с, накрывая замеренный лаг. Тюнить по новым транзитам.
+SPEC_FIRE_BURST_PROBES = int(os.environ.get("SPEC_FIRE_BURST_PROBES", "2"))
+SPEC_FIRE_SLOW_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_SLOW_INTERVAL_SEC", "3.5"))
 SPEC_FIRE_MIN_PROFIT_BPS = int(os.environ.get("SPEC_FIRE_MIN_PROFIT_BPS", "30"))
 SPEC_FIRE_POLL_SEC = float(os.environ.get("SPEC_FIRE_POLL_SEC", "0.15"))
 SPEC_FIRE_RECEIPT_TIMEOUT = float(os.environ.get("SPEC_FIRE_RECEIPT_TIMEOUT", "45"))
@@ -58,6 +71,7 @@ class SpecFireLive:
         self._now = now
         self._lock = threading.Lock()
         self._windows: dict = {}                  # feed -> stop Event
+        self._armskip_ts: dict = {}               # feed -> ts последнего arm-skip-лога (троттлинг 300с)
         self.stats = {"windows_armed": 0, "probes": 0, "wins": 0}
 
     # ---- боевые швы ----
@@ -194,8 +208,10 @@ class SpecFireLive:
                 pass
             hot = (r is not None and ((direction == "down" and r <= -thr)
                                       or (direction == "up" and r >= thr)))
-            if hot and self._now() - last_fire >= SPEC_FIRE_INTERVAL_SEC:
-                reach = abs(r) * SPEC_FIRE_REACH
+            iv = (SPEC_FIRE_INTERVAL_SEC if probes < SPEC_FIRE_BURST_PROBES
+                  else SPEC_FIRE_SLOW_INTERVAL_SEC)
+            if hot and self._now() - last_fire >= iv:
+                reach = abs(r) + SPEC_FIRE_DIST_MARGIN_DEVS * self.dev_by.get(feed, 0.005)
                 tgt, hold_dist = self._top_fat(feed, direction, max_dist=reach)
                 if tgt is None:
                     if hold_dist is None:
@@ -234,8 +250,15 @@ class SpecFireLive:
             feed = (ev.get("feed") or "").upper()
             if kind == "arm":
                 direction = ev.get("dir") or "down"
-                if self._top_fat(feed, direction)[0] is None:
-                    return None                            # окна без жира не запускают петлю вовсе
+                best, hold_dist = self._top_fat(feed, direction, max_dist=SPEC_FIRE_ARM_MAX_DIST)
+                if best is None:
+                    if hold_dist is not None:              # жир есть, но заведомо вне окна — не палим
+                        _n = self._now()                   # ни петлю, ни ончейн-паттерн
+                        if _n - self._armskip_ts.get(feed, -1e9) >= 300.0:
+                            self._armskip_ts[feed] = _n
+                            self._log("SPECFIRE arm-skip feed=%s: ближ. жир dist=%.2f%% > потолок %.1f%%" % (
+                                feed, hold_dist * 100.0, SPEC_FIRE_ARM_MAX_DIST * 100.0))
+                    return None                            # окна без (досягаемого) жира не запускают петлю
                 with self._lock:
                     old = self._windows.pop(feed, None)
                     if old is not None:

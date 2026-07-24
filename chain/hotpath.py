@@ -1275,10 +1275,10 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             _maybe_canary(agg, block, subidx, rpc, cfg, log, t0=t)   # ⭐ нет ликвидации -> пробить гонку
         return []
 
-    from chain.execute import current_inflight
+    from chain.execute import current_inflight, specfire_gas_today
     today = store.realized_today()                           # SHARED kill-switch with the block loop
     blocked = guard.blocked_reason(GuardState(realized_net_today=today["net"],
-                                              gas_spent_today=today["gas"],
+                                              gas_spent_today=today["gas"] + specfire_gas_today(),
                                               inflight=current_inflight()))   # P0: был хардкод 0 — inflight-гейт мёртв
     if blocked:
         log.error("HOT kill switch engaged: %s — %d ready NOT dispatched", blocked, len(ready))

@@ -302,18 +302,39 @@ def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=N
 _SPECFIRE_PROBES = 0
 _SPECFIRE_GAS_USD = 0.0
 _SPECFIRE_LAST_TS = 0.0
+_SPECFIRE_DAY = int(time.time() // 86400)   # UTC-день бакета: суточный сброс (был lifetime —
+                                            # к вечернему каскаду волатильного дня бакет пуст)
 _SPECFIRE_MAX_GAS_USD = float(os.environ.get("SPEC_FIRE_MAX_GAS_USD", "10"))
 _SPECFIRE_MIN_INTERVAL = float(os.environ.get("SPEC_FIRE_MIN_INTERVAL_SEC", "0.25"))
 
 
+def _specfire_roll_day_locked():
+    """Вызывать ТОЛЬКО под _INFLIGHT_LOCK: сброс бакета на границе UTC-суток."""
+    global _SPECFIRE_DAY, _SPECFIRE_GAS_USD
+    d = int(time.time() // 86400)
+    if d != _SPECFIRE_DAY:
+        _SPECFIRE_DAY = d
+        _SPECFIRE_GAS_USD = 0.0
+
+
 def specfire_stats():
     with _INFLIGHT_LOCK:
+        _specfire_roll_day_locked()
         return (_SPECFIRE_PROBES, _SPECFIRE_GAS_USD)
+
+
+def specfire_gas_today() -> float:
+    """Спек-газ за текущие UTC-сутки — слагаемое в общий kill-switch (гард видит СУММАРНЫЙ
+    дневной расход: боевой + пробный; спек-кап $10 = максимум 10% от дневного лимита)."""
+    with _INFLIGHT_LOCK:
+        _specfire_roll_day_locked()
+        return _SPECFIRE_GAS_USD
 
 
 def specfire_gas_add(gas_usd: float):
     global _SPECFIRE_GAS_USD
     with _INFLIGHT_LOCK:
+        _specfire_roll_day_locked()
         _SPECFIRE_GAS_USD += max(0.0, gas_usd)
 
 
@@ -333,6 +354,7 @@ def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
     _now = time.monotonic()
     with _SEND_LOCK:
         with _INFLIGHT_LOCK:
+            _specfire_roll_day_locked()
             if (_SPECFIRE_GAS_USD >= _SPECFIRE_MAX_GAS_USD
                     or _now - _SPECFIRE_LAST_TS < _SPECFIRE_MIN_INTERVAL
                     or _INFLIGHT > 0):
@@ -520,8 +542,12 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     # cbBTC/USDC: ПРЯМОЙ пул fee=500 (0xfbb6eed8, liq 2.1e12) доминирует 2-hop через WETH на ВСЕХ
     # размерах — QuoterV2 23.07: $30k imp 0.01% vs 0.10%, $500k 0.95% vs 1.68%, $1M 2.02% vs 3.48%
     # (при LIF 4.4% профит жив и на $1M). fee=100/3000 хуже на порядок/в разы.
+    # max_in (24.07, ревью мега-сайза): QuoterV2 imp $1.6M=3.39%, $2.5M=5.78% > бонуса 4.38% —
+    # сверх ~$2M директ гарантированно ревертит по minProfit-floor. Кап 30 cbBTC (~$1.9M):
+    # ниже — скорость директа (профит жив), выше — Kyber-агрегат (PREARM греет в окнах).
     (_CBBTC, _UNIV3_USDC): {"router": UNIV3_SWAP_ROUTER, "style": "02",
-                            "path": _pack_path(_CBBTC, 500, _UNIV3_USDC)},
+                            "path": _pack_path(_CBBTC, 500, _UNIV3_USDC),
+                            "max_in": 30 * 10**8},
     # LBTC/cbBTC 07-12 (нож $350.8k долга, BTC-пег пара — профиль «мгновенный флип на ноже»):
     # UniV3 ПУСТ на всех тирах (QuoterV2-проба impact~99.6%, analysis/lbtc_route_probe.py);
     # Slipstream ts=1 ЖИВОЙ (router.factory()->getPool, liquidity=125.6B, 07-12); Kyber-глубина

@@ -115,37 +115,64 @@ sf5._collect("0xh2", "0xbtc", "0xFAT", 1_500_000.0)
 assert ("0xbtc", "0xFAT") not in ex._RECENT_SENDS and sf5.stats["wins"] == 0
 print("UNIT_OK: WIN маркирует дедуп, revert — нет (реактивный путь не глушится)")
 
-# 7) REACH-гейт: жир с HF далеко от флипа НЕ жжёт бакет на малом ret; большой ret — огонь
-shared_far = types.SimpleNamespace(
-    lock=threading.Lock(),
-    groups={"0xbtc": ["0xFAT"]},
-    debt_by={("0xbtc", "0xFAT"): 1_500_000.0},
-    hf_by={("0xbtc", "0xFAT"): 1.0899},           # dist=8.25% (живой кит 24.07)
-    by_id={"0xbtc": mk("cbBTC", "USDC")},
-)
-sent.clear(); LOGS.clear(); RET["v"] = -0.0011    # reach = 0.11%*3 = 0.33% << 8.25%
-sf6 = SpecFireLive(rpc=None, cfg=cfg, shared=shared_far, ret_fn=lambda l: RET["v"],
+# 7a) АРМ-гейт: жир заведомо вне окна (dist > потолок 3%) -> окно вовсе не стартует
+def mk_shared(hf):
+    return types.SimpleNamespace(
+        lock=threading.Lock(),
+        groups={"0xbtc": ["0xFAT"]},
+        debt_by={("0xbtc", "0xFAT"): 1_500_000.0},
+        hf_by={("0xbtc", "0xFAT"): hf},
+        by_id={"0xbtc": mk("cbBTC", "USDC")},
+    )
+sent.clear(); LOGS.clear(); RET["v"] = -0.05
+sf6 = SpecFireLive(rpc=None, cfg=cfg, shared=mk_shared(1.0899), ret_fn=lambda l: RET["v"],
                    dev_by={"BTC": 0.0010}, build_fn=build_fn, send_fn=send_fn,
-                   receipt_fn=receipt_fn, log_fn=LOGS.append)
+                   receipt_fn=receipt_fn, log_fn=LOGS.append)   # dist=8.25% (живой кит 24.07)
 sf6.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
-time.sleep(0.6)
-assert sf6.stats["windows_armed"] == 1, "арм БЕЗ гейта — окно должно запускаться"
-assert not sent, sent
-assert any("hold" in m and "8.25" in m for m in LOGS), LOGS
-RET["v"] = -0.05                                  # краш −5%: reach 15% >= 8.25% — огонь
-time.sleep(1.0)
-sf6.handle_event({"event": "disarm", "feed": "BTC"})
-assert len(sent) >= 1, "в пределах досягаемости гейт обязан пропустить огонь"
-print("UNIT_OK: reach-гейт держит далёкий жир (hold-лог), краш-ret открывает огонь")
+time.sleep(0.3)
+assert sf6.stats["windows_armed"] == 0 and not sent
+assert any("arm-skip" in m and "8.25" in m for m in LOGS), LOGS
+print("UNIT_OK: арм-гейт — мёртвое окно не стартует (arm-skip, ни петли, ни фингерпринта)")
 
-# 7b) HF неизвестен (нет hf_by / старый снапшот) -> fail-open, поведение прежнее
-sent.clear(); RET["v"] = -0.0011
-sf7 = make()                                      # shared без hf_by вовсе
+# 7b) FIRE-гейт (predicted-HF): dist 2% армится (< потолка), малый ret -> hold;
+#     ret с досягаемостью |ret|+2×dev >= dist -> огонь
+sent.clear(); LOGS.clear(); RET["v"] = -0.0011    # достягаемость 0.11%+0.20% = 0.31% < 2%
+sf7 = SpecFireLive(rpc=None, cfg=cfg, shared=mk_shared(1.0204), ret_fn=lambda l: RET["v"],
+                   dev_by={"BTC": 0.0010}, build_fn=build_fn, send_fn=send_fn,
+                   receipt_fn=receipt_fn, log_fn=LOGS.append)   # dist=2.00%
 sf7.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
-time.sleep(0.9)
+time.sleep(0.6)
+assert sf7.stats["windows_armed"] == 1 and not sent, sent
+assert any("hold" in m and "2.00" in m for m in LOGS), LOGS
+RET["v"] = -0.019                                 # 1.9%+0.2% = 2.1% >= 2.00% — этот транзит флипает
+time.sleep(1.0)
 sf7.handle_event({"event": "disarm", "feed": "BTC"})
+assert len(sent) >= 1, "в пределах досягаемости гейт обязан пропустить огонь"
+print("UNIT_OK: fire-гейт держит недосягаемый транзит (hold), досягаемый — открывает огонь")
+
+# 7c) HF неизвестен (нет hf_by / старый снапшот) -> fail-open, поведение прежнее
+sent.clear(); RET["v"] = -0.0011
+sf8 = make()                                      # shared без hf_by вовсе
+sf8.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.9)
+sf8.handle_event({"event": "disarm", "feed": "BTC"})
 assert len(sent) >= 1, "без HF гейт должен быть открыт (fail-open)"
 print("UNIT_OK: HF неизвестен -> fail-open (без hf_by поведение прежнее)")
+
+# 7d) двухфазный каденс: burst=2 быстрых, дальше медленный интервал (транзит на 22-31с позже dev)
+sent.clear(); RET["v"] = -0.005
+old_slow = sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC
+old_fast = sfl_mod.SPEC_FIRE_INTERVAL_SEC
+sfl_mod.SPEC_FIRE_INTERVAL_SEC = 0.05
+sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC = 30.0        # медленная фаза не успеет за тест
+sf9 = make()
+sf9.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.9)
+sf9.handle_event({"event": "disarm", "feed": "BTC"})
+assert len(sent) == sfl_mod.SPEC_FIRE_BURST_PROBES == 2, sent
+sfl_mod.SPEC_FIRE_INTERVAL_SEC = old_fast
+sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC = old_slow
+print("UNIT_OK: burst-фаза = 2 пробы, дальше медленный каденс (растяжка на OCR-лаг)")
 
 # 8) send_spec_fire_probe: гейт inflight>0 молчит; газ-бакет стопит
 ex._INFLIGHT = 1
@@ -155,5 +182,14 @@ ex._SPECFIRE_GAS_USD = ex._SPECFIRE_MAX_GAS_USD + 1
 assert ex.send_spec_fire_probe(None, cfg, "0x", 100000) is None
 ex._SPECFIRE_GAS_USD = 0.0
 print("UNIT_OK: probe-гейты (inflight, газ-бакет) атомарно закрывают отправку")
+
+# 9) суточный бакет: на границе UTC-суток спек-газ сбрасывается (был lifetime — к вечернему
+#    каскаду волатильного дня бакет пуст); specfire_gas_today кормит общий kill-switch
+ex._SPECFIRE_GAS_USD = 5.0
+assert ex.specfire_gas_today() == 5.0
+ex._SPECFIRE_DAY -= 1                             # «наступили» новые сутки
+assert ex.specfire_gas_today() == 0.0, "смена UTC-суток обязана сбросить бакет"
+ex._SPECFIRE_GAS_USD = 0.0
+print("UNIT_OK: суточный сброс бакета + specfire_gas_today для общего kill-switch")
 
 print("=== ВСЕ SPEC-FIRE-LIVE ЮНИТЫ ПРОШЛИ ===")

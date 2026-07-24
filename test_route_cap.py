@@ -25,12 +25,14 @@ assert direct_swap(_WSTETH, _UNIV3_WETH, 300 * 10**18, LIQ, LIQ, repaid_assets=1
 assert direct_swap(_WSTETH, _UNIV3_WETH, 300 * 10**18 + 1, LIQ, LIQ, repaid_assets=1) is None, "кап+1 — None"
 print("UNIT_OK: wstETH кап 300 включительно, кап+1 -> None")
 
-# 4) роут БЕЗ капа (cbBTC/USDC) не задет — любой размер отдаёт calldata
+# 4) cbBTC/USDC кап 30 cbBTC (~$1.9M): кит $1.5M (~25 cbBTC) — директ; сверх — Kyber
 from chain.execute import _CBBTC, _UNIV3_USDC
-assert "max_in" not in _SWAP_ROUTES[(_CBBTC, _UNIV3_USDC)]
-big = direct_swap(_CBBTC, _UNIV3_USDC, 10**12, LIQ, LIQ, repaid_assets=1)
-assert big is not None, "роут без капа не должен резаться"
-print("UNIT_OK: роуты без max_in не затронуты")
+assert _SWAP_ROUTES[(_CBBTC, _UNIV3_USDC)]["max_in"] == 30 * 10**8
+whale = direct_swap(_CBBTC, _UNIV3_USDC, 25 * 10**8, LIQ, LIQ, repaid_assets=1)
+assert whale is not None, "сайз кита обязан идти директом (скорость, профит жив)"
+mega = direct_swap(_CBBTC, _UNIV3_USDC, 31 * 10**8, LIQ, LIQ, repaid_assets=1)
+assert mega is None, "сверх капа (imp>бонуса) — None -> Kyber"
+print("UNIT_OK: cbBTC кап 30 — кит директом, минусовый мега-сайз в Kyber")
 
 # 5) peg-пары (weETH/wstETH — обе ноги ETH) исключены из predict-окон -> кап там не нужен,
 #    он защищает ТОЛЬКО реактивное исполнение

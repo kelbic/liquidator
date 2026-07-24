@@ -19,7 +19,8 @@ import time
 from collections import defaultdict
 
 from config import Config
-from chain.execute import try_liquidate, prepare_liquidation, dispatch_liquidations, current_inflight
+from chain.execute import (try_liquidate, prepare_liquidation, dispatch_liquidations,
+                           current_inflight, specfire_gas_today)
 from store import Store
 from alerts import Alerter
 from strategy.scanner import load_covered_markets
@@ -131,7 +132,7 @@ def _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, gu
 
     today = store.realized_today()
     blocked = guard.blocked_reason(GuardState(realized_net_today=today["net"],
-                                              gas_spent_today=today["gas"], inflight=current_inflight()))
+                                              gas_spent_today=today["gas"] + specfire_gas_today(), inflight=current_inflight()))
     if blocked:
         for mid, borrower, hr, sr in actionable:
             _record(mid, borrower, hr, sr, f"blocked:{blocked}")
@@ -546,7 +547,7 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     fails = 0   # blocks are flowing on this source
                     by_id, groups, debt_by, debt_assets_by, ncand = shared.snapshot()
                     today = store.realized_today()
-                    gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"],
+                    gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"] + specfire_gas_today(),
                                     inflight=current_inflight())
                     blocked = guard.blocked_reason(gs)
                     if blocked and cfg.mode == "execute":
@@ -638,7 +639,7 @@ def main():
                 last_rescan = time.time()
             t0 = time.time()
             today = store.realized_today()
-            st = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"],
+            st = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"] + specfire_gas_today(),
                             inflight=current_inflight())
             blocked = guard.blocked_reason(st)
             if blocked and cfg.mode == "execute":
