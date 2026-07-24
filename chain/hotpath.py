@@ -1254,6 +1254,9 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         else:                                                # страховка (префетч покрывает штатно)
             price = read_price_hedged(preconf_rpc, rpc, oracle, price_fn=price_fn)
         _t_price_last = (time.perf_counter() - _pxs) * 1000.0
+        if stats is not None:                                # 24.07: ДЕНЕЖНЫЙ путь = цена из flashblocks-WS
+            k = "px_free" if _t_price_last < 5.0 else "px_rpc"   # (декод/гейт/префетч, 0мс) без RPC вообще.
+            stats[k] = stats.get(k, 0) + 1                   # px_rpc = чтения, которым preconf реально нужен.
         if price is None:
             if stats is not None: stats["f_noprice"] += 1
             continue
@@ -1546,25 +1549,35 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         _re_thread.start()
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
                         _px_ok, _px_fail = px_preconf_take()
-                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d poll_lat=%d px_pre=%d/%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
+                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d poll_lat=%d px_free=%d/%d px_pre=%d/%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
-                                 stats.get("poll_lat", 0), _px_ok, _px_ok + _px_fail,
+                                 stats.get("poll_lat", 0),
+                                 stats.get("px_free", 0), stats.get("px_free", 0) + stats.get("px_rpc", 0),
+                                 _px_ok, _px_ok + _px_fail,
                                  stats["proceed"], stats["skip"], stats["none"], stats["poll_none"], stats["poll_fb"],
                                  stats["f_nocand"], stats["f_noprice"], stats["f_norp"], stats["f_noflip"], stats["f_floor"], stats["f_prep"])
                         # порог: >3 фолбэка/поллинг ≈ >8% чтений цены потеряли фору = РЕАЛЬНАЯ cap-деградация
                         # (исходный preconf-кап был 1457/окно=67%); микро-остаток спайков фида (≤2%, ~48/окно)
                         # НЕ будит — иначе ложно «мелькает» в норме (07-22, poll_fb калибр. на катастрофу, не на 1-2 оракула)
-                        # 24.07: после приоритетного фикса poll_fb уходит в ~0 и СЛЕПНЕТ как сигнал —
-                        # честный датчик теперь РЕАКТИВНЫЙ путь: доля чтений цены, где preconf не успел
-                        # (фора реально потеряна). Порог >50% при выборке >=4 — деньги, а не шум.
+                        # 24.07 РЕ-КАЛИБРОВКА (инцидент «degraded 18x windows» = ложная тревога): poll_fb
+                        # мерил РЕЗЕРВНЫЙ полл (пыльные cbXRP/cbDOGE/cbADA), а денежный путь берёт цену
+                        # из flashblocks-WS за 0мс — замер 90 мин: 35/38 спавнов price=0ms, позиции 74/77
+                        # из кэша, e2e p50=2мс. Публичный preconf ужался до ~0.2 pending-вызова/с (проба
+                        # 24.07: 8 из 10 отказов даже в темпе 1/с) — это НОРМА среды, а не наша поломка.
+                        # Будим ТОЛЬКО если пострадал денежный путь: цена реально пошла через RPC (px_rpc
+                        # заметная доля) И этот RPC не даёт форы. Иначе — тишина (деградация косметическая).
+                        _px_tot = stats.get("px_free", 0) + stats.get("px_rpc", 0)
+                        _money_hit = _px_tot >= 4 and stats.get("px_rpc", 0) * 4 > _px_tot   # >25% цен через RPC
                         _px_bad = (_px_ok + _px_fail) >= 4 and _px_fail * 2 > (_px_ok + _px_fail)
-                        fb_windows = fb_windows + 1 if (_px_bad or stats["poll_fb"] > stats["poll"] * 3) else 0
+                        fb_windows = fb_windows + 1 if (_money_hit and _px_bad) else 0
                         if fb_windows >= 3 and time.monotonic() - last_fb_alert > 1800:
                             last_fb_alert = time.monotonic()
                             try:
-                                alerter.send_async("preconf degraded %dx windows: РЕАКТИВНАЯ фора теряется "
-                                             "(px_pre %d/%d ok, poll_fb=%d) -> спорные гонки. check preconf RPC."
-                                             % (fb_windows, _px_ok, _px_ok + _px_fail, stats["poll_fb"]))
+                                alerter.send_async("preconf degraded %dx windows: ДЕНЕЖНЫЙ путь потерял фору "
+                                             "(px_free %d/%d, preconf ok %d/%d) — WS-декод цены сломался, "
+                                             "не резерв. check flashblocks WS + preconf RPC."
+                                             % (fb_windows, stats.get("px_free", 0), _px_tot,
+                                                _px_ok, _px_ok + _px_fail))
                             except Exception:
                                 pass
                         for _k in list(stats):
