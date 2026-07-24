@@ -58,6 +58,9 @@ class Config:
     fast_lane_max_consec_reverts: int = 3     # II.6 circuit breaker: N подряд ревертов fast-lane -> off ТОЛЬКО fast-lane (фолбэк sim)
     batch_liquidate: bool = False             # мультибатч: N жертв в ОДНОЙ tx (каскад). OFF -> путь бит-в-бит старый
     batch_max_items: int = 5                  # макс items в одной batch-tx (хвост -> следующими tx в пределах max_inflight)
+    parallel_broadcast: bool = False          # залп: >1 юнита -> подписать ВСЕ, raw в секвенсер ОДНИМ залпом,
+                                              # Alchemy-нога журналом ПОСЛЕ (юнит u+1 не ждёт RTT юнита u).
+                                              # OFF/1 юнит -> цикл бит-в-бит старый
     canary_probe: bool = False                # ⭐ canary: замер inclusion-гонки минимальной tx (OFF; ARM на кампанию)
     canary_max_probes: int = 100              # стоп кампании после N проб
     canary_min_interval_sec: float = 120.0    # не чаще 1 пробы / N сек (разброс по условиям)
@@ -133,6 +136,7 @@ class Config:
             fast_lane_max_consec_reverts=i("FAST_LANE_MAX_CONSEC_REVERTS", d.fast_lane_max_consec_reverts),
             batch_liquidate=b("BATCH_LIQUIDATE"),
             batch_max_items=i("BATCH_MAX_ITEMS", d.batch_max_items),
+            parallel_broadcast=b("PARALLEL_BROADCAST"),
             canary_probe=b("CANARY_PROBE"),
             canary_max_probes=i("CANARY_MAX_PROBES", d.canary_max_probes),
             canary_min_interval_sec=f("CANARY_MIN_INTERVAL_SEC", d.canary_min_interval_sec),

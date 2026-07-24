@@ -845,6 +845,92 @@ def _revert_reason(rpc, tx_hash, block_number):
         return _revert_bucket(str(e))
 
 
+def _send_units_volley(rpc, w3, cfg, units, base_nonce, tip_wei, bcast_urls, log=None):
+    """PARALLEL_BROADCAST (залп): подписать ВСЕ юниты -> раздать ВСЕ raw в секвенсер одним залпом ->
+    Alchemy-нога журналом ПОСЛЕ. Старый цикл шлёт юниты последовательно: гоночная нога юнита u+1
+    стартует только после синхронной Alchemy-ноги юнита u (~60мс RTT) — в каскаде >batch_max_items
+    жертв юнит 3 приходит в FCFS-очередь на ~120мс позже юнита 1. Здесь подпись = CPU-мс (fee-контекст
+    ОДИН на залп, не RTT×юниты), межюнитная задержка гоночной ноги = спавн треда (~0).
+    Sign-фейл юнита u: ничего ещё не в сети -> хвост дропаем (nonce-гэп исключён, семантика старого
+    цикла), префикс 0..u-1 уходит залпом. Alchemy-фейл юнита НЕ стопит журнал остальных — их raw уже
+    в секвенсере (SEND-3 uncertain семантика: учтён sent, nonce инвалидируется вызывающим).
+    Возвращает (sent, err_results, send_failed): sent=[(unit, hash)] как у старого цикла."""
+    acct = account_for(w3, cfg.wallet_key)
+    _t0 = time.perf_counter()
+    _base_fee = _dyn_tip = None
+    signed_units = []                                     # (unit, raw_bytes, hash_hex)
+    err_results = []
+    send_failed = False
+    for u, unit in enumerate(units):
+        try:
+            if len(unit) == 1:                            # сборка txd бит-в-бит со старым циклом
+                _prep = unit[0][2]
+                _data = _prep["calldata"]; _gas = _prep.get("gas")
+                _mf = _prep.get("max_fee"); _tp = _prep.get("tip")
+            else:
+                _preps = [p for _, _, p in unit]
+                _data = encode_batch_liquidate(_preps)
+                _gas = int((sum(p.get("gas", cfg.gas_limit_est) for p in _preps) + 30_000 * len(_preps)) * 1.25)
+                _fee_src = next((p for p in _preps if p.get("max_fee")), None)
+                _mf = _fee_src.get("max_fee") if _fee_src else None
+                _tp = _fee_src.get("tip") if _fee_src else None
+            t = {"to": cfg.liquidator_address, "data": _data, "nonce": base_nonce + u,
+                 "from": acct.address, "chainId": rpc.chain_id}
+            if _mf:                                       # SEND-2: fee из fb-хедера
+                t["maxFeePerGas"] = _mf; t["maxPriorityFeePerGas"] = _tp
+            else:                                         # fee-контекст один на ВЕСЬ залп
+                if _base_fee is None:
+                    _base_fee = int(w3.eth.get_block("latest").get("baseFeePerGas") or 0)
+                    _dyn_tip = max(int(w3.eth.max_priority_fee), int(tip_wei))
+                t["maxPriorityFeePerGas"] = _dyn_tip
+                t["maxFeePerGas"] = _base_fee * 2 + _dyn_tip
+            t["gas"] = _gas if _gas else int(w3.eth.estimate_gas(t) * 12 // 10)
+            signed = acct.sign_transaction(t)
+            raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+            signed_units.append((unit, bytes(raw), signed.hash.hex()))
+        except Exception as e:
+            if log:
+                log.warning("volley: sign FAILED at nonce %d (n=%d): %s — хвост дропнут (гэп исключён)",
+                            base_nonce + u, len(unit), type(e).__name__)
+            for _mid, _b, _p in unit:
+                err_results.append({"market_id": _mid, "borrower": _b, "sent": False,
+                                    "reason": f"sign error: {type(e).__name__}: {str(e)[:80]}",
+                                    "net_usd": _p["net_usd"]})
+            send_failed = True
+            break
+    _t_sign = time.perf_counter()
+    for _, _raw, _h in signed_units:                      # ЗАЛП: все raw в секвенсер разом (гоночная нога)
+        _raw_hex = "0x" + _raw.hex()
+        for _u in bcast_urls:
+            threading.Thread(target=_post_raw_tx, args=(_u, _raw_hex), daemon=True).start()
+    _t_volley = time.perf_counter()
+    sent = []
+    n_unc = 0
+    for u, (unit, _raw, h) in enumerate(signed_units):    # Alchemy-нога: журнал/дедуп, НЕ гонка
+        try:
+            w3.eth.send_raw_transaction(_raw)
+        except Exception as e:
+            n_unc += 1                                    # raw уже в секвенсере -> tx МОЖЕТ сесть: учтён sent
+            if log:
+                log.warning("volley: Alchemy-нога nonce=%d бросила (%s) — raw уже в секвенсере, "
+                            "учтён sent/uncertain, журнал остальных продолжаем",
+                            base_nonce + u, type(e).__name__)
+        sent.append((unit, h))
+        for _mid, _b, _p in unit:                         # дедуп: ВСЕ жертвы юнита помечены отправленными
+            _RECENT_SENDS[(_mid, _b)] = time.monotonic()
+        _inflight_add(1)                                  # ОДИН inflight на tx (не на item)
+        if log:
+            log.info("dispatch: sent nonce=%d n=%d %s tx=%s (volley)",
+                     base_nonce + u, len(unit), "batch" if len(unit) > 1 else "single", h)
+    if n_unc:
+        send_failed = True
+    if log and signed_units:
+        log.info("DIAG send-volley n=%d sign_all=%.0fms volley_spawn=%.0fms alch_leg=%.0fms unc=%d",
+                 len(signed_units), (_t_sign - _t0) * 1000.0, (_t_volley - _t_sign) * 1000.0,
+                 (time.perf_counter() - _t_volley) * 1000.0, n_unc)
+    return sent, err_results, send_failed
+
+
 def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int = 3,
                           send_fn=None, wait_receipts: bool = True, timeout: int = 120) -> list:
     """Send up to `max_inflight` already-prepared liquidations NON-BLOCKING with SEQUENTIAL nonces,
@@ -908,6 +994,17 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
 
         sent = []                                             # (unit, hash)
         _send_failed = False
+        # PARALLEL_BROADCAST: каскадный залп — все юниты в секвенсер разом (юнит u+1 не ждёт
+        # Alchemy-RTT юнита u). Только >1 юнита и при живой SEND-3 ноге; OFF / 1 юнит /
+        # инжект-send_fn -> старый цикл ниже бит-в-бит.
+        _par = (bool(getattr(cfg, "parallel_broadcast", False)) and send_fn is None
+                and _bcast and len(units) > 1)
+        if _par:
+            sent, _verr, _send_failed = _send_units_volley(rpc, w3, cfg, units, base_nonce, tip, _bcast, log)
+            results.extend(_verr)
+            if _send_failed:
+                _LOCAL_NONCE.pop(bot, None)
+            units = []                                        # старый цикл ниже не выполняется
         for u, unit in enumerate(units):
             try:
                 if len(unit) == 1:
