@@ -103,7 +103,7 @@ class SpecFireShadow:
                 if kind == "confirmed":
                     self._log("SPECFIRE shadow outcome feed=%s lead=%ss targets=%d fat=%d debt=$%.0fk | "
                               "run: win=%d with_targets=%d with_fat=%d confirmed_hit=%d" % (
-                                  feed, ev.get("held_s"), (w or {}).get("targets", 0), (w or {}).get("fat", 0),
+                                  feed, ev.get("lead_s"), (w or {}).get("targets", 0), (w or {}).get("fat", 0),
                                   (w or {}).get("debt", 0.0) / 1e3, self.stats["windows"],
                                   self.stats["with_targets"], self.stats["with_fat"],
                                   self.stats["confirmed_with_targets"]))
