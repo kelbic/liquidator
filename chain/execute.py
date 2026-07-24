@@ -294,6 +294,74 @@ def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=N
         return res["hash"]
 
 
+# ---- SPEC-FIRE live (Stage B, 24.07): боевые пробы-ликвидации в predict-окнах ----
+# Свой газ-бакет (НЕ kill-switch: реверты проб = замер, как канарейка; WIN попадает в обычный
+# учёт при желании владельца). Гейты атомарно под _SEND_LOCK. Пробы НЕ трогают _RECENT_SENDS
+# (иначе проба глушила бы БОЕВОЙ реактивный выстрел по той же жертве — дедуп-ловушка Stage B);
+# WIN маркируется отдельно (mark_recent_send) сборщиком receipts.
+_SPECFIRE_PROBES = 0
+_SPECFIRE_GAS_USD = 0.0
+_SPECFIRE_LAST_TS = 0.0
+_SPECFIRE_MAX_GAS_USD = float(os.environ.get("SPEC_FIRE_MAX_GAS_USD", "10"))
+_SPECFIRE_MIN_INTERVAL = float(os.environ.get("SPEC_FIRE_MIN_INTERVAL_SEC", "0.25"))
+
+
+def specfire_stats():
+    with _INFLIGHT_LOCK:
+        return (_SPECFIRE_PROBES, _SPECFIRE_GAS_USD)
+
+
+def specfire_gas_add(gas_usd: float):
+    global _SPECFIRE_GAS_USD
+    with _INFLIGHT_LOCK:
+        _SPECFIRE_GAS_USD += max(0.0, gas_usd)
+
+
+def mark_recent_send(market_id: str, borrower: str):
+    """WIN спек-пробы: жертва взята — гасим последующий реактивный дубль (дешевле $0.01 реверта)."""
+    with _SEND_LOCK:
+        _RECENT_SENDS[(market_id, borrower)] = time.monotonic()
+
+
+def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
+                         max_fee=None, tip=None, broadcast_raw_urls=None):
+    """Боевая спек-проба: НАСТОЯЩИЙ liquidate-calldata ДО транзита (реверт 'healthy' ~$0.01-0.02,
+    проба в блоке транзита = предочередь = WIN). Зеркало send_canary: общий _SEND_LOCK/_LOCAL_NONCE
+    (канареечная машинерия, 1500+ проб без nonce-инцидентов), fb-fee, SEND-3. Гейты атомарно:
+    газ-бакет / мин-интервал / _INFLIGHT==0 (боевая tx главнее). Возвращает hash или None."""
+    global _SPECFIRE_PROBES, _SPECFIRE_LAST_TS
+    _now = time.monotonic()
+    with _SEND_LOCK:
+        with _INFLIGHT_LOCK:
+            if (_SPECFIRE_GAS_USD >= _SPECFIRE_MAX_GAS_USD
+                    or _now - _SPECFIRE_LAST_TS < _SPECFIRE_MIN_INTERVAL
+                    or _INFLIGHT > 0):
+                return None
+        w3 = rpc._web3()
+        bot = account_for(w3, cfg.wallet_key).address
+        base_nonce = _LOCAL_NONCE.get(bot)
+        if base_nonce is None:
+            base_nonce = _pending_nonce(w3, bot)
+        tip_wei = int(cfg.tip_gwei * 1e9)
+        _tx = {"to": cfg.liquidator_address, "data": calldata, "nonce": base_nonce, "gas": int(gas)}
+        if max_fee is not None:
+            _tx["maxFeePerGas"] = int(max_fee)
+            _tx["maxPriorityFeePerGas"] = int(tip) if tip else tip_wei
+        try:
+            res = send_tx(rpc, cfg.wallet_key, _tx,
+                          wait=False, min_tip_wei=tip_wei, broadcast_raw_urls=broadcast_raw_urls)
+        except Exception as e:
+            _LOCAL_NONCE.pop(bot, None)
+            if log:
+                log.info("SPECFIRE probe send fail: %s", type(e).__name__)
+            return None
+        _LOCAL_NONCE[bot] = base_nonce + 1
+        with _INFLIGHT_LOCK:
+            _SPECFIRE_PROBES += 1
+            _SPECFIRE_LAST_TS = _now
+        return res["hash"]
+
+
 def canary_invalidate_nonce(rpc, cfg):
     """Канарейка не замайнилась за timeout (возможно дропнута) -> _LOCAL_NONCE впереди чейна ->
     следующая tx уйдёт в дыру. Инвалидируем (как timeout-ветка dispatch, II нонс-фикс)."""

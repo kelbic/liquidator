@@ -485,6 +485,26 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                     PREARM_TOP_K, PREARM_MIN_DEBT_USD / 1e3)
                     except Exception:
                         log.exception("pre-arm не стартовал (опционален, остальные слои не задеты)")
+                if os.environ.get("SPEC_FIRE_LIVE", "").lower() in ("1", "true", "yes", "on"):
+                    # SPEC-FIRE LIVE (Stage B, 24.07): боевые пробы по жиру >=$500k в последние
+                    # секунды окна (|ret|>=dev). Канареечная nonce-машинерия, свой газ-бакет,
+                    # пробы молчат при inflight>0 и НЕ трогают дедуп реактивного пути.
+                    try:
+                        from chain.spec_fire_live import (SpecFireLive, SPEC_FIRE_MIN_REPAID_USD,
+                                                          SPEC_FIRE_MAX_PROBES_WINDOW)
+                        from chain.predict import FEEDS_BASE
+                        _l2s = {row["label"].upper(): sym for sym, row in FEEDS_BASE.items()}
+                        _dev = {row["label"].upper(): float(row["dev"]) for row in FEEDS_BASE.values()}
+                        _sfl = SpecFireLive(rpc, cfg, shared,
+                                            ret_fn=lambda lbl: engine.ret(_l2s.get(lbl.upper(), lbl)),
+                                            dev_by=_dev)
+                        _handlers.append(_sfl.handle_event)
+                        log.warning("SPEC-FIRE LIVE ENABLED — пробы по жиру >=$%.0fk при |ret|>=dev "
+                                    "(кап %d проб/окно, газ-бакет $%s)",
+                                    SPEC_FIRE_MIN_REPAID_USD / 1e3, SPEC_FIRE_MAX_PROBES_WINDOW,
+                                    os.environ.get("SPEC_FIRE_MAX_GAS_USD", "10"))
+                    except Exception:
+                        log.exception("spec-fire live не стартовал (опционален, остальные слои не задеты)")
                 _on_event = None
                 if _handlers:
                     def _on_event(ev, _hs=tuple(_handlers)):
