@@ -1545,20 +1545,26 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         _re_thread = threading.Thread(target=_bg_resolve, daemon=True)
                         _re_thread.start()
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
-                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d poll_lat=%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
+                        _px_ok, _px_fail = px_preconf_take()
+                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d poll_lat=%d px_pre=%d/%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
-                                 stats.get("poll_lat", 0),
+                                 stats.get("poll_lat", 0), _px_ok, _px_ok + _px_fail,
                                  stats["proceed"], stats["skip"], stats["none"], stats["poll_none"], stats["poll_fb"],
                                  stats["f_nocand"], stats["f_noprice"], stats["f_norp"], stats["f_noflip"], stats["f_floor"], stats["f_prep"])
                         # порог: >3 фолбэка/поллинг ≈ >8% чтений цены потеряли фору = РЕАЛЬНАЯ cap-деградация
                         # (исходный preconf-кап был 1457/окно=67%); микро-остаток спайков фида (≤2%, ~48/окно)
                         # НЕ будит — иначе ложно «мелькает» в норме (07-22, poll_fb калибр. на катастрофу, не на 1-2 оракула)
-                        fb_windows = fb_windows + 1 if stats["poll_fb"] > stats["poll"] * 3 else 0
+                        # 24.07: после приоритетного фикса poll_fb уходит в ~0 и СЛЕПНЕТ как сигнал —
+                        # честный датчик теперь РЕАКТИВНЫЙ путь: доля чтений цены, где preconf не успел
+                        # (фора реально потеряна). Порог >50% при выборке >=4 — деньги, а не шум.
+                        _px_bad = (_px_ok + _px_fail) >= 4 and _px_fail * 2 > (_px_ok + _px_fail)
+                        fb_windows = fb_windows + 1 if (_px_bad or stats["poll_fb"] > stats["poll"] * 3) else 0
                         if fb_windows >= 3 and time.monotonic() - last_fb_alert > 1800:
                             last_fb_alert = time.monotonic()
                             try:
-                                alerter.send_async("preconf degraded %dx windows: polling on LATEST (detection alive, "
-                                             "but WITHOUT the ~1.8s lead -> contested races lost). check preconf RPC." % fb_windows)
+                                alerter.send_async("preconf degraded %dx windows: РЕАКТИВНАЯ фора теряется "
+                                             "(px_pre %d/%d ok, poll_fb=%d) -> спорные гонки. check preconf RPC."
+                                             % (fb_windows, _px_ok, _px_ok + _px_fail, stats["poll_fb"]))
                             except Exception:
                                 pass
                         for _k in list(stats):
