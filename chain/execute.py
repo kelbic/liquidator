@@ -519,11 +519,17 @@ _UNIV3_WETH_USDC_FEE = 500
 _UNIV3_EXACT_INPUT_SEL = "b858183f"    # exactInput((bytes,address,uint256,uint256)) verified cast sig
 _AERO_EXACT_INPUT_SEL = "c04b8d59"     # exactInput((bytes,address,uint256,uint256,uint256)) verified bytecode
 _AERO_DEADLINE = 2 ** 63               # v1-форма требует deadline; константа = «не истекает»
-UNIV3_PATHS = {  # collateral(lower) -> fee tier of coll/WETH pool (verified factory.getPool)
-    "0xcb585250f852c6c6bf90434ab21a00f02833a4af": 3000,   # cbXRP/WETH
-    "0xcbd06e5a2b0c65597161de254aa074e489deb510": 3000,   # cbDOGE/WETH
-    "0xcbada732173e39521cdbe8bf59a6dc85a9fc7b8c": 3000,   # cbADA/WETH
+# Ре-верификация 24.07 (живой пропуск cbDOGE 13:08 — победитель вышел Slipstream ts=2000,
+# наш UniV3 fee=3000 дал underflow): ликвидность мем-ног УЕХАЛА с проверки 07-08.
+# QuoterV2/Slipstream-quoter 24.07: cbXRP fee=3000 МЁРТВ -> fee=10000 (линейно x10);
+# cbDOGE UniV3 3000 полупуст (x10 обрыв), Slipstream ts=2000 даёт 2.1x больше и линеен
+# ($152/$1514 на x1/x10); cbADA UniV3 мёртв ВСЕ тиры -> Slipstream ts=200 ($31/$305/$1525
+# линейно). cbDOGE/cbADA -> полные Slipstream-пути (вторая нога WETH->USDC ts=100, как cbLTC).
+UNIV3_PATHS = {  # collateral(lower) -> fee tier of coll/WETH pool (re-verified 24.07)
+    "0xcb585250f852c6c6bf90434ab21a00f02833a4af": 10000,  # cbXRP/WETH (3000 умер, 1% живой)
 }
+_CBDOGE = "0xcbd06e5a2b0c65597161de254aa074e489deb510"
+_CBADA = "0xcbada732173e39521cdbe8bf59a6dc85a9fc7b8c"
 
 
 def _pack_path(*hops) -> bytes:
@@ -571,6 +577,11 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     (_WEETH, _UNIV3_WETH): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_WEETH, 1, _UNIV3_WETH),
                             "max_in": 160 * 10**18},
+    # cbDOGE/cbADA -> USDC: полные Slipstream-пути (ре-верификация 24.07, см. коммент выше)
+    (_CBDOGE, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
+                             "path": _pack_path(_CBDOGE, 2000, _UNIV3_WETH, 100, _UNIV3_USDC)},
+    (_CBADA, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
+                            "path": _pack_path(_CBADA, 200, _UNIV3_WETH, 100, _UNIV3_USDC)},
 }
 for _coll, _fee in UNIV3_PATHS.items():   # существующие UniV3-пути -> та же таблица (loan=USDC)
     _SWAP_ROUTES[(_coll, _UNIV3_USDC)] = {"router": UNIV3_SWAP_ROUTER, "style": "02",

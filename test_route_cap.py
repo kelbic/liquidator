@@ -41,4 +41,17 @@ assert _label_of("weETH") == _label_of("WETH") == "ETH", "weETH/WETH обе ETH-
 assert _label_of("wstETH") == "ETH"
 print("UNIT_OK: weETH/wstETH — peg (обе ETH-ноги), predict их не армит; кап только для реактива")
 
+# 6) ре-верификация мем-ног 24.07: cbXRP -> UniV3 1%; cbDOGE/cbADA -> Slipstream-пути
+from chain.execute import (UNIV3_PATHS, _CBDOGE, _CBADA, AERO_CL_ROUTER,
+                           UNIV3_SWAP_ROUTER, ROUTE_COLLATERALS as RC)
+assert UNIV3_PATHS["0xcb585250f852c6c6bf90434ab21a00f02833a4af"] == 10000, "cbXRP: 3000 мёртв"
+for tok, ts in ((_CBDOGE, 2000), (_CBADA, 200)):
+    r = _SWAP_ROUTES[(tok, _UNIV3_USDC)]
+    assert r["router"] == AERO_CL_ROUTER and r["style"] == "v1", r
+    assert r["path"][20:23] == ts.to_bytes(3, "big"), "первая нога ts=%d" % ts
+    assert tok in RC, "выпал из fast-lane/кэша слоя-2"
+sw = direct_swap(_CBDOGE, _UNIV3_USDC, 223671650512, LIQ, LIQ, repaid_assets=135680940)
+assert sw is not None and sw["router"] == AERO_CL_ROUTER, sw
+print("UNIT_OK: мем-ноги пере-верифицированы (cbXRP 1%%, cbDOGE ts2000, cbADA ts200)")
+
 print("=== ВСЕ ROUTE-CAP ЮНИТЫ ПРОШЛИ ===")
