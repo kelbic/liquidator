@@ -53,16 +53,18 @@ def _empty_summary(n_markets: int) -> dict:
 def fetch_candidates(markets):
     """SLOW path (Morpho API): enumerate at-risk borrowers (HF <= HF_API_CEILING), grouped by
     market + debt maps. Candidate SET drifts slowly; refresh periodically (~60s), NOT per block.
-    Returns (groups, debt_by, debt_assets_by, n)."""
+    Returns (groups, debt_by, debt_assets_by, hf_by, n)."""
     candidates = positions_at_risk(markets, hf_ceiling=HF_API_CEILING)
     groups = defaultdict(list)
     debt_by = {}
     debt_assets_by = {}
+    hf_by = {}
     for c in candidates:
         groups[c.market_id].append(c.borrower)
         debt_by[(c.market_id, c.borrower)] = c.debt_usd
         debt_assets_by[(c.market_id, c.borrower)] = c.debt_assets
-    return dict(groups), debt_by, debt_assets_by, len(candidates)
+        hf_by[(c.market_id, c.borrower)] = c.health_factor
+    return dict(groups), debt_by, debt_assets_by, hf_by, len(candidates)
 
 
 # ---- warm-start (P0-1): снапшот candidate set на диск + загрузка при рестарте ----
@@ -74,12 +76,13 @@ def fetch_candidates(markets):
 WARM_START_MAX_AGE_SEC = 3600.0
 
 
-def _save_candidates_snapshot(path, groups, debt_by, debt_assets_by, n):
+def _save_candidates_snapshot(path, groups, debt_by, debt_assets_by, hf_by, n):
     """Best-effort: ошибка записи не роняет refresh-воркер. Ключи-кортежи -> 'mid|borrower'."""
     try:
         payload = {"ts": time.time(), "n": n, "groups": groups,
                    "debt_by": {f"{m}|{b}": v for (m, b), v in debt_by.items()},
-                   "debt_assets_by": {f"{m}|{b}": v for (m, b), v in debt_assets_by.items()}}
+                   "debt_assets_by": {f"{m}|{b}": v for (m, b), v in debt_assets_by.items()},
+                   "hf_by": {f"{m}|{b}": v for (m, b), v in hf_by.items()}}
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
             json.dump(payload, fh)
@@ -89,7 +92,8 @@ def _save_candidates_snapshot(path, groups, debt_by, debt_assets_by, n):
 
 
 def _load_candidates_snapshot(path, max_age_sec=WARM_START_MAX_AGE_SEC):
-    """(groups, debt_by, debt_assets_by, n) либо None (нет файла / стар / битый)."""
+    """(groups, debt_by, debt_assets_by, hf_by, n) либо None (нет файла / стар / битый).
+    hf_by в старом снапшоте отсутствует -> {} (гейты по HF fail-open)."""
     try:
         with open(path) as fh:
             d = json.load(fh)
@@ -97,7 +101,8 @@ def _load_candidates_snapshot(path, max_age_sec=WARM_START_MAX_AGE_SEC):
             return None
         def _unkey(dd):
             return {tuple(k.split("|", 1)): v for k, v in dd.items()}
-        return dict(d["groups"]), _unkey(d["debt_by"]), _unkey(d["debt_assets_by"]), int(d.get("n", 0))
+        return (dict(d["groups"]), _unkey(d["debt_by"]), _unkey(d["debt_assets_by"]),
+                _unkey(d.get("hf_by", {})), int(d.get("n", 0)))
     except Exception:
         return None
 
@@ -201,7 +206,7 @@ def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, 
 def scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) -> dict:
     """One full scan pass (poll mode): fetch candidate set (API) then process it (on-chain)."""
     by_id = {m.market_id: m for m in markets}
-    groups, debt_by, debt_assets_by, ncand = fetch_candidates(markets)
+    groups, debt_by, debt_assets_by, _hf_by, ncand = fetch_candidates(markets)
     if ncand and rpc is None:
         log.warning("near-risk positions found but RPC_URL empty — on-chain confirm skipped")
         s = _empty_summary(len(markets)); s["api_candidates"] = ncand; return s
@@ -248,6 +253,7 @@ class _Shared:
         self.lock = threading.Lock()
         self.by_id = {m.market_id: m for m in markets}
         self.groups, self.debt_by, self.debt_assets_by, self.n = {}, {}, {}, 0
+        self.hf_by = {}                          # (mid, borrower) -> USD-approx HF (для SPEC-FIRE reach-гейта)
         from collections import deque
         self.groups_history = deque(maxlen=64)   # (monotonic_ts, {mid: frozenset(borrowers)}) — closes B
                                                  # retrospectively: was borrower in groups at transmit-time N?
@@ -290,14 +296,15 @@ def _refresh_worker(shared, markets, cfg, ctx_cache, log, stop):
             except Exception:
                 pass                                  # keep last good price
             _t0 = time.time()
-            g, db, dab, n = fetch_candidates(markets)
+            g, db, dab, hb, n = fetch_candidates(markets)
             log.info("DIAG candidate refresh n=%d dt=%.1fs", n, time.time() - _t0)
             with shared.lock:
                 shared.by_id = {m.market_id: m for m in markets}
                 shared.groups, shared.debt_by, shared.debt_assets_by, shared.n = g, db, dab, n
+                shared.hf_by = hb
                 shared.groups_history.append(                          # snapshot per fetch (monotonic ts)
                     (time.monotonic(), {mid: frozenset(bs) for mid, bs in g.items()}))
-            _save_candidates_snapshot(cfg.candidates_snapshot_path, g, db, dab, n)   # P0-1 warm-start
+            _save_candidates_snapshot(cfg.candidates_snapshot_path, g, db, dab, hb, n)   # P0-1 warm-start
         except Exception:
             log.exception("candidate refresh error")
         stop.wait(cfg.candidate_refresh_sec)
@@ -408,9 +415,10 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
     shared = _Shared(markets)
     _snap = _load_candidates_snapshot(cfg.candidates_snapshot_path)      # P0-1: закрыть слепое окно рестарта
     if _snap:
-        _g, _db, _dab, _n = _snap
+        _g, _db, _dab, _hb, _n = _snap
         with shared.lock:
             shared.groups, shared.debt_by, shared.debt_assets_by, shared.n = _g, _db, _dab, _n
+            shared.hf_by = _hb
         log.info("warm-start: %d candidates / %d markets из снапшота (age<=%.0fс) — hot path видит набор с первого блока",
                  _n, len(_g), WARM_START_MAX_AGE_SEC)
     stop = threading.Event()

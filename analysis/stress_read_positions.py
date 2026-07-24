@@ -26,7 +26,7 @@ n_passes = int(sys.argv[1]) if len(sys.argv) > 1 else 10
 markets = load_covered_markets(cfg.covered_markets_path)
 print(f"Покрытых рынков: {len(markets)}")
 
-groups, debt_by, debt_assets_by, ncand = fetch_candidates(markets)
+groups, debt_by, debt_assets_by, _hf_by, ncand = fetch_candidates(markets)
 print(f"Кандидатов всего: {ncand} по {len(groups)} рынкам")
 print(f"Прогонов: {n_passes} полных проходов по всем рынкам\n")
 

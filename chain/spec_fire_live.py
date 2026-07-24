@@ -31,6 +31,12 @@ SPEC_FIRE_MIN_REPAID_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_USD", "500
 SPEC_FIRE_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_INTERVAL_SEC", "0.7"))
 SPEC_FIRE_MAX_PROBES_WINDOW = int(os.environ.get("SPEC_FIRE_MAX_PROBES_WINDOW", "10"))
 SPEC_FIRE_THRESHOLD = float(os.environ.get("SPEC_FIRE_THRESHOLD", "1.0"))     # ×dev
+# Reach-гейт (24.07, по первым live-данным): стрелять только если дистанция цели до флипа
+# достижима ТЕКУЩИМ движением: dist <= |ret| × REACH. Первый живой огонь жёг кап по киту
+# dist=8.25% на ret=-0.11% (досягаемость 0.33%) — шанс WIN ~0, бакет-то накопительный.
+# REACH=3 — запас на лаг HF-кэша (~60с refresh) и овершут транзита в каскаде.
+# Откат без кода: SPEC_FIRE_REACH=1e9 (гейт всегда открыт). HF цели неизвестен -> fail-open.
+SPEC_FIRE_REACH = float(os.environ.get("SPEC_FIRE_REACH", "3.0"))
 SPEC_FIRE_MIN_PROFIT_BPS = int(os.environ.get("SPEC_FIRE_MIN_PROFIT_BPS", "30"))
 SPEC_FIRE_POLL_SEC = float(os.environ.get("SPEC_FIRE_POLL_SEC", "0.15"))
 SPEC_FIRE_RECEIPT_TIMEOUT = float(os.environ.get("SPEC_FIRE_RECEIPT_TIMEOUT", "45"))
@@ -121,12 +127,19 @@ class SpecFireLive:
             return None
 
     # ---- выбор жирной цели (top-1 по долгу; та же фид/направление-семантика) ----
-    def _top_fat(self, feed: str, direction: str):
+    # max_dist (доля, напр. 0.0033): reach-гейт — пропускать цели, чей флип дальше, чем
+    # достаёт текущее движение (down: цена залога должна упасть на 1-1/HF; up: долг вырасти
+    # на HF-1). Применяется ТОЛЬКО в момент огня — арм окна без гейта, иначе в настоящий
+    # каскад окно не запустится вовсе (на арме ret всегда мал по построению).
+    def _top_fat(self, feed: str, direction: str, max_dist=None):
+        """-> (best|(mid, b, debt), hold_dist) — hold_dist = ближайшая отсечённая гейтом цель."""
         best = None
+        hold_dist = None
         with self.shared.lock:
             groups = dict(self.shared.groups)
             debt_by = dict(self.shared.debt_by)
             by_id = dict(self.shared.by_id)
+            hf_by = dict(getattr(self.shared, "hf_by", {}) or {})
         for mid, borrowers in groups.items():
             m = by_id.get(mid)
             if m is None:
@@ -137,9 +150,19 @@ class SpecFireLive:
                 continue
             for b in borrowers:
                 d = float(debt_by.get((mid, b), 0.0) or 0.0)
-                if d >= SPEC_FIRE_MIN_REPAID_USD and (best is None or d > best[2]):
+                if d < SPEC_FIRE_MIN_REPAID_USD:
+                    continue
+                if max_dist is not None:
+                    hf = float(hf_by.get((mid, b), 0.0) or 0.0)
+                    if hf > 1.0:                  # HF неизвестен/битый -> fail-open
+                        dist = (1.0 - 1.0 / hf) if direction == "down" else (hf - 1.0)
+                        if dist > max_dist:
+                            if hold_dist is None or dist < hold_dist:
+                                hold_dist = dist
+                            continue
+                if best is None or d > best[2]:
                     best = (mid, b, d)
-        return best
+        return best, hold_dist
 
     def _collect(self, h, mid, borrower, debt_usd):
         from chain.execute import specfire_gas_add, mark_recent_send, canary_invalidate_nonce
@@ -162,6 +185,7 @@ class SpecFireLive:
         thr = self.dev_by.get(feed, 0.005) * SPEC_FIRE_THRESHOLD
         probes = 0
         last_fire = 0.0
+        last_hold_log = 0.0
         while not stop.is_set() and probes < SPEC_FIRE_MAX_PROBES_WINDOW:
             r = None
             try:
@@ -171,9 +195,17 @@ class SpecFireLive:
             hot = (r is not None and ((direction == "down" and r <= -thr)
                                       or (direction == "up" and r >= thr)))
             if hot and self._now() - last_fire >= SPEC_FIRE_INTERVAL_SEC:
-                tgt = self._top_fat(feed, direction)
+                reach = abs(r) * SPEC_FIRE_REACH
+                tgt, hold_dist = self._top_fat(feed, direction, max_dist=reach)
                 if tgt is None:
-                    break                                  # жир ушёл из набора — окно нам не нужно
+                    if hold_dist is None:
+                        break                              # жир ушёл из набора — окно нам не нужно
+                    if self._now() - last_hold_log >= 10.0:   # жир есть, но флип вне досягаемости
+                        last_hold_log = self._now()           # движения — держим окно, НЕ жжём бакет
+                        self._log("SPECFIRE hold feed=%s: жир вне досягаемости (ближ. dist=%.2f%% > reach=%.2f%%)" % (
+                            feed, hold_dist * 100.0, reach * 100.0))
+                    stop.wait(SPEC_FIRE_POLL_SEC)
+                    continue
                 mid, b, d = tgt
                 try:
                     probe = (self._build_fn or self._build)(mid, b, d)
@@ -202,7 +234,7 @@ class SpecFireLive:
             feed = (ev.get("feed") or "").upper()
             if kind == "arm":
                 direction = ev.get("dir") or "down"
-                if self._top_fat(feed, direction) is None:
+                if self._top_fat(feed, direction)[0] is None:
                     return None                            # окна без жира не запускают петлю вовсе
                 with self._lock:
                     old = self._windows.pop(feed, None)

@@ -115,7 +115,39 @@ sf5._collect("0xh2", "0xbtc", "0xFAT", 1_500_000.0)
 assert ("0xbtc", "0xFAT") not in ex._RECENT_SENDS and sf5.stats["wins"] == 0
 print("UNIT_OK: WIN маркирует дедуп, revert — нет (реактивный путь не глушится)")
 
-# 7) send_spec_fire_probe: гейт inflight>0 молчит; газ-бакет стопит
+# 7) REACH-гейт: жир с HF далеко от флипа НЕ жжёт бакет на малом ret; большой ret — огонь
+shared_far = types.SimpleNamespace(
+    lock=threading.Lock(),
+    groups={"0xbtc": ["0xFAT"]},
+    debt_by={("0xbtc", "0xFAT"): 1_500_000.0},
+    hf_by={("0xbtc", "0xFAT"): 1.0899},           # dist=8.25% (живой кит 24.07)
+    by_id={"0xbtc": mk("cbBTC", "USDC")},
+)
+sent.clear(); LOGS.clear(); RET["v"] = -0.0011    # reach = 0.11%*3 = 0.33% << 8.25%
+sf6 = SpecFireLive(rpc=None, cfg=cfg, shared=shared_far, ret_fn=lambda l: RET["v"],
+                   dev_by={"BTC": 0.0010}, build_fn=build_fn, send_fn=send_fn,
+                   receipt_fn=receipt_fn, log_fn=LOGS.append)
+sf6.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.6)
+assert sf6.stats["windows_armed"] == 1, "арм БЕЗ гейта — окно должно запускаться"
+assert not sent, sent
+assert any("hold" in m and "8.25" in m for m in LOGS), LOGS
+RET["v"] = -0.05                                  # краш −5%: reach 15% >= 8.25% — огонь
+time.sleep(1.0)
+sf6.handle_event({"event": "disarm", "feed": "BTC"})
+assert len(sent) >= 1, "в пределах досягаемости гейт обязан пропустить огонь"
+print("UNIT_OK: reach-гейт держит далёкий жир (hold-лог), краш-ret открывает огонь")
+
+# 7b) HF неизвестен (нет hf_by / старый снапшот) -> fail-open, поведение прежнее
+sent.clear(); RET["v"] = -0.0011
+sf7 = make()                                      # shared без hf_by вовсе
+sf7.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.9)
+sf7.handle_event({"event": "disarm", "feed": "BTC"})
+assert len(sent) >= 1, "без HF гейт должен быть открыт (fail-open)"
+print("UNIT_OK: HF неизвестен -> fail-open (без hf_by поведение прежнее)")
+
+# 8) send_spec_fire_probe: гейт inflight>0 молчит; газ-бакет стопит
 ex._INFLIGHT = 1
 assert ex.send_spec_fire_probe(None, cfg, "0x", 100000) is None
 ex._INFLIGHT = 0
