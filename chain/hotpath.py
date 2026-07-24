@@ -24,6 +24,69 @@ log = logging.getLogger(__name__)
 MORPHO_BLUE = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
 FB_URL = "wss://mainnet.flashblocks.base.org/ws"
 PRECONF_RPC_DEFAULT = "https://mainnet-preconf.base.org"
+# ---- бюджет публичного preconf (24.07, инцидент «degraded 18x windows») ----
+# Публичный preconf = per-IP токен-бакет по ВЕСУ (~1 тяжёлый pending-вызов/с, замер 21-07 и
+# 24-07: 2 из 5 aggregate3@pending с шагом 0.4с -> 429). Инверсия приоритетов: ФОНОВЫЙ полл
+# (36 оракулов КАЖДЫЙ блок) выжирал бакет, и РЕАКТИВНЫЙ путь (хедж цены/позиций на транзите)
+# ловил 429 -> терял ~1.8с форы в спорных гонках, т.е. бэкап-триггер душил главный.
+# Лечение БЕЗ денег (Alchemy НЕ подходит: его `pending` = уже СОБРАННЫЙ блок — замер 24.07:
+# txs=114 байт-в-байт равен latest публичного preconf, тогда как настоящий preconf отдаёт блок
+# В СБОРКЕ (42 tx, 6.5M из 19M gas) — форы не даёт, а переключение выжгло фри-квоту 21-07).
+# ПРАВИЛО: полл пропускает preconf ТОЛЬКО в REACTIVE_QUIET-тени реактивного чтения — то есть
+# ровно там, где он и так получал 429 (и приходил к latest, но ПОСЛЕ оплаченного отказа).
+# Форы НЕ теряет никто: вне тени полл читает pending как раньше; в тени — latest без 429-платы.
+# MIN_GAP=0 (выключен) — резерв на случай, если тени не хватит: поднять env'ом без кода.
+# Откат без кода: PRECONF_REACTIVE_QUIET_SEC=0.
+PRECONF_POLL_MIN_GAP = float(os.environ.get("PRECONF_POLL_MIN_GAP_SEC", "0"))
+PRECONF_REACTIVE_QUIET = float(os.environ.get("PRECONF_REACTIVE_QUIET_SEC", "1.2"))
+_PRECONF_BUDGET_LOCK = threading.Lock()
+_PRECONF_LAST_REACTIVE = -1e9
+_PRECONF_LAST_POLL = -1e9
+
+
+def preconf_mark_reactive(now=None):
+    """Реактивный путь занял канал preconf — полл обязан уступить."""
+    global _PRECONF_LAST_REACTIVE
+    with _PRECONF_BUDGET_LOCK:
+        _PRECONF_LAST_REACTIVE = time.monotonic() if now is None else now
+
+
+_PX_PRE_OK = 0        # реактивные чтения цены: preconf успел (фора взята)
+_PX_PRE_FAIL = 0      # ...не успел/429 -> отдали confirmed (фора потеряна) — ЭТО и есть датчик
+                      # деградации после того, как полл перестал жечь бакет (poll_fb -> ~0).
+
+
+def px_preconf_note(ok: bool):
+    global _PX_PRE_OK, _PX_PRE_FAIL
+    with _PRECONF_BUDGET_LOCK:
+        if ok:
+            _PX_PRE_OK += 1
+        else:
+            _PX_PRE_FAIL += 1
+
+
+def px_preconf_take():
+    """(ok, fail) за окно + сброс — для hot stats/алерта."""
+    global _PX_PRE_OK, _PX_PRE_FAIL
+    with _PRECONF_BUDGET_LOCK:
+        o, f = _PX_PRE_OK, _PX_PRE_FAIL
+        _PX_PRE_OK = _PX_PRE_FAIL = 0
+        return o, f
+
+
+def preconf_poll_allowed(now=None) -> bool:
+    """Можно ли фоновому поллу тратить preconf-бюджет. Чистая при переданном now (юнит)."""
+    global _PRECONF_LAST_POLL
+    t = time.monotonic() if now is None else now
+    with _PRECONF_BUDGET_LOCK:
+        if t - _PRECONF_LAST_REACTIVE < PRECONF_REACTIVE_QUIET:
+            return False
+        if t - _PRECONF_LAST_POLL < PRECONF_POLL_MIN_GAP:
+            return False
+        _PRECONF_LAST_POLL = t
+        return True
+
+
 HOT_THROTTLE_SEC = 0.25   # min seconds between hot-path spawns PER aggregator. The bare match fires on
                           # frequent price-READ txs; this bounds preconf-RPC reads + thread spawns.
                           # Transmit cadence is minutes, so 0.25s loses no real update; raise if the
@@ -335,11 +398,14 @@ def read_price_hedged(preconf_rpc, rpc, oracle, price_fn=read_preconf_price):
         finally:
             ev.set()
 
+    preconf_mark_reactive()                  # канал preconf занят реактивом -> фоновый полл уступает
     threading.Thread(target=_leg, args=(preconf_rpc, ev_p, box_p), daemon=True).start()
     threading.Thread(target=_leg, args=(rpc, ev_c, box_c), daemon=True).start()
     ev_p.wait(timeout=_PX_HEDGE_SEC)
     if box_p and box_p[0] is not None:
+        px_preconf_note(True)
         return box_p[0]
+    px_preconf_note(False)                   # фора потеряна на ЭТОМ чтении — датчик деградации
     ev_c.wait(timeout=2.0)
     if box_c and box_c[0] is not None:
         return box_c[0]
@@ -374,6 +440,7 @@ def read_positions(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
                 _box.append(_e)                              # исключение в бокс: отличать fail от «ещё летит»
             finally:
                 _ev.set()
+        preconf_mark_reactive()              # см. read_price_hedged: реактив главнее фонового полла
         threading.Thread(target=_leg, args=(preconf_rpc, "pending", _ev_p, _box_p), daemon=True).start()
         threading.Thread(target=_leg, args=(rpc, None, _ev_c, _box_c), daemon=True).start()
         _ev_p.wait(timeout=_POS_HEDGE_SEC)
@@ -601,7 +668,7 @@ def _refresh_position_caches(*, cache_rpc, shared, bn):
         log.info("DIAG position-cache cycle markets=%d dt=%.1fs block=%s", n_markets, time.time() - _t0, bn)
 
 
-def read_preconf_prices(preconf_rpc, oracles, rpc_fallback=None):
+def read_preconf_prices(preconf_rpc, oracles, rpc_fallback=None, block_identifier="pending"):
     """ONE aggregate3 at block='pending' on the preconf RPC -> ({oracle: price|None}, n_fallback). Reads
     ALL our oracles each block; covers markets whose aggregator never surfaces in the tx stream (the money
     markets cbXRP/cbDOGE/cbADA), which the bare match structurally misses. If rpc_fallback is given, any
@@ -613,7 +680,7 @@ def read_preconf_prices(preconf_rpc, oracles, rpc_fallback=None):
         return {}, 0
     calls = [(o, encode_price_call()) for o in oracles]
     try:
-        res = aggregate3(preconf_rpc, calls, block_identifier="pending")
+        res = aggregate3(preconf_rpc, calls, block_identifier=block_identifier)
         out = {o: (decode_price(data) if (ok and data) else None) for o, (ok, data) in zip(oracles, res)}
     except Exception:
         out = {o: None for o in oracles}
@@ -663,11 +730,18 @@ def _poll_prices(*, preconf_rpc, rpc_fallback, feeds, meta, poll_seen, stats, sp
             om = meta.get(mid)
             if om:
                 oracle2agg[om[0]] = agg
-    prices, n_fb = read_preconf_prices(preconf_rpc, list(oracle2agg), rpc_fallback=rpc_fallback)
+    if preconf_poll_allowed():
+        prices, n_fb = read_preconf_prices(preconf_rpc, list(oracle2agg), rpc_fallback=rpc_fallback)
+        n_lat = 0
+    else:                                   # уступаем канал реактиву: latest напрямую, БЕЗ 429-платы
+        prices, n_fb = read_preconf_prices(rpc_fallback, list(oracle2agg),
+                                           rpc_fallback=None, block_identifier=None)
+        n_lat = 1
     if stats is not None:
         stats["poll"] += 1
         stats["poll_none"] += sum(1 for v in prices.values() if v is None)
         stats["poll_fb"] += n_fb
+        stats["poll_lat"] = stats.get("poll_lat", 0) + n_lat
     changed = _poll_changed(prices, poll_seen, oracle2agg, feed_handled=feed_handled, bn=bn)
     if stats is not None:
         stats["pspawn"] += len(changed)
@@ -1471,8 +1545,9 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         _re_thread = threading.Thread(target=_bg_resolve, daemon=True)
                         _re_thread.start()
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
-                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
+                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d poll_lat=%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
+                                 stats.get("poll_lat", 0),
                                  stats["proceed"], stats["skip"], stats["none"], stats["poll_none"], stats["poll_fb"],
                                  stats["f_nocand"], stats["f_noprice"], stats["f_norp"], stats["f_noflip"], stats["f_floor"], stats["f_prep"])
                         # порог: >3 фолбэка/поллинг ≈ >8% чтений цены потеряли фору = РЕАЛЬНАЯ cap-деградация
