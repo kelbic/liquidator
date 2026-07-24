@@ -474,6 +474,17 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                     _sf.fat_usd / 1e3)
                     except Exception:
                         log.exception("spec-fire shadow не стартовал (опционален, канарейка/predict не задеты)")
+                if os.environ.get("PREDICT_PREARM", "").lower() in ("1", "true", "yes", "on"):
+                    # PRE-ARM Stage A (24.07): греет Kyber-квоты top-K целей фида в окне (weETH и
+                    # мега-сайз). Ноль отправок; потребление — прозрачный кэш в kyber_swap.
+                    try:
+                        from chain.prearm import PreArmWorker, PREARM_MIN_DEBT_USD, PREARM_TOP_K
+                        _pa = PreArmWorker(rpc, cfg, shared)
+                        _handlers.append(_pa.handle_event)
+                        log.warning("PRE-ARM ENABLED — Kyber-прогрев в окнах (top-%d, debt>=$%.0fk), ноль отправок",
+                                    PREARM_TOP_K, PREARM_MIN_DEBT_USD / 1e3)
+                    except Exception:
+                        log.exception("pre-arm не стартовал (опционален, остальные слои не задеты)")
                 _on_event = None
                 if _handlers:
                     def _on_event(ev, _hs=tuple(_handlers)):

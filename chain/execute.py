@@ -370,6 +370,21 @@ def kyber_swap(token_in: str, token_out: str, amount_in: int, sender: str, recip
     from `sender` (our contract, which approved the router) and sends token_out to `recipient`
     (our contract). slippage_bps caps the route's own min-out (10000 = 100%); we ALSO gate on
     minProfit in the contract, so this is a secondary guard."""
+    # PRE-ARM (Stage A, 24.07): predict-окно уже прогрело квоту этой пары -> отдаём из кэша
+    # (0мс вместо 2 HTTP RTT 0.4-0.9с В ГОНКЕ). Валидация внутри prearm_get: возраст <= TTL,
+    # cached_amount_in в [BAND..1.0]*amount_in (сайзинг при arm-цене <= seized при флип-цене
+    # по построению — цена идёт в сторону флипа). Экономика не обходится: sim/minProfit ниже
+    # по потоку работают как обычно; недобор <= 3% остаётся пылью в контракте.
+    try:
+        from chain.prearm import prearm_get
+        _hit = prearm_get(token_in, token_out, int(amount_in))
+    except Exception:
+        _hit = None
+    if _hit is not None:
+        log.info("PREARM hit %s->%s req=%d cached=%d age=%.1fs (Kyber RTT снят)",
+                 token_in[:10], token_out[:10], int(amount_in),
+                 _hit["swap"].get("amount_in", 0), _hit["age_sec"])
+        return _hit["swap"]
     api = f"{KYBER_HOST}/{chain}/api/v1"
     q = urlencode({"tokenIn": token_in, "tokenOut": token_out, "amountIn": str(int(amount_in))})
     routes = _get(f"{api}/routes?{q}", timeout)
