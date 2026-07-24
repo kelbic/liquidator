@@ -36,7 +36,7 @@ assert "targets=3" in LOGS[-1] and "fat500k=1" in LOGS[-1] and "0xbtc_us/0xA:$60
 print("UNIT_OK: BTC down — 3 цели, peg/USR исключены, жир найден")
 
 # 2) confirmed закрывает окно и инкрементит счётчики
-sf.handle_event({"event": "confirmed", "feed": "BTC", "held_s": 42.1})
+sf.handle_event({"event": "confirmed", "feed": "BTC", "lead_s": 42.1})  # боевой ключ = lead_s
 assert sf.stats == {"windows": 1, "with_targets": 1, "with_fat": 1, "confirmed_with_targets": 1}, sf.stats
 assert "lead=42.1s" in LOGS[-1] and "confirmed_hit=1" in LOGS[-1], LOGS[-1]
 print("UNIT_OK: confirmed — lead и счётчики в логе")
