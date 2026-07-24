@@ -515,6 +515,7 @@ _CBLTC = "0xcb17c9db87b595717c857a08468793f5bab6445f"
 _LBTC = "0xecac9c5f704e954931349da37f60e39f515c11c1"   # из Morpho idToMarketParams(0x4944a116) 07-12
 _WSTETH = "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452" # из idToMarketParams(wstETH/WETH) 07-14
 _WEETH = "0x04c0599ae5a44757c0af6f9ec3b93da8976c150a"  # из idToMarketParams(weETH/WETH 0x78d11c03) 24.07
+_CBETH = "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22"  # Coinbase Wrapped Staked ETH (Base)
 _UNIV3_WETH_USDC_FEE = 500
 _UNIV3_EXACT_INPUT_SEL = "b858183f"    # exactInput((bytes,address,uint256,uint256)) verified cast sig
 _AERO_EXACT_INPUT_SEL = "c04b8d59"     # exactInput((bytes,address,uint256,uint256,uint256)) verified bytecode
@@ -541,8 +542,11 @@ def _pack_path(*hops) -> bytes:
 
 
 _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
+    # max_in (24.07 ре-верификация): пул просел с 07-08 — ratio 1.0 cbBTC=0.9967,
+    # 2.0=0.9696 (плавная деградация, не обрыв). Кап 1.5 (~$97k, imp ~1.2%), сверх — Kyber.
     (_CBBTC, _EURC): {"router": AERO_CL_ROUTER, "style": "v1",
-                      "path": _pack_path(_CBBTC, 100, _EURC)},
+                      "path": _pack_path(_CBBTC, 100, _EURC),
+                      "max_in": 15 * 10**7},
     (_CBLTC, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_CBLTC, 200, _UNIV3_WETH, 100, _UNIV3_USDC)},
     # cbBTC/USDC: ПРЯМОЙ пул fee=500 (0xfbb6eed8, liq 2.1e12) доминирует 2-hop через WETH на ВСЕХ
@@ -577,6 +581,13 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     (_WEETH, _UNIV3_WETH): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_WEETH, 1, _UNIV3_WETH),
                             "max_in": 160 * 10**18},
+    # cbETH/WETH 24.07 (пег-нож, кандидаты HF 1.01-1.02; выхода НЕ БЫЛО вовсе — Kyber
+    # block-loop, та же дыра, что у weETH до 24.07): UniV3 fee=500 обрывается после ~7 cbETH
+    # (28 -> ratio 0.59), Slipstream ts=1 БЕЗ обрыва до 500 cbETH (ratio 1.13531 плоско).
+    # Кап 300 по уроку wstETH (ликвидность ts=1 подвижна). fast-lane + кэш слоя-2 авто.
+    (_CBETH, _UNIV3_WETH): {"router": AERO_CL_ROUTER, "style": "v1",
+                            "path": _pack_path(_CBETH, 1, _UNIV3_WETH),
+                            "max_in": 300 * 10**18},
     # cbDOGE/cbADA -> USDC: полные Slipstream-пути (ре-верификация 24.07, см. коммент выше)
     (_CBDOGE, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
                              "path": _pack_path(_CBDOGE, 2000, _UNIV3_WETH, 100, _UNIV3_USDC)},

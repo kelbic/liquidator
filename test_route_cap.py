@@ -54,4 +54,17 @@ sw = direct_swap(_CBDOGE, _UNIV3_USDC, 223671650512, LIQ, LIQ, repaid_assets=135
 assert sw is not None and sw["router"] == AERO_CL_ROUTER, sw
 print("UNIT_OK: мем-ноги пере-верифицированы (cbXRP 1%%, cbDOGE ts2000, cbADA ts200)")
 
+# 7) 24.07 вечер: cbETH-роут (дыра как у weETH) + кап EURC-ноги cbBTC
+from chain.execute import _CBETH, _CBBTC as _CB, _EURC
+r = _SWAP_ROUTES[(_CBETH, _UNIV3_WETH)]
+assert r["router"] == AERO_CL_ROUTER and r["max_in"] == 300 * 10**18, r
+assert _CBETH in RC, "cbETH не попал в fast-lane/кэш слоя-2"
+assert direct_swap(_CBETH, _UNIV3_WETH, 250 * 10**18, LIQ, LIQ, repaid_assets=1) is not None
+assert direct_swap(_CBETH, _UNIV3_WETH, 301 * 10**18, LIQ, LIQ, repaid_assets=1) is None
+assert _SWAP_ROUTES[(_CB, _EURC)]["max_in"] == 15 * 10**7, "EURC-нога: кап 1.5 cbBTC"
+assert direct_swap(_CB, _EURC, 2 * 10**8, LIQ, LIQ, repaid_assets=1) is None, "2 cbBTC -> Kyber"
+from chain.spec_fire import _label_of as _lo
+assert _lo("cbETH") == "ETH", "cbETH — пег (ETH-нога), predict не армит"
+print("UNIT_OK: cbETH-роут (кап 300) + EURC-кап 1.5; пег-семантика верна")
+
 print("=== ВСЕ ROUTE-CAP ЮНИТЫ ПРОШЛИ ===")
