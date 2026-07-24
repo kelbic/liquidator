@@ -454,15 +454,34 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                 engine = PredictEngine()
                 pf = PriceFeed(symbols=list(proxies), log=lambda m: log.info("%s", m))
                 pf.start()
-                _on_event = None
+                _handlers = []
                 if os.environ.get("PREDICT_SPEC_CANARY", "").lower() in ("1", "true", "yes", "on"):
                     # SPEC-канарейка: замер достижимости предочереди (delta 0..5) спам-пробами
                     # в predict-окнах. Копеечные self-tx, общий канареечный газ-кап, ликвидаций нет.
                     from chain.spec_canary import SpecCanary
                     _sc = SpecCanary(rpc, cfg, proxies)
-                    _on_event = _sc.handle_event
+                    _handlers.append(_sc.handle_event)
                     log.warning("SPEC-CANARY ENABLED — predict-окна пробивают предочередь (кап %s окон)",
                                 os.environ.get("SPEC_CANARY_MAX_WINDOWS", "60"))
+                if os.environ.get("PREDICT_SPEC_FIRE_SHADOW", "").lower() in ("1", "true", "yes", "on"):
+                    # SPEC-FIRE shadow (24.07, гейт снят бэктестом каскада 24-25.06): считает ЦЕЛИ
+                    # из нашего candidate set в каждом predict-окне (targets/fat/debt). Ноль отправок.
+                    try:
+                        from chain.spec_fire import SpecFireShadow
+                        _sf = SpecFireShadow(cfg, shared)
+                        _handlers.append(_sf.handle_event)
+                        log.warning("SPEC-FIRE SHADOW ENABLED — цели в predict-окнах (fat>=$%.0fk), ноль отправок",
+                                    _sf.fat_usd / 1e3)
+                    except Exception:
+                        log.exception("spec-fire shadow не стартовал (опционален, канарейка/predict не задеты)")
+                _on_event = None
+                if _handlers:
+                    def _on_event(ev, _hs=tuple(_handlers)):
+                        for _h in _hs:              # каждый хендлер в своём try — падение одного
+                            try:                    # не глушит остальных (канарейка главнее)
+                                _h(ev)
+                            except Exception:
+                                log.exception("predict on_event handler упал (изолирован)")
                 drv = PredictDriver(engine, mid_fn=pf.mid, poll_fn=make_poll_fn(rpc, proxies),
                                     on_event=_on_event,
                                     log=lambda m: log.info("%s", m))
