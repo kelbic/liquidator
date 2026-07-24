@@ -492,6 +492,7 @@ _CBBTC = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
 _CBLTC = "0xcb17c9db87b595717c857a08468793f5bab6445f"
 _LBTC = "0xecac9c5f704e954931349da37f60e39f515c11c1"   # из Morpho idToMarketParams(0x4944a116) 07-12
 _WSTETH = "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452" # из idToMarketParams(wstETH/WETH) 07-14
+_WEETH = "0x04c0599ae5a44757c0af6f9ec3b93da8976c150a"  # из idToMarketParams(weETH/WETH 0x78d11c03) 24.07
 _UNIV3_WETH_USDC_FEE = 500
 _UNIV3_EXACT_INPUT_SEL = "b858183f"    # exactInput((bytes,address,uint256,uint256)) verified cast sig
 _AERO_EXACT_INPUT_SEL = "c04b8d59"     # exactInput((bytes,address,uint256,uint256,uint256)) verified bytecode
@@ -529,11 +530,21 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     (_LBTC, _CBBTC): {"router": AERO_CL_ROUTER, "style": "v1",
                       "path": _pack_path(_LBTC, 1, _CBBTC)},
     # wstETH/WETH 07-14 (нож $180.2k @ HF 1.0056, LST-пег — профиль «мгновенного флипа на тике»):
-    # UniV3 тонкий (fee=100 imp@60wstETH=57%, fee=500 пусто), Slipstream ts=1 живой+глубокий
-    # (Kyber агрегирует Slipstream: 10/40/80 wstETH ratio 1.2391 flat = 0% слиппажа до ~$360k).
+    # UniV3 тонкий (fee=100 imp@60wstETH=57%, fee=500 пусто), Slipstream ts=1 живой+глубокий.
     # loan=WETH -> single-hop wstETH->WETH; fast-lane + кэш слоя-2 (ROUTE_COLLATERALS авто).
+    # max_in (24.07): QuoterV2 показал ликвидность ts=1 подвижна — 200 wstETH imp 0.002%, 500 imp
+    # 6.8% (за ночь просело). Кап 300 wstETH (~$700k) < обрыва -> сверх него direct=None ->
+    # Kyber-агрегат (глубже, но серверный RTT). Кап в ЕДИНИЦАХ token_in (18 dec).
     (_WSTETH, _UNIV3_WETH): {"router": AERO_CL_ROUTER, "style": "v1",
-                             "path": _pack_path(_WSTETH, 1, _UNIV3_WETH)},
+                             "path": _pack_path(_WSTETH, 1, _UNIV3_WETH),
+                             "max_in": 300 * 10**18},
+    # weETH/WETH 24.07 (кандидат $452k @ HF 1.0113 — direction по ETH? нет: weETH↔WETH оба ETH-нога,
+    # но ликвидатору всё равно нужен ВЫХОД weETH->WETH при взятии). Раньше роута НЕ было -> Kyber
+    # block-loop 0.4-0.9с. Slipstream ts=1 живой (pool 0xbd3cd0, liq 2.23e24): плоско до 180 weETH
+    # (imp 0.012%), обрыв 210 (0.83%). Кап 160 weETH (~$330k) < обрыва. loan=WETH single-hop.
+    (_WEETH, _UNIV3_WETH): {"router": AERO_CL_ROUTER, "style": "v1",
+                            "path": _pack_path(_WEETH, 1, _UNIV3_WETH),
+                            "max_in": 160 * 10**18},
 }
 for _coll, _fee in UNIV3_PATHS.items():   # существующие UniV3-пути -> та же таблица (loan=USDC)
     _SWAP_ROUTES[(_coll, _UNIV3_USDC)] = {"router": UNIV3_SWAP_ROUTER, "style": "02",
@@ -550,6 +561,12 @@ def direct_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_ass
     from eth_abi import encode
     r = _SWAP_ROUTES.get((token_in.lower(), token_out.lower()))
     if r is None:
+        return None
+    # пер-роутный кап (24.07): выше ёмкости одиночного пула (обрыв слиппажа) отдаём None ->
+    # caller падает на Kyber-агрегат (глубже, но серверный RTT — уже НЕ fast-lane). Защищает
+    # wstETH/weETH от исполнения мега-сайза в тонкий пул. Кап в единицах token_in.
+    _cap = r.get("max_in")
+    if _cap is not None and int(amount_in) > int(_cap):
         return None
     if r["style"] == "v1":     # Slipstream: v1-форма с deadline
         params = encode(["(bytes,address,uint256,uint256,uint256)"],
