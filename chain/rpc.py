@@ -37,17 +37,24 @@ def rpc_usage_cu(snapshot: dict) -> int:
     return sum(CU_COST.get(m, 20) * n for d in snapshot.values() for m, n in d.items())
 
 
-def _counting_middleware(url: str):
-    """web3 v6/v7-совместимая обёртка провайдера: считает методы, ничего не меняет."""
-    def factory(make_request, _w3):
-        def middleware(method, params):
-            try:
-                rpc_usage_note(str(method), url)
-            except Exception:
-                pass
-            return make_request(method, params)
-        return middleware
-    return factory
+def wrap_provider_counting(w3, url: str):
+    """Оборачивает provider.make_request счётчиком. НЕ middleware: в web3 v7 middleware —
+    классы Web3Middleware (v6-фабрика молча отваливалась, 25.07 счётчик не завёлся), а
+    provider.make_request стабилен в обеих версиях. Идемпотентно."""
+    prov = getattr(w3, "provider", None)
+    if prov is None or getattr(prov, "_cu_counted", False):
+        return
+    _orig = prov.make_request
+
+    def _counted(method, params):
+        try:
+            rpc_usage_note(str(method), url)
+        except Exception:
+            pass
+        return _orig(method, params)
+
+    prov.make_request = _counted
+    prov._cu_counted = True
 
 
 class BaseRpc:
@@ -68,9 +75,9 @@ class BaseRpc:
             self._w3 = Web3(Web3.HTTPProvider(self.rpc_url, request_kwargs=kw) if kw
                             else Web3.HTTPProvider(self.rpc_url))
             try:                                  # учёт CU: обёртка провайдера, поведение не меняет
-                self._w3.middleware_onion.add(_counting_middleware(self.rpc_url), name="cu_count")
+                wrap_provider_counting(self._w3, self.rpc_url)
             except Exception:
-                pass                              # версия web3 без onion -> просто без учёта
+                pass
         return self._w3
 
     def contract(self, address: str, abi: list):
