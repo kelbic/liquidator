@@ -167,14 +167,23 @@ def _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, gu
 
 
 def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, guard, alerter,
-                       log, ctx_cache, n_candidates=0, hf_cache=None):
+                       log, ctx_cache, n_candidates=0, hf_cache=None, read_rpc=None):
     """FAST path (on-chain): ONE aggregate3 over the candidate set -> exact HF; per
-    liquidatable+profitable+unblocked candidate, execute. ~1-2 eth_calls — cheap per block."""
+    liquidatable+profitable+unblocked candidate, execute. ~1-2 eth_calls — cheap per block.
+    read_rpc: откуда ЧИТАТЬ ассессмент (по умолчанию rpc). Замер CU 25.07: этот батч —
+    0.5-0.8 eth_call/с = 37-52M CU/мес, т.е. один он съедал квоту Alchemy; отправки и
+    реактивный путь остаются на rpc, читаем с бесплатного bg (при отказе — ретрай на rpc)."""
     summary = _empty_summary(len(by_id))
     summary["api_candidates"] = n_candidates
     if not groups:
         return summary
-    assessed = assess_candidates_batched(rpc, MORPHO_BLUE_ADDRESS, groups, ctx_cache)
+    _rr = read_rpc or rpc
+    try:
+        assessed = assess_candidates_batched(_rr, MORPHO_BLUE_ADDRESS, groups, ctx_cache)
+    except Exception:
+        if _rr is rpc:
+            raise
+        assessed = assess_candidates_batched(rpc, MORPHO_BLUE_ADDRESS, groups, ctx_cache)
     actionable = []
 
     for mid, borrower, hr in assessed:
@@ -413,6 +422,13 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
     """wss newHeads -> fast on-chain assess+execute every block (~2s). Background thread refreshes
     candidates+markets so the per-block path never blocks on the API. Reconnects on wss drop."""
     import websockets
+    _bg_read_rpc = rpc                            # ассессмент читаем с бесплатного bg-RPC (CU 25.07)
+    try:
+        _u = str(getattr(cfg, "bg_rpc_url", "") or "")
+        if _u and _u != cfg.rpc_url:
+            _bg_read_rpc = BaseRpc(_u, cfg.chain_id, request_timeout=10)
+    except Exception:
+        _bg_read_rpc = rpc
     shared = _Shared(markets)
     _snap = _load_candidates_snapshot(cfg.candidates_snapshot_path)      # P0-1: закрыть слепое окно рестарта
     if _snap:
@@ -576,7 +592,8 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     t0 = time.time()
                     try:
                         s = process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg,
-                                               guard, alerter, log, ctx_cache, ncand, hf_cache=hf_cache)
+                                               guard, alerter, log, ctx_cache, ncand, hf_cache=hf_cache,
+                                               read_rpc=_bg_read_rpc)
                     except Exception as e:
                         # RPC-split (07-21): per-block process_candidates ходит по общей ноде (сейчас
                         # публичная, лимитированная) — её транзиентный HTTPError/429 НЕ должен ронять WS
