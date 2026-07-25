@@ -60,3 +60,43 @@ assert _bullet <= int(0.193838 * 10 ** 18) * 9 // 10
 print("UNIT_OK: патрон %.2f ETH защищён от расходников; на 0.12 пробы молчат" % (_bullet / 1e18))
 
 print("=== ВСЕ GAS/BALANCE ЮНИТЫ ПРОШЛИ (вкл. патронный резерв) ===")
+
+# 8) ПЕССИМИСТИЧНЫЙ fail-open (ревью #4): при неудачном чтении баланса гейт деградирует в
+#    консервативный (кэш МИНУС оценки проб), а не в открытый — иначе слепота подгрызает патрон.
+import types as _t
+import chain.execute as _ex
+_ex._BAL_CACHE.update({"wei": None, "ts": 0.0, "spent": 0})
+
+
+class _BrokenRpc:
+    def __init__(self, bal=None): self._bal = bal
+    def _web3(self):
+        _b = self._bal
+        class _E:
+            @staticmethod
+            def get_balance(_a):
+                if _b is None:
+                    raise RuntimeError("RPC down")
+                return _b
+        return _t.SimpleNamespace(eth=_E())
+
+
+# пустой кэш + отказ чтения -> None (fail-open: измерительный слой не глушим)
+assert _ex.cached_balance_wei(_BrokenRpc(None), "0xa") is None
+# успешное чтение наполняет кэш
+assert _ex.cached_balance_wei(_BrokenRpc(int(0.15 * 10**18)), "0xa") == int(0.15 * 10**18)
+# пробы тратят -> при ОТКАЗЕ чтения баланс тает сам
+_probe_cost = 4_000_000 * int(0.15 * GW)
+for _ in range(20):
+    _ex.probe_note_spend(_probe_cost)
+_seen = _ex.cached_balance_wei(_BrokenRpc(None), "0xa", now=1e9)     # TTL истёк, чтение падает
+assert _seen == int(0.15 * 10**18) - 20 * _probe_cost, _seen
+print("UNIT_OK: слепота -> кэш минус потраченное (0.150 -> %.4f ETH), а не «разрешить всё»"
+      % (_seen / 1e18))
+# и гейт на этом фоне закрывается, как только съеден запас над патроном
+_ex._BAL_CACHE.update({"wei": int(0.125 * 10**18), "ts": 1e9, "spent": 0})
+assert probe_allowed_by_reserve(_ex.cached_balance_wei(_BrokenRpc(None), "0xa", now=1e9), _probe_cost) is True
+_ex.probe_note_spend(int(0.006 * 10**18))
+assert probe_allowed_by_reserve(_ex.cached_balance_wei(_BrokenRpc(None), "0xa", now=1e9), _probe_cost) is False
+_ex._BAL_CACHE.update({"wei": None, "ts": 0.0, "spent": 0})
+print("UNIT_OK: по мере трат гейт закрывается сам, патрон 0.12 ETH цел")

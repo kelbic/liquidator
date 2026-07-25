@@ -295,6 +295,7 @@ def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=N
             else:
                 _CANARY_PROBES += 1
                 _CANARY_LAST_TS = _now
+        probe_note_spend(21000 * int(cfg.tip_gwei * 1e9) * 3)     # пессимистичный гейт
         return res["hash"]
 
 
@@ -393,6 +394,7 @@ def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
         with _INFLIGHT_LOCK:
             _SPECFIRE_PROBES += 1
             _SPECFIRE_LAST_TS = _now
+        probe_note_spend(_cost)                   # пессимистичный гейт: см. cached_balance_wei
         return res["hash"]
 
 
@@ -699,21 +701,34 @@ def _prep_to_item_tuple(prep: dict):
 # покрывает патрон + стоимость пробы, ПРОБЫ МОЛЧАТ. Боевой путь резервом НЕ гейтится — он и есть
 # патрон. Баланс кэшируем (19 CU/чтение, квота дорога): пробы редки, 60с свежести достаточно.
 BULLET_RESERVE_WEI = int(float(os.environ.get("GAS_BULLET_RESERVE_ETH", "0.12")) * 10 ** 18)
-_BAL_CACHE = {"wei": None, "ts": 0.0}
+_BAL_CACHE = {"wei": None, "ts": 0.0, "spent": 0}
 _BAL_TTL = float(os.environ.get("GAS_BALANCE_TTL_SEC", "60"))
 
 
+def probe_note_spend(cost_wei: int):
+    """Учесть ОЦЕНКУ стоимости отправленной пробы между чтениями баланса (см. cached_balance_wei):
+    в длинный RPC-аут гейт деградирует в КОНСЕРВАТИВНЫЙ, а не в открытый."""
+    with _INFLIGHT_LOCK:
+        _BAL_CACHE["spent"] = int(_BAL_CACHE["spent"]) + max(0, int(cost_wei))
+
+
 def cached_balance_wei(rpc, address: str, now=None):
-    """Баланс с TTL-кэшем. None = прочитать не удалось (вызыватель обязан fail-open)."""
+    """Баланс с TTL-кэшем, ПЕССИМИСТИЧНО: возвращает last_balance − Σ(оценок проб с последнего
+    успешного чтения). None только если баланс не читался НИ РАЗУ (тогда вызыватель fail-open —
+    глушить измерительный слой на пустом кэше нельзя). Пока чтение падает, знаменатель тает сам,
+    и пробы упираются в патронный резерв, а не грызут его по копейке."""
     t = time.monotonic() if now is None else now
-    if _BAL_CACHE["wei"] is not None and t - _BAL_CACHE["ts"] < _BAL_TTL:
-        return _BAL_CACHE["wei"]
-    try:
-        w = int(rpc._web3().eth.get_balance(address))
-    except Exception:
-        return _BAL_CACHE["wei"]                  # старое значение лучше слепоты
-    _BAL_CACHE["wei"], _BAL_CACHE["ts"] = w, t
-    return w
+    fresh = _BAL_CACHE["wei"] is not None and t - _BAL_CACHE["ts"] < _BAL_TTL
+    if not fresh:
+        try:
+            w = int(rpc._web3().eth.get_balance(address))
+            with _INFLIGHT_LOCK:
+                _BAL_CACHE["wei"], _BAL_CACHE["ts"], _BAL_CACHE["spent"] = w, t, 0
+        except Exception:
+            pass                                  # читаем дальше по кэшу МИНУС потраченное
+    if _BAL_CACHE["wei"] is None:
+        return None
+    return max(0, int(_BAL_CACHE["wei"]) - int(_BAL_CACHE["spent"]))
 
 
 def probe_allowed_by_reserve(balance_wei, probe_cost_wei: int, reserve_wei=None) -> bool:
