@@ -120,8 +120,10 @@ def margin_changes(rows, path=STATE_PATH):
         was = prev.get(r["key"])
         if was is not None and was > 0 >= r["margin"]:
             changes.append((r["key"], r["pair"], was, r["margin"], "ЗНАК СМЕНИЛСЯ — цель ожила"))
-        elif r["margin"] <= MARGIN_WARN:
-            changes.append((r["key"], r["pair"], was, r["margin"], "запас < %.2f%%/год" % (MARGIN_WARN * 100)))
+        elif r["margin"] < 0:
+            # запас отрицательный = HF реально падает, ETA существует (см. таблицу в flip_eta)
+            changes.append((r["key"], r["pair"], was, r["margin"], "запас отрицательный — ETA есть"))
+        # 0 < margin < MARGIN_WARN — «тонко, но уходит вверх»: видно в таблице, кричать не о чем
     try:
         json.dump(cur, open(path, "w"))
     except Exception:

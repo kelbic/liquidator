@@ -94,8 +94,9 @@ try:
                             (r["drift"] or 0) * 100, r["margin"] * 100))
     _ch = margin_changes(_rows)
     if _ch:
-        lines.append("⚠️ RATE-КЛАСС: " + "; ".join("%s %s (было %+.2f%% -> %+.2f%%)"
-                     % (p_, why, (was or 0) * 100, now * 100) for _k, p_, was, now, why in _ch))
+        lines.append("⚠️ RATE-КЛАСС: " + "; ".join(
+            "%s %s (%s -> %+.2f%%)" % (p_, why, ("базлайн" if was is None else "%+.2f%%" % (was * 100)), now * 100)
+            for _k, p_, was, now, why in _ch))
     _mkt = [r for r in _rows if r["market_oracle"]]
     if _mkt:
         lines.append("— рыночно-оракульные цели (там и живёт SPEC-FIRE): " +
