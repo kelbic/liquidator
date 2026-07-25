@@ -588,11 +588,17 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     (_CBETH, _UNIV3_WETH): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_CBETH, 1, _UNIV3_WETH),
                             "max_in": 300 * 10**18},
-    # cbDOGE/cbADA -> USDC: полные Slipstream-пути (ре-верификация 24.07, см. коммент выше)
+    # cbDOGE/cbADA -> USDC: полные Slipstream-пути (ре-верификация 24.07, см. коммент выше).
+    # max_in (25.07): пул cbDOGE чист до 90k ток. (imp 0.9%), обрыв на 135k (out каппится $8.2k);
+    # cbADA чист до 60k (imp 2.3%), обрыв на 120k. Сверх капа -> Kyber. NB: Kyber на ките $80k
+    # cbDOGE отдаёт лишь $17.3k (21.5% номинала) — ВСЯ DOGE-ликвидность Base мелкая; жирный
+    # cbDOGE-кандидат экономически несобираем целиком, minProfit-floor отсечёт сам.
     (_CBDOGE, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
-                             "path": _pack_path(_CBDOGE, 2000, _UNIV3_WETH, 100, _UNIV3_USDC)},
+                             "path": _pack_path(_CBDOGE, 2000, _UNIV3_WETH, 100, _UNIV3_USDC),
+                             "max_in": 100_000 * 10**8},
     (_CBADA, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
-                            "path": _pack_path(_CBADA, 200, _UNIV3_WETH, 100, _UNIV3_USDC)},
+                            "path": _pack_path(_CBADA, 200, _UNIV3_WETH, 100, _UNIV3_USDC),
+                            "max_in": 60_000 * 10**6},
 }
 for _coll, _fee in UNIV3_PATHS.items():   # существующие UniV3-пути -> та же таблица (loan=USDC)
     _SWAP_ROUTES[(_coll, _UNIV3_USDC)] = {"router": UNIV3_SWAP_ROUTER, "style": "02",
