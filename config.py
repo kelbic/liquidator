@@ -25,6 +25,14 @@ class Config:
                                          # открывает спекулятивный огонь. 0.05 = запас над толпой 0.003
                                          # на случай fee-сортировки ВНУТРИ флешблок-кадра (op-rbuilder).
     gas_limit_est: int = 500000          # ~gas used per liquidation, for the net-cost estimate
+    # ЛИМИТ tx (не оценка стоимости!). Форк-экзамен 25.07 на ките $1.5M: фактический gasUsed
+    # 2 470 096 против gas_limit_est=500k — а этот est подставлялся как фолбэк лимита, когда
+    # preconf-estimate_gas не ответил (а он отбивает ~8/10 при нынешнем капе) => приз $143k ушёл
+    # бы в out-of-gas. Развязано: лимит берёт floor, стоимость по-прежнему считается по
+    # gas_limit_est (иначе завышенный лимит × каскадный tip задушил бы net-гейт мелких призов).
+    # На Base платим за ИСПОЛЬЗОВАННЫЙ газ, запас в лимите почти бесплатен (цена — резерв
+    # maxFee × limit из баланса: 3M × 30 gwei ≈ 0.09 ETH, см. заметку по кошельку в STATE).
+    gas_limit_floor: int = 3_000_000
     eth_price_usd: float = 1730.0        # ETH/USD to value gas/tip cost (keep ~current; tip dominates)
     max_daily_loss_usd: float = 50.0
     max_daily_gas_usd: float = 100.0
@@ -108,6 +116,7 @@ class Config:
             min_profit_usd=f("MIN_PROFIT_USD", d.min_profit_usd),
             tip_gwei=f("TIP_GWEI", d.tip_gwei),
             gas_limit_est=i("GAS_LIMIT_EST", d.gas_limit_est),
+            gas_limit_floor=i("GAS_LIMIT_FLOOR", d.gas_limit_floor),
             eth_price_usd=f("ETH_PRICE_USD", d.eth_price_usd),
             max_daily_loss_usd=f("MAX_DAILY_LOSS_USD", d.max_daily_loss_usd),
             max_daily_gas_usd=f("MAX_DAILY_GAS_USD", d.max_daily_gas_usd),

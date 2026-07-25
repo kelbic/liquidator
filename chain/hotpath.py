@@ -964,17 +964,18 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         # gas: из per-market кэша (0 RTT) либо от параллельного preconf-estimate выше. Явный gas в prep
         # по-прежнему нужен, иначе send_tx оценит на confirmed-Alchemy, где reaction-флип ещё healthy ->
         # estimate_gas ревертит -> tx НЕ уходит. Лимит всегда max(..., cfg.gas_limit_est) — запас бесплатен.
+        _floor = int(getattr(cfg, "gas_limit_floor", 3_000_000) or 3_000_000)   # см. config: форк 25.07
         if _cached_gas is not None:
-            _gas_limit = max(_cached_gas, cfg.gas_limit_est)
+            _gas_limit = max(_cached_gas, _floor)
         else:
             if _est_thread is not None:
                 _est_thread.join(timeout=2.0)
             _est = _gas_holder.get("gas")
             if _est is not None:
                 _GAS_CACHE[market_id] = _est
-                _gas_limit = max(_est, cfg.gas_limit_est)
+                _gas_limit = max(_est, _floor)
             else:
-                _gas_limit = cfg.gas_limit_est
+                _gas_limit = _floor            # estimate не ответил (preconf 429) -> НЕ 500k, иначе OOG
         _prep = {"ok": True, "calldata": cd1, "gas": _gas_limit, "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd,
                  # сырые компоненты для batch-энкодера + debt для per-item USD в receipt-цикле (prep["calldata"] = одиночный вызов)
                  "mp": mp, "borrower": borrower, "repaid_shares": repaid_shares, "swap_target": swap["router"],
@@ -1038,7 +1039,9 @@ def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asse
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
         cd = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit)
         _tip = int(dynamic_tip_gwei(cfg, debt_usd) * 1e9)     # каскадная страховка по призу
-        return {"ok": True, "calldata": cd, "gas": max(_GAS_CACHE.get(market_id, 0), cfg.gas_limit_est),
+        return {"ok": True, "calldata": cd,
+                "gas": max(_GAS_CACHE.get(market_id, 0),
+                           int(getattr(cfg, "gas_limit_floor", 3_000_000) or 3_000_000)),
                 "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd,
                 "max_fee": _fb * 2 + _tip, "tip": _tip, "fast": True,
                 # сырые компоненты для batch-энкодера + debt для per-item USD в receipt-цикле
