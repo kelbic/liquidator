@@ -32,7 +32,9 @@ class Config:
     # gas_limit_est (иначе завышенный лимит × каскадный tip задушил бы net-гейт мелких призов).
     # На Base платим за ИСПОЛЬЗОВАННЫЙ газ, запас в лимите почти бесплатен (цена — резерв
     # maxFee × limit из баланса: 3M × 30 gwei ≈ 0.09 ETH, см. заметку по кошельку в STATE).
-    gas_limit_floor: int = 3_000_000
+    # 4M: форк-батч 25.07 (3 кита, status=1) израсходовал 11.25M = ФАКТИЧЕСКИ 3.75M на позицию —
+    # выше прежнего floor 3M; запас формулы был всего 1.01×. С 4M запас батча 1.3-1.4×.
+    gas_limit_floor: int = 4_000_000
     eth_price_usd: float = 1730.0        # ETH/USD to value gas/tip cost (keep ~current; tip dominates)
     max_daily_loss_usd: float = 50.0
     max_daily_gas_usd: float = 100.0

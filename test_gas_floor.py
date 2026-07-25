@@ -32,7 +32,11 @@ print("UNIT_OK: стоимость в гейте $%.0f (по est), а не $%.0f
     cost, cost_if_floor))
 
 # 4) кэш газа: реальный estimate ВЫШЕ floor -> берём его (батч не занизит лимит)
-assert max(3_500_000, d.gas_limit_floor) == 3_500_000
+assert max(d.gas_limit_floor + 500_000, d.gas_limit_floor) == d.gas_limit_floor + 500_000
 print("UNIT_OK: живой estimate выше floor не срезается")
+
+# 5) floor покрывает ФАКТИЧЕСКИЙ расход на позицию в батче (форк 25.07: 11.25M / 3 = 3.75M)
+assert d.gas_limit_floor >= 3_750_000, "floor ниже замеренного расхода позиции в батче"
+print("UNIT_OK: floor=%.1fM >= 3.75M (факт на позицию в батче из 3 китов)" % (d.gas_limit_floor / 1e6))
 
 print("=== ВСЕ GAS-FLOOR ЮНИТЫ ПРОШЛИ ===")
