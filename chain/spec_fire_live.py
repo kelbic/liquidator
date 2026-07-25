@@ -50,6 +50,10 @@ SPEC_FIRE_ARM_MAX_DIST = float(os.environ.get("SPEC_FIRE_ARM_MAX_DIST", "0.03"))
 # растягивается на ~0.7+8×3.5 ~= 29с, накрывая замеренный лаг. Тюнить по новым транзитам.
 SPEC_FIRE_BURST_PROBES = int(os.environ.get("SPEC_FIRE_BURST_PROBES", "2"))
 SPEC_FIRE_SLOW_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_SLOW_INTERVAL_SEC", "3.5"))
+# Пауза после WIN (25.07, ревью-фингерпринт): серия «пробы -> приз» ончейн читается конкурентом
+# как учебник нашего слоя. После взятого приза окна не армятся COOLDOWN сек — паттерн рвётся,
+# а сам приз уже в кармане (реактивный путь паузой НЕ трогаем, он главный). 0 = выключено.
+SPEC_FIRE_WIN_COOLDOWN_SEC = float(os.environ.get("SPEC_FIRE_WIN_COOLDOWN_SEC", "900"))
 SPEC_FIRE_MIN_PROFIT_BPS = int(os.environ.get("SPEC_FIRE_MIN_PROFIT_BPS", "30"))
 SPEC_FIRE_POLL_SEC = float(os.environ.get("SPEC_FIRE_POLL_SEC", "0.15"))
 SPEC_FIRE_RECEIPT_TIMEOUT = float(os.environ.get("SPEC_FIRE_RECEIPT_TIMEOUT", "45"))
@@ -72,6 +76,7 @@ class SpecFireLive:
         self._lock = threading.Lock()
         self._windows: dict = {}                  # feed -> stop Event
         self._armskip_ts: dict = {}               # feed -> ts последнего arm-skip-лога (троттлинг 300с)
+        self._cooldown_until = 0.0                # WIN-пауза: до этого момента окна не армим
         self.stats = {"windows_armed": 0, "probes": 0, "wins": 0}
 
     # ---- боевые швы ----
@@ -190,8 +195,10 @@ class SpecFireLive:
         if status == 1:
             self.stats["wins"] += 1
             mark_recent_send(mid, borrower)               # жертва взята — глушим реактивный дубль
-            log.warning("SPECFIRE WIN!!! %s/%s debt=$%.0fk tx=%s gas=$%.2f — предочередь взята",
-                        mid[:10], borrower[:10], debt_usd / 1e3, h, gas_usd)
+            self._cooldown_until = self._now() + SPEC_FIRE_WIN_COOLDOWN_SEC   # рвём паттерн «пробы->приз»
+            log.warning("SPECFIRE WIN!!! %s/%s debt=$%.0fk tx=%s gas=$%.2f — предочередь взята "
+                        "(окна на паузе %.0fс)",
+                        mid[:10], borrower[:10], debt_usd / 1e3, h, gas_usd, SPEC_FIRE_WIN_COOLDOWN_SEC)
         else:
             self._log("SPECFIRE probe revert (healthy, ожидаемо) tx=%s gas=$%.3f" % (h, gas_usd))
 
@@ -250,6 +257,8 @@ class SpecFireLive:
             feed = (ev.get("feed") or "").upper()
             if kind == "arm":
                 direction = ev.get("dir") or "down"
+                if self._now() < self._cooldown_until:     # WIN-пауза: приз взят, паттерн не палим
+                    return None
                 best, hold_dist = self._top_fat(feed, direction, max_dist=SPEC_FIRE_ARM_MAX_DIST)
                 if best is None:
                     if hold_dist is not None:              # жир есть, но заведомо вне окна — не палим

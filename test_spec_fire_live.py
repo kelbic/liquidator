@@ -183,6 +183,23 @@ assert ex.send_spec_fire_probe(None, cfg, "0x", 100000) is None
 ex._SPECFIRE_GAS_USD = 0.0
 print("UNIT_OK: probe-гейты (inflight, газ-бакет) атомарно закрывают отправку")
 
+# 8b) WIN-cooldown: после приза окна не армятся (паттерн «пробы->приз» не палим)
+sent.clear()
+sf10 = make(receipt_fn=lambda h: (1, 0.02))
+sf10._collect("0xw", "0xbtc", "0xFAT", 1_500_000.0)     # WIN -> кулдаун
+assert sf10._cooldown_until > 0
+sf10.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.3)
+assert sf10.stats["windows_armed"] == 0, "в WIN-паузе окно не должно армиться"
+sf10._cooldown_until = 0.0                               # пауза прошла
+RET["v"] = -0.0011
+sf10.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.2)
+sf10.handle_event({"event": "disarm", "feed": "BTC"})
+assert sf10.stats["windows_armed"] == 1, "после паузы армится как обычно"
+ex._RECENT_SENDS.clear()
+print("UNIT_OK: WIN-пауза рвёт паттерн, после неё армы штатные")
+
 # 9) суточный бакет: на границе UTC-суток спек-газ сбрасывается (был lifetime — к вечернему
 #    каскаду волатильного дня бакет пуст); specfire_gas_today кормит общий kill-switch
 ex._SPECFIRE_GAS_USD = 5.0
