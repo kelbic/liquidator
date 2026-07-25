@@ -1501,7 +1501,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     from chain.rpc import BaseRpc
     _fb_resolve_rpc = BaseRpc(os.environ.get("FEEDS_FALLBACK_RPC", "https://mainnet.base.org"),
                               getattr(rpc, "chain_id", 8453), request_timeout=8.0)
-    feeds = _init_resolve_retry(resolve_feeds, rpc, markets, _fb_resolve_rpc,
+    feeds = _init_resolve_retry(resolve_feeds, _bg_rpc, markets, rpc,   # 25.07: резолв (283 лёгких
+                                # вызова × 2 на рестарт + раз в 6ч) — фон, ему не место на платном
                                 what="feeds", log=log, empty_ok=False)
 
     def _resolve_meta_fb():
@@ -1509,9 +1510,12 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
         # (self-heal рестартил его циклом). Симметрия с f96854d: фолбэк-эндпоинт + empty_ok=False
         # ниже = слепой старт вместо смерти; слепая meta ре-резолвится ускоренно (120с, bg).
         try:
-            return resolve_meta(rpc, markets)
+            return resolve_meta(_bg_rpc, markets)      # 25.07: meta иммутабельна — чистый фон
         except Exception:
-            return resolve_meta(_fb_resolve_rpc, markets)
+            try:
+                return resolve_meta(rpc, markets)
+            except Exception:
+                return resolve_meta(_fb_resolve_rpc, markets)
     meta = _init_resolve_retry(_resolve_meta_fb, what="meta", log=log, empty_ok=False)
     agg_set = set(feeds)
     shadow_map = _build_shadow_map(feeds, meta, markets, primary=primary_map())   # SHADOW слоя 1 (log-only спавн-гейт)
@@ -1596,7 +1600,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
 
                         def _bg_resolve(box=_re_box, cur_meta=meta):
                             try:
-                                nf = resolve_feeds(rpc, markets, _fb_resolve_rpc)
+                                nf = resolve_feeds(_bg_rpc, markets, rpc)
                             except Exception:
                                 box["res"] = None
                                 return
