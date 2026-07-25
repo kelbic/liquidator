@@ -1438,6 +1438,17 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     import brotli
     from chain.feeds import (resolve_feeds, extract_txs, block_number_of, decode_forward_answer,
                              FORWARD_SEL, basefee_of, primary_map)
+    # ФОНОВЫЕ чтения -> бесплатный публичный RPC (CU-замер 25.07: фоновые читатели съедали 5×
+    # квоту Alchemy). Пусто/ошибка конструктора -> прежний rpc, поведение как раньше.
+    _bg_rpc = rpc
+    try:
+        _bg_url = str(getattr(cfg, "bg_rpc_url", "") or "")
+        if _bg_url and _bg_url != cfg.rpc_url:
+            from chain.rpc import BaseRpc as _BR
+            _bg_rpc = _BR(_bg_url, cfg.chain_id, request_timeout=10)
+            log.info("фоновые чтения -> %s (Alchemy остаётся денежному пути)", _bg_url)
+    except Exception:
+        _bg_rpc = rpc
 
     def _default_ws():
         return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
@@ -1624,7 +1635,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         if _bf is not None:
                             _basefee_probe(bn=bn, fb=_bf, rpc=rpc, log=log)
                         threading.Thread(target=_poll_prices, daemon=True,
-                                         kwargs=dict(preconf_rpc=preconf_rpc, rpc_fallback=rpc, feeds=feeds, meta=meta,
+                                         kwargs=dict(preconf_rpc=preconf_rpc, rpc_fallback=_bg_rpc, feeds=feeds, meta=meta,
                                                      poll_seen=poll_seen, stats=stats, bn=bn, log=log,
                                                      feed_handled=feed_handled,
                                                      spawn_kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,
@@ -1634,7 +1645,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         # Layer 2, measurement phase (C temporary — see STATE.md): fills _POSITION_CACHE +
                         # logs refresh-miss/cycle timing. Does NOT touch reads_fn — read_positions_cached
                         # is not wired into _process_transmit yet, so this has zero effect on hot-path behavior.
-                        _spawn_cache_refresh(cache_rpc=rpc, shared=shared, bn=bn)   # RPC-split: рефреш на общий rpc (confirmed), НЕ на preconf
+                        _spawn_cache_refresh(cache_rpc=_bg_rpc, shared=shared, bn=bn)   # фоновый рефреш -> бесплатный bg-RPC (CU-замер 25.07)
                     idx = d.get("index"); txs = extract_txs(d); now = time.time()
                     for _raw, _to in txs:                        # SHADOW слоя 1: декод transmit из фида (log-only)
                         if _raw and FORWARD_SEL in _raw:

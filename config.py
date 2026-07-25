@@ -75,6 +75,12 @@ class Config:
     canary_max_probes: int = 100              # стоп кампании после N проб
     canary_min_interval_sec: float = 120.0    # не чаще 1 пробы / N сек (разброс по условиям)
     canary_max_gas_usd: float = 25.0          # СВОЙ газ-кап канарейки (НЕ в kill-switch) -> стоп кампании
+    # ФОНОВЫЕ чтения (рефреш кэша позиций, predict-полл агрегаторов, фолбэк цен-полла) уходят
+    # СЮДА, а не на платный RPC_URL. Замер CU 25.07: фоновые читатели = ~56 CU/s = 145M/мес при
+    # квоте Alchemy 30M (плюс spec-канарейка 125 CU/s, отключена). Публичный эндпоинт бесплатен;
+    # при его отказе вызыватели штатно падают на RPC_URL (поведение как раньше, только дороже).
+    # Пусто => RPC_URL (прежнее поведение). Откат: BG_RPC_URL= (пусто).
+    bg_rpc_url: str = "https://mainnet.base.org"
     preconf_rpc: str = "https://mainnet-preconf.base.org"   # pre-confirmed price source for the hot path
     sequencer_rpc: str = "https://mainnet-sequencer.base.org"  # SEND-3: параллельный raw-broadcast; "off" = выкл
     candidates_snapshot_path: str = "candidates_snapshot.json"  # warm-start: последний candidate set (P0-1)
@@ -152,6 +158,7 @@ class Config:
             canary_max_probes=i("CANARY_MAX_PROBES", d.canary_max_probes),
             canary_min_interval_sec=f("CANARY_MIN_INTERVAL_SEC", d.canary_min_interval_sec),
             canary_max_gas_usd=f("CANARY_MAX_GAS_USD", d.canary_max_gas_usd),
+            bg_rpc_url=s("BG_RPC_URL", d.bg_rpc_url),
             preconf_rpc=s("PRECONF_RPC", d.preconf_rpc),
             sequencer_rpc=s("SEQUENCER_RPC", d.sequencer_rpc),
             candidates_snapshot_path=s("CANDIDATES_SNAPSHOT_PATH", d.candidates_snapshot_path),

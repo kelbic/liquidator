@@ -456,6 +456,13 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
             try:
                 from chain.pricefeed import PriceFeed
                 from chain.predict import PredictEngine, PredictDriver, resolve_feed_proxies, make_poll_fn
+                _bg = rpc                       # predict-полл агрегаторов = фоновое чтение (CU 25.07)
+                try:
+                    _bgu = str(getattr(cfg, "bg_rpc_url", "") or "")
+                    if _bgu and _bgu != cfg.rpc_url:
+                        _bg = BaseRpc(_bgu, cfg.chain_id, request_timeout=10)
+                except Exception:
+                    _bg = rpc
                 proxies = resolve_feed_proxies(rpc, markets)
                 if not proxies:
                     log.warning("predict-shadow: прокси не разрезолвились — слой не стартует")
@@ -522,7 +529,7 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                 _h(ev)
                             except Exception:
                                 log.exception("predict on_event handler упал (изолирован)")
-                drv = PredictDriver(engine, mid_fn=pf.mid, poll_fn=make_poll_fn(rpc, proxies),
+                drv = PredictDriver(engine, mid_fn=pf.mid, poll_fn=make_poll_fn(_bg, proxies),
                                     on_event=_on_event,
                                     log=lambda m: log.info("%s", m))
                 drv.start()
