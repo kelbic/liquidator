@@ -37,6 +37,44 @@ PRECONF_RPC_DEFAULT = "https://mainnet-preconf.base.org"
 # Форы НЕ теряет никто: вне тени полл читает pending как раньше; в тени — latest без 429-платы.
 # MIN_GAP=0 (выключен) — резерв на случай, если тени не хватит: поднять env'ом без кода.
 # Откат без кода: PRECONF_REACTIVE_QUIET_SEC=0.
+# ---- STAGE-ТАЙМИНГ (25.07, замечание ревьювера #1): атрибуция ВРЕМЕНИ фоном, а не кампанией.
+# 45мс налога middleware нашлись атрибуцией РАСХОДА; следующий «собственный налог» должен всплыть
+# сам. Копим p50/p95 по стадиям в скользящем часе и печатаем строкой в hot stats.
+# Стадии: detect (транзит->спавн), price, read (позиции), flips (CPU), prep (sim+сборка),
+# sign (подпись залпа), volley (raw в секвенсер), e2e.
+_STAGE_LOCK = threading.Lock()
+_STAGES: dict = {}
+STAGE_WINDOW_SEC = float(os.environ.get("STAGE_WINDOW_SEC", "3600"))
+CU_ALERT_PROJ_M = float(os.environ.get("CU_ALERT_PROJ_M", "26"))   # проекция M CU/мес -> TG-будильник
+
+
+def stage_note(name: str, ms: float, now=None):
+    t = time.monotonic() if now is None else now
+    with _STAGE_LOCK:
+        d = _STAGES.setdefault(name, [])
+        d.append((t, float(ms)))
+        if len(d) > 4000:                     # страховка от разрастания на длинном каскаде
+            del d[:len(d) - 4000]
+
+
+def stage_report(now=None) -> str:
+    """'detect 4/12 price 0/1 read 87/294 ...' = p50/p95 мс за окно. Пусто -> ''."""
+    t = time.monotonic() if now is None else now
+    out = []
+    with _STAGE_LOCK:
+        for name in ("detect", "price", "read", "flips", "prep", "sign", "volley", "e2e"):
+            vals = [v for (ts, v) in _STAGES.get(name, []) if t - ts <= STAGE_WINDOW_SEC]
+            if not vals:
+                continue
+            vals.sort()
+            p50 = vals[len(vals) // 2]
+            p95 = vals[min(len(vals) - 1, int(len(vals) * 0.95))]
+            out.append("%s %.0f/%.0f" % (name, p50, p95))
+        for name in list(_STAGES):            # чистка хвостов вне окна
+            _STAGES[name] = [(ts, v) for (ts, v) in _STAGES[name] if t - ts <= STAGE_WINDOW_SEC]
+    return " ".join(out)
+
+
 def CU_TOP_KEY(kv):
     """Сортировка по ВКЛАДУ в CU (n × цена), а не по числу вызовов. Ключ может быть
     'method@caller' (CU_ATTRIBUTION=1) — цену берём по части до '@'."""
@@ -1264,6 +1302,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         else:                                                # страховка (префетч покрывает штатно)
             price = read_price_hedged(preconf_rpc, rpc, oracle, price_fn=price_fn)
         _t_price_last = (time.perf_counter() - _pxs) * 1000.0
+        stage_note("price", _t_price_last)
         if stats is not None:                                # 24.07: ДЕНЕЖНЫЙ путь = цена из flashblocks-WS
             k = "px_free" if _t_price_last < 5.0 else "px_rpc"   # (декод/гейт/префетч, 0мс) без RPC вообще.
             stats[k] = stats.get(k, 0) + 1                   # px_rpc = чтения, которым preconf реально нужен.
@@ -1281,6 +1320,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             log.info("DIAG cache-coverage market=%s in_cache=%d/%d avg_age=%.1fs max_age=%.1fs missing=%s",
                      mid[:10], _in_cache, _total, _avg_age, _max_age, ",".join(_missing) if _missing else "-")
         _t_read_last = (time.perf_counter() - _rs) * 1000.0; _t_read_total += _t_read_last
+        stage_note("read", _t_read_last)
         if not rp:
             if stats is not None: stats["f_norp"] += 1
             continue
@@ -1307,6 +1347,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         _fls = time.perf_counter()                           # 07-17 п.1: CPU _flips по непруненному набору — мерить
         flipped = _flips(price, lltv_wad, tba, tbs, positions)
         _t_flips_last = (time.perf_counter() - _fls) * 1000.0; _t_flips_total += _t_flips_last
+        stage_note("flips", _t_flips_last)
         if not flipped:
             if stats is not None: stats["f_noflip"] += 1
             if positions:                                    # DIAG: what state did we read? (preconf-source check)
@@ -1382,6 +1423,9 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     _be_trip = pop_batch_empty_trip()              # мультибатч: серия пустых батчей (nOk=0) -> TG-пейдж
     if _be_trip:
         alerter.send_async(_be_trip, key="batch-empty")
+    stage_note("prep", _t_prep_total); stage_note("e2e", (time.time() - t) * 1000.0)
+    if _t_send:
+        stage_note("send", _t_send)
     log.info("DIAG timing read=%.0fms flips=%.0fms sim=%.0fms send=%.0fms e2e=%.0fms n_ready=%d",
              _t_read_total, _t_flips_total, _t_prep_total, _t_send, (time.time() - t) * 1000.0, len(ready))
     for r in results:
@@ -1497,6 +1541,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                  # per-IP лимит на ЧАСТОТУ коннектов: фикс-3с реконнект при транзиентном сбое
                                  # Base превращал его в самоподдерживающийся 429-шторм на час (инцидент 07-21).
     last_fb_alert = 0.0          # monotonic of last degradation alert (anti-flood)
+    last_cu_alert = 0.0          # анти-флуд будильника по CU-квоте (раз в 6ч)
     recon_ts = []                # monotonic'ы реконнектов hot-path ws; одиночный разрыв публичного
     last_recon_alert = 0.0       # Flashblocks-WS = НОРМА (роняет соединение раз в час-два) -> TG молчит,
                                  # алерт ТОЛЬКО на серию (3+ за 180с = реальная нестабильность фида/сети)
@@ -1576,11 +1621,29 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             for _host, _ms in sorted(_snap.items()):
                                 _cu = rpc_usage_cu({_host: _ms})
                                 _top = sorted(_ms.items(), key=lambda kv: -CU_TOP_KEY(kv))[:6]
+                                _proj = _cu / _win * 86400 * 30 / 1e6
                                 log.info("CU %s: %d CU/окно = %.0f CU/s (проекция %.1fM/мес) | %s",
-                                         _host, _cu, _cu / _win, _cu / _win * 86400 * 30 / 1e6,
+                                         _host, _cu, _cu / _win, _proj,
                                          " ".join("%s×%d" % (m, n) for m, n in _top))
+                                # БУДИЛЬНИК по квоте (ревью #3): порядок эвакуации на dRPC (210M)
+                                # см. STATE «ПОРЯДОК ЭВАКУАЦИИ». Отправки/sim уезжают ПОСЛЕДНИМИ.
+                                if ("alchemy" in _host and _proj >= CU_ALERT_PROJ_M
+                                        and time.monotonic() - last_cu_alert > 21600):
+                                    last_cu_alert = time.monotonic()
+                                    try:
+                                        alerter.send_async(
+                                            "CU-квота: Alchemy проекция %.0fM/мес (порог %.0fM) — "
+                                            "эвакуация по порядку из STATE: 1) ассессмент+кэш на dRPC, "
+                                            "2) predict-полл, 3) диагностика; отправки/sim НЕ трогать. "
+                                            "Топ: %s" % (_proj, CU_ALERT_PROJ_M,
+                                                         " ".join("%s×%d" % (m, n) for m, n in _top[:3])))
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
+                        _stg = stage_report()
+                        if _stg:
+                            log.info("STAGE p50/p95 мс (окно %.0fч): %s", STAGE_WINDOW_SEC / 3600.0, _stg)
                         _px_ok, _px_fail = px_preconf_take()
                         log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d poll_lat=%d px_free=%d/%d px_pre=%d/%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],

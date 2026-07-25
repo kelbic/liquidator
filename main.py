@@ -177,13 +177,29 @@ def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, 
     summary["api_candidates"] = n_candidates
     if not groups:
         return summary
+    # ЦЕПОЧКА ДЕНЕЖНЫХ ЧТЕНИЙ (25.07, замечание ревьювера #2): keyed dRPC -> Alchemy -> публичный.
+    # Публичный НЕ годится первым: замер 25.07 — 429 на батче 1262 кандидатов ЦЕЛИКОМ (dRPC 100%
+    # за 0.7с, Alchemy за 0.6с). И главное: assess_candidates_batched при ЧАСТИЧНОМ отказе молча
+    # ПРОПУСКАЕТ кандидатов (ok=False -> continue, исключения нет) => фолбэк по except не срабатывал
+    # бы, а флип в день приза потерялся молча (класс дыры 07-23). Поэтому проверяем ПОКРЫТИЕ.
     _rr = read_rpc or rpc
+    _expect = sum(len(v) for mid, v in groups.items() if mid in ctx_cache) or None
     try:
         assessed = assess_candidates_batched(_rr, MORPHO_BLUE_ADDRESS, groups, ctx_cache)
     except Exception:
         if _rr is rpc:
             raise
         assessed = assess_candidates_batched(rpc, MORPHO_BLUE_ADDRESS, groups, ctx_cache)
+    else:
+        if _expect and _rr is not rpc and len(assessed) < _expect:
+            log.warning("assess неполон на bg-RPC (%d из %d) — перечитываю на основном",
+                        len(assessed), _expect)
+            try:
+                _re = assess_candidates_batched(rpc, MORPHO_BLUE_ADDRESS, groups, ctx_cache)
+                if len(_re) > len(assessed):
+                    assessed = _re
+            except Exception:
+                pass                          # основной тоже отказал -> работаем с неполным набором
     actionable = []
 
     for mid, borrower, hr in assessed:
