@@ -38,9 +38,10 @@ PRECONF_RPC_DEFAULT = "https://mainnet-preconf.base.org"
 # MIN_GAP=0 (выключен) — резерв на случай, если тени не хватит: поднять env'ом без кода.
 # Откат без кода: PRECONF_REACTIVE_QUIET_SEC=0.
 def CU_TOP_KEY(kv):
-    """Сортировка методов по ВКЛАДУ в CU (n × цена), а не по числу вызовов."""
+    """Сортировка по ВКЛАДУ в CU (n × цена), а не по числу вызовов. Ключ может быть
+    'method@caller' (CU_ATTRIBUTION=1) — цену берём по части до '@'."""
     from chain.rpc import CU_COST
-    return CU_COST.get(kv[0], 20) * kv[1]
+    return CU_COST.get(str(kv[0]).split("@", 1)[0], 20) * kv[1]
 
 
 PRECONF_POLL_MIN_GAP = float(os.environ.get("PRECONF_POLL_MIN_GAP_SEC", "0"))
@@ -1563,7 +1564,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             _win = max(1e-9, time.monotonic() - last_stats)
                             for _host, _ms in sorted(_snap.items()):
                                 _cu = rpc_usage_cu({_host: _ms})
-                                _top = sorted(_ms.items(), key=lambda kv: -CU_TOP_KEY(kv))[:4]
+                                _top = sorted(_ms.items(), key=lambda kv: -CU_TOP_KEY(kv))[:6]
                                 log.info("CU %s: %d CU/окно = %.0f CU/s (проекция %.1fM/мес) | %s",
                                          _host, _cu, _cu / _win, _cu / _win * 86400 * 30 / 1e6,
                                          " ".join("%s×%d" % (m, n) for m, n in _top))
