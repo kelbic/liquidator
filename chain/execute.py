@@ -681,6 +681,43 @@ def _prep_to_item_tuple(prep: dict):
             prep["borrower"], int(prep["repaid_shares"]), prep["swap_target"], cd, int(prep["min_profit"]))
 
 
+def gas_floor_of(cfg) -> int:
+    """Лимит-фолбэк (НЕ оценка стоимости). См. config.gas_limit_floor + форк-экзамен 25.07."""
+    return int(getattr(cfg, "gas_limit_floor", 3_000_000) or 3_000_000)
+
+
+def batch_gas_limit(preps: list, cfg) -> int:
+    """Лимит батч-tx: Σ(gas каждой позиции) + 30k×n, ×1.25 (63/64-мина C3c — голодный хвост).
+    ФОЛБЭК = gas_limit_floor, НЕ gas_limit_est: форк 25.07 показал реальный расход 2.2-2.5M на
+    ОДНУ жирную ликвидацию, а prepare_liquidation (блок-луп) поле gas не отдаёт вовсе — с прежним
+    фолбэком 500k батч из 3 китов ушёл бы с лимитом ~2M против нужных ~7M = out-of-gas. Чистая."""
+    floor = gas_floor_of(cfg)
+    return int((sum(int(p.get("gas") or floor) for p in preps) + 30_000 * len(preps)) * 1.25)
+
+
+def clamp_fee_to_balance(gas_limit: int, max_fee: int, tip: int, balance_wei: int,
+                         min_tip_wei: int = 0, reserve_bps: int = 1000):
+    """Резерв под tx = gas_limit × max_fee и он должен влезть в БАЛАНС (иначе узел отбивает
+    'insufficient funds' и выстрел не уходит вовсе). Лимит НЕ режем — это вернуло бы OOG-дыру;
+    режем max_fee/tip: теряем позицию в fee-сорте, но транзакция летит. reserve_bps — подушка
+    на уже висящие в полёте tx. -> (max_fee, tip, ok). ok=False: даже базовая цена не влезает.
+    Чистая (юнит). Мотив: владелец не доливает ETH (25.07) — код обязан жить на текущем балансе."""
+    if balance_wei <= 0 or gas_limit <= 0 or max_fee <= 0:
+        return max_fee, tip, False
+    budget = balance_wei * (10_000 - reserve_bps) // 10_000
+    need = gas_limit * max_fee
+    if need <= budget:
+        return max_fee, tip, True
+    base_part = max(0, max_fee - tip)                  # ~2×basefee из нашей конструкции fee
+    affordable = budget // gas_limit
+    if affordable <= base_part:                        # не хватает даже на базовую цену
+        return max_fee, tip, False
+    new_tip = affordable - base_part
+    if min_tip_wei and new_tip < min_tip_wei:
+        return max_fee, tip, False                     # ниже минимального tip смысла нет
+    return int(affordable), int(new_tip), True
+
+
 def encode_batch_liquidate(preps: list) -> str:
     """ABI-encode Liquidator.batchLiquidate([LiquidationItem...]) из списка prep-словарей, у каждого
     из которых есть сырые компоненты (mp/borrower/repaid_shares/swap_target/swap_calldata/min_profit)."""
@@ -863,7 +900,7 @@ def prepare_liquidation(rpc, cfg, market_id: str, borrower: str, debt_usd: float
 
         min_profit_final = profit_wei * 95 // 100   # revert if realized < 95% of simulated
         cd1 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit_final)
-        return {"ok": True, "calldata": cd1, "net_usd": net_usd,
+        return {"ok": True, "calldata": cd1, "net_usd": net_usd, "gas": gas_floor_of(cfg),
                 "profit_usd": profit_usd, "cost_usd": cost_usd}
     except Exception as e:
         return {"ok": False, "reason": f"error: {type(e).__name__}: {str(e)[:120]}"}
@@ -1015,6 +1052,11 @@ def _send_units_volley(rpc, w3, cfg, units, base_nonce, tip_wei, bcast_urls, log
     signed_units = []                                     # (unit, raw_bytes, hash_hex)
     err_results = []
     send_failed = False
+    try:                                                  # тонкий кошелёк (25.07): владелец не доливает
+        _bal_wei = int(w3.eth.get_balance(acct.address))  # ETH -> резерв limit×maxFee обязан влезать
+    except Exception:
+        _bal_wei = None                                   # не прочитали -> ведём себя как раньше
+    _reserved = 0
     for u, unit in enumerate(units):
         try:
             if len(unit) == 1:                            # сборка txd бит-в-бит со старым циклом
@@ -1024,7 +1066,7 @@ def _send_units_volley(rpc, w3, cfg, units, base_nonce, tip_wei, bcast_urls, log
             else:
                 _preps = [p for _, _, p in unit]
                 _data = encode_batch_liquidate(_preps)
-                _gas = int((sum(p.get("gas", cfg.gas_limit_est) for p in _preps) + 30_000 * len(_preps)) * 1.25)
+                _gas = batch_gas_limit(_preps, cfg)
                 _fee_src = next((p for p in _preps if p.get("max_fee")), None)
                 _mf = _fee_src.get("max_fee") if _fee_src else None
                 _tp = _fee_src.get("tip") if _fee_src else None
@@ -1039,6 +1081,26 @@ def _send_units_volley(rpc, w3, cfg, units, base_nonce, tip_wei, bcast_urls, log
                 t["maxPriorityFeePerGas"] = _dyn_tip
                 t["maxFeePerGas"] = _base_fee * 2 + _dyn_tip
             t["gas"] = _gas if _gas else int(w3.eth.estimate_gas(t) * 12 // 10)
+            if _bal_wei is not None and t.get("maxFeePerGas"):      # тонкий кошелёк: см. clamp_fee_to_balance
+                _mf2, _tp2, _ok = clamp_fee_to_balance(
+                    int(t["gas"]), int(t["maxFeePerGas"]), int(t.get("maxPriorityFeePerGas") or 0),
+                    _bal_wei - _reserved, min_tip_wei=int(tip_wei))
+                if not _ok:
+                    if log:                               # ХВОСТ дропаем, не continue: пропуск юнита
+                        log.warning("volley: резерв %d×%d не влезает в баланс (тонкий кошелёк) at "
+                                    "nonce %d — хвост дропнут (nonce-гэп исключён)",
+                                    int(t["gas"]), int(t["maxFeePerGas"]), base_nonce + u)
+                    for _mid, _b, _p in unit:
+                        err_results.append({"market_id": _mid, "borrower": _b, "sent": False,
+                                            "reason": "insufficient ETH for gas reserve",
+                                            "net_usd": _p["net_usd"]})
+                    send_failed = True
+                    break
+                if _mf2 != int(t["maxFeePerGas"]) and log:
+                    log.warning("SEND fee-кламп по балансу: maxFee %d->%d, tip %d->%d (лимит %d НЕ тронут)",
+                                int(t["maxFeePerGas"]), _mf2, int(t.get("maxPriorityFeePerGas") or 0), _tp2, int(t["gas"]))
+                t["maxFeePerGas"], t["maxPriorityFeePerGas"] = _mf2, _tp2
+                _reserved += int(t["gas"]) * _mf2                   # следующий юнит видит занятое
             signed = acct.sign_transaction(t)
             raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
             signed_units.append((unit, bytes(raw), signed.hash.hex()))
@@ -1169,7 +1231,7 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                     _preps = [p for _, _, p in unit]
                     _data = encode_batch_liquidate(_preps)
                     # 63/64-мина C3c: голодный хвост молча морится -> запас газа обязателен (×1.25)
-                    _gas = int((sum(p.get("gas", cfg.gas_limit_est) for p in _preps) + 30_000 * len(_preps)) * 1.25)
+                    _gas = batch_gas_limit(_preps, cfg)
                     _fee_src = next((p for p in _preps if p.get("max_fee")), None)   # у блок-лупа max_fee нет
                     _mf = _fee_src.get("max_fee") if _fee_src else None
                     _tp = _fee_src.get("tip") if _fee_src else None
