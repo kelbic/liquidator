@@ -49,6 +49,86 @@ def oracle_drift_apr(w3, oracle, bn, days=30):
         return None
 
 
+MARGIN_WARN = float(os.environ.get("RATE_MARGIN_WARN", "0.005"))   # 0.5%/год: запас до смены знака
+STATE_PATH = os.environ.get("FLIP_ETA_STATE", "flip_eta_state.json")
+
+
+def compute_rows(cfg, hf_max=1.05, n=10, days=30):
+    """[{pair, borrower, debt_usd, hf, apr, drift, margin, market_oracle}] — переиспользуемо
+    (дневная сводка зовёт это же). margin = дрейф оракула − APR долга: ОСЬ НАБЛЮДЕНИЯ для
+    rate-класса (ревью 25.07): пока margin>0 цель уходит вверх, смена знака = цель ожила.
+    APR не константа — Morpho IRM адаптивен, за изломом утилизации (~90%) ставка растёт кратно."""
+    rpc = BaseRpc(cfg.rpc_url, cfg.chain_id)
+    w3 = rpc._web3()
+    MORPHO = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
+    bn = w3.eth.block_number
+    by_id = {m.market_id: m for m in load_covered_markets(cfg.covered_markets_path)}
+    snap = json.load(open(cfg.candidates_snapshot_path))
+    cands = []
+    for key, hf in (snap.get("hf_by") or {}).items():
+        mid, b = key.split("|", 1)
+        if hf and hf <= hf_max and mid in by_id:
+            cands.append((snap["debt_by"].get(key, 0.0), mid, b))
+    cands.sort(reverse=True)
+    out, drift_cache = [], {}
+    for debt_usd, mid, b in cands[:n]:
+        m = by_id[mid]
+        m32 = rpc.to_bytes32(mid)
+        try:
+            r = aggregate3(rpc, [(MORPHO, encode_id_to_market_params_call(m32)),
+                                 (MORPHO, encode_market_call(m32)),
+                                 (MORPHO, encode_position_call(m32, b))])
+            loan, coll, oracle, irm, lltv = decode_id_to_market_params(r[0][1])
+            mk = decode_market(r[1][1])
+            bs, col = decode_position(r[2][1])
+            if bs == 0:
+                continue
+            px = decode_price(aggregate3(rpc, [(oracle, encode_price_call())])[0][1])
+            debt = to_assets_up(int(bs), mk[2], mk[3])
+            hf = (col * px // 10 ** 36) * (lltv / 1e18) / debt
+            args = abi_encode(["(address,address,address,address,uint256)",
+                               "(uint128,uint128,uint128,uint128,uint128,uint128)"],
+                              [(loan, coll, oracle, irm, lltv),
+                               (mk[0], mk[1], mk[2], mk[3], mk[4], mk[5])])
+            apr = abi_decode(["uint256"], w3.eth.call(
+                {"to": w3.to_checksum_address(irm), "data": IRM_SEL + args}))[0] / 1e18 * 365 * 86400
+        except Exception:
+            continue
+        if oracle not in drift_cache:
+            drift_cache[oracle] = oracle_drift_apr(w3, oracle, bn, days)
+        drift = drift_cache[oracle]
+        out.append({"pair": "%s/%s" % (m.collateral_token, m.loan_token), "borrower": b,
+                    "debt_usd": debt_usd, "hf": hf, "apr": apr, "drift": drift,
+                    "margin": (drift - apr) if drift is not None else None,
+                    "market_oracle": drift is not None and abs(drift) > 0.10,
+                    "key": "%s|%s" % (mid[:10], b[:8])})
+    return out
+
+
+def margin_changes(rows, path=STATE_PATH):
+    """Сравнить margin с прошлым прогоном: [(key, pair, было, стало, тип)] — СМЕНА ЗНАКА или
+    падение запаса ниже MARGIN_WARN. Пишет новое состояние. Это и есть вотчер класса."""
+    try:
+        prev = json.load(open(path))
+    except Exception:
+        prev = {}
+    changes, cur = [], {}
+    for r in rows:
+        if r["market_oracle"] or r["margin"] is None:
+            continue                                    # ось имеет смысл только для rate-оракулов
+        cur[r["key"]] = r["margin"]
+        was = prev.get(r["key"])
+        if was is not None and was > 0 >= r["margin"]:
+            changes.append((r["key"], r["pair"], was, r["margin"], "ЗНАК СМЕНИЛСЯ — цель ожила"))
+        elif r["margin"] <= MARGIN_WARN:
+            changes.append((r["key"], r["pair"], was, r["margin"], "запас < %.2f%%/год" % (MARGIN_WARN * 100)))
+    try:
+        json.dump(cur, open(path, "w"))
+    except Exception:
+        pass
+    return changes
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hf", type=float, default=1.05)

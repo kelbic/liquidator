@@ -77,6 +77,33 @@ try:
 except Exception as e:
     lines.append(f"рыночный блок упал: {type(e).__name__}: {str(e)[:80]}")
 
+# ---- ОСЬ НАБЛЮДЕНИЯ rate-класса (ревью 25.07): не «HF близко», а РАЗНИЦА СКОРОСТЕЙ ----
+# margin = дрейф оракула − APR долга. margin>0 => цель уходит вверх (пег-ножи «в 0.4%» бессмертны);
+# смена знака => класс ожил. APR адаптивен (Morpho IRM), за изломом утилизации растёт кратно —
+# поэтому «уходит вверх» это УСЛОВИЕ под наблюдением, а не приговор.
+try:
+    from analysis.flip_eta import compute_rows, margin_changes
+    _rows = compute_rows(cfg, hf_max=1.05, n=12)
+    _rate = [r for r in _rows if not r["market_oracle"] and r["margin"] is not None]
+    if _rate:
+        _rate.sort(key=lambda r: r["margin"])
+        lines.append("— ось rate-класса (дрейф−APR, + = уходит вверх):")
+        for r in _rate[:5]:
+            lines.append("   %-15s $%-9.0f HF=%.4f  APR %.2f%%  фид %+.2f%%  запас %+.2f%%/год"
+                         % (r["pair"], r["debt_usd"], r["hf"], r["apr"] * 100,
+                            (r["drift"] or 0) * 100, r["margin"] * 100))
+    _ch = margin_changes(_rows)
+    if _ch:
+        lines.append("⚠️ RATE-КЛАСС: " + "; ".join("%s %s (было %+.2f%% -> %+.2f%%)"
+                     % (p_, why, (was or 0) * 100, now * 100) for _k, p_, was, now, why in _ch))
+    _mkt = [r for r in _rows if r["market_oracle"]]
+    if _mkt:
+        lines.append("— рыночно-оракульные цели (там и живёт SPEC-FIRE): " +
+                     ", ".join("%s $%.0fk HF=%.3f" % (r["pair"], r["debt_usd"] / 1e3, r["hf"])
+                               for r in _mkt[:4]))
+except Exception as e:
+    lines.append(f"ось rate-класса упала: {type(e).__name__}: {str(e)[:70]}")
+
 msg = "\n".join(lines)[:3900]
 print(msg)
 ok = Alerter(cfg.tg_bot_token, cfg.tg_admin_id, antiflood_sec=0, tag=cfg.bot_tag).send(msg, key=f"daily:{dt.date.today()}")
