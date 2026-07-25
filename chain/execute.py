@@ -265,6 +265,10 @@ def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=N
                     or _CANARY_GAS_USD >= getattr(cfg, "canary_max_gas_usd", 25.0)
                     or _now - _CANARY_LAST_TS < getattr(cfg, "canary_min_interval_sec", 120.0)):
                 return None
+        _bot_r = account_for(rpc._web3(), cfg.wallet_key).address   # патронный резерв (см. выше)
+        if not probe_allowed_by_reserve(cached_balance_wei(rpc, _bot_r),
+                                        21000 * int(cfg.tip_gwei * 1e9) * 3):
+            return None
         w3 = rpc._web3()
         bot = account_for(w3, cfg.wallet_key).address
         base_nonce = _LOCAL_NONCE.get(bot)
@@ -359,6 +363,14 @@ def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
                     or _now - _SPECFIRE_LAST_TS < _SPECFIRE_MIN_INTERVAL
                     or _INFLIGHT > 0):
                 return None
+        # патронный резерв: расходники не грызут выстрел (см. BULLET_RESERVE_WEI)
+        _bot_addr = account_for(rpc._web3(), cfg.wallet_key).address
+        _cost = int(gas) * int(max_fee if max_fee else int(cfg.tip_gwei * 1e9) * 3)
+        if not probe_allowed_by_reserve(cached_balance_wei(rpc, _bot_addr), _cost):
+            if log:
+                log.info("SPECFIRE проба молчит: баланс не покрывает патрон %.3f ETH + пробу",
+                         BULLET_RESERVE_WEI / 1e18)
+            return None
         w3 = rpc._web3()
         bot = account_for(w3, cfg.wallet_key).address
         base_nonce = _LOCAL_NONCE.get(bot)
@@ -679,6 +691,38 @@ def _prep_to_item_tuple(prep: dict):
     cd = bytes.fromhex(cd[2:] if cd.startswith("0x") else cd) if isinstance(cd, str) else bytes(cd)
     return ((mp["loanToken"], mp["collateralToken"], mp["oracle"], mp["irm"], int(mp["lltv"])),
             prep["borrower"], int(prep["repaid_shares"]), prep["swap_target"], cd, int(prep["min_profit"]))
+
+
+# ---- ПАТРОННЫЙ РЕЗЕРВ (25.07, баланс долит до 0.1938 ETH) ----
+# Один полный выстрел на каскадном tip стоит РЕЗЕРВА limit×maxFee ≈ 4M × 30 gwei = 0.12 ETH.
+# Расходники (канареечные/спек-пробы по 0.05 gwei) не должны его отгрызть: пока баланс не
+# покрывает патрон + стоимость пробы, ПРОБЫ МОЛЧАТ. Боевой путь резервом НЕ гейтится — он и есть
+# патрон. Баланс кэшируем (19 CU/чтение, квота дорога): пробы редки, 60с свежести достаточно.
+BULLET_RESERVE_WEI = int(float(os.environ.get("GAS_BULLET_RESERVE_ETH", "0.12")) * 10 ** 18)
+_BAL_CACHE = {"wei": None, "ts": 0.0}
+_BAL_TTL = float(os.environ.get("GAS_BALANCE_TTL_SEC", "60"))
+
+
+def cached_balance_wei(rpc, address: str, now=None):
+    """Баланс с TTL-кэшем. None = прочитать не удалось (вызыватель обязан fail-open)."""
+    t = time.monotonic() if now is None else now
+    if _BAL_CACHE["wei"] is not None and t - _BAL_CACHE["ts"] < _BAL_TTL:
+        return _BAL_CACHE["wei"]
+    try:
+        w = int(rpc._web3().eth.get_balance(address))
+    except Exception:
+        return _BAL_CACHE["wei"]                  # старое значение лучше слепоты
+    _BAL_CACHE["wei"], _BAL_CACHE["ts"] = w, t
+    return w
+
+
+def probe_allowed_by_reserve(balance_wei, probe_cost_wei: int, reserve_wei=None) -> bool:
+    """Чистая: можно ли тратить на ПРОБУ, не залезая в патронный резерв. Неизвестный баланс
+    (None) -> True (fail-open: слепота не должна глушить измерительный слой)."""
+    if balance_wei is None:
+        return True
+    r = BULLET_RESERVE_WEI if reserve_wei is None else int(reserve_wei)
+    return int(balance_wei) - int(probe_cost_wei) >= r
 
 
 def gas_floor_of(cfg) -> int:

@@ -48,4 +48,15 @@ mf, tip, ok = clamp_fee_to_balance(3_000_000, 31 * GW, 30 * GW, 10 ** 16, min_ti
 assert not ok, (mf, tip, ok)
 print("UNIT_OK: tip ниже min_tip -> отказ, а не бессмысленный выстрел")
 
-print("=== ВСЕ GAS/BALANCE ЮНИТЫ ПРОШЛИ ===")
+# 7) 25.07 патронный резерв: расходники не грызут выстрел (баланс долит до 0.1938)
+from chain.execute import probe_allowed_by_reserve, BULLET_RESERVE_WEI
+_probe = 4_000_000 * int(0.15 * GW)                 # проба: лимит 4M, maxFee ~0.15 gwei
+assert BULLET_RESERVE_WEI == int(0.12 * 10 ** 18), BULLET_RESERVE_WEI
+assert probe_allowed_by_reserve(int(0.193838 * 10 ** 18), _probe) is True
+assert probe_allowed_by_reserve(int(0.1205 * 10 ** 18), _probe) is False
+assert probe_allowed_by_reserve(None, _probe) is True, "слепота -> fail-open"
+_bullet = 4_000_000 * 30 * GW                       # патрон 30 gwei влезает в 0.1938 с подушкой
+assert _bullet <= int(0.193838 * 10 ** 18) * 9 // 10
+print("UNIT_OK: патрон %.2f ETH защищён от расходников; на 0.12 пробы молчат" % (_bullet / 1e18))
+
+print("=== ВСЕ GAS/BALANCE ЮНИТЫ ПРОШЛИ (вкл. патронный резерв) ===")
