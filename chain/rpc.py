@@ -2,6 +2,53 @@
 the runtime-import check (see docs/WORKFLOW.md). Phase 1 reads only."""
 from __future__ import annotations
 
+import threading
+
+# ---- учёт CU (25.07: Alchemy №2 сжёг 7.1M/30M за ~2 суток => ~8 дней до нуля; пик 558 CU/s
+# против лимита 500). Считаем ВЫЗОВЫ ПО МЕТОДАМ на каждом URL, чтобы резать по факту, а не на
+# ощупь. Веса — прайс Alchemy (CU/вызов); неизвестный метод = 20 (средняя). Только счётчики,
+# сетевого поведения не меняем. Снимок: rpc_usage_take() (в hot stats раз в окно).
+CU_COST = {"eth_call": 26, "eth_getBalance": 19, "eth_blockNumber": 10, "eth_chainId": 0,
+           "eth_getBlockByNumber": 16, "eth_getBlockByHash": 21, "eth_getTransactionReceipt": 15,
+           "eth_getTransactionByHash": 17, "eth_getTransactionCount": 26, "eth_estimateGas": 87,
+           "eth_getLogs": 75, "eth_sendRawTransaction": 250, "eth_feeHistory": 10,
+           "eth_maxPriorityFeePerGas": 10, "eth_getCode": 19, "eth_getStorageAt": 17,
+           "eth_gasPrice": 19, "eth_syncing": 10, "net_version": 0, "web3_clientVersion": 0}
+_USAGE: dict = {}
+_USAGE_LOCK = threading.Lock()
+
+
+def rpc_usage_note(method: str, url: str = ""):
+    host = (url.split("//")[-1].split("/")[0] or "?") if url else "?"
+    with _USAGE_LOCK:
+        d = _USAGE.setdefault(host, {})
+        d[method] = d.get(method, 0) + 1
+
+
+def rpc_usage_take():
+    """{host: {method: n}} за окно + сброс. Пустой словарь = вызовов не было."""
+    global _USAGE
+    with _USAGE_LOCK:
+        out, _USAGE = _USAGE, {}
+        return out
+
+
+def rpc_usage_cu(snapshot: dict) -> int:
+    return sum(CU_COST.get(m, 20) * n for d in snapshot.values() for m, n in d.items())
+
+
+def _counting_middleware(url: str):
+    """web3 v6/v7-совместимая обёртка провайдера: считает методы, ничего не меняет."""
+    def factory(make_request, _w3):
+        def middleware(method, params):
+            try:
+                rpc_usage_note(str(method), url)
+            except Exception:
+                pass
+            return make_request(method, params)
+        return middleware
+    return factory
+
 
 class BaseRpc:
     def __init__(self, rpc_url: str, chain_id: int, request_timeout: float | None = None):
@@ -20,6 +67,10 @@ class BaseRpc:
             kw = {"timeout": self.request_timeout} if self.request_timeout else None
             self._w3 = Web3(Web3.HTTPProvider(self.rpc_url, request_kwargs=kw) if kw
                             else Web3.HTTPProvider(self.rpc_url))
+            try:                                  # учёт CU: обёртка провайдера, поведение не меняет
+                self._w3.middleware_onion.add(_counting_middleware(self.rpc_url), name="cu_count")
+            except Exception:
+                pass                              # версия web3 без onion -> просто без учёта
         return self._w3
 
     def contract(self, address: str, abi: list):
