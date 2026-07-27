@@ -41,6 +41,11 @@ MEGA_MARKETS = frozenset({
     "0x9103c3b4e834476c9a62ea009ba2c884ee42e94e6e314a26f04d312434191836",   # cbBTC/USDC $1.23B
 })
 MEGA_FETCH_MAX_PAGES = 3   # top-3000 по долгу; при упоре в кап пишется предупреждение в лог
+# Жёсткий предел пагинации Morpho API: skip<=10000. 27.07 добавление WETH/USDC ($70.2M, тысячи
+# заёмщиков) увело пагинацию за него -> BAD_USER_INPUT -> исключение УРОНИЛО candidate refresh
+# целиком (набор жил только на warm-start-снапшоте). Позиции идут по borrowShares desc, т.е.
+# усечение режет САМЫЕ МЕЛКИЕ долги — терпимо; падение refresh'а — нет.
+API_SKIP_MAX = 10000
 
 # HF-ДОПОЛНЕНИЕ к bounded-fetch (07-10, measured-переоткрытие по образцу cbBTC): серверный
 # where healthFactor_lte РАБОТАЕТ (CBBTC_PLAN пробовал только orderBy: HealthFactor -> 400).
@@ -191,6 +196,10 @@ def _fetch_borrower_positions(keys: list[str], api_url: str, page: int = 1000,
     for _ in range(max_pages):
         if time.monotonic() - _t0 > cycle_deadline:
             break                               # budget exhausted -> return partial (biggest debts first)
+        if skip > API_SKIP_MAX:                 # 27.07: жёсткий предел Morpho API (skip<=10000).
+            log.warning("borrower-positions: упёрлись в API-кап skip>%d (набор УСЕЧЁН по %d строк; "
+                        "добавлен крупный рынок?) — дальше идут мелкие долги", API_SKIP_MAX, skip)
+            break                               # иначе BAD_USER_INPUT рушил ВЕСЬ candidate refresh
         batch = _query_page(keys, skip, page, api_url, timeout)
         for it in batch:
             if _int((it.get("state") or {}).get("borrowShares")) == 0:
