@@ -1425,3 +1425,20 @@ nonce-кэш; SEND-3 секвенсер; warm-start; inflight-гейт ожил;
 - **Откаты:** `.bak-*` на VPS / `git revert <hash>`.
 - **Если нода ребутнётся:** `systemctl is-enabled liquidator-bot` (AEZA-инцидент 4ч изоляции пережит).
 - Workflow-доки: `CLAUDE.md`, `WORKFLOW.md`, `STATE.md` (этот файл — заливается вручную).
+
+## 27.07 ~17:30 IOWAIT-ФИКС: флап flashblocks-WS = наш же fsync-шторм (подготовлен, ЖДЁТ ТИХОГО ОКНА)
+Алерт «block-loop: 12 reconnects/30m» разобран до конца. Дифф-проба с Вены: эндпоинт
+mainnet.flashblocks.base.org ЗДОРОВ (7 мин, 2000+ сообщений, 0 обрывов), рвёт только Charlotte.
+Причина на Charlotte (1 ядро): 90-97% iowait — бот сам написал 75.7ГБ за 5ч44м (~3.7МБ/с),
+источник = store.upsert_position на КАЖДУЮ позицию block-assess (connect+PRAGMA+commit/fsync+close
+× ~98 позиций × блок/2с ≈ 50 fsync/с). Recv-цикл flashblocks голодает -> сервер закрывает WS как
+slow-consumer. Ирония: этот же db уже ронял WS в каскад раньше (комментарий в store._conn про
+database is locked) — WAL вылечил локи, но поток commit'ов остался.
+ФИКС (закоммичен, НЕ задеплоен — рынок кипел): (1) upsert_positions батчем, 1 транзакция на
+assess-проход вместо ~98; (2) PRAGMA synchronous=NORMAL (fsync только на чекпоинте — телеметрия,
+не деньги); (3) порядок в process_candidates: _execute_actionable ПЕРЕД телеметрией (upsert+sim-логи
+после денег — при каскаде запись не стоит в пути залпа). Юниты test_store_batch.py 5/5.
+ДЕПЛОЙ: рестарт Charlotte в тихое окно (нет армов/транзитов несколько минут) вместе с бэклогом
+(du-пересчёт при флипе; форк-реплей panic-underflow cbADA блока 49189341).
+Пока не задеплоено: флап продолжается (~5/10мин в горячие часы), хеджи держат (px_free/poll_lat
+чистые), риск ~2-3% времени с worst-case +0.4с на реакцию.

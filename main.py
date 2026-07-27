@@ -201,6 +201,8 @@ def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, 
             except Exception:
                 pass                          # основной тоже отказал -> работаем с неполным набором
     actionable = []
+    _pos_rows = []                                   # 27.07: батч-апсерт после цикла (1 commit, не ~98)
+    _sim_rows = []                                   # 27.07: sim-телеметрия тоже после диспатча
 
     for mid, borrower, hr in assessed:
         mkt = by_id.get(mid)
@@ -210,22 +212,25 @@ def process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg, 
             hf_cache[(mid, borrower)] = hr.hf       # remember reading -> drives the hot set
         summary["confirmed"] += 1
         summary["min_hf"] = hr.hf if summary["min_hf"] is None else min(summary["min_hf"], hr.hf)
-        store.upsert_position(mid, borrower, hr.hf)
+        _pos_rows.append((mid, borrower, hr.hf))
         if not hr.liquidatable:
             continue
         summary["liquidatable"] += 1
         sr = estimate(hr, debt_by.get((mid, borrower), 0.0), mkt.expected_slippage,
                       GAS_USD_EST, TIP_USD_EST, cfg.min_profit_usd)        # analytic net, pure
-        store.log_simulation(market_id=mid, borrower=borrower,
-                             repaid_usd=sr.repaid_usd, seized_usd=sr.seized_usd,
-                             bonus_usd=sr.seized_usd - sr.repaid_usd, gas_usd=sr.gas_usd,
-                             net_usd=sr.net_usd, would_submit=int(sr.profitable),
-                             reverted=int(sr.reverted), note=sr.note)
+        _sim_rows.append(dict(market_id=mid, borrower=borrower,
+                              repaid_usd=sr.repaid_usd, seized_usd=sr.seized_usd,
+                              bonus_usd=sr.seized_usd - sr.repaid_usd, gas_usd=sr.gas_usd,
+                              net_usd=sr.net_usd, would_submit=int(sr.profitable),
+                              reverted=int(sr.reverted), note=sr.note))   # 27.07: пишем ПОСЛЕ денег
         if not sr.profitable:
             continue
         summary["profitable"] += 1
         actionable.append((mid, borrower, hr, sr))   # collect -> batch-dispatch after the loop
     _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, guard, alerter, log)
+    store.upsert_positions(_pos_rows)                # телеметрия одной транзакцией ПОСЛЕ денег (не в их пути)
+    for _kw in _sim_rows:
+        store.log_simulation(**_kw)
     return summary
 
 

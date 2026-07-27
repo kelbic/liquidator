@@ -54,17 +54,31 @@ class Store:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA journal_mode=WAL")
+        # 27.07: NORMAL (fsync только на чекпоинте, не на каждом commit). Дефолтный FULL при
+        # ~50 commit/с (upsert на КАЖДУЮ позицию block-assess) давал 90%+ iowait на 1-ядерной
+        # Charlotte -> recv-цикл flashblocks голодал -> сервер рвал WS как slow-consumer
+        # (12 реконнектов/30мин, дифф-проба с Вены: эндпоинт здоров). Телеметрия переживёт
+        # потерю хвоста при падении ОС; целостность БД NORMAL в WAL не трогает.
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def upsert_position(self, market_id: str, borrower: str, hf: float):
+        self.upsert_positions([(market_id, borrower, hf)])
+
+    def upsert_positions(self, rows):
+        """Батч: ОДНА транзакция/commit на весь assess-проход вместо connect+fsync на позицию.
+        95-98 позиций × блок каждые 2с в горячем рынке = ~50 fsync/с — источник iowait-шторма
+        27.07 (см. комментарий в _conn). rows: [(market_id, borrower, hf), ...]."""
+        if not rows:
+            return
         now = int(time.time())
         with closing(self._conn()) as c:
-            c.execute(
+            c.executemany(
                 """INSERT INTO positions(market_id,borrower,first_seen,last_hf,last_seen)
                    VALUES(?,?,?,?,?)
                    ON CONFLICT(market_id,borrower)
                    DO UPDATE SET last_hf=excluded.last_hf, last_seen=excluded.last_seen""",
-                (market_id, borrower, now, hf, now))
+                [(m, b, now, hf, now) for (m, b, hf) in rows])
             c.commit()
 
     def _insert(self, table: str, kw: dict):
