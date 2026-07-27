@@ -75,4 +75,14 @@ assert direct_swap(_CBDOGE, _UNIV3_USDC, 135_000 * 10**8, LIQ, LIQ, repaid_asset
 assert direct_swap(_CBADA, _UNIV3_USDC, 120_000 * 10**6, LIQ, LIQ, repaid_assets=1) is None
 print("UNIT_OK: капы cbDOGE/cbADA — под обрывом директ, сверх — Kyber")
 
-print("=== ВСЕ ROUTE-CAP ЮНИТЫ ПРОШЛИ ===")
+# 9) 27.07 WETH->USDC (новый рынок $70.2M): fee=3000, НЕ 500 — замер глубины опрокинул шаблон
+from chain.execute import _UNIV3_WETH as _W
+_r = _SWAP_ROUTES[(_W, _UNIV3_USDC)]
+assert _r["router"] == UNIV3_SWAP_ROUTER and _r["max_in"] == 8000 * 10**18
+assert _r["path"][20:23] == (3000).to_bytes(3, "big"), "должен быть тир 3000 (замер: 500 в 25× тоньше)"
+assert _W in RC, "WETH обязан попасть в fast-lane/кэш слоя-2 нового рынка"
+assert direct_swap(_W, _UNIV3_USDC, 600 * 10**18, LIQ, LIQ, repaid_assets=1) is not None
+assert direct_swap(_W, _UNIV3_USDC, 8001 * 10**18, LIQ, LIQ, repaid_assets=1) is None
+print("UNIT_OK: WETH->USDC fee=3000 кап 8000 ETH; крупнейшая позиция рынка ~545 ETH (запас 15×)")
+
+print("=== ВСЕ ROUTE-CAP ЮНИТЫ ПРОШЛИ (вкл. WETH/USDC) ===")

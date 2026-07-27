@@ -602,6 +602,13 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     (_CBETH, _UNIV3_WETH): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_CBETH, 1, _UNIV3_WETH),
                             "max_in": 300 * 10**18},
+    # WETH/USDC 27.07 (новый рынок $70.2M, 199 ликвидаций/90д): ЗАМЕР ОПРОКИНУЛ ОЖИДАНИЕ —
+    # канонический fee=500 ТОНКИЙ (1200 ETH imp 5.25% > бонуса 4.38%), а fee=3000 глубокий:
+    # 1200 ETH imp 0.20%, 8000 ETH ($15.7M) 1.05%, 16000 ($31M) 2.08%. Крупнейшие позиции рынка
+    # ~545 ETH ⇒ запас 15×. Кап 8000 ETH. Скопировать паттерн cbBTC (fee=500) было бы ошибкой.
+    (_UNIV3_WETH, _UNIV3_USDC): {"router": UNIV3_SWAP_ROUTER, "style": "02",
+                                 "path": _pack_path(_UNIV3_WETH, 3000, _UNIV3_USDC),
+                                 "max_in": 8000 * 10**18},
     # cbDOGE/cbADA -> USDC: полные Slipstream-пути (ре-верификация 24.07, см. коммент выше).
     # max_in (25.07): пул cbDOGE чист до 90k ток. (imp 0.9%), обрыв на 135k (out каппится $8.2k);
     # cbADA чист до 60k (imp 2.3%), обрыв на 120k. Сверх капа -> Kyber. NB: Kyber на ките $80k
