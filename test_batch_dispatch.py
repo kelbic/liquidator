@@ -51,7 +51,7 @@ class _FakeRpc:
 class _Cfg:
     wallet_key = TESTKEY
     liquidator_address = LIQ
-    tip_gwei = 6.0
+    tip_gwei = 0.05   # боевой с 23.07; на старом 6.0 EV-отсечка (27.07) справедливо режет net $4-5
     gas_limit_est = 500000
     eth_price_usd = 1900.0
     sequencer_rpc = "off"

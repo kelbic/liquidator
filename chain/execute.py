@@ -761,6 +761,77 @@ def batch_gas_limit(preps: list, cfg) -> int:
     return int((sum(int(p.get("gas") or floor) for p in preps) + 30_000 * len(preps)) * 1.25)
 
 
+def tip_ladder_wei(cfg) -> list:
+    """Лестница tip-ярусов (base, mid, big) в wei, по убыванию. Чистая."""
+    return sorted({int(float(cfg.tip_gwei) * 1e9),
+                   int(float(getattr(cfg, "tip_mid_gwei", 2.0)) * 1e9),
+                   int(float(getattr(cfg, "tip_big_gwei", 30.0)) * 1e9)}, reverse=True)
+
+
+def marginal_item_cost_usd(prep, cfg, tip_wei: int) -> float:
+    """Маржинальная ЦЕНА добавления позиции в батч: её вклад в batch_gas_limit × tip. basefee
+    сознательно не в формуле — на Base он мгвеи против ярусов 0.05-30 gwei и покрыт запасом
+    batch_ev_margin. gas-фолбэк = floor (пере-, не недо-оценка: реальная пылинка ~0.5-1M). Чистая."""
+    marg_gas = (int(prep.get("gas") or gas_floor_of(cfg)) + 30_000) * 1.25
+    return marg_gas * tip_wei / 1e18 * float(cfg.eth_price_usd)
+
+
+def assign_tier(prep, cfg, base_tip_wei: int, margin: float):
+    """EV-ярус позиции: идём от её собственного tip ВНИЗ по лестнице до первого яруса, где
+    net >= margin × маржинальный газ. (None, cost) = не тянет даже базовый (EV-дроп). Чистая."""
+    own = int(prep.get("tip") or base_tip_wei)
+    net = float(prep.get("net_usd") or 0.0)
+    for t in [c for c in sorted(set(tip_ladder_wei(cfg) + [own]), reverse=True) if c <= own]:
+        cost = marginal_item_cost_usd(prep, cfg, t)
+        if net >= margin * cost:
+            return t, cost
+    return None, marginal_item_cost_usd(prep, cfg, base_tip_wei)
+
+
+def assemble_units(deduped, cfg, max_inflight: int, log=None):
+    """Тир-чистые юниты + EV-отсечка (27.07 «пылевой догруз», из разбора каскадов 06.25):
+    (1) юнит НЕ смешивает tip-ярусы: батч платит fee своего жирнейшего члена, и пылинка в юните
+        кита ехала бы на tip 30 → маржинальный газ ~$200+ против приза $10-20 (глубокий минус);
+    (2) позиция, чей net не тянет свой ярус (margin × маржинальный газ), ДЕМОТИРУЕТСЯ вниз по
+        лестнице до проходного (fee переписывается: max_fee − old_tip + new_tip);
+    (3) не тянет даже base — skip 'ev-cutoff' (при текущем конфиге не срабатывает: min_profit $5
+        выше порога ~$0.9; это защита от будущей смены tip/цен, не новый гейт);
+    (4) юниты уходят дорогим ярусом вперёд (нонс = позиция в блоке): киты гонятся первыми,
+        пыле-батчи хвостом на tip 0.05 — пыль скорости не требует (41% пыли поле берёт вообще
+        без транзита в блоке). Внутри яруса — net desc, чанки по batch_max_items (для чисто
+        базового входа блок-лупа порядок бит-в-бит со старой сборкой).
+    Возвращает (units[:max_inflight], dropped — skip-строки для results). Чистая (юниты)."""
+    base_tip = int(float(cfg.tip_gwei) * 1e9)
+    margin = float(getattr(cfg, "batch_ev_margin", 2.0))
+    bmax = max(1, int(getattr(cfg, "batch_max_items", 5)))
+    tiers, dropped = {}, []
+    for mid, b, prep in deduped:
+        t, cost = assign_tier(prep, cfg, base_tip, margin)
+        net = float(prep.get("net_usd") or 0.0)
+        if t is None:
+            dropped.append({"market_id": mid, "borrower": b, "sent": False,
+                            "reason": f"ev-cutoff: net ${net:.2f} < {margin:g}x газ ${cost:.2f} @base-tip",
+                            "net_usd": net})
+            if log:
+                log.info("batch-tier: EV-дроп %s/%s net$%.2f < %gx маржинальный газ $%.2f",
+                         mid[:10], b[:10], net, margin, cost)
+            continue
+        own = int(prep.get("tip") or base_tip)
+        if t != own and prep.get("max_fee"):
+            prep = dict(prep)                                 # копия: prep расшарен с вызывающим
+            prep["max_fee"] = max(t, int(prep["max_fee"]) - own + t)
+            prep["tip"] = t
+            if log:
+                log.info("batch-tier: демоция %s/%s net$%.2f tip %.3g→%.3g gwei (свой ярус EV не отбит)",
+                         mid[:10], b[:10], net, own / 1e9, t / 1e9)
+        tiers.setdefault(t, []).append((mid, b, prep))
+    units = []
+    for t in sorted(tiers, reverse=True):
+        rows = sorted(tiers[t], key=lambda r: r[2].get("net_usd", 0.0), reverse=True)
+        units += [rows[i:i + bmax] for i in range(0, len(rows), bmax)]
+    return units[:max_inflight], dropped
+
+
 def clamp_fee_to_balance(gas_limit: int, max_fee: int, tip: int, balance_wei: int,
                          min_tip_wei: int = 0, reserve_bps: int = 1000):
     """Резерв под tx = gas_limit × max_fee и он должен влезть в БАЛАНС (иначе узел отбивает
@@ -1264,13 +1335,13 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
         if base_nonce is None:                               # кэше/после инвалидации (см. инварианты у _LOCAL_NONCE)
             base_nonce = _pending_nonce(w3, bot)
         tip = int(cfg.tip_gwei * 1e9)
-        # ЮНИТЫ: батч ON и >1 жертвы -> группы по batch_max_items (сорт по net desc, ПОСЛЕ дедупа —
-        # иначе fee-источник может быть выкинут); хвост = следующими tx в пределах max_inflight. Иначе
-        # каждая жертва = свой юнит (путь бит-в-бит старый). Юнит из 1 item шлётся ОДИНОЧНЫМ вызовом.
+        # ЮНИТЫ: батч ON и >1 жертвы -> тир-чистая сборка assemble_units (27.07 «пылевой догруз»):
+        # ярусы по tip не смешиваются в юните (батч платит fee жирнейшего), EV-демоция вниз по
+        # лестнице, киты первыми нонсами, пыле-батчи хвостом; хвост за max_inflight = deferred.
+        # Иначе каждая жертва = свой юнит (путь бит-в-бит старый).
         if getattr(cfg, "batch_liquidate", False) and len(_deduped) > 1:
-            _sorted = sorted(_deduped, key=lambda r: r[2].get("net_usd", 0.0), reverse=True)
-            _bmax = max(1, int(getattr(cfg, "batch_max_items", 5)))
-            units = [_sorted[i:i + _bmax] for i in range(0, len(_sorted), _bmax)][:max_inflight]
+            units, _ev_dropped = assemble_units(_deduped, cfg, max_inflight, log=log)
+            results.extend(_ev_dropped)
         else:
             units = [[row] for row in _deduped[:max_inflight]]
 
