@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import threading
 import time
 
@@ -29,7 +30,7 @@ log = logging.getLogger("liq.spec_fire_live")
 
 SPEC_FIRE_MIN_REPAID_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_USD", "500000"))
 SPEC_FIRE_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_INTERVAL_SEC", "0.7"))
-SPEC_FIRE_MAX_PROBES_WINDOW = int(os.environ.get("SPEC_FIRE_MAX_PROBES_WINDOW", "10"))
+SPEC_FIRE_MAX_PROBES_WINDOW = int(os.environ.get("SPEC_FIRE_MAX_PROBES_WINDOW", "24"))
 SPEC_FIRE_THRESHOLD = float(os.environ.get("SPEC_FIRE_THRESHOLD", "1.0"))     # ×dev
 # Predicted-HF гейт (24.07, ревью + live-данные): цена на транзите ~= текущий Binance mid,
 # значит проба имеет смысл ТОЛЬКО если этот транзит способен флипнуть цель:
@@ -49,7 +50,15 @@ SPEC_FIRE_ARM_MAX_DIST = float(os.environ.get("SPEC_FIRE_ARM_MAX_DIST", "0.03"))
 # BURST проб быстро (страховка от мгновенного/heartbeat-транзита), дальше медленно — кап 10
 # растягивается на ~0.7+8×3.5 ~= 29с, накрывая замеренный лаг. Тюнить по новым транзитам.
 SPEC_FIRE_BURST_PROBES = int(os.environ.get("SPEC_FIRE_BURST_PROBES", "2"))
-SPEC_FIRE_SLOW_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_SLOW_INTERVAL_SEC", "3.5"))
+# ХВОСТ 3.5 -> 2.0с и кап 10 -> 24 (27.07, shadow-датасет 871 арм/462 транзита): проба полезна
+# ровно в БЛОКЕ транзита, значит ценность = доля покрытых блоков в зоне плотности. Замер
+# «первая проба -> транзит» (живые окна): медиана 31с, 6-213с; окна с жиром: мед 40 p75 64с.
+# 24×2.0с = ~45с покрытия ОДНОЙ пробой на КАЖДЫЙ блок (было 10×3.5 = 29с и один выстрел на
+# ~1.75 блока). Цена $0.29/окно против $0.12 — суточный бакет $10 не замечает (7 окон/19д).
+SPEC_FIRE_SLOW_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_SLOW_INTERVAL_SEC", "2.0"))
+# ДЖИТТЕР хвоста: ровное расписание читается конкурентом как подпись слоя (тот же мотив, что
+# у WIN-паузы). ±0.3с ломает периодичность почти бесплатно — покрытие блоков не страдает.
+SPEC_FIRE_TAIL_JITTER_SEC = float(os.environ.get("SPEC_FIRE_TAIL_JITTER_SEC", "0.3"))
 # Пауза после WIN (25.07, ревью-фингерпринт): серия «пробы -> приз» ончейн читается конкурентом
 # как учебник нашего слоя. После взятого приза окна не армятся COOLDOWN сек — паттерн рвётся,
 # а сам приз уже в кармане (реактивный путь паузой НЕ трогаем, он главный). 0 = выключено.
@@ -215,8 +224,11 @@ class SpecFireLive:
                 pass
             hot = (r is not None and ((direction == "down" and r <= -thr)
                                       or (direction == "up" and r >= thr)))
-            iv = (SPEC_FIRE_INTERVAL_SEC if probes < SPEC_FIRE_BURST_PROBES
-                  else SPEC_FIRE_SLOW_INTERVAL_SEC)
+            if probes < SPEC_FIRE_BURST_PROBES:
+                iv = SPEC_FIRE_INTERVAL_SEC
+            else:                                  # хвост с джиттером (см. SPEC_FIRE_TAIL_JITTER_SEC)
+                _j = SPEC_FIRE_TAIL_JITTER_SEC
+                iv = max(0.3, SPEC_FIRE_SLOW_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
             if hot and self._now() - last_fire >= iv:
                 reach = abs(r) + SPEC_FIRE_DIST_MARGIN_DEVS * self.dev_by.get(feed, 0.005)
                 tgt, hold_dist = self._top_fat(feed, direction, max_dist=reach)

@@ -209,4 +209,34 @@ assert ex.specfire_gas_today() == 0.0, "смена UTC-суток обязана
 ex._SPECFIRE_GAS_USD = 0.0
 print("UNIT_OK: суточный сброс бакета + specfire_gas_today для общего kill-switch")
 
-print("=== ВСЕ SPEC-FIRE-LIVE ЮНИТЫ ПРОШЛИ ===")
+# 10) КАДЕНС ПО ДАТАСЕТУ (27.07, 871 арм/462 транзита): кап 24, хвост 2.0с ±джиттер 0.3
+assert sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW == 24, sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW
+assert sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC == 2.0
+assert sfl_mod.SPEC_FIRE_TAIL_JITTER_SEC == 0.3
+_cov = sfl_mod.SPEC_FIRE_BURST_PROBES * sfl_mod.SPEC_FIRE_INTERVAL_SEC + \
+       (sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW - sfl_mod.SPEC_FIRE_BURST_PROBES) * sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC
+assert _cov >= 40.0, _cov                 # покрывает замеренную медиану «проба->транзит» 31с с запасом
+assert sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC <= 2.0, "одна проба на блок (2с) — плотнее не нужно"
+print("UNIT_OK: каденс %d проб × %.1f±%.1fс = покрытие %.0fс (медиана проба→транзит 31с)" % (
+    sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW, sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC,
+    sfl_mod.SPEC_FIRE_TAIL_JITTER_SEC, _cov))
+
+# 10b) джиттер реально ломает периодичность и не уводит интервал в опасную зону
+import statistics as _st
+_ivs = []
+for _ in range(400):
+    _j = sfl_mod.SPEC_FIRE_TAIL_JITTER_SEC
+    _ivs.append(max(0.3, sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC + __import__("random").uniform(-_j, _j)))
+assert 1.7 <= min(_ivs) and max(_ivs) <= 2.3, (min(_ivs), max(_ivs))
+assert _st.stdev(_ivs) > 0.1, "джиттер должен реально разбрасывать"
+assert min(_ivs) > sfl_mod.SPEC_FIRE_INTERVAL_SEC, "хвост не должен опускаться до burst-темпа"
+print("UNIT_OK: джиттер в [%.2f..%.2f]с, σ=%.2f — расписание нечитаемо, burst не задет" % (
+    min(_ivs), max(_ivs), _st.stdev(_ivs)))
+
+# 10c) цена окна остаётся под суточным бакетом с большим запасом
+_probe_usd = 0.012
+assert sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW * _probe_usd < ex._SPECFIRE_MAX_GAS_USD / 10, "окно < 10% бакета"
+print("UNIT_OK: полное окно ~$%.2f против суточного бакета $%.0f" % (
+    sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW * _probe_usd, ex._SPECFIRE_MAX_GAS_USD))
+
+print("=== ВСЕ SPEC-FIRE-LIVE ЮНИТЫ ПРОШЛИ (вкл. каденс по датасету) ===")
