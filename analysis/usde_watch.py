@@ -167,7 +167,7 @@ def main():
         print("КАП СРЕЗА по глубине пула (импакт<=%.1f%%): $%.0fk | приз ~$%.1fk "
               "(LIF %.3f%%, минус импакт) | лечение после среза: HF+%.4f"
               % (SLICE_MAX_IMPACT * 100, cap / 1e3, slice_prize(cap, lif, cap_imp) / 1e3,
-                 (lif - 1) * 100, heal_after(cap, rows[0]["debt"] * 1e6, lif, lltv / 1e18)
+                 (lif - 1) * 100, heal_after(cap, rows[0]["debt"], lif, lltv / 1e18)
                  if rows else 0.0))
         for x in rows:
             print("   $%8.1fM HF=%.5f ETA=%5.0f дней  %s" % (x["debt"] / 1e6, x["hf"], x["eta"], x["a"][:12]))
@@ -181,7 +181,7 @@ def main():
                           "(выход держит ~$%.0fk). ОДИН срез лечит позицию на %.0f дней — "
                           "второго шанса сегодня не будет"
                           % (x["debt"] / 1e6, x["hf"], cap / 1e3, slice_prize(cap, lif, cap_imp) / 1e3, cap / 1e3,
-                             heal_days(cap, x["debt"] * 1e6, lif, lltv / 1e18, apr)))
+                             heal_days(cap, x["debt"], lif, lltv / 1e18, apr)))
         elif x["hf"] <= HF_NEAR and (was is None or was > HF_NEAR):
             alerts.append("USDe $%.1fM подошёл к порогу: HF=%.5f, ETA %.0f дней — ручное наблюдение"
                           % (x["debt"] / 1e6, x["hf"], x["eta"]))
