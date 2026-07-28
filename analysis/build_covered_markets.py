@@ -28,6 +28,11 @@ MAX_BORROW_USD = 30_000_000   # exclude mega-cap markets: contested (we won't wi
 # WETH/USDC и прочие мега-рынки без решения). Сустейн закрыт MEGA_MARKETS bounded-фетчем (morpho.py).
 INCLUDE_MARKETS = frozenset({
     "0x9103c3b4e834476c9a62ea009ba2c884ee42e94e6e314a26f04d312434191836",   # cbBTC/USDC
+    # WETH/USDC (EXOTIC_COVERAGE_SCAN, «го» владельца 27.07): $70M займа, оракул = наш же
+    # ETH/USD-фид, 199 ликв/$820k repaid/90д; топ-3 по объёму молчат с начала июня. 28.07
+    # рескан молча откатил ручную правку covered (потолок $30M) — решения владельца живут
+    # ЗДЕСЬ, ручные правки JSON рескан не переживают.
+    "0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda",   # WETH/USDC
 })
 # collateral our swap venue (KyberSwap) cannot exit -> liquidation would revert; don't waste a slot.
 # Pendle PT tokens trade on Pendle's own AMM, not the DEXs Kyber aggregates.
@@ -137,6 +142,44 @@ def select_markets(items, min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD
 def to_json_records(selected) -> list:
     """Strip private fields -> clean Market(**rec)-compatible records."""
     return [{k: v for k, v in m.items() if not k.startswith("_")} for m in selected]
+
+
+def _removal_reason(mid, items_by_id, exclude_oracles=None,
+                    min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD) -> str:
+    """Почему select_markets не взял рынок (зеркало его фильтров, для алерта). Чистая."""
+    it = items_by_id.get(mid.lower())
+    if it is None:
+        return "исчез из API"
+    borrow = float(((it.get("state") or {}).get("borrowAssetsUsd")) or 0)
+    if borrow > max_borrow_usd:
+        return "займ $%.1fM > потолка $%.0fM" % (borrow / 1e6, max_borrow_usd / 1e6)
+    if borrow < min_borrow_usd:
+        return "займ $%.0fk < пола $%.0fk" % (borrow / 1e3, min_borrow_usd / 1e3)
+    if exclude_oracles and (it.get("oracleAddress") or "").lower() in exclude_oracles:
+        return "оракул исключён (SVR/OEV)"
+    csym = ((it.get("collateralAsset") or {}).get("symbol") or "")
+    if any(csym.upper().startswith(p.upper()) for p in EXIT_BLOCKED_COLLATERAL):
+        return "выход заблокирован (%s)" % csym
+    if _lif_bonus(_lltv_fraction(it.get("lltv"))) <= MIN_BONUS:
+        return "бонус <= слиппеджа"
+    return "вытеснен из топ-N (займ $%.0fk)" % (borrow / 1e3)
+
+
+def rescan_change_msg(items, old_pairs, new_pairs, added, removed, exclude_oracles=None) -> str:
+    """Текст TG-алерта об изменении covered-листа ресканом (28.07: рескан молча откатил ручную
+    правку владельца — ЛЮБОЕ изменение листа обязано быть видимым, с причиной). Чистая (юнит)."""
+    items_by_id = {(it.get("marketId") or "").lower(): it for it in items}
+    parts = []
+    for mid in sorted(added):
+        it = items_by_id.get(mid.lower()) or {}
+        borrow = float(((it.get("state") or {}).get("borrowAssetsUsd")) or 0)
+        why = "allowlist" if mid.lower() in {m.lower() for m in INCLUDE_MARKETS} \
+            else "займ $%.0fk, вошёл в отбор" % (borrow / 1e3)
+        parts.append("+%s %s… (%s)" % (new_pairs.get(mid, "?/?"), mid[:10], why))
+    for mid in sorted(removed):
+        parts.append("-%s %s… (%s)" % (old_pairs.get(mid, "?/?"), mid[:10],
+                                       _removal_reason(mid, items_by_id, exclude_oracles)))
+    return "\U0001F4CB rescan covered: " + " | ".join(parts)
 
 
 def main(argv):

@@ -248,14 +248,16 @@ def scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) -> dict:
                               alerter, log, ctx_cache, ncand)
 
 
-def rescan_markets(cfg, current_markets, ctx_cache, log):
+def rescan_markets(cfg, current_markets, ctx_cache, log, alerter=None):
     """Re-fetch + re-select the covered set: catches new tail markets, drops out-of-band ones,
     excludes configured SVR/OEV oracles. Hot-swaps, prunes ctx_cache, persists JSON, reloads.
     Returns the new list, or the current one unchanged on any failure."""
     try:
-        from analysis.build_covered_markets import fetch_markets, select_markets, to_json_records
+        from analysis.build_covered_markets import (fetch_markets, rescan_change_msg,
+                                                    select_markets, to_json_records)
         exclude = {a.strip().lower() for a in (cfg.exclude_oracles or "").split(",") if a.strip()}
-        records = to_json_records(select_markets(fetch_markets(), exclude_oracles=exclude))
+        items = fetch_markets()
+        records = to_json_records(select_markets(items, exclude_oracles=exclude))
         if not records:
             log.warning("market rescan: empty selection — keeping current %d markets", len(current_markets))
             return current_markets
@@ -273,6 +275,18 @@ def rescan_markets(cfg, current_markets, ctx_cache, log):
         if added or removed:
             log.info("market rescan: %d markets (+%d/-%d) added=%s removed=%s", len(new_markets),
                      len(added), len(removed), sorted(a[:10] for a in added), sorted(r[:10] for r in removed))
+            if alerter is not None:
+                # 28.07: рескан молча откатил ручную правку covered (WETH/USDC) — любое
+                # изменение листа обязано быть видимым владельцу, с причиной по каждому рынку
+                try:
+                    old_pairs = {m.market_id: "%s/%s" % (m.collateral_token, m.loan_token)
+                                 for m in current_markets}
+                    new_pairs = {r["market_id"]: "%s/%s" % (r["collateral_token"], r["loan_token"])
+                                 for r in records}
+                    alerter.send_async(rescan_change_msg(items, old_pairs, new_pairs, added,
+                                                         removed, exclude), key="rescan-cov")
+                except Exception:
+                    pass
         else:
             log.info("market rescan: %d markets (no change)", len(new_markets))
         return new_markets
@@ -314,14 +328,14 @@ def fetch_eth_price_usd(timeout=10):
     return float(usd) if usd else None
 
 
-def _refresh_worker(shared, markets, cfg, ctx_cache, log, stop):
+def _refresh_worker(shared, markets, cfg, ctx_cache, log, stop, alerter=None):
     """Background thread: periodically re-fetch the at-risk candidate set (slow API) + rescan
     markets (6h). API-only (no web3) -> safe alongside the loop. Updates `shared` atomically."""
     last_rescan = time.time()
     while not stop.is_set():
         try:
             if time.time() - last_rescan >= cfg.rescan_interval_sec:
-                markets = rescan_markets(cfg, markets, ctx_cache, log)
+                markets = rescan_markets(cfg, markets, ctx_cache, log, alerter)
                 last_rescan = time.time()
             try:
                 px = fetch_eth_price_usd()
@@ -463,7 +477,7 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
         log.info("warm-start: %d candidates / %d markets из снапшота (age<=%.0fс) — hot path видит набор с первого блока",
                  _n, len(_g), WARM_START_MAX_AGE_SEC)
     stop = threading.Event()
-    threading.Thread(target=_refresh_worker, args=(shared, markets, cfg, ctx_cache, log, stop),
+    threading.Thread(target=_refresh_worker, args=(shared, markets, cfg, ctx_cache, log, stop, alerter),
                      daemon=True).start()
     if getattr(cfg, "hot_path", False):                      # preconf-triggered hot path (OFF until ARM)
         from chain.hotpath import hot_loop
@@ -687,7 +701,7 @@ def main():
     while True:
         try:
             if rpc and time.time() - last_rescan >= cfg.rescan_interval_sec:
-                markets = rescan_markets(cfg, markets, ctx_cache, log)
+                markets = rescan_markets(cfg, markets, ctx_cache, log, alerter)
                 last_rescan = time.time()
             t0 = time.time()
             today = store.realized_today()
