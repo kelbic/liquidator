@@ -203,6 +203,10 @@ def main():
             pass
     json.dump({"addrs": addrs, "apr": apr, "liq": liq,
                "hf": {x["a"].lower(): x["hf"] for x in rows}}, open(STATE, "w"))
+    # Пульс ТОЛЬКО на успешном цикле: упавший на 429 прогон не бьётся — heartbeat-check увидит
+    # ровно ту поломку, что молчала весь день 28.07.
+    from heartbeat import beat
+    beat("usde-watch")
 
 
 if __name__ == "__main__":

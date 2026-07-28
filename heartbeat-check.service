@@ -1,0 +1,17 @@
+# /etc/systemd/system/heartbeat-check.service — надзор за сторожами (урок 28.07: usde-watch
+# молча падал на 429; мёртвый сторож хуже отсутствующего). Пара: heartbeat-check.timer.
+# Установка: cp heartbeat-check.{service,timer} /etc/systemd/system/ && systemctl daemon-reload \
+#            && systemctl enable --now heartbeat-check.timer
+# ВАЖНО: НЕТ inline-комментариев после директив — только на своих строках.
+[Unit]
+Description=heartbeat supervisor: dead-watchdog alarm to TG
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/liquidator
+EnvironmentFile=/root/liquidator/.env
+ExecStart=/root/liquidator/venv/bin/python -m analysis.heartbeat_check
+CPUWeight=10
+MemoryMax=128M
+NoNewPrivileges=true

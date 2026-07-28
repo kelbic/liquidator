@@ -105,7 +105,31 @@ try:
 except Exception as e:
     lines.append(f"ось rate-класса упала: {type(e).__name__}: {str(e)[:70]}")
 
+# ---- пульсы сторожей (урок 28.07: мёртвый сторож хуже отсутствующего) ----
+# Независимый суточный канал надзора за самим heartbeat-check: если таймер надзора умрёт,
+# его протухший пульс всплывёт здесь — в сводке, которую человек читает каждый день.
+try:
+    from heartbeat import age_sec
+    from analysis.heartbeat_check import REGISTRY, SELF_THRESHOLD_SEC
+
+    def _fmt_age(a):
+        if a is None:
+            return "нет"
+        return "%.0fс" % a if a < 120 else "%.0fм" % (a / 60) if a < 7200 else "%.1fч" % (a / 3600)
+
+    parts = []
+    for name in list(REGISTRY) + ["heartbeat-check"]:
+        a = age_sec(name)
+        thr = REGISTRY[name][1] if name in REGISTRY else SELF_THRESHOLD_SEC
+        parts.append(name + " " + _fmt_age(a) + (" ⚠️" if a is None or a > thr else ""))
+    lines.append("пульсы: " + "; ".join(parts))
+except Exception as e:
+    lines.append(f"пульсы сторожей: блок упал: {type(e).__name__}")
+
 msg = "\n".join(lines)[:3900]
 print(msg)
 ok = Alerter(cfg.tg_bot_token, cfg.tg_admin_id, antiflood_sec=0, tag=cfg.bot_tag).send(msg, key=f"daily:{dt.date.today()}")
 print(f"\n[tg sent={ok}]")
+if ok:
+    from heartbeat import beat
+    beat("daily-summary")

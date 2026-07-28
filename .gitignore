@@ -13,3 +13,4 @@ contracts/lib/
 contracts/broadcast/
 hotset.log
 *.bak-*
+state/

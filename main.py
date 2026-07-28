@@ -23,6 +23,7 @@ from chain.execute import (try_liquidate, prepare_liquidation, dispatch_liquidat
                            current_inflight, specfire_gas_today)
 from store import Store
 from alerts import Alerter
+from heartbeat import beat as hb_beat
 from strategy.scanner import load_covered_markets
 from strategy.guard import KillSwitch, GuardState
 from chain.rpc import BaseRpc
@@ -579,6 +580,7 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
         threading.Thread(target=_run_predict, daemon=True).start()
     last_hb = 0.0
     last_full = 0.0
+    last_pulse = 0.0   # файловый пульс для heartbeat-check (не путать с HEARTBEAT_SEC — лог-троттл)
     hf_cache = {}
     active = cfg.block_source if cfg.block_source in ("flashblocks", "newheads") else "newheads"
     fails = 0
@@ -591,6 +593,9 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                 log.info("block source=%s connected — loop (mode=%s)", active, cfg.mode)
                 async for blk in gen(ws):
                     fails = 0   # blocks are flowing on this source
+                    if time.time() - last_pulse >= 30.0:
+                        hb_beat("bot-block")
+                        last_pulse = time.time()
                     by_id, groups, debt_by, debt_assets_by, ncand = shared.snapshot()
                     today = store.realized_today()
                     gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"] + specfire_gas_today(),
@@ -693,6 +698,7 @@ def main():
                 log.error("kill switch engaged: %s", blocked)
                 alerter.send_async(f"\U0001F6D1 liquidator halted: {blocked}", key="killswitch")
             s = scan_once(rpc, markets, store, cfg, guard, alerter, log, ctx_cache) if markets else _empty_summary(0)
+            hb_beat("bot-block")
             now = time.time()
             if (s["liquidatable"] or s["profitable"]) or (now - last_hb >= HEARTBEAT_SEC):
                 last_hb = now
