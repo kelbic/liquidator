@@ -120,8 +120,10 @@ def _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, gu
                          net_usd=net, gas_usd=gas, status=status)
         log.info("ACTIONABLE %s/%s HF=%.4f net=$%.2f mode=%s status=%s",
                  mid[:10], borrower[:10], hr.hf, net, cfg.mode, status)
+        # 28.07: исход ОБЯЗАН быть в тексте — «💰 execute … net $6.79» без статуса читается
+        # с телефона как заработок, хотя это мог быть skip:sim (вопрос kelbic по 0x6e0bdA0b)
         alerter.send_async(f"\U0001F4B0 {cfg.mode} liquidation {borrower[:10]} "
-                     f"net ${net:.2f} HF={hr.hf:.4f}", key=f"act:{mid}:{borrower}")
+                     f"net ${net:.2f} HF={hr.hf:.4f} → {status[:60]}", key=f"act:{mid}:{borrower}")
 
     if not actionable:
         return
