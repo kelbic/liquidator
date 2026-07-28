@@ -563,14 +563,16 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
                       "max_in": 15 * 10**7},
     (_CBLTC, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_CBLTC, 200, _UNIV3_WETH, 100, _UNIV3_USDC)},
-    # cbBTC/USDC: ПРЯМОЙ пул fee=500 (0xfbb6eed8, liq 2.1e12) доминирует 2-hop через WETH на ВСЕХ
-    # размерах — QuoterV2 23.07: $30k imp 0.01% vs 0.10%, $500k 0.95% vs 1.68%, $1M 2.02% vs 3.48%
-    # (при LIF 4.4% профит жив и на $1M). fee=100/3000 хуже на порядок/в разы.
-    # max_in (24.07, ревью мега-сайза): QuoterV2 imp $1.6M=3.39%, $2.5M=5.78% > бонуса 4.38% —
-    # сверх ~$2M директ гарантированно ревертит по minProfit-floor. Кап 30 cbBTC (~$1.9M):
-    # ниже — скорость директа (профит жив), выше — Kyber-агрегат (PREARM греет в окнах).
-    (_CBBTC, _UNIV3_USDC): {"router": UNIV3_SWAP_ROUTER, "style": "02",
-                            "path": _pack_path(_CBBTC, 500, _UNIV3_USDC),
+    # cbBTC/USDC 28.07: UniV3 fee=500 -> Aerodrome Slipstream ts=100 (пул 0x4e962bb3, liq 3.7e12
+    # против 2.1e12, fee динамический 30-162 = 0.003-0.016% против наших 0.05%). Урок разбора
+    # победителя cbBTC $65.6k (27.07 23:04): его РЕАЛЬНЫЙ выход через этот пул стоил 0.52% против
+    # нашей модели 1% — нетто $2,840 при нашей оценке $1,486. Бенч квотами 28.07 (Slipstream
+    # QuoterV2 0x254cF9E1): Aero >= Uni на ВСЕХ размерах — $68k +$84, $500k +$2.2k (imp 0.56%
+    # vs 0.99%), $1M +$8.6k (1.14% vs 1.99%), $1.9M +$27.8k (2.59% vs 4.05%). Кап 30 cbBTC
+    # ОСТАВЛЕН: на капе impact 2.59% < LIF 4.38% с бОльшим запасом, чем было; сверх — Kyber
+    # (PREARM греет в окнах). Старый роут для отката: UNIV3_SWAP_ROUTER style 02 fee=500.
+    (_CBBTC, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
+                            "path": _pack_path(_CBBTC, 100, _UNIV3_USDC),
                             "max_in": 30 * 10**8},
     # LBTC/cbBTC 07-12 (нож $350.8k долга, BTC-пег пара — профиль «мгновенный флип на ноже»):
     # UniV3 ПУСТ на всех тирах (QuoterV2-проба impact~99.6%, analysis/lbtc_route_probe.py);
