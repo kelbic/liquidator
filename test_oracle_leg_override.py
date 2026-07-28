@@ -68,6 +68,14 @@ assert JITO_ORACLE.lower() in feeds.ORACLE_LEG_OVERRIDES
 assert JITO_ORACLE != JITO_ORACLE.lower(), "тест обязан гонять checksummed-адрес"
 print("UNIT_OK: lookup по lower() при checksummed-входе")
 
+# D2) wsuperOETHb-оракул (детонатор-пачка 28.07): ключ = superOETHb-токен (ребейз = апдейт курса)
+SOETH_ORACLE = "0x28C964c985fe84736fAdc7Cf0bBd58B54bc7CF93"
+rpc = _StubRpc(SOETH_ORACLE)
+primary, legs = feeds._resolve_legs(rpc, MID)
+assert primary == "0xdbfefd2e8460a6ee4955a68582f85708baea60a3" and len(legs) == 1, (primary, legs)
+assert rpc.leg_calls == []
+print("UNIT_OK: wsuperOETHb-оракул отдаёт superOETHb-ключ (ребейз-watch)")
+
 
 # E) resolve_feeds: рынок группируется под ключом оверрайда
 class _Mkt:

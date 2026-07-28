@@ -77,9 +77,15 @@ WATCH_PATTERN_OVERRIDES = {
 # SGD/USD hb 24ч) сюда НЕ идут — та же философия, что возраст-фильтр extra-ног.
 ORACLE_LEG_OVERRIDES = {
     # JitoSOL/USDC: обёртка читает SOL/USD OCR-агрегатор (hb ~10мин, деньги) + JITOSOL-SOL
-    # Calculated (staking rate, hb 24ч — вне watch). Свип 28.07 остальных 7 безногих рынков:
-    # только rate-класс/стейблы/hardcoded — суб-блочная фора им не нужна, не добавляем.
+    # Calculated (staking rate, hb 24ч — вне watch). Свип 28.07 остальных безногих рынков:
+    # rate-класс/стейблы/hardcoded — суб-блочная фора им не нужна, не добавляем.
     "0x78f772f5fcc03256260cc1165e34da9bb3f9be1c": ["0x43151d66d653ad888bf909f006a01792d5f33243"],
+    # wsuperOETHb/WETH + /msETH (один оракул): price() = wsuperOETHb.convertToAssets, курс
+    # меняется ТОЛЬКО ребейзом superOETHb — слешинг Origin = негативный ребейз тем же tx.
+    # Ключ = адрес superOETHb: bare-match ловит ребейз суб-блочно (~1 tx/5мин, throttle 0.25с).
+    # «Детонатор»-класс (kelbic 28.07): LST-стресс флипает пачку ножей cbETH/weETH/wsuperOETHb
+    # разом; cbETH и weETH уже в watch своими Chainlink-ногами, этот был полл-only.
+    "0x28c964c985fe84736fadc7cf0bbd58b54bc7cf93": ["0xdbfefd2e8460a6ee4955a68582f85708baea60a3"],
 }
 
 
