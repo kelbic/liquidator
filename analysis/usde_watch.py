@@ -48,14 +48,23 @@ STATE = os.environ.get("USDE_WATCH_STATE", "usde_watch_state.json")
 HF_FLIP, HF_NEAR = 1.0, float(os.environ.get("USDE_HF_NEAR", "1.002"))
 APR_JUMP = float(os.environ.get("USDE_APR_JUMP", "1.5"))
 LIQ_WARN = float(os.environ.get("USDE_LIQ_WARN_USD", "5e6"))
-SLICE_MAX_IMPACT = float(os.environ.get("USDE_SLICE_MAX_IMPACT", "0.01"))   # 1% от бонуса 2.5%
+SLICE_MAX_IMPACT = float(os.environ.get("USDE_SLICE_MAX_IMPACT", "0.01"))   # доля от бонуса LIF-1
+LIQ_CURSOR, MAX_LIF = 0.3, 1.15        # Morpho Blue: LIF = min(MAX_LIF, 1/(1-CURSOR*(1-LLTV)))
+
+
+def lif_of(lltv_wad: int) -> float:
+    """Бонус ликвидатора рынка. Чистая. 28.07: было зашито 2.5% — на LLTV 0.915 реально 2.617%."""
+    return min(MAX_LIF, 1.0 / (1.0 - LIQ_CURSOR * (1.0 - lltv_wad / 1e18)))
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120"}
 
 
-def slice_cap_usd(probe=(250_000, 500_000, 1_000_000, 2_000_000)):
-    """КАП СРЕЗА по живой глубине: наибольший размер с импактом <= SLICE_MAX_IMPACT.
-    Обязателен: полный репей кита ($20M) при выходе ~$0.5M = гарантированный минус."""
-    best = 0.0
+def slice_cap_usd(probe=(250_000, 500_000, 1_000_000, 1_150_000, 1_300_000, 2_000_000)):
+    """КАП СРЕЗА по живой глубине -> (cap_usd, impact). Наибольший размер с импактом <=
+    SLICE_MAX_IMPACT, ВМЕСТЕ с его фактическим импактом (28.07: на капе он 0.22%, а не
+    потолочный 1% — считать приз по потолку значит занижать его в полтора раза).
+    Обязателен: полный репей кита ($20M) при выходе ~$1.2M = гарантированный минус.
+    Сетка доведена до обрыва маршрута (замер 28.07: выход упирается в ~$1.2M)."""
+    best, best_imp = 0.0, 0.0
     for usd in probe:
         url = ("https://aggregator-api.kyberswap.com/base/api/v1/routes"
                "?tokenIn=%s&tokenOut=%s&amountIn=%d" % (USDE, USDC, int(usd * 10 ** 18)))
@@ -65,8 +74,28 @@ def slice_cap_usd(probe=(250_000, 500_000, 1_000_000, 2_000_000)):
         except Exception:
             continue
         if out and (1 - out / usd) <= SLICE_MAX_IMPACT:
-            best = usd
-    return best
+            best, best_imp = usd, (1 - out / usd)
+    return best, best_imp
+
+
+def slice_prize(cap_usd: float, lif: float, impact: float = None) -> float:
+    """Нетто среза: бонус минус ФАКТИЧЕСКИЙ импакт выхода (не потолочный — см. slice_cap_usd).
+    impact=None -> считаем по потолку (консервативный пол). Чистая."""
+    imp = SLICE_MAX_IMPACT if impact is None else float(impact)
+    return cap_usd * lif * (1.0 - imp) - cap_usd
+
+
+def heal_after(cap_usd: float, debt_usd: float, lif: float, lltv: float) -> float:
+    """Насколько ВЫРАСТЕТ HF после среза: LIF*LLTV<1 => ликвидация ЛЕЧИТ позицию. Чистая."""
+    if debt_usd <= cap_usd:
+        return 0.0
+    return (debt_usd - cap_usd * lif * lltv) / (debt_usd - cap_usd) - 1.0
+
+
+def heal_days(cap_usd: float, debt_usd: float, lif: float, lltv: float, apr: float) -> float:
+    """Через сколько дней позиция вернётся под 1.0 после среза (тот же таймер процентов)."""
+    h = heal_after(cap_usd, debt_usd, lif, lltv)
+    return math.log(1.0 + h) / apr * 365 if h > 0 and apr > 0 else 0.0
 
 
 def main():
@@ -75,7 +104,16 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     cfg = Config.from_env()
-    rpc = BaseRpc(os.environ.get("BG_RPC_URL") or cfg.rpc_url, cfg.chain_id)
+    # 28.07: фолбэк на основной RPC. Часовой прогон сидел ТОЛЬКО на bg-ключе (dRPC) и падал
+    # с 429 -> сторож главного приза молча не работал (нашли при проверке ревьюверских цифр).
+    # Цена страховки: ~26 CU/час на Alchemy = шум против его квоты, зато будильник не слепнет.
+    _bg = os.environ.get("BG_RPC_URL") or cfg.rpc_url
+    rpc = BaseRpc(_bg, cfg.chain_id)
+    try:
+        rpc._web3().eth.block_number
+    except Exception as e:
+        print("bg-RPC отказал (%s) -> перехожу на основной" % type(e).__name__)
+        rpc = BaseRpc(cfg.rpc_url, cfg.chain_id)
     w3 = rpc._web3()
     m32 = rpc.to_bytes32(MID)
     r = aggregate3(rpc, [(MORPHO, encode_id_to_market_params_call(m32)), (MORPHO, encode_market_call(m32))])
@@ -87,6 +125,7 @@ def main():
                       [(loan, coll, oracle, irm, lltv), (mk[0], mk[1], mk[2], mk[3], mk[4], mk[5])])
     apr = abi_decode(["uint256"], w3.eth.call(
         {"to": w3.to_checksum_address(irm), "data": IRM_SEL + args}))[0] / 1e18 * 365 * 86400
+    lif = lif_of(lltv)
     supply, borrow = mk[0] / 1e6, mk[2] / 1e6
     liq = supply - borrow
     # top-N позиций: список адресов держим в state (обновляется API-прогоном flip_eta/verify)
@@ -121,12 +160,15 @@ def main():
         eta = math.log(hf) / apr * 365 if hf > 1 and apr > 0 else 0.0
         rows.append({"a": b, "debt": debt / 1e6, "hf": hf, "eta": eta})
     rows.sort(key=lambda x: x["hf"])
-    cap = slice_cap_usd()
+    cap, cap_imp = slice_cap_usd()
     if not a.quiet:
         print("USDe/USDC: долг $%.1fM supply $%.1fM ЛИКВИДНОСТЬ ЛЕНДЕРОВ $%.1fM | APR %.2f%%"
               % (borrow / 1e6, supply / 1e6, liq / 1e6, apr * 100))
-        print("КАП СРЕЗА по глубине пула (импакт<=%.1f%%): $%.0fk | приз@2.5%% ~$%.1fk"
-              % (SLICE_MAX_IMPACT * 100, cap / 1e3, cap * 0.025 / 1e3))
+        print("КАП СРЕЗА по глубине пула (импакт<=%.1f%%): $%.0fk | приз ~$%.1fk "
+              "(LIF %.3f%%, минус импакт) | лечение после среза: HF+%.4f"
+              % (SLICE_MAX_IMPACT * 100, cap / 1e3, slice_prize(cap, lif, cap_imp) / 1e3,
+                 (lif - 1) * 100, heal_after(cap, rows[0]["debt"] * 1e6, lif, lltv / 1e18)
+                 if rows else 0.0))
         for x in rows:
             print("   $%8.1fM HF=%.5f ETA=%5.0f дней  %s" % (x["debt"] / 1e6, x["hf"], x["eta"], x["a"][:12]))
     # ---- тревоги только на СМЕНУ состояния ----
@@ -135,9 +177,11 @@ def main():
         key = x["a"].lower()
         was = (prev.get("hf") or {}).get(key)
         if x["hf"] <= HF_FLIP:
-            alerts.append("ФЛИП USDe $%.1fM HF=%.4f — ликвидируем СРЕЗАМИ по $%.0fk (приз ~$%.1fk/срез); "
-                          "полный репей НЕЛЬЗЯ (выход держит ~$%.0fk)"
-                          % (x["debt"] / 1e6, x["hf"], cap / 1e3, cap * 0.025 / 1e3, cap / 1e3))
+            alerts.append("ФЛИП USDe $%.1fM HF=%.4f — СРЕЗ $%.0fk, приз ~$%.1fk; полный репей НЕЛЬЗЯ "
+                          "(выход держит ~$%.0fk). ОДИН срез лечит позицию на %.0f дней — "
+                          "второго шанса сегодня не будет"
+                          % (x["debt"] / 1e6, x["hf"], cap / 1e3, slice_prize(cap, lif, cap_imp) / 1e3, cap / 1e3,
+                             heal_days(cap, x["debt"] * 1e6, lif, lltv / 1e18, apr)))
         elif x["hf"] <= HF_NEAR and (was is None or was > HF_NEAR):
             alerts.append("USDe $%.1fM подошёл к порогу: HF=%.5f, ETA %.0f дней — ручное наблюдение"
                           % (x["debt"] / 1e6, x["hf"], x["eta"]))
