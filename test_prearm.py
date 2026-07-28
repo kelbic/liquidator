@@ -93,4 +93,31 @@ time.sleep(0.4)
 assert len(quotes) == n, "прогрев после stop"
 print("UNIT_OK: stop-событие реально останавливает воркер")
 
+# 7) баг слотов (28.07, SOL-окно 01:06): роутнутые не-мега НЕ занимают top-K —
+#    негретая мелкая цель без статик-роута обязана попасть в выборку
+ex._SWAP_ROUTES[("0xrc", "0xrl")] = ("dummy",)      # помечаем пару роутнутой
+try:
+    shared_slots = types.SimpleNamespace(
+        lock=threading.Lock(),
+        groups={"0xm_routed": ["0xR1", "0xR2", "0xR3"], "0xm_usol": ["0xU"]},
+        debt_by={("0xm_routed", "0xR1"): 100_000.0, ("0xm_routed", "0xR2"): 90_000.0,
+                 ("0xm_routed", "0xR3"): 80_000.0, ("0xm_usol", "0xU"): 4_000.0},
+        by_id={"0xm_routed": types.SimpleNamespace(collateral_token="0xRC", loan_token="0xRL"),
+               "0xm_usol": types.SimpleNamespace(collateral_token="0xUC", loan_token="0xUL")},
+    )
+    _lbl = pa._label_of
+    pa._label_of = lambda t: "SOL" if t in ("0xRC", "0xUC") else "USDC"
+    try:
+        w2 = pa.PreArmWorker(rpc=None, cfg=cfg, shared=shared_slots,
+                             read_fn=read_fn, quote_fn=quote_fn, log_fn=lambda m: None)
+        picked = w2._pick("SOL", "down")
+    finally:
+        pa._label_of = _lbl
+    assert ("0xm_usol", "0xU", 4_000.0) in picked, picked
+    assert not any(mid == "0xm_routed" for mid, _, _ in picked), \
+        "роутнутые не-мега обязаны фильтроваться ДО top-K"
+finally:
+    ex._SWAP_ROUTES.pop(("0xrc", "0xrl"), None)
+print("UNIT_OK: слоты top-K не съедаются роутнутыми не-мега — uSOL-цель греется")
+
 print("=== ВСЕ PRE-ARM ЮНИТЫ ПРОШЛИ ===")

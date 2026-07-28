@@ -26,7 +26,9 @@ PREARM_TTL_SEC = float(os.environ.get("PREARM_TTL_SEC", "45"))
 PREARM_BAND = float(os.environ.get("PREARM_BAND", "0.97"))
 PREARM_REFRESH_SEC = float(os.environ.get("PREARM_REFRESH_SEC", "15"))
 PREARM_TOP_K = int(os.environ.get("PREARM_TOP_K", "3"))
-PREARM_MIN_DEBT_USD = float(os.environ.get("PREARM_MIN_DEBT_USD", "20000"))
+# 28.07: 20000 -> 1000. Пол прогрева НЕ МОЖЕТ быть выше пола spec-fire (mid-tier $1k):
+# негретая цель $1-20k без статик-роута = пробы «нет свопа» весь боевой цикл (SOL-окно 01:06).
+PREARM_MIN_DEBT_USD = float(os.environ.get("PREARM_MIN_DEBT_USD", "1000"))
 PREARM_MAX_WARMS = int(os.environ.get("PREARM_MAX_WARMS", "40"))   # кап Kyber-вызовов на окно
 
 _CACHE_LOCK = threading.Lock()
@@ -108,6 +110,8 @@ class PreArmWorker:
 
     # ---- выбор целей (та же фид/направление-семантика, что у spec_fire) ----
     def _pick(self, feed: str, direction: str):
+        from chain.execute import _SWAP_ROUTES
+        fl_max = float(getattr(self.cfg, "fast_lane_max_repaid_usd", 500000.0) or 500000.0)
         rows = []
         with self.shared.lock:
             groups = dict(self.shared.groups)
@@ -121,10 +125,20 @@ class PreArmWorker:
             ll = _label_of(getattr(m, "loan_token", ""))
             if cl == ll or not ((direction == "down" and cl == feed) or (direction == "up" and ll == feed)):
                 continue
+            # 28.07 (баг слотов, SOL-окно 01:06): роутнутая не-мега в top-K бессмысленна —
+            # window_loop её всё равно continue-ит (direct_swap 0 RTT), а слот top-K съеден,
+            # и негретая цель (uSOL без статик-роута) до Kyber не доходила: пробы spec-fire
+            # скипались «нет свопа» весь боевой цикл. Фильтруем ДО среза top-K; проверка в
+            # window_loop остаётся (свежее on-chain чтение — страховка от рассинхрона).
+            pair_routed = ((getattr(m, "collateral_token", "") or "").lower(),
+                           (getattr(m, "loan_token", "") or "").lower()) in _SWAP_ROUTES
             for b in borrowers:
                 d = float(debt_by.get((mid, b), 0.0) or 0.0)
-                if d >= PREARM_MIN_DEBT_USD:
-                    rows.append((mid, b, d))
+                if d < PREARM_MIN_DEBT_USD:
+                    continue
+                if pair_routed and d < fl_max:
+                    continue
+                rows.append((mid, b, d))
         rows.sort(key=lambda t: -t[2])
         return rows[:PREARM_TOP_K]
 
