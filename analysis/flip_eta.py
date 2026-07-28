@@ -50,6 +50,8 @@ def oracle_drift_apr(w3, oracle, bn, days=30):
 
 
 MARGIN_WARN = float(os.environ.get("RATE_MARGIN_WARN", "0.005"))   # 0.5%/год: запас до смены знака
+ETA_ALERT_DAYS = float(os.environ.get("RATE_ETA_ALERT_DAYS", "90"))  # ближе — кричать ежедневно
+WORSEN_X = 1.5                     # минус ухудшился в 1.5 раза с прошлого прогона = APR-скачок
 STATE_PATH = os.environ.get("FLIP_ETA_STATE", "flip_eta_state.json")
 
 
@@ -106,8 +108,15 @@ def compute_rows(cfg, hf_max=1.05, n=10, days=30):
 
 
 def margin_changes(rows, path=STATE_PATH):
-    """Сравнить margin с прошлым прогоном: [(key, pair, было, стало, тип)] — СМЕНА ЗНАКА или
-    падение запаса ниже MARGIN_WARN. Пишет новое состояние. Это и есть вотчер класса."""
+    """Сравнить margin с прошлым прогоном: [(key, pair, было, стало, тип)]. Пишет новое состояние.
+
+    Кричим только на СОБЫТИЯ (28.07: известные дальние минусы — wstETH/msETH ETA 2.3г,
+    yoUSD 1г — долбили сводку ежедневно, kelbic попросил убрать):
+      - смена знака (+ -> −): цель ожила;
+      - НОВАЯ цель сразу с минусом (первое появление в состоянии);
+      - ETA <= ETA_ALERT_DAYS: фитиль короткий — ежедневно, это уже план работ;
+      - минус ухудшился в WORSEN_X раза: адаптивный IRM прыгнул, ETA сжалась кратно.
+    Известный дальний минус МОЛЧИТ — он и так виден в тихой таблице оси rate-класса."""
     try:
         prev = json.load(open(path))
     except Exception:
@@ -116,14 +125,24 @@ def margin_changes(rows, path=STATE_PATH):
     for r in rows:
         if r["market_oracle"] or r["margin"] is None:
             continue                                    # ось имеет смысл только для rate-оракулов
-        cur[r["key"]] = r["margin"]
+        m = r["margin"]
+        cur[r["key"]] = m
         was = prev.get(r["key"])
-        if was is not None and was > 0 >= r["margin"]:
-            changes.append((r["key"], r["pair"], was, r["margin"], "ЗНАК СМЕНИЛСЯ — цель ожила"))
-        elif r["margin"] < 0:
-            # запас отрицательный = HF реально падает, ETA существует (см. таблицу в flip_eta)
-            changes.append((r["key"], r["pair"], was, r["margin"], "запас отрицательный — ETA есть"))
-        # 0 < margin < MARGIN_WARN — «тонко, но уходит вверх»: видно в таблице, кричать не о чем
+        if was is not None and was > 0 >= m:
+            changes.append((r["key"], r["pair"], was, m, "ЗНАК СМЕНИЛСЯ — цель ожила"))
+            continue
+        if m >= 0:
+            continue        # 0 < margin < MARGIN_WARN — «тонко, но уходит вверх»: не кричим
+        hf = float(r.get("hf") or 0.0)
+        eta_d = math.log(hf) / (-m) * 365 if hf > 1 else 0.0
+        if eta_d and eta_d <= ETA_ALERT_DAYS:
+            changes.append((r["key"], r["pair"], was, m, "ETA %.0f дн — БЛИЗКО" % eta_d))
+        elif was is None:
+            changes.append((r["key"], r["pair"], was, m,
+                            "новая цель с отрицательным запасом (ETA %.0f дн)" % eta_d))
+        elif was < 0 and m <= was * WORSEN_X:
+            changes.append((r["key"], r["pair"], was, m,
+                            "запас ухудшился ×%.1f — APR-скачок, ETA сжалась" % (m / was)))
     try:
         json.dump(cur, open(path, "w"))
     except Exception:
