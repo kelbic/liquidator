@@ -68,6 +68,21 @@ WATCH_PATTERN_OVERRIDES = {
 }
 
 
+# Оракулы-обёртки БЕЗ Chainlink-геттеров (no-BF1 «фантомы» классификации 07-23): резолв по
+# геттерам даёт (None, []) и рынок МОЛЧА выпадает из watch. 28.07 это стоило двух ликвидаций:
+# JitoSOL/USDC (0x09276541…) был невидим реактивному пути с деплоя — SOL-дамп, spec-проба
+# предсказала жертву за 20с, а стрелять было нечем (рынок вне watch, prearm его не грел).
+# Ноги ниже найдены eth_createAccessList на price() и проверены on-chain (description/возраст).
+# {oracle_lower: [watch-ключи]} — первый ключ primary. Медленные ноги (staking rate hb 24ч,
+# SGD/USD hb 24ч) сюда НЕ идут — та же философия, что возраст-фильтр extra-ног.
+ORACLE_LEG_OVERRIDES = {
+    # JitoSOL/USDC: обёртка читает SOL/USD OCR-агрегатор (hb ~10мин, деньги) + JITOSOL-SOL
+    # Calculated (staking rate, hb 24ч — вне watch). Свип 28.07 остальных 7 безногих рынков:
+    # только rate-класс/стейблы/hardcoded — суб-блочная фора им не нужна, не добавляем.
+    "0x78f772f5fcc03256260cc1165e34da9bb3f9be1c": ["0x43151d66d653ad888bf909f006a01792d5f33243"],
+}
+
+
 # Не-primary ноги оракула (двуногая база и quote-сторона): транзит ЛЮБОЙ ноги меняет price()
 # композита, но до 07-23 watch держал только BASE_FEED_1 — апдейт ETH/USD-ноги cbBTC/WETH не
 # армил рынок суб-блочно (детекцию давал только per-block poll, без форы). Ноги ниже идут в watch
@@ -128,6 +143,9 @@ def _resolve_one(rpc, market_id):
         oracle = morpho.functions.idToMarketParams(rpc.to_bytes32(market_id)).call()[2]
     except Exception:
         return None
+    ov = ORACLE_LEG_OVERRIDES.get(oracle.lower())
+    if ov:
+        return ov[0]
     return _leg_agg(rpc, oracle, "BASE_FEED_1")
 
 
@@ -144,6 +162,9 @@ def _resolve_legs(rpc, market_id, fallback_rpc=None):
         oracle = morpho.functions.idToMarketParams(rpc.to_bytes32(market_id)).call()[2]
     except Exception:
         return None, []
+    ov = ORACLE_LEG_OVERRIDES.get(oracle.lower())
+    if ov:
+        return ov[0], list(ov)
     legs = []
     primary = _leg_agg(rpc, oracle, "BASE_FEED_1", fallback_rpc)
     if primary:
