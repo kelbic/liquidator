@@ -33,6 +33,12 @@ INCLUDE_MARKETS = frozenset({
     # рескан молча откатил ручную правку covered (потолок $30M) — решения владельца живут
     # ЗДЕСЬ, ручные правки JSON рескан не переживают.
     "0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda",   # WETH/USDC
+    # cbXRP/USDC-мега («го» владельца 28.07): $34.6M займа, 8 ликвидаций/~$11.6k repaid за
+    # один день, бонус 12.7%. Цена включения замерена: watch-ключ ТОТ ЖЕ, что у малого
+    # cbXRP-рынка (0x92a7c3a5, уже в shadow-декоде) — hot-путь не трогаем; +965 позиций
+    # HF<=1.15 в кандидат-сет (фоновый CU). ОБЯЗАН быть и в MEGA_MARKETS (morpho.py) —
+    # без bounded-фетча пагинация роняет candidate refresh (инцидент WETH 27.07).
+    "0xd4a903dc6d949519060c7707f9604fdc9772c046e05c2e3a8fce0bd7196e4109",   # cbXRP/USDC $34.6M
 })
 # collateral our swap venue (KyberSwap) cannot exit -> liquidation would revert; don't waste a slot.
 # Pendle PT tokens trade on Pendle's own AMM, not the DEXs Kyber aggregates.

@@ -21,6 +21,13 @@ def item(mid, col, loan, borrow, lltv=860000000000000000, oracle="0x" + "77" * 2
 
 # A) WETH/USDC: займ $70.8M > потолка $30M, но allowlist держит его в отборе
 assert WETH_MID in INCLUDE_MARKETS
+# 28.07: cbXRP-мега — allowlist и mega-фетч обязаны идти ПАРОЙ (инцидент WETH 27.07: мега без
+# bounded-фетча роняет candidate refresh пагинацией)
+from chain.morpho import MEGA_MARKETS
+CBXRP_MID = "0xd4a903dc6d949519060c7707f9604fdc9772c046e05c2e3a8fce0bd7196e4109"
+assert CBXRP_MID in INCLUDE_MARKETS and CBXRP_MID in MEGA_MARKETS
+assert WETH_MID in MEGA_MARKETS
+print("UNIT_OK: мега-allowlist (WETH, cbXRP) синхронен с MEGA_MARKETS")
 items = [item(WETH_MID, "WETH", "USDC", 70_800_000),
          item(MEGA_MID, "FAT", "USDC", 99_000_000),
          item(SMALL_MID, "cbDOGE", "USDC", 240_000)]
