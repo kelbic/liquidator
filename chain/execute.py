@@ -731,8 +731,12 @@ def slice_to_depth(probe_fn):
     for _ in range(SLICE_MAX_ITERS):
         res = probe_fn(f)
         if res is None:
-            return best if best is not None else (0.0, None)
+            # отказ котировки (mGLO 29.07: Kyber 400 на 13.5M токенов) = «импакт за капом»,
+            # НЕ «глубины нет»: сжимаемся и пробуем меньше; сдаёмся только на полу
+            res = (1.0, None)
         impact, swap = res
+        if swap is None:
+            impact = max(impact, 1.0)
         if impact <= SLICE_MAX_IMPACT:
             if f >= 0.999:
                 return 1.0, swap

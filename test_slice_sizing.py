@@ -50,9 +50,25 @@ f, swap = slice_to_depth(lambda fr: (calls.append(fr) or (0.5, SWAP)))
 assert (f, swap) == (0.0, None) and len(calls) <= 4, (f, calls)
 print("UNIT_OK: глубины нет — (0, None) за <=%d проб" % len(calls))
 
-# 5) отказ котировки -> (0, None) сразу
+# 5) отказ котировки на КРУПНОМ размере = «слишком жирно», а не «глубины нет» (mGLO 29.07:
+# Kyber отдавал 400 на 13.5M токенов, первая версия сдавалась и теряла цель $12.3M)
+calls = []
+
+
+def refuse_big(f):
+    calls.append(round(f, 4))
+    if f > 0.5:
+        return None                      # агрегатор не строит маршрут такого размера
+    return (0.003 if f <= 0.3 else 0.05, SWAP)
+
+
+f, swap = slice_to_depth(refuse_big)
+assert swap is SWAP and f >= 0.1, "отказ обязан вести к сжатию, а не к капитуляции: %s %s" % (f, calls)
+print("UNIT_OK: отказ на жирном -> сжатие -> глубина f=%.3f (пробы %s)" % (f, len(calls)))
+
+# 5b) отказ на ВСЕХ размерах -> (0, None)
 assert slice_to_depth(lambda fr: None) == (0.0, None)
-print("UNIT_OK: отказ котировки — (0, None)")
+print("UNIT_OK: тотальный отказ котировки — (0, None)")
 
 assert SLICE_MIN_FRACTION == 0.02 and SLICE_MAX_IMPACT == 0.01
 print("=== ВСЕ SLICE-ЮНИТЫ ПРОШЛИ ===")
