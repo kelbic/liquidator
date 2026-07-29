@@ -28,10 +28,55 @@ WS_URL = os.environ.get("PREDICT_WS_URL", "wss://data-stream.binance.vision/ws")
 STALE_SEC = float(os.environ.get("PREDICT_WS_STALE_SEC", "10.0"))
 BACKOFF_MAX_SEC = float(os.environ.get("PREDICT_WS_BACKOFF_MAX", "30.0"))
 
+# 29.07 ротация edge-IP: у vision 8 A-записей, ДВА edge гнилые (пер-IP замер: залипание 12с и
+# keepalive 1011 — ровно сигнатуры дневного шторма, 10 обрывов/30мин), DNS-рулетка ловила их
+# ~25% реконнектов. Коннектимся к выбранному IP своим TCP-сокетом (URI сохраняет hostname =>
+# SNI и Host корректны), упавший IP — в карантин. Пустой резолв = прежний коннект по hostname.
+EDGE_QUARANTINE_SEC = float(os.environ.get("PREDICT_WS_EDGE_QUARANTINE_SEC", "600"))
+_edge_bad: dict = {}          # ip -> monotonic последнего фейла
+_edge_last = {"ip": None}     # ip текущего/последнего коннекта (для маркировки из _run)
+
+
+def _resolve_edges(host: str):
+    import socket
+    try:
+        return sorted({ai[4][0] for ai in socket.getaddrinfo(host, 443, socket.AF_INET)})
+    except Exception:
+        return []
+
+
+def _pick_edge(host: str, now=time.monotonic):
+    """Случайный edge вне карантина; все в карантине = карантин обнуляется (хуже не станет)."""
+    import random
+    ips = _resolve_edges(host)
+    if not ips:
+        return None
+    ok = [ip for ip in ips if now() - _edge_bad.get(ip, -1e9) >= EDGE_QUARANTINE_SEC]
+    if not ok:
+        _edge_bad.clear()
+        ok = ips
+    return random.choice(ok)
+
+
+def _mark_last_edge_bad(now=time.monotonic):
+    """Зовётся из PriceFeed._run на обрыве: текущий edge — в карантин. No-op без ротации
+    (тестовые/кастомные connect не трогают _edge_last)."""
+    ip = _edge_last.get("ip")
+    if ip:
+        _edge_bad[ip] = now()
+
 
 def _default_connect(url: str = WS_URL):
+    import socket
+    from urllib.parse import urlparse
     from websockets.sync.client import connect
-    return connect(url, open_timeout=15, close_timeout=3)
+    host = urlparse(url).hostname
+    ip = _pick_edge(host) if host else None
+    _edge_last["ip"] = ip
+    if ip is None:
+        return connect(url, open_timeout=15, close_timeout=3)
+    raw = socket.create_connection((ip, 443), timeout=15)
+    return connect(url, sock=raw, open_timeout=15, close_timeout=3)
 
 
 class PriceFeed:
@@ -95,8 +140,9 @@ class PriceFeed:
                 backoff = 0.5
                 self._serve(conn)
             except Exception as e:                 # обрыв/парс — деградация, не смерть
-                self._log("[predict] Binance WS dropped (%s: %s) — reconnect in %.1fs"
-                          % (type(e).__name__, str(e)[:100], backoff))
+                _mark_last_edge_bad()              # 29.07: гнилой edge — в карантин до ротации
+                self._log("[predict] Binance WS dropped (%s: %s, edge=%s) — reconnect in %.1fs"
+                          % (type(e).__name__, str(e)[:100], _edge_last.get("ip") or "dns", backoff))
             finally:
                 with self._lock:
                     self._connected = False
