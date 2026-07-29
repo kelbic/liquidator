@@ -709,6 +709,35 @@ def swap_plan(rpc, coll: str, seized: int):
     return under, int(amount * _UNWRAP_HAIRCUT), coll
 
 
+# 29.07 SLICE («го» kelbic, USDe ETA сжалась 62->23 дн): умный частичный сайзинг до глубины
+# пула — Katana-урок «no profitable chunk» + срез USDe-кита ($20M долга при глубине ~$1.15M).
+# Если своп ПОЛНОГО seized продавливает рынок сильнее SLICE_MAX_IMPACT, режем repaidShares до
+# доли, чей своп укладывается в импакт. Частичная ликвидация ЛЕЧИТ позицию (LIF*lltv < 1) —
+# остаток дозревает и режется снова по мере наполнения пула арбитражем. f=1 проходит с ПЕРВОЙ
+# котировки => для обычных целей поведение и число RTT не меняются.
+SLICE_MAX_IMPACT = float(os.environ.get("SLICE_MAX_IMPACT", "0.01"))
+SLICE_MIN_FRACTION = float(os.environ.get("SLICE_MIN_FRACTION", "0.02"))
+SLICE_MAX_ITERS = int(os.environ.get("SLICE_MAX_ITERS", "4"))
+
+
+def slice_to_depth(probe_fn):
+    """probe_fn(fraction) -> (impact_float, swap) | None. Ищет наибольшую долю с импактом
+    <= SLICE_MAX_IMPACT: сжатие пропорционально перебору с демпфером 0.8, пол SLICE_MIN_FRACTION.
+    -> (fraction, swap) или (0.0, None) — глубины нет даже для минимального среза. Чистая."""
+    f = 1.0
+    for _ in range(SLICE_MAX_ITERS):
+        res = probe_fn(f)
+        if res is None:
+            return 0.0, None
+        impact, swap = res
+        if impact <= SLICE_MAX_IMPACT:
+            return f, swap
+        if f <= SLICE_MIN_FRACTION:
+            return 0.0, None
+        f = max(SLICE_MIN_FRACTION, f * SLICE_MAX_IMPACT / max(impact, 1e-9) * 0.8)
+    return 0.0, None
+
+
 _LIQUIDATE_SIG = ("liquidate((address,address,address,address,uint256),"
                   "address,uint256,address,bytes,uint256,address)")
 
@@ -1066,8 +1095,30 @@ def prepare_liquidation(rpc, cfg, market_id: str, borrower: str, debt_usd: float
             return {"ok": False, "reason": "seized=0"}
 
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
-        swap_token, swap_amount, unwrap = swap_plan(rpc, coll, seized)
-        swap = kyber_swap(swap_token, loan, swap_amount, liq, liq, slippage_bps=slippage_bps)
+        swap_token, swap_amount_full, unwrap = swap_plan(rpc, coll, seized)
+
+        def _probe(f):
+            amt = max(1, int(swap_amount_full * f))
+            try:
+                s = kyber_swap(swap_token, loan, amt, liq, liq, slippage_bps=slippage_bps)
+            except Exception:
+                return None
+            out = int(s.get("amount_out") or 0)
+            # референс нулевого импакта: цена оракула (loan за коллатерал, 1e36); для unwrap
+            # amt уже в подлежащем с haircut'ом — переводим обратно через seized-эквивалент
+            seized_eq = int(seized * f)
+            ref = seized_eq * int(price) // ORACLE_PRICE_SCALE
+            return (1.0 - out / ref) if ref > 0 else 1.0, s
+
+        fraction, swap = slice_to_depth(_probe)
+        if swap is None:
+            return {"ok": False, "reason": "нет глубины даже для среза (SLICE_MIN_FRACTION)"}
+        if fraction < 1.0:
+            repaid_shares = max(1, int(int(borrow_shares) * fraction))
+            repaid_assets = to_assets_up(repaid_shares, tba, tbs)
+            seized = expected_seized(repaid_assets, lif_from_lltv(lltv_wad / 10**18), price)
+            swap_token, swap_amount, unwrap = swap_plan(rpc, coll, seized)
+            swap = kyber_swap(swap_token, loan, swap_amount, liq, liq, slippage_bps=slippage_bps)
 
         cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0, unwrap)
         sim = simulate_tx(rpc, liq, bot, cd0)
@@ -1085,7 +1136,7 @@ def prepare_liquidation(rpc, cfg, market_id: str, borrower: str, debt_usd: float
         cd1 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"],
                                min_profit_final, unwrap)
         return {"ok": True, "calldata": cd1, "net_usd": net_usd, "gas": gas_floor_of(cfg),
-                "profit_usd": profit_usd, "cost_usd": cost_usd}
+                "profit_usd": profit_usd, "cost_usd": cost_usd, "slice_fraction": fraction}
     except Exception as e:
         return {"ok": False, "reason": f"error: {type(e).__name__}: {str(e)[:120]}"}
 
