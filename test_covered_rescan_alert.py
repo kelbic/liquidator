@@ -53,4 +53,15 @@ assert "-cbDOGE/USDC" in msg and "вытеснен из топ-N" in msg, msg
 print("UNIT_OK: rescan_change_msg — причина по каждому изменению")
 print("  пример:", msg)
 
+# D) списанные пары молчат (kelbic 29.07: mGLO вышел за потолок -> алерт был спамом)
+MGLO_MID = "0x" + "dd" * 32
+mglo_item = item(MGLO_MID, "mGLO", "USDC", 32_900_000)
+only_quiet = rescan_change_msg([mglo_item], {MGLO_MID: "mGLO/USDC"}, {}, added=set(),
+                               removed={MGLO_MID})
+assert only_quiet == "", only_quiet
+mixed = rescan_change_msg(items + [mglo_item], {MGLO_MID: "mGLO/USDC", MEGA_MID: "FAT/USDC"}, {},
+                          added=set(), removed={MGLO_MID, MEGA_MID})
+assert "mGLO" not in mixed and "FAT/USDC" in mixed, mixed
+print("UNIT_OK: mGLO-изменения в TG не идут (пусто -> не слать; смешанное -> без mGLO)")
+
 print("=== ВСЕ COVERED-RESCAN ЮНИТЫ ПРОШЛИ ===")

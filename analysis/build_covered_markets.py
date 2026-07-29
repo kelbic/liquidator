@@ -171,20 +171,36 @@ def _removal_reason(mid, items_by_id, exclude_oracles=None,
     return "вытеснен из топ-N (займ $%.0fk)" % (borrow / 1e3)
 
 
+# Списанные цели: их приход/уход из покрытия — рутина, не событие (kelbic 29.07: mGLO вышел за
+# потолок -> TG-алерт был спамом, у mGLO свой вотчер оживления на Вене). Лог остаётся всегда.
+RESCAN_ALERT_QUIET = frozenset({"mGLO"})
+
+
 def rescan_change_msg(items, old_pairs, new_pairs, added, removed, exclude_oracles=None) -> str:
     """Текст TG-алерта об изменении covered-листа ресканом (28.07: рескан молча откатил ручную
-    правку владельца — ЛЮБОЕ изменение листа обязано быть видимым, с причиной). Чистая (юнит)."""
+    правку владельца — изменение листа обязано быть видимым, с причиной). Изменения по парам из
+    RESCAN_ALERT_QUIET в TG не идут; пусто = не слать (лог-строка рескана есть всегда). Чистая."""
     items_by_id = {(it.get("marketId") or "").lower(): it for it in items}
+
+    def _quiet(pair):
+        return (pair or "").split("/")[0] in RESCAN_ALERT_QUIET
+
     parts = []
     for mid in sorted(added):
+        if _quiet(new_pairs.get(mid)):
+            continue
         it = items_by_id.get(mid.lower()) or {}
         borrow = float(((it.get("state") or {}).get("borrowAssetsUsd")) or 0)
         why = "allowlist" if mid.lower() in {m.lower() for m in INCLUDE_MARKETS} \
             else "займ $%.0fk, вошёл в отбор" % (borrow / 1e3)
         parts.append("+%s %s… (%s)" % (new_pairs.get(mid, "?/?"), mid[:10], why))
     for mid in sorted(removed):
+        if _quiet(old_pairs.get(mid)):
+            continue
         parts.append("-%s %s… (%s)" % (old_pairs.get(mid, "?/?"), mid[:10],
                                        _removal_reason(mid, items_by_id, exclude_oracles)))
+    if not parts:
+        return ""
     return "\U0001F4CB rescan covered: " + " | ".join(parts)
 
 

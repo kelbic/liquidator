@@ -276,15 +276,17 @@ def rescan_markets(cfg, current_markets, ctx_cache, log, alerter=None):
             log.info("market rescan: %d markets (+%d/-%d) added=%s removed=%s", len(new_markets),
                      len(added), len(removed), sorted(a[:10] for a in added), sorted(r[:10] for r in removed))
             if alerter is not None:
-                # 28.07: рескан молча откатил ручную правку covered (WETH/USDC) — любое
-                # изменение листа обязано быть видимым владельцу, с причиной по каждому рынку
+                # 28.07: рескан молча откатил ручную правку covered (WETH/USDC) — изменение
+                # листа обязано быть видимым владельцу; 29.07: списанные пары (RESCAN_ALERT_QUIET)
+                # ходят молча — пустое сообщение НЕ шлём (лог-строка выше есть всегда)
                 try:
                     old_pairs = {m.market_id: "%s/%s" % (m.collateral_token, m.loan_token)
                                  for m in current_markets}
                     new_pairs = {r["market_id"]: "%s/%s" % (r["collateral_token"], r["loan_token"])
                                  for r in records}
-                    alerter.send_async(rescan_change_msg(items, old_pairs, new_pairs, added,
-                                                         removed, exclude), key="rescan-cov")
+                    _msg = rescan_change_msg(items, old_pairs, new_pairs, added, removed, exclude)
+                    if _msg:
+                        alerter.send_async(_msg, key="rescan-cov")
                 except Exception:
                     pass
         else:
