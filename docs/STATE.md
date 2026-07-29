@@ -52,9 +52,10 @@ UniV3/Aerodrome (on-chain), редим Midas = KYC-волты (асинхрон�
 
 **Вотчер: `~/.chainwatch/mglo_watch.py` на ВЕНЕ** (не грузим Charlotte), cron ежечасно :24,
 зарегистрирован в fleet-cronwatch (надзор 2×каденс). Три триггера оживления (любой = пересмотр):
-(1) оракул: price != 0.94e24 ЛИБО roundId > 1; (2) USDC-баланс RedemptionVaultWithSwapper
-`0xA80F9BfFff91CBC13314fEfD05560032aF018F18` (Base; из midas-apps/contracts addresses.ts, блок
-mGLO; верифицирован: mToken()==mGLO, баланс $1 = пуст) > $100k; (3) появление mGLO-пула на 6 фабриках Base
+(1) оракул: price != 0.94e24 ЛИБО roundId > 1; (2) редем ожил — ПАРА условий (ревью kelbic:
+в WithSwapper instant-ликвидность идёт из liquidityProvider() = EOA `0x0461bd69…`, не из RV):
+balanceOf(RV `0xA80F9BfF…8F18`) > $100k ИЛИ (balanceOf(LP) > $100k И allowance(LP→RV) > $100k) —
+сейчас все три величины ~$0; (3) появление mGLO-пула на 6 фабриках Base
 (UniV3/UniV2/Sushi V2/AeroAMM/AeroCL int24!/PancakeV3) против USDC и WETH. Отчётные скрипты
 жертв исключают mGLO с пометкой. Тихий режим; FAIL_STREAK=6 → один пинг о слепоте.
 
