@@ -63,7 +63,7 @@ contract Reenterer {
     bool public reenteredLiquidate; bool public reenteredBatch;
     constructor(Liquidator l, MarketParams memory m) { lq = l; mp = m; }
     function attack() external {
-        try lq.liquidate(mp, address(0xdead), 1, address(this), "", 0) returns (uint256) {
+        try lq.liquidate(mp, address(0xdead), 1, address(this), "", 0, address(0)) returns (uint256) {
             reenteredLiquidate = true;
         } catch {}
         LiquidationItem[] memory items = new LiquidationItem[](0);
@@ -97,7 +97,7 @@ contract BatchTest is Test {
     }
 
     function _item(address b, uint256 minP) internal view returns (LiquidationItem memory) {
-        return LiquidationItem(mp, b, 1, address(swapper), abi.encodeWithSelector(MockSwapperB.swapAll.selector), minP);
+        return LiquidationItem(mp, b, 1, address(swapper), abi.encodeWithSelector(MockSwapperB.swapAll.selector), minP, address(0));
     }
 
     // --- auth (замена C1 прототипа: теперь self ДОЛЖЕН проходить, чужой — нет) ---
@@ -105,7 +105,7 @@ contract BatchTest is Test {
     function testAuth_RandomCannotLiquidate() public {
         vm.prank(rando);
         vm.expectRevert(Liquidator.NotOwner.selector);
-        lq.liquidate(mp, borrower1, 1, address(swapper), "", 0);
+        lq.liquidate(mp, borrower1, 1, address(swapper), "", 0, address(0));
     }
 
     function testAuth_RandomCannotBatch() public {
@@ -121,7 +121,7 @@ contract BatchTest is Test {
     function testSinglePathStillWorks() public {
         uint256 profit = lq.liquidate(
             mp, borrower1, 1, address(swapper),
-            abi.encodeWithSelector(MockSwapperB.swapAll.selector), 0
+            abi.encodeWithSelector(MockSwapperB.swapAll.selector), 0, address(0)
         );
         assertEq(profit, 5e18);
         assertEq(loan.balanceOf(address(this)), 5e18); // swept to owner
@@ -140,7 +140,7 @@ contract BatchTest is Test {
     function testC2b_RouterCannotReenter() public {
         Reenterer r = new Reenterer(lq, mp);
         LiquidationItem[] memory items = new LiquidationItem[](1);
-        items[0] = LiquidationItem(mp, borrower1, 1, address(r), abi.encodeWithSelector(Reenterer.attack.selector), 0);
+        items[0] = LiquidationItem(mp, borrower1, 1, address(r), abi.encodeWithSelector(Reenterer.attack.selector), 0, address(0));
         uint256 nOk = lq.batchLiquidate(items);
         assertEq(r.reenteredLiquidate(), false);
         assertEq(r.reenteredBatch(), false);
@@ -164,7 +164,7 @@ contract BatchTest is Test {
     function testC3b_OOGSubcallCaughtBatchContinues() public {
         GasBurner gb = new GasBurner();
         LiquidationItem[] memory items = new LiquidationItem[](2);
-        items[0] = LiquidationItem(mp, borrower1, 1, address(gb), abi.encodeWithSelector(GasBurner.burn.selector), 0);
+        items[0] = LiquidationItem(mp, borrower1, 1, address(gb), abi.encodeWithSelector(GasBurner.burn.selector), 0, address(0));
         items[1] = _item(borrower2, 0);
         uint256 nOk = lq.batchLiquidate{gas: 30_000_000}(items);
         assertEq(nOk, 1, "item2 should still succeed after item1 OOG");
@@ -175,7 +175,7 @@ contract BatchTest is Test {
     function testC3c_TightGasStarvesLaterItems() public {
         GasBurner gb = new GasBurner();
         LiquidationItem[] memory items = new LiquidationItem[](2);
-        items[0] = LiquidationItem(mp, borrower1, 1, address(gb), abi.encodeWithSelector(GasBurner.burn.selector), 0);
+        items[0] = LiquidationItem(mp, borrower1, 1, address(gb), abi.encodeWithSelector(GasBurner.burn.selector), 0, address(0));
         items[1] = _item(borrower2, 0);
         uint256 nOk = lq.batchLiquidate{gas: 3_000_000}(items);
         console.log("nOk at 3M gas:", nOk);

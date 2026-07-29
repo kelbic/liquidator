@@ -670,29 +670,71 @@ def expected_seized(repaid_assets: int, lif: float, price: int) -> int:
 
 # --- liquidate() bundle + pre-send eth_call gate ---
 
+ZERO_ADDR = "0x" + "00" * 20
+
+# 29.07 unwrap-хоп (контракт v3, «го» kelbic): обёртка без DEX-ликвидности -> redeem -> своп
+# ПОДЛЕЖАЩИМ. Пары проверены on-chain (asset()) и лестницей Kyber: обёртка мертва (~0.9 WETH
+# при любом входе), подлежащий бездонный (impact 0.1% на $400k). {wrapper_lower: underlying}.
+UNWRAP_COLLATERALS = {
+    "0x7fcd174e80f264448ebee8c88a7c4476aaf58ea6":       # wsuperOETHb (ERC4626)
+        "0xdbfefd2e8460a6ee4955a68582f85708baea60a3",    # superOETHb
+}
+_UNWRAP_RATE_TTL = 3600.0     # convertToAssets дрейфует ребейзом ~раз в сутки — часа хватает
+_UNWRAP_HAIRCUT = 0.997       # котируем ЧУТЬ меньше ожидаемого redeem: недобор -> SwapFailed,
+_unwrap_rate_cache: dict = {}  # излишек — пыль в контракте (sweep), экономику держит minProfit
+
+
+def _unwrap_rate_wad(rpc, wrapper: str) -> int:
+    """convertToAssets(1e18) обёртки с TTL-кэшем (ставка меняется только ребейзом). I/O."""
+    key = wrapper.lower()
+    ent = _unwrap_rate_cache.get(key)
+    now = time.monotonic()
+    if ent and now - ent[1] < _UNWRAP_RATE_TTL:
+        return ent[0]
+    sel = "0x07a2d13a"                                    # convertToAssets(uint256)
+    data = sel + hex(WAD)[2:].rjust(64, "0")
+    raw = rpc.eth_call({"to": wrapper, "data": data})
+    rate = int.from_bytes(bytes(raw)[:32], "big")
+    _unwrap_rate_cache[key] = (rate, now)
+    return rate
+
+
+def swap_plan(rpc, coll: str, seized: int):
+    """(token_in, amount_in, unwrap_target) для свопа выхода: обёртки из UNWRAP_COLLATERALS
+    котируются ПОДЛЕЖАЩИМ (redeem в контракте до свопа), остальное — как есть. I/O при unwrap."""
+    under = UNWRAP_COLLATERALS.get(coll.lower())
+    if under is None:
+        return coll, seized, ZERO_ADDR
+    amount = int(seized) * _unwrap_rate_wad(rpc, coll) // WAD
+    return under, int(amount * _UNWRAP_HAIRCUT), coll
+
+
 _LIQUIDATE_SIG = ("liquidate((address,address,address,address,uint256),"
-                  "address,uint256,address,bytes,uint256)")
+                  "address,uint256,address,bytes,uint256,address)")
 
 
 def encode_liquidate(mp: dict, borrower: str, repaid_shares: int, swap_target: str,
-                     swap_calldata: str, min_profit: int) -> str:
-    """ABI-encode Liquidator.liquidate(mp, borrower, repaidShares, swapTarget, swapData, minProfit)."""
+                     swap_calldata: str, min_profit: int, unwrap_target: str = ZERO_ADDR) -> str:
+    """ABI-encode Liquidator.liquidate(mp, borrower, repaidShares, swapTarget, swapData,
+    minProfit, unwrapTarget). unwrap_target=0 = прежний путь (без redeem)."""
     from eth_abi import encode
     from eth_utils import keccak
     selector = keccak(text=_LIQUIDATE_SIG)[:4]
     cd = bytes.fromhex(swap_calldata[2:] if swap_calldata.startswith("0x") else swap_calldata)
     args = encode(
-        ["(address,address,address,address,uint256)", "address", "uint256", "address", "bytes", "uint256"],
+        ["(address,address,address,address,uint256)", "address", "uint256", "address", "bytes",
+         "uint256", "address"],
         [(mp["loanToken"], mp["collateralToken"], mp["oracle"], mp["irm"], int(mp["lltv"])),
-         borrower, int(repaid_shares), swap_target, cd, int(min_profit)],
+         borrower, int(repaid_shares), swap_target, cd, int(min_profit), unwrap_target],
     )
     return "0x" + (selector + args).hex()
 
 
 # --- batch: N targets in ONE tx (cascade capture). Контракт: batchLiquidate(LiquidationItem[]) ---
 _BATCH_LIQUIDATE_SIG = ("batchLiquidate(((address,address,address,address,uint256),"
-                        "address,uint256,address,bytes,uint256)[])")
-_ITEM_TYPE = "((address,address,address,address,uint256),address,uint256,address,bytes,uint256)"
+                        "address,uint256,address,bytes,uint256,address)[])")
+_ITEM_TYPE = ("((address,address,address,address,uint256),address,uint256,address,bytes,"
+              "uint256,address)")
 
 
 def _prep_to_item_tuple(prep: dict):
@@ -701,7 +743,8 @@ def _prep_to_item_tuple(prep: dict):
     cd = prep["swap_calldata"]
     cd = bytes.fromhex(cd[2:] if cd.startswith("0x") else cd) if isinstance(cd, str) else bytes(cd)
     return ((mp["loanToken"], mp["collateralToken"], mp["oracle"], mp["irm"], int(mp["lltv"])),
-            prep["borrower"], int(prep["repaid_shares"]), prep["swap_target"], cd, int(prep["min_profit"]))
+            prep["borrower"], int(prep["repaid_shares"]), prep["swap_target"], cd,
+            int(prep["min_profit"]), prep.get("unwrap_target", ZERO_ADDR))
 
 
 # ---- ПАТРОННЫЙ РЕЗЕРВ (25.07, баланс долит до 0.1938 ETH) ----
@@ -1023,9 +1066,10 @@ def prepare_liquidation(rpc, cfg, market_id: str, borrower: str, debt_usd: float
             return {"ok": False, "reason": "seized=0"}
 
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
-        swap = kyber_swap(coll, loan, seized, liq, liq, slippage_bps=slippage_bps)
+        swap_token, swap_amount, unwrap = swap_plan(rpc, coll, seized)
+        swap = kyber_swap(swap_token, loan, swap_amount, liq, liq, slippage_bps=slippage_bps)
 
-        cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0)
+        cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0, unwrap)
         sim = simulate_tx(rpc, liq, bot, cd0)
         if not sim["ok"]:
             return {"ok": False, "reason": f"sim revert: {sim['error']}"}
@@ -1038,7 +1082,8 @@ def prepare_liquidation(rpc, cfg, market_id: str, borrower: str, debt_usd: float
                     "reason": f"net ${net_usd:.2f} (profit ${profit_usd:.2f} - cost ${cost_usd:.2f}) < min ${cfg.min_profit_usd:.2f}"}
 
         min_profit_final = profit_wei * 95 // 100   # revert if realized < 95% of simulated
-        cd1 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit_final)
+        cd1 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"],
+                               min_profit_final, unwrap)
         return {"ok": True, "calldata": cd1, "net_usd": net_usd, "gas": gas_floor_of(cfg),
                 "profit_usd": profit_usd, "cost_usd": cost_usd}
     except Exception as e:

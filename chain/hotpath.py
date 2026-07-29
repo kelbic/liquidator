@@ -961,15 +961,19 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
             return {"ok": False, "reason": "seized=0"}
 
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
-        swap = direct_swap(coll, loan, seized, liq, liq, repaid_assets=repaid_assets)
+        # 29.07 unwrap-хоп: обёртки без DEX-ликвидности котируются ПОДЛЕЖАЩИМ (redeem в контракте
+        # v3 до свопа); rate кэширован (TTL 1ч) — RTT в горячем пути не добавляется.
+        from chain.execute import swap_plan
+        swap_token, swap_amount, unwrap = swap_plan(rpc, coll, seized)
+        swap = direct_swap(swap_token, loan, swap_amount, liq, liq, repaid_assets=repaid_assets)
         if swap is None:                       # market outside direct routes -> Kyber fallback (unchanged)
-            swap = kyber_swap(coll, loan, seized, liq, liq, slippage_bps=slippage_bps)
+            swap = kyber_swap(swap_token, loan, swap_amount, liq, liq, slippage_bps=slippage_bps)
 
         # P0-4: guard-read свежести УДАЛЁН — он дублировал sim: тот же preconf-pending источник, а sim
         # ниже ревертит (Panic 0x11) на том же устаревшем долге и даёт тот же skip. Отдельное чтение
         # стоило ~350мс RTT в горячем пути и ловило только окно «между guard и sim» ~0мс шириной.
 
-        cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0)
+        cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0, unwrap)
         # P0-4: gas per-market из кэша; при промахе estimate_gas идёт ПАРАЛЛЕЛЬНО sim (оба preconf,
         # cd0/cd1 по газу эквивалентны — отличаются одним сравнением minProfit) -> первый выстрел по
         # рынку платит max(sim, estimate) вместо суммы, последующие — только sim.
@@ -1005,7 +1009,8 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
                     "reason": f"net ${net_usd:.2f} (profit ${profit_usd:.2f} - cost ${cost_usd:.2f}) < min ${cfg.min_profit_usd:.2f}"}
 
         min_profit_final = profit_wei * 95 // 100
-        cd1 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit_final)
+        cd1 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"],
+                               min_profit_final, unwrap)
         # gas: из per-market кэша (0 RTT) либо от параллельного preconf-estimate выше. Явный gas в prep
         # по-прежнему нужен, иначе send_tx оценит на confirmed-Alchemy, где reaction-флип ещё healthy ->
         # estimate_gas ревертит -> tx НЕ уходит. Лимит всегда max(..., cfg.gas_limit_est) — запас бесплатен.
@@ -1024,7 +1029,8 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         _prep = {"ok": True, "calldata": cd1, "gas": _gas_limit, "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd,
                  # сырые компоненты для batch-энкодера + debt для per-item USD в receipt-цикле (prep["calldata"] = одиночный вызов)
                  "mp": mp, "borrower": borrower, "repaid_shares": repaid_shares, "swap_target": swap["router"],
-                 "swap_calldata": swap["calldata"], "min_profit": min_profit_final, "debt_usd": debt_usd, "debt_assets": debt_assets}
+                 "swap_calldata": swap["calldata"], "min_profit": min_profit_final, "debt_usd": debt_usd,
+                 "debt_assets": debt_assets, "unwrap_target": unwrap}
         _fb = _fresh_basefee()
         if _fb is not None:                                   # SEND-2: fee из fb-хедера (0 Alchemy-RTT в send)
             _tip = int(dynamic_tip_gwei(cfg, debt_usd) * 1e9)   # каскадная страховка по призу

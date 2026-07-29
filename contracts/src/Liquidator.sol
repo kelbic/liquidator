@@ -18,6 +18,7 @@ struct LiquidationItem {
     address swapTarget;
     bytes swapCallData;
     uint256 minProfit;
+    address unwrapTarget;
 }
 
 interface IMorpho {
@@ -34,6 +35,12 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
     function approve(address spender, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
+}
+
+/// @dev Minimal ERC4626 surface for the unwrap hop (wsuperOETHb -> superOETHb).
+interface IERC4626 {
+    function asset() external view returns (address);
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256);
 }
 
 /// @title Liquidator — zero-capital Morpho Blue liquidations on Base.
@@ -55,7 +62,8 @@ contract Liquidator {
         address swapTarget;       // aggregator router (0x/1inch/Odos/KyberSwap)
         bytes swapCallData;       // pre-built off-chain by the bot
         address loanToken;
-        address collateralToken;
+        address collateralToken;  // token the SWAP spends: market collateral, or its ERC4626 underlying when unwrapping
+        address unwrapTarget;     // ERC4626 wrapper to redeem before the swap (0 = no unwrap)
     }
 
     error NotOwner();
@@ -103,20 +111,29 @@ contract Liquidator {
     /// @notice Liquidate `borrower` on market `mp`, repaying `repaidShares` of debt, swapping the
     /// seized collateral to loanToken via `swapTarget`/`swapCallData`. Reverts unless realized
     /// profit (swept to owner) >= `minProfit`. onlyOwner so swap calldata is always our own.
+    /// @param unwrapTarget ERC4626 wrapper (== mp.collateralToken) to redeem before the swap when
+    /// the wrapper itself has no DEX liquidity but its underlying does (wsuperOETHb -> superOETHb);
+    /// the swap calldata must then spend the UNDERLYING. address(0) = no unwrap (unchanged path).
     function liquidate(
         MarketParams calldata mp,
         address borrower,
         uint256 repaidShares,
         address swapTarget,
         bytes calldata swapCallData,
-        uint256 minProfit
+        uint256 minProfit,
+        address unwrapTarget
     ) external onlyOwnerOrSelf nonReentrant returns (uint256 profit) {
+        // asset() read on-chain: the swap-spend token can never disagree with what redeem() emits
+        address swapToken = unwrapTarget == address(0)
+            ? mp.collateralToken
+            : IERC4626(unwrapTarget).asset();
         bytes memory data = abi.encode(
             SwapData({
                 swapTarget: swapTarget,
                 swapCallData: swapCallData,
                 loanToken: mp.loanToken,
-                collateralToken: mp.collateralToken
+                collateralToken: swapToken,
+                unwrapTarget: unwrapTarget
             })
         );
 
@@ -143,7 +160,8 @@ contract Liquidator {
         for (uint256 i = 0; i < items.length; i++) {
             try this.liquidate(
                 items[i].mp, items[i].borrower, items[i].repaidShares,
-                items[i].swapTarget, items[i].swapCallData, items[i].minProfit
+                items[i].swapTarget, items[i].swapCallData, items[i].minProfit,
+                items[i].unwrapTarget
             ) returns (uint256) {
                 nOk++;
             } catch (bytes memory reason) {
@@ -158,6 +176,12 @@ contract Liquidator {
         if (msg.sender != MORPHO) revert NotMorpho();
         SwapData memory s = abi.decode(data, (SwapData));
 
+        if (s.unwrapTarget != address(0)) {
+            // seized wrapper -> underlying; redeem to self, swap below spends the underlying
+            IERC4626(s.unwrapTarget).redeem(
+                IERC20(s.unwrapTarget).balanceOf(address(this)), address(this), address(this)
+            );
+        }
         uint256 collBal = IERC20(s.collateralToken).balanceOf(address(this));
         _forceApprove(s.collateralToken, s.swapTarget, collBal);
         (bool ok, ) = s.swapTarget.call(s.swapCallData);
