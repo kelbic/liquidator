@@ -42,6 +42,26 @@
 
 ---
 
+## 🔧 29.07 КОНТРАКТ v3 В БОЮ: UNWRAP-ХОП (ERC4626 redeem перед свопом), «го» kelbic
+
+**Адрес: `0x0eC5ae5cF6d048cBfc058ae2dDE14176956690aA`** (tx dafb30c2…, gas 1.23M, owner = боевой
+кошелёк). ОТКАТ: в .env вернуть `0x839B66867286eAfbc93Ced8e8519B97686d1B120` (v2 мультибатч) +
+`git checkout de12b6c` (до-ABI код бота: v2-сигнатура 6 аргументов) + restart; бэкап .env =
+`.env.bak_0729_unwrap`. Прежний одиночный v1: 0x54730E….
+
+Что нового: `liquidate(...)/LiquidationItem` получили `unwrapTarget` (0 = прежний путь бит-в-бит);
+в callback при unwrapTarget≠0 контракт делает `IERC4626.redeem(balance)` и свопит ПОДЛЕЖАЩИМ
+(swap-токен = `asset()` читается on-chain — рассинхрон с redeem невозможен). Бот:
+`UNWRAP_COLLATERALS` (wsuperOETHb→superOETHb), `swap_plan()` котирует подлежащим (rate
+`convertToAssets` TTL 1ч, haircut 0.997: недобор=SwapFailed-revert, излишек=пыль под sweep).
+Верификация: 5 форк-тестов (вкл. redeem НАСТОЯЩЕГО wsuperOETHb из контракта + негативный контроль
+«без unwrap своп голодает»), 11 batch/мок, 4 юнита бота, live-канарейки через v3 на wsuperOETHb-
+и cbBTC-целях = чистый «position is healthy». Итог: wsuperOETHb-цели ($199k) переходят из
+«⚠️ выход не реализован» в боевую очередь детонаторов; тот же хоп открывает будущие
+завёрнутые коллатерали одной строкой в UNWRAP_COLLATERALS.
+
+---
+
 ## 🔍 27.07 ВЕРИФИКАЦИЯ ТРЁХ НЕПОКРЫТЫХ РЫНКОВ (read-only, ноль деплоев)
 
 **USDe/USDC $230.5M — структура подтверждена ПОЛНОСТЬЮ, экономика УПИРАЕТСЯ В ВЫХОД.**
