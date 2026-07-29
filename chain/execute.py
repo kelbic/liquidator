@@ -717,25 +717,42 @@ def swap_plan(rpc, coll: str, seized: int):
 # котировки => для обычных целей поведение и число RTT не меняются.
 SLICE_MAX_IMPACT = float(os.environ.get("SLICE_MAX_IMPACT", "0.01"))
 SLICE_MIN_FRACTION = float(os.environ.get("SLICE_MIN_FRACTION", "0.02"))
-SLICE_MAX_ITERS = int(os.environ.get("SLICE_MAX_ITERS", "4"))
+SLICE_MAX_ITERS = int(os.environ.get("SLICE_MAX_ITERS", "6"))
 
 
 def slice_to_depth(probe_fn):
-    """probe_fn(fraction) -> (impact_float, swap) | None. Ищет наибольшую долю с импактом
-    <= SLICE_MAX_IMPACT: сжатие пропорционально перебору с демпфером 0.8, пол SLICE_MIN_FRACTION.
-    -> (fraction, swap) или (0.0, None) — глубины нет даже для минимального среза. Чистая."""
-    f = 1.0
+    """probe_fn(fraction) -> (impact_float, swap) | None. Ищет НАИБОЛЬШУЮ долю с импактом
+    <= SLICE_MAX_IMPACT. Вниз — пропорционально перебору (демпфер 0.8, пол SLICE_MIN_FRACTION);
+    после первого проходного размера — расширение к глубине (x2.5, капнутое серединой до
+    известной непроходной границы): канарейка 29.07 показала, что на обрывном профиле USDe
+    (импакт 97% на полном) чистое сжатие перепрыгивает оптимум в пол и оставляет ~2/3 среза.
+    f=1 проходит с первой котировки. -> (fraction, swap) или (0.0, None) — глубины нет. Чистая."""
+    f, best, hi = 1.0, None, None
     for _ in range(SLICE_MAX_ITERS):
         res = probe_fn(f)
         if res is None:
-            return 0.0, None
+            return best if best is not None else (0.0, None)
         impact, swap = res
         if impact <= SLICE_MAX_IMPACT:
-            return f, swap
-        if f <= SLICE_MIN_FRACTION:
-            return 0.0, None
-        f = max(SLICE_MIN_FRACTION, f * SLICE_MAX_IMPACT / max(impact, 1e-9) * 0.8)
-    return 0.0, None
+            if f >= 0.999:
+                return 1.0, swap
+            best = (f, swap)
+            nxt = f * 2.5 if hi is None else min(f * 2.5, (f + hi) / 2)
+            if nxt <= f * 1.05:
+                return best
+            f = min(nxt, 1.0)
+        else:
+            hi = f
+            if best is not None:
+                nxt = (best[0] + hi) / 2
+                if nxt <= best[0] * 1.05:
+                    return best
+                f = nxt
+            else:
+                if f <= SLICE_MIN_FRACTION:
+                    return 0.0, None
+                f = max(SLICE_MIN_FRACTION, f * SLICE_MAX_IMPACT / max(impact, 1e-9) * 0.8)
+    return best if best is not None else (0.0, None)
 
 
 _LIQUIDATE_SIG = ("liquidate((address,address,address,address,uint256),"

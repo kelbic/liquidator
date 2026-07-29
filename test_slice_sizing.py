@@ -20,17 +20,29 @@ f, swap = slice_to_depth(probe_linear(0.002, calls))
 assert f == 1.0 and swap is SWAP and calls == [1.0], (f, calls)
 print("UNIT_OK: глубокий пул — f=1.0 с первой котировки")
 
-# 2) USDe-профиль (импакт 40% на полном): сходится к min-доле, импакт в пределе
+# 2) линейный крутой профиль (импакт 40% на полном): предел ~f=0.025, идём к нему, не в пол
 calls = []
 f, swap = slice_to_depth(probe_linear(0.40, calls))
-assert swap is SWAP and f <= 0.021 and 0.40 * f <= SLICE_MAX_IMPACT, (f, calls)
-print("UNIT_OK: USDe-профиль — срез до f=%.3f за %d котировки" % (f, len(calls)))
+assert swap is SWAP and 0.019 <= f <= 0.026 and 0.40 * f <= SLICE_MAX_IMPACT, (f, calls)
+print("UNIT_OK: линейный 40%% — f=%.4f за %d котировок" % (f, len(calls)))
 
-# 3) средний случай (импакт 3% на полном): доля ~0.27, не пол
+# 3) средний случай (импакт 3% на полном): оптимум f=1/3, сходимся в 0.26-0.34
 calls = []
 f, swap = slice_to_depth(probe_linear(0.03, calls))
-assert swap is SWAP and 0.2 < f < 0.4 and 0.03 * f <= SLICE_MAX_IMPACT, (f, calls)
-print("UNIT_OK: импакт 3%% -> f=%.3f (режем пропорционально, не в пол)" % f)
+assert swap is SWAP and 0.25 < f < 0.35 and 0.03 * f <= SLICE_MAX_IMPACT, (f, calls)
+print("UNIT_OK: импакт 3%% -> f=%.3f (близко к оптимуму 0.333)" % f)
+
+# 3b) ОБРЫВНЫЙ профиль USDe (канарейка 29.07): глубина до f=0.056 бездонная, дальше стена.
+# Чистое сжатие падало в пол 0.02 и теряло 2/3 среза — теперь расширяемся к глубине.
+def cliff(f):
+    return (0.0005 if f <= 0.056 else 0.97, SWAP)
+
+
+calls = []
+f, swap = slice_to_depth(lambda fr: (calls.append(fr) or cliff(fr)))
+assert swap is SWAP and f >= 0.04, "обязан дожать к глубине, а не остаться в полу: f=%s %s" % (f, calls)
+print("UNIT_OK: обрывный USDe-профиль — f=%.4f (пол был бы 0.02), пробы: %s" %
+      (f, ["%.3f" % c for c in calls]))
 
 # 4) глубины нет вообще: импакт высокий даже на полу -> (0, None), цикл конечен
 calls = []
