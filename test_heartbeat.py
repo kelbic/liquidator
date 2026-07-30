@@ -72,3 +72,19 @@ assert beat("x", hb_dir=bad) is False
 print("UNIT_OK: beat не кидает на битой директории")
 
 print("=== ВСЕ HEARTBEAT-ЮНИТЫ ПРОШЛИ ===")
+
+# 8) хост-фильтр реестра (30.07: usde-watch переехал на Вену): ONLY сужает, SKIP вычитает
+import tempfile as _tf
+from analysis.heartbeat_check import _host_registry
+d8 = _tf.mkdtemp()
+os.environ["HB_WATCH_ONLY"] = "usde-watch"
+assert set(_host_registry()) == {"usde-watch"}
+run_check(NOW, lambda t: None, hb_dir=d8)                       # бутстрап часов пустой директории
+got8 = run_check(NOW + 10 * 86400, lambda t: None, hb_dir=d8)   # все давно молчат, но следим за одним
+assert len(got8) == 1 and "usde-watch" in got8[0], got8
+del os.environ["HB_WATCH_ONLY"]
+os.environ["HB_WATCH_SKIP"] = "usde-watch"
+assert "usde-watch" not in _host_registry() and "bot-block" in _host_registry()
+del os.environ["HB_WATCH_SKIP"]
+assert set(_host_registry()) == set(REGISTRY), "без env фильтр обязан быть прозрачным"
+print("UNIT_OK: HB_WATCH_ONLY/SKIP — пер-хостовый реестр, без env поведение прежнее")

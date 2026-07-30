@@ -22,9 +22,19 @@ from heartbeat import HB_DIR, age_sec, beat
 REGISTRY = {
     # имя: (каденс_сек, порог_тревоги_сек)
     "bot-block":     (30,    300),      # блок-луп: реконнекты легитимно рвут пульс до минут
-    "usde-watch":    (3600,  7500),     # hourly таймер + RandomizedDelaySec 300 -> 2x + джиттер
+    "usde-watch":    (3600,  7500),     # hourly + джиттер -> 2x (30.07 живёт на Вене: HB_WATCH_*)
     "daily-summary": (86400, 176400),   # суточная сводка: 2x + час
 }
+
+
+def _host_registry() -> dict:
+    """30.07: вотчеры разъезжаются по хостам (usde-watch -> Вена, разгрузка одноядерной
+    Charlotte) — реестр один на все хосты, каждый хост фильтрует своё окружением:
+    HB_WATCH_ONLY="a,b" — следить только за этими; HB_WATCH_SKIP="c" — за всеми, кроме."""
+    only = {s.strip() for s in os.environ.get("HB_WATCH_ONLY", "").split(",") if s.strip()}
+    skip = {s.strip() for s in os.environ.get("HB_WATCH_SKIP", "").split(",") if s.strip()}
+    reg = {k: v for k, v in REGISTRY.items() if not only or k in only}
+    return {k: v for k, v in reg.items() if k not in skip}
 SELF_THRESHOLD_SEC = 1800               # порог самого надзора (таймер 10 мин) — для daily_summary
 REALERT_SEC = 6 * 3600                  # пока молчит — напоминание раз в 6ч, не каждые 10 мин
 _STATE = ".supervisor.json"
@@ -48,7 +58,7 @@ def run_check(now: float, send, hb_dir: str = "") -> list[str]:
     os.makedirs(d, exist_ok=True)
     st = _load_state(d)
     sent = []
-    for name, (cadence, threshold) in REGISTRY.items():
+    for name, (cadence, threshold) in _host_registry().items():
         age = age_sec(name, now=now, hb_dir=d)
         if age is None:
             boot = st["boot"].setdefault(name, now)
