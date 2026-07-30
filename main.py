@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import asyncio
+import queue
 import threading
 import logging
 import time
@@ -469,6 +470,27 @@ _RECON_SERIES_N = 3
 _RECON_SERIES_WINDOW_SEC = 1800
 
 
+def _offer_latest(q, blk):
+    """Слот «последний блок» (Queue maxsize=1) для воркера-ассессора: занятый воркер не копит
+    очередь — устаревший блок вытесняется свежим (ассессмент по старому блоку бесполезен).
+    -> True, если старый блок вытеснен (сигнал деградации, лог троттлится у вызывающего)."""
+    try:
+        q.put_nowait(blk)
+        return False
+    except queue.Full:
+        dropped = False
+        try:
+            q.get_nowait()
+            dropped = True
+        except queue.Empty:
+            pass
+        try:
+            q.put_nowait(blk)
+        except queue.Full:
+            pass
+        return dropped
+
+
 def _source_params(cfg, active):
     """(url, connect_kwargs, generator) for the active block source. flashblocks = the public feed
     (~2.1s earlier, brotli, large frames -> max_size=None); newheads = the RPC wss (fallback)."""
@@ -620,13 +642,84 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
             except Exception:
                 log.exception("predict-shadow не стартовал (слой опционален, бот не задет)")
         threading.Thread(target=_run_predict, daemon=True).start()
-    last_hb = 0.0
-    last_full = 0.0
-    last_pulse = 0.0   # файловый пульс для heartbeat-check (не путать с HEARTBEAT_SEC — лог-троттл)
-    hf_cache = {}
+    def _assess_block(blk, st):
+        """Пер-блочный ассессмент — бывшее тело recv-цикла, 1:1. st — состояние ассессора
+        (hf_cache/троттлы/пульс), локальное для его потока.
+        30.07: под штормом МЕДЛЕННЫХ отказов RPC (408/таймаут ~7.4с; вчерашние быстрые 429 флапа
+        не давали) inline-ассессмент держал event loop 7-10с/блок — сервер рвал flashblocks-WS как
+        slow-consumer: 83 обрыва block-loop за 3ч при 0 у hot_loop в том же процессе (у того recv
+        чистый с 07-23, «inline-резолв глушил hot-path» — тот же класс бага)."""
+        if time.time() - st["last_pulse"] >= 30.0:
+            hb_beat("bot-block")             # пульс = живой АССЕССМЕНТ, не просто живой WS:
+            st["last_pulse"] = time.time()   # зависший воркер будит heartbeat-check, как раньше inline
+        by_id, groups, debt_by, debt_assets_by, ncand = shared.snapshot()
+        today = store.realized_today()
+        gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"] + specfire_gas_today(),
+                        inflight=current_inflight())
+        blocked = guard.blocked_reason(gs)
+        if blocked and cfg.mode == "execute":
+            if time.time() - st["last_hb"] >= HEARTBEAT_SEC:
+                log.error("kill switch engaged: %s", blocked)
+                alerter.send_async(f"\U0001F6D1 liquidator halted: {blocked}", key="killswitch")
+                st["last_hb"] = time.time()
+            return
+        if not groups:
+            return
+        hf_cache = st["hf_cache"]
+        do_full = time.time() - st["last_full"] >= HOT_FULL_REFRESH_SEC
+        if do_full:
+            st["last_full"] = time.time()
+            live = {(m, b) for m, bs in groups.items() for b in bs}
+            for k in [k for k in hf_cache if k not in live]:
+                del hf_cache[k]                       # prune cache to current set
+        else:
+            groups = _hot_subset(groups, hf_cache)    # per block: only near-threshold
+        t0 = time.time()
+        try:
+            s = process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg,
+                                   guard, alerter, log, ctx_cache, ncand, hf_cache=hf_cache,
+                                   read_rpc=_bg_read_rpc)
+        except Exception as e:
+            # RPC-split (07-21): per-block process_candidates ходит по общей ноде (сейчас
+            # публичная, лимитированная) — её транзиентный HTTPError/429 НЕ должен ронять ассессор.
+            # Пропускаем ЭТОТ блок; следующий блок повторит. Троттл-лог 1/30с.
+            _bnow = time.monotonic()
+            if _bnow - st["last_blockerr"] >= 30.0:
+                log.warning("block %s assess skipped (%s) — RPC hiccup, следующий блок повторит",
+                            blk, type(e).__name__)
+                st["last_blockerr"] = _bnow
+            return
+        if s["liquidatable"] or s["profitable"] or (time.time() - st["last_hb"] >= HEARTBEAT_SEC):
+            st["last_hb"] = time.time()
+            tag = "full" if do_full else "hot"
+            mh = f"{s['min_hf']:.4f}" if s["min_hf"] is not None else "n/a"
+            log.info("block %d: assessed=%d/%d (%s) liq=%d profit=%d min_hf=%s in %.2fs",
+                     blk, s["confirmed"], ncand, tag, s["liquidatable"],
+                     s["profitable"], mh, time.time() - t0)
+
+    _assess_st = {"last_hb": 0.0, "last_full": 0.0, "last_pulse": 0.0, "last_blockerr": 0.0,
+                  "hf_cache": {}}
+    # 30.07: ассессмент УХОДИТ ИЗ recv-петли в один воркер (симметрия с hot_loop 07-23) — WS
+    # всегда читает кадры, busy-воркер вытесняет устаревший блок. BLOCK_ASSESS_ASYNC=0 = откат inline.
+    _assess_async = os.environ.get("BLOCK_ASSESS_ASYNC", "1").lower() not in ("0", "false", "off")
+    _assess_q: queue.Queue = queue.Queue(maxsize=1)
+    _skip_n = 0
+    _skip_log_ts = 0.0
+    if _assess_async:
+        def _assess_worker():
+            while not stop.is_set():
+                try:
+                    _blk = _assess_q.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                try:
+                    _assess_block(_blk, _assess_st)
+                except Exception:                     # баг ассессора не убивает воркер
+                    log.exception("assess-воркер: ошибка на блоке %s (воркер жив)", _blk)
+        threading.Thread(target=_assess_worker, daemon=True, name="block-assess").start()
+        log.info("block-assess: воркер-тред активен (recv-петля не блокируется; BLOCK_ASSESS_ASYNC=0 = откат)")
     active = cfg.block_source if cfg.block_source in ("flashblocks", "newheads") else "newheads"
     fails = 0
-    last_blockerr_log = 0.0      # троттл лога «блок пропущен»: транзиентная RPC-ошибка НЕ роняет WS
     recon_ts: list[float] = []   # моменты ws-обрывов для серия-гейта TG (см. _RECON_SERIES_N)
     while True:
         url, conn_kw, gen = _source_params(cfg, active)
@@ -635,52 +728,17 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                 log.info("block source=%s connected — loop (mode=%s)", active, cfg.mode)
                 async for blk in gen(ws):
                     fails = 0   # blocks are flowing on this source
-                    if time.time() - last_pulse >= 30.0:
-                        hb_beat("bot-block")
-                        last_pulse = time.time()
-                    by_id, groups, debt_by, debt_assets_by, ncand = shared.snapshot()
-                    today = store.realized_today()
-                    gs = GuardState(realized_net_today=today["net"], gas_spent_today=today["gas"] + specfire_gas_today(),
-                                    inflight=current_inflight())
-                    blocked = guard.blocked_reason(gs)
-                    if blocked and cfg.mode == "execute":
-                        if time.time() - last_hb >= HEARTBEAT_SEC:
-                            log.error("kill switch engaged: %s", blocked)
-                            alerter.send_async(f"\U0001F6D1 liquidator halted: {blocked}", key="killswitch")
-                            last_hb = time.time()
-                        continue
-                    if not groups:
-                        continue
-                    do_full = time.time() - last_full >= HOT_FULL_REFRESH_SEC
-                    if do_full:
-                        last_full = time.time()
-                        live = {(m, b) for m, bs in groups.items() for b in bs}
-                        for k in [k for k in hf_cache if k not in live]:
-                            del hf_cache[k]                       # prune cache to current set
+                    if _assess_async:
+                        if _offer_latest(_assess_q, blk):
+                            _skip_n += 1
+                            _snow = time.monotonic()
+                            if _snow - _skip_log_ts >= 60.0:
+                                log.info("DIAG assess-lag: %d блоков вытеснено (воркер занят) — WS жив",
+                                         _skip_n)
+                                _skip_n = 0
+                                _skip_log_ts = _snow
                     else:
-                        groups = _hot_subset(groups, hf_cache)    # per block: only near-threshold
-                    t0 = time.time()
-                    try:
-                        s = process_candidates(rpc, by_id, groups, debt_by, debt_assets_by, store, cfg,
-                                               guard, alerter, log, ctx_cache, ncand, hf_cache=hf_cache,
-                                               read_rpc=_bg_read_rpc)
-                    except Exception as e:
-                        # RPC-split (07-21): per-block process_candidates ходит по общей ноде (сейчас
-                        # публичная, лимитированная) — её транзиентный HTTPError/429 НЕ должен ронять WS
-                        # (иначе реконнект-флап). Пропускаем ЭТОТ блок, WS живёт; следующий блок повторит.
-                        # Троттл-лог 1/30с, чтобы реальная поломка (постоянный скип) была видна.
-                        _bnow = time.monotonic()
-                        if _bnow - last_blockerr_log >= 30.0:
-                            log.warning("block %s assess skipped (%s) — WS сохранён (RPC hiccup)", blk, type(e).__name__)
-                            last_blockerr_log = _bnow
-                        continue
-                    if s["liquidatable"] or s["profitable"] or (time.time() - last_hb >= HEARTBEAT_SEC):
-                        last_hb = time.time()
-                        tag = "full" if do_full else "hot"
-                        mh = f"{s['min_hf']:.4f}" if s["min_hf"] is not None else "n/a"
-                        log.info("block %d: assessed=%d/%d (%s) liq=%d profit=%d min_hf=%s in %.2fs",
-                                 blk, s["confirmed"], ncand, tag, s["liquidatable"],
-                                 s["profitable"], mh, time.time() - t0)
+                        _assess_block(blk, _assess_st)
         except Exception as e:
             log.warning("block source=%s error (%s) — reconnecting in 3s", active, type(e).__name__)
             _now = time.monotonic()

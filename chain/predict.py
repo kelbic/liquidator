@@ -38,6 +38,11 @@ FEEDS_BASE: dict = {
 }
 HOLD_SEC = 600.0        # falsepos-кап: релиз таймером только если цена отклонена, а пуша всё нет
 MID_STALE_SEC = float(os.environ.get("PREDICT_MID_STALE_SEC", "30.0"))
+# бэкофф полла агрегаторов при серии отказов (шторм 30.07): после AFTER подряд — 5с*2^n, кап 30с
+POLL_BACKOFF_ON = os.environ.get("PREDICT_POLL_BACKOFF", "1").lower() not in ("0", "false", "off")
+POLL_BACKOFF_AFTER = 3
+POLL_BACKOFF_BASE_SEC = 5.0
+POLL_BACKOFF_CAP_SEC = 30.0
 # mid старше -> фид заморожен (обрыв WS не генерит фантомные arm/falsepos). 30с, не 10: bookTicker
 # тихих альтов (ADA) легитимно молчит >10с без смены best-bid/ask — 10с давало stale/recovered-чёрн
 # (2 эпизода за первые 7 мин shadow). Реальный клин WS ловит транспорт (recv-таймаут 10с -> реконнект).
@@ -271,6 +276,11 @@ class PredictDriver:
         self._thread = None
         self._last_updated: dict = {}
         self._last_poll = None
+        # 30.07: шторм dRPC (429 быстрые, 408 по ~7.4с) — полл без бэкоффа долбил задушенный
+        # эндпоинт каждые poll_interval часами, кормя его же троттлер. Серия отказов (>=3) ->
+        # экспоненциальная пауза 5с..кап 30с, успех сбрасывает. PREDICT_POLL_BACKOFF=0 = откат.
+        self._poll_fail_streak = 0
+        self._poll_backoff_until = 0.0
         self._prev_armed: set = set()
         self._stale_since: dict = {}
         self.stats = {"steps": 0, "arms": 0, "confirmed": 0, "falsepos": 0, "poll_fail": 0,
@@ -323,7 +333,8 @@ class PredictDriver:
                 events += self.engine.on_mid(sym, mid, wall)   # recovered-mid ДО пуша этого шага
                 continue
             fresh[sym] = mid
-        if self._last_poll is None or (self._now() - self._last_poll) >= self.poll_interval:
+        if ((self._last_poll is None or (self._now() - self._last_poll) >= self.poll_interval)
+                and self._now() >= self._poll_backoff_until):
             self._last_poll = self._now()
             events += self._poll(wall, stale)
         for sym, mid in fresh.items():
@@ -347,9 +358,19 @@ class PredictDriver:
     def _poll(self, wall, stale: set | None = None) -> list:
         try:
             reads = self.poll_fn() or {}
+            self._poll_fail_streak = 0
+            self._poll_backoff_until = 0.0
         except Exception as e:
             self.stats["poll_fail"] += 1
-            self.log("[predict] aggregator poll failed (skipped): %s" % str(e)[:120])
+            self._poll_fail_streak += 1
+            if POLL_BACKOFF_ON and self._poll_fail_streak >= POLL_BACKOFF_AFTER:
+                delay = min(POLL_BACKOFF_BASE_SEC * (2 ** (self._poll_fail_streak - POLL_BACKOFF_AFTER)),
+                            POLL_BACKOFF_CAP_SEC)
+                self._poll_backoff_until = self._now() + delay
+                self.log("[predict] aggregator poll failed #%d — backoff %.0fs: %s"
+                         % (self._poll_fail_streak, delay, str(e)[:120]))
+            else:
+                self.log("[predict] aggregator poll failed (skipped): %s" % str(e)[:120])
             return []
         events = []
         for sym, val in reads.items():
