@@ -13,7 +13,11 @@ Usage:
 Defaults: OUT_PATH=covered_markets.json  MIN_BORROW_USD=50000  MAX_MARKETS=40
 """
 import json
+import os
 import sys
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 MORPHO_API_URL = "https://api.morpho.org/graphql"
@@ -43,6 +47,18 @@ INCLUDE_MARKETS = frozenset({
 # collateral our swap venue (KyberSwap) cannot exit -> liquidation would revert; don't waste a slot.
 # Pendle PT tokens trade on Pendle's own AMM, not the DEXs Kyber aggregates.
 EXIT_BLOCKED_COLLATERAL = ("PT-",)
+
+# Скам-рынки Morpho (permissionless-создание): мусорный токен под знакомым тикером, оракул-константа
+# (price() без внешних зависимостей), Kyber-выхода нет. «Займ» надувается ради входа в топ-N и
+# дренажа лендеров — слот покрытия им не отдаём, добычи там не бывает (залог не продать).
+# 30.07: оба «RSS/USDC» = elephanToken (новый 0x7a30…, старый 0x5063…), оракулы прибиты к 1.0.
+PHANTOM_MARKETS = {
+    "0x40ac09f34c5bc0b0b6d9b5f1ec1b97a6a149ff6278104797c9cb740453a2b794":
+        "elephanToken под тикером RSS: оракул-константа 1.0, Kyber-выхода нет",
+    "0xa4ec527128b425ee3fcb7f60eca37677b63b3d003345ec2a72ef6a2e72da53fc":
+        "elephanToken под тикером RSS (старый слот): оракул-константа, выхода нет",
+}
+_PHANTOM_LC = {k.lower(): v for k, v in PHANTOM_MARKETS.items()}
 
 _MARKETS_QUERY = """
 query Markets($chains: [Int!], $first: Int!, $skip: Int!) {
@@ -109,6 +125,8 @@ def select_markets(items, min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD
         borrow = float(st.get("borrowAssetsUsd") or 0)
         key = it.get("marketId")
         included = (key or "").lower() in inc_lc          # CBBTC_PLAN: allowlist обходит borrow-границы
+        if not included and (key or "").lower() in _PHANTOM_LC:
+            continue                            # скам-рынок: слот не выдаём (allowlist выше эвристик)
         if not included and (borrow < min_borrow_usd or borrow > max_borrow_usd):
             continue
         col = it.get("collateralAsset") or {}
@@ -151,8 +169,13 @@ def to_json_records(selected) -> list:
 
 
 def _removal_reason(mid, items_by_id, exclude_oracles=None,
-                    min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD) -> str:
+                    min_borrow_usd=50_000.0, max_borrow_usd=MAX_BORROW_USD,
+                    phantom_reasons=None) -> str:
     """Почему select_markets не взял рынок (зеркало его фильтров, для алерта). Чистая."""
+    if phantom_reasons and mid in phantom_reasons:
+        return "отсеян как фантом: %s" % phantom_reasons[mid]
+    if mid.lower() in _PHANTOM_LC:
+        return "отсеян как фантом: %s" % _PHANTOM_LC[mid.lower()]
     it = items_by_id.get(mid.lower())
     if it is None:
         return "исчез из API"
@@ -171,12 +194,126 @@ def _removal_reason(mid, items_by_id, exclude_oracles=None,
     return "вытеснен из топ-N (займ $%.0fk)" % (borrow / 1e3)
 
 
+USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+KYBER_ROUTES_URL = "https://aggregator-api.kyberswap.com/base/api/v1/routes"
+PHANTOM_RECHECK_SEC = 7 * 86400    # фантом: выход может появиться (mGLO-урок) — перепроверяем
+LIVE_RECHECK_SEC = 30 * 86400      # живой рынок фантомом не становится — редкая перепроверка
+
+
+def _is_constant_oracle(access_list, oracle) -> bool:
+    """Pure: price() оракула-константы не читает ничьих слотов, кроме своих собственных."""
+    o = (oracle or "").lower()
+    return not any((e.get("address") or "").lower() != o for e in (access_list or []))
+
+
+def probe_market_phantom(it, rpc_url, timeout=20):
+    """-> причина-строка, если рынок фантом (оракул-константа И нет Kyber-выхода), иначе "".
+    Транспортные сбои поднимаются исключениями — вызыватель решает (fail-open). Дешёвая
+    последовательность: accessList (1 RPC) отсекает живые оракулы ДО похода в Kyber."""
+    oracle = it.get("oracleAddress") or ""
+    col = it.get("collateralAsset") or {}
+    if not oracle or not col.get("address"):
+        return ""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_createAccessList",
+                       "params": [{"to": oracle, "data": "0xa035b1fe"}, "latest"]}).encode()
+    req = urllib.request.Request(rpc_url, data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": "curl/8.5"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        res = json.loads(r.read())
+    al = (res.get("result") or {}).get("accessList")
+    if res.get("error") or al is None:
+        raise RuntimeError("accessList: %s" % str(res.get("error"))[:60])
+    if not _is_constant_oracle(al, oracle):
+        return ""
+    dec = int(col.get("decimals") or 18)
+    qs = urllib.parse.urlencode({"tokenIn": col["address"], "tokenOut": USDC_BASE,
+                                 "amountIn": str(1000 * 10 ** dec)})
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                KYBER_ROUTES_URL + "?" + qs, headers={"User-Agent": "curl/8.5"}),
+                timeout=timeout) as r:
+            d = json.loads(r.read())
+        out_usd = float(((d.get("data") or {}).get("routeSummary") or {}).get("amountOutUsd") or 0)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:          # Kyber «token not found» (mGLO-стиль) = выхода нет
+            out_usd = 0.0
+        else:
+            raise
+    if out_usd >= 1.0:
+        return ""
+    return ("оракул-константа (0 внешних зависимостей) + Kyber-выхода нет "
+            "(out $%.2f за 1000 %s)" % (out_usd, col.get("symbol") or "?"))
+
+
+def filter_phantoms(records, items, rpc_url, cache_path, log_fn=None, probe_fn=None, now=None):
+    """Динамический фантом-фильтр поверх select_markets («го» kelbic 30.07: скам-рынок
+    elephanToken-«RSS» надул займ $1M и вошёл в топ-N — отбор по займу геймится). Рынок с
+    оракулом-константой И без Kyber-выхода слот покрытия не получает. Вердикты кэшируются в
+    cache_path; сбой пробы = fail-open (рынок остаётся, вердикт не пишем). Allowlist не
+    фильтруется никогда (решения владельца выше эвристик). Откат: PHANTOM_FILTER=0.
+    -> (kept_records, {mid: причина}, свежепомеченные mid)."""
+    if os.environ.get("PHANTOM_FILTER", "1").strip().lower() in ("0", "false", "off"):
+        return records, {}, set()
+    log = log_fn or (lambda _m: None)
+    now = time.time() if now is None else now
+    probe = probe_fn or (lambda it: probe_market_phantom(it, rpc_url))
+    try:
+        with open(cache_path) as fh:
+            cache = json.load(fh)
+    except (OSError, ValueError):
+        cache = {}
+    items_by_id = {(it.get("marketId") or "").lower(): it for it in items}
+    inc_lc = {m.lower() for m in INCLUDE_MARKETS}
+    kept, reasons, fresh, dirty = [], {}, set(), False
+    for rec in records:
+        mid = rec["market_id"]
+        mlc = mid.lower()
+        if mlc in inc_lc:
+            kept.append(rec)
+            continue
+        ent = cache.get(mlc)
+        ttl = PHANTOM_RECHECK_SEC if (ent or {}).get("phantom") else LIVE_RECHECK_SEC
+        if ent is None or now - float(ent.get("ts") or 0) >= ttl:
+            it = items_by_id.get(mlc)
+            if it is None:
+                kept.append(rec)
+                continue
+            try:
+                why = probe(it)
+            except Exception as e:  # noqa: BLE001 — транспорт: fail-open, без кэша
+                log("phantom probe fail %s: %s" % (mid[:10], type(e).__name__))
+                kept.append(rec)
+                continue
+            ent = {"phantom": bool(why), "reason": why, "ts": now}
+            cache[mlc] = ent
+            dirty = True
+            if why:
+                fresh.add(mid)
+        if ent.get("phantom"):
+            reasons[mid] = ent.get("reason") or "фантом"
+            log("phantom filter: %s/%s %s… отсеян (%s)" % (
+                rec.get("collateral_token"), rec.get("loan_token"), mid[:10], reasons[mid]))
+        else:
+            kept.append(rec)
+    if dirty:
+        try:
+            tmp = cache_path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(cache, fh)
+            os.replace(tmp, cache_path)
+        except OSError:
+            pass
+    return kept, reasons, fresh
+
+
 # Списанные цели: их приход/уход из покрытия — рутина, не событие (kelbic 29.07: mGLO вышел за
 # потолок -> TG-алерт был спамом, у mGLO свой вотчер оживления на Вене). Лог остаётся всегда.
 RESCAN_ALERT_QUIET = frozenset({"mGLO"})
 
 
-def rescan_change_msg(items, old_pairs, new_pairs, added, removed, exclude_oracles=None) -> str:
+def rescan_change_msg(items, old_pairs, new_pairs, added, removed, exclude_oracles=None,
+                      phantom_reasons=None) -> str:
     """Текст TG-алерта об изменении covered-листа ресканом (28.07: рескан молча откатил ручную
     правку владельца — изменение листа обязано быть видимым, с причиной). Изменения по парам из
     RESCAN_ALERT_QUIET в TG не идут; пусто = не слать (лог-строка рескана есть всегда). Чистая."""
@@ -198,7 +335,8 @@ def rescan_change_msg(items, old_pairs, new_pairs, added, removed, exclude_oracl
         if _quiet(old_pairs.get(mid)):
             continue
         parts.append("-%s %s… (%s)" % (old_pairs.get(mid, "?/?"), mid[:10],
-                                       _removal_reason(mid, items_by_id, exclude_oracles)))
+                                       _removal_reason(mid, items_by_id, exclude_oracles,
+                                                       phantom_reasons=phantom_reasons)))
     if not parts:
         return ""
     return "\U0001F4CB rescan covered: " + " | ".join(parts)

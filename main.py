@@ -253,11 +253,25 @@ def rescan_markets(cfg, current_markets, ctx_cache, log, alerter=None):
     excludes configured SVR/OEV oracles. Hot-swaps, prunes ctx_cache, persists JSON, reloads.
     Returns the new list, or the current one unchanged on any failure."""
     try:
-        from analysis.build_covered_markets import (fetch_markets, rescan_change_msg,
-                                                    select_markets, to_json_records)
+        from analysis.build_covered_markets import (fetch_markets, filter_phantoms,
+                                                    rescan_change_msg, select_markets,
+                                                    to_json_records)
         exclude = {a.strip().lower() for a in (cfg.exclude_oracles or "").split(",") if a.strip()}
         items = fetch_markets()
         records = to_json_records(select_markets(items, exclude_oracles=exclude))
+        # 30.07 («го» kelbic): отбор по займу геймится скам-рынками (elephanToken-«RSS», $1M
+        # фейкового займа) — фантомы (оракул-константа + нет выхода) отсеиваются до записи.
+        ph_reasons, ph_fresh, _pre_pairs = {}, set(), {}
+        try:
+            _pre_pairs = {r["market_id"]: "%s/%s" % (r["collateral_token"], r["loan_token"])
+                          for r in records}
+            _ph_cache = os.path.join(os.path.dirname(cfg.covered_markets_path) or ".",
+                                     "phantom_cache.json")
+            records, ph_reasons, ph_fresh = filter_phantoms(
+                records, items, cfg.bg_rpc_url or cfg.rpc_url, _ph_cache,
+                log_fn=lambda m: log.info("%s", m))
+        except Exception as e:  # фильтр не имеет права уронить рескан
+            log.warning("phantom filter failed (%s) — пропускаю", type(e).__name__)
         if not records:
             log.warning("market rescan: empty selection — keeping current %d markets", len(current_markets))
             return current_markets
@@ -284,13 +298,25 @@ def rescan_markets(cfg, current_markets, ctx_cache, log, alerter=None):
                                  for m in current_markets}
                     new_pairs = {r["market_id"]: "%s/%s" % (r["collateral_token"], r["loan_token"])
                                  for r in records}
-                    _msg = rescan_change_msg(items, old_pairs, new_pairs, added, removed, exclude)
+                    _msg = rescan_change_msg(items, old_pairs, new_pairs, added, removed, exclude,
+                                             phantom_reasons=ph_reasons)
                     if _msg:
                         alerter.send_async(_msg, key="rescan-cov")
                 except Exception:
                     pass
         else:
             log.info("market rescan: %d markets (no change)", len(new_markets))
+        # свежий фантом, которого в covered и не было: change-алерта не будет — одна 🕳-строка
+        # (кэш вердиктов гарантирует «без спама»: повторные ресканы молчат)
+        _ph_new = [m for m in sorted(ph_fresh) if m not in old_ids]
+        if _ph_new and alerter is not None:
+            try:
+                alerter.send_async("🕳 rescan: " + " | ".join(
+                    "%s %s… отсеян как фантом (%s)" % (_pre_pairs.get(m, "?/?"), m[:10],
+                                                       ph_reasons.get(m, ""))
+                    for m in _ph_new), key="rescan-phantom")
+            except Exception:
+                pass
         return new_markets
     except Exception as e:
         log.warning("market rescan failed (%s) — keeping current %d markets", type(e).__name__, len(current_markets))
