@@ -1684,3 +1684,17 @@ PREDICT_POLL_BACKOFF=0. Юниты test_block_assess_async.py (Вена+Charlott
 min HF 1.00595, APR 3.61%, ликвидность лендеров $27.7M (флип не близко, ETA ~60 дн).
 Урок в копилку «мёртвый сторож»: гардить надо ЧТЕНИЯ, не рукопожатие — прерывистый шторм
 проходит пробу и убивает работу.
+
+**30.07 ~19:30 usde-watch ПЕРЕЕХАЛ НА ВЕНУ (kelbic: «вотчеров лучше запускать на Вене»; 1fbf73b):**
+разгрузка одноядерной боевой Charlotte (каждый почасовой web3-спавн = наш же observer-effect) +
+сторож теперь переживает падение самой Charlotte (независимый канал тревоги). Вена: реповая
+копия /root/liquidator (в синке) + venv; env строго из .env.watch — санитарный срез 6 ключей
+(RPC/TG), БЕЗ WALLET_KEY; state перенесён (непрерывность hf-базлайнов); root-cron :07 hourly
+(usde_cron.sh) + пульс-чекер */10 (usde_hbcheck.sh, HB_WATCH_ONLY=usde-watch). Надзор
+двухслойный: cronwatch (claude-agent, видит root-CMD через systemd-journal) подтверждает
+ЗАПУСК, heartbeat_check — УСПЕХ (пульс только на удачном цикле). heartbeat_check.py:
+пер-хостовый реестр HB_WATCH_ONLY/HB_WATCH_SKIP (один файл на все хосты). Charlotte:
+usde-watch.timer disabled, drop-in heartbeat-check.service.d HB_WATCH_SKIP=usde-watch
+(проверен: «0 событий»). Первый венский прогон живьём: bg-ступень отказала (шторм ещё жив) ->
+лесенка -> успех, пульс бьётся. На Charlotte остаются только журнал-локальные вещи
+(seizure_export) и надзор за самим ботом (bot-block/daily-summary).
