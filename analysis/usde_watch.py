@@ -98,22 +98,11 @@ def heal_days(cap_usd: float, debt_usd: float, lif: float, lltv: float, apr: flo
     return math.log(1.0 + h) / apr * 365 if h > 0 and apr > 0 else 0.0
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--top", type=int, default=10)
-    ap.add_argument("--quiet", action="store_true")
-    a = ap.parse_args()
-    cfg = Config.from_env()
-    # 28.07: фолбэк на основной RPC. Часовой прогон сидел ТОЛЬКО на bg-ключе (dRPC) и падал
-    # с 429 -> сторож главного приза молча не работал (нашли при проверке ревьюверских цифр).
-    # Цена страховки: ~26 CU/час на Alchemy = шум против его квоты, зато будильник не слепнет.
-    _bg = os.environ.get("BG_RPC_URL") or cfg.rpc_url
-    rpc = BaseRpc(_bg, cfg.chain_id)
-    try:
-        rpc._web3().eth.block_number
-    except Exception as e:
-        print("bg-RPC отказал (%s) -> перехожу на основной" % type(e).__name__)
-        rpc = BaseRpc(cfg.rpc_url, cfg.chain_id)
+def read_chain(rpc, addrs, top):
+    """ВСЕ on-chain чтения одного прогона — одной функцией, чтобы лесенка RPC ретраила цикл
+    ЦЕЛИКОМ. 30.07: шторм dRPC отдавал 408 ПРЕРЫВИСТО — проба block_number (фикс 28.07)
+    проходила, а тяжёлый aggregate3 дальше падал и ронял весь прогон; два часовых прогона
+    подряд = «💀 молчит 127 мин» от мета-сторожа. Гардить надо чтения, не рукопожатие."""
     w3 = rpc._web3()
     m32 = rpc.to_bytes32(MID)
     r = aggregate3(rpc, [(MORPHO, encode_id_to_market_params_call(m32)), (MORPHO, encode_market_call(m32))])
@@ -125,9 +114,16 @@ def main():
                       [(loan, coll, oracle, irm, lltv), (mk[0], mk[1], mk[2], mk[3], mk[4], mk[5])])
     apr = abi_decode(["uint256"], w3.eth.call(
         {"to": w3.to_checksum_address(irm), "data": IRM_SEL + args}))[0] / 1e18 * 365 * 86400
-    lif = lif_of(lltv)
-    supply, borrow = mk[0] / 1e6, mk[2] / 1e6
-    liq = supply - borrow
+    res = aggregate3(rpc, [(MORPHO, encode_position_call(m32, b)) for b in addrs[:top]])
+    return mk, px, apr, lltv, res
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+    cfg = Config.from_env()
     # top-N позиций: список адресов держим в state (обновляется API-прогоном flip_eta/verify)
     try:
         prev = json.load(open(STATE))
@@ -147,7 +143,30 @@ def main():
         except Exception as e:
             print("не смог получить список позиций: %s" % type(e).__name__)
             return
-    res = aggregate3(rpc, [(MORPHO, encode_position_call(m32, b)) for b in addrs[:a.top]])
+    # 28.07 (проба) -> 30.07 (весь цикл): лесенка bg -> основной -> публичный. Цена страховки
+    # ~26 CU/час на Alchemy — шум против квоты, зато будильник главного приза не слепнет.
+    _bg = os.environ.get("BG_RPC_URL") or cfg.rpc_url
+    ladder, _seen = [], set()
+    for label, url in (("bg", _bg), ("основной", cfg.rpc_url),
+                       ("публичный", os.environ.get("USDE_FALLBACK_RPC", "https://mainnet.base.org"))):
+        if url and url not in _seen:
+            _seen.add(url)
+            ladder.append((label, url))
+    data = None
+    for i, (label, url) in enumerate(ladder):
+        try:
+            data = read_chain(BaseRpc(url, cfg.chain_id), addrs, a.top)
+            break
+        except Exception as e:
+            print("RPC %s отказал на цикле чтения (%s)%s"
+                  % (label, type(e).__name__,
+                     " -> следующая ступень" if i + 1 < len(ladder) else " — ступени кончились"))
+    if data is None:
+        sys.exit(1)          # громко: пульса не будет, мета-сторож считает минуты
+    mk, px, apr, lltv, res = data
+    lif = lif_of(lltv)
+    supply, borrow = mk[0] / 1e6, mk[2] / 1e6
+    liq = supply - borrow
     rows = []
     for b, (ok, data) in zip(addrs[:a.top], res):
         if not (ok and data):
