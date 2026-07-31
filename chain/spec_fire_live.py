@@ -61,6 +61,9 @@ SPEC_FIRE_TIP_CAP_GWEI = float(os.environ.get("SPEC_FIRE_TIP_CAP_GWEI", "0.1"))
 # когда плотность на top-1 доказала себя).
 SPEC_FIRE_TOPK = max(1, int(os.environ.get("SPEC_FIRE_TOPK", "1")))
 SPEC_FIRE_RECEIPT_POLL_SEC = float(os.environ.get("SPEC_FIRE_RECEIPT_POLL_SEC", "1.0"))
+# КАСКАД-ДЕТЕКТ (ревью 31.07): столько армленных окон за час = каскадный день -> дёргаем
+# бустер бакета в execute (тот мёртв, пока владелец не подписал SPEC_FIRE_CASCADE_GAS_USD).
+SPEC_FIRE_CASCADE_WINDOWS = int(os.environ.get("SPEC_FIRE_CASCADE_WINDOWS", "4"))
 SPEC_FIRE_THRESHOLD = float(os.environ.get("SPEC_FIRE_THRESHOLD", "1.0"))     # ×dev
 # Predicted-HF гейт (24.07, ревью + live-данные): цена на транзите ~= текущий Binance mid,
 # значит проба имеет смысл ТОЛЬКО если этот транзит способен флипнуть цель:
@@ -122,6 +125,7 @@ class SpecFireLive:
         self._windows: dict = {}                  # feed -> stop Event
         self._armskip_ts: dict = {}               # feed -> ts последнего arm-skip-лога (троттлинг 300с)
         self._cooldown_until = 0.0                # WIN-пауза: до этого момента окна не армим
+        self._arm_ts: list = []                   # ts армленных окон за час (каскад-детект)
         self.stats = {"windows_armed": 0, "probes": 0, "wins": 0}
 
     # ---- боевые швы ----
@@ -142,7 +146,7 @@ class SpecFireLive:
         mk = decode_market(r1[1][1]); tba, tbs = mk[2], mk[3]
         bs, _ = decode_position(r1[2][1])
         if bs == 0:
-            return None
+            return "gone"                         # позиция разобрана (конкурент/погашение) — LOSS-стоп
         price = decode_price(aggregate3(self.rpc, [(oracle, encode_price_call())])[0][1])
         repaid_shares = int(bs)
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)
@@ -196,7 +200,10 @@ class SpecFireLive:
             if r is not None:
                 gas_usd = (int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
                            * float(self.cfg.eth_price_usd) / 1e18)
-                return int(r.get("status") or 0), gas_usd
+                # blk/idx — метрика гонки плотностей: позиция пробы в очереди против
+                # транзита/победителя снимается прямо из журнала (ревью 31.07)
+                return (int(r.get("status") or 0), gas_usd,
+                        r.get("blockNumber"), r.get("transactionIndex"))
             self._sleep(SPEC_FIRE_RECEIPT_POLL_SEC)
         return None
 
@@ -246,7 +253,8 @@ class SpecFireLive:
             canary_invalidate_nonce(self.rpc, self.cfg)   # дроп? nonce вперёд чейна -> инвалидация
             self._log("SPECFIRE probe NO-RECEIPT tx=%s (nonce инвалидирован)" % h)
             return
-        status, gas_usd = res
+        status, gas_usd = res[0], res[1]
+        pos = (" blk=%s idx=%s" % (res[2], res[3])) if len(res) >= 4 and res[2] is not None else ""
         specfire_gas_add(gas_usd)
         if status == 1:
             self.stats["wins"] += 1
@@ -257,11 +265,12 @@ class SpecFireLive:
                     stop = self._windows.pop(feed, None)
                 if stop is not None:
                     stop.set()
-            log.warning("SPECFIRE WIN!!! %s/%s debt=$%.0fk tx=%s gas=$%.2f — предочередь взята "
+            log.warning("SPECFIRE WIN!!! %s/%s debt=$%.0fk tx=%s gas=$%.2f%s — предочередь взята "
                         "(окна на паузе %.0fс)",
-                        mid[:10], borrower[:10], debt_usd / 1e3, h, gas_usd, SPEC_FIRE_WIN_COOLDOWN_SEC)
+                        mid[:10], borrower[:10], debt_usd / 1e3, h, gas_usd, pos,
+                        SPEC_FIRE_WIN_COOLDOWN_SEC)
         else:
-            self._log("SPECFIRE probe revert (healthy, ожидаемо) tx=%s gas=$%.3f" % (h, gas_usd))
+            self._log("SPECFIRE probe revert (healthy, ожидаемо) tx=%s gas=$%.3f%s" % (h, gas_usd, pos))
 
     def _window_loop(self, feed: str, direction: str, stop: threading.Event):
         thr = self.dev_by.get(feed, 0.005) * SPEC_FIRE_THRESHOLD
@@ -269,6 +278,7 @@ class SpecFireLive:
         last_fire = 0.0
         last_hold_log = 0.0
         cache = {}      # (mid, b) -> (probe|None, built_ts): кэш пробы, см. SPEC_FIRE_REBUILD_SEC
+        dead = set()    # LOSS-стоп: цели, разобранные конкурентом/погашенные (bs==0 на пересборке)
         while not stop.is_set() and probes < SPEC_FIRE_MAX_PROBES_WINDOW:
             r = None
             try:
@@ -288,6 +298,8 @@ class SpecFireLive:
             if hot and self._now() - last_fire >= iv:
                 reach = abs(r) + SPEC_FIRE_DIST_MARGIN_DEVS * self.dev_by.get(feed, 0.005)
                 tgts, hold_dist = self._top_fat(feed, direction, max_dist=reach, k=SPEC_FIRE_TOPK)
+                if dead:
+                    tgts = [t for t in tgts if (t[0], t[1]) not in dead]
                 if not tgts:
                     if hold_dist is None:
                         break                              # жир ушёл из набора — окно нам не нужно
@@ -302,6 +314,12 @@ class SpecFireLive:
                     probe, built_ts = cache.get((mid, b), (None, 0.0))
                     if probe is None or self._now() - built_ts >= SPEC_FIRE_REBUILD_SEC:
                         probe = (self._build_fn or self._build)(mid, b, d)
+                        if probe == "gone":       # LOSS-стоп (ревью 31.07): жертву разобрали —
+                            dead.add((mid, b))    # кап не догорает ревертами по мёртвой цели
+                            cache.pop((mid, b), None)
+                            self._log("SPECFIRE loss-stop feed=%s %s/%s: позиция разобрана "
+                                      "(конкурент/погашение) — цель снята" % (feed, mid[:10], b[:10]))
+                            continue
                         cache[(mid, b)] = (probe, self._now())
                     if probe is not None:
                         h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
@@ -346,6 +364,14 @@ class SpecFireLive:
                     stop = threading.Event()
                     self._windows[feed] = stop
                     self.stats["windows_armed"] += 1
+                _n = self._now()                           # каскад-детект: спам армов за час
+                self._arm_ts = [t for t in self._arm_ts if _n - t < 3600.0] + [_n]
+                if len(self._arm_ts) >= SPEC_FIRE_CASCADE_WINDOWS:
+                    from chain.execute import specfire_cascade_boost
+                    if specfire_cascade_boost() and _n - self._armskip_ts.get("_boost", -1e9) >= 300.0:
+                        self._armskip_ts["_boost"] = _n
+                        self._log("SPECFIRE каскад-детект: %d окон/час — бакет поднят до каскадного "
+                                  "(TTL 1ч, продлевается армами)" % len(self._arm_ts))
                 self._log("SPECFIRE LIVE window feed=%s dir=%s — жир на прицеле, огонь при |ret|>=%.3f%%" % (
                     feed, direction, self.dev_by.get(feed, 0.005) * SPEC_FIRE_THRESHOLD * 100.0))
                 threading.Thread(target=self._window_loop, args=(feed, direction, stop),

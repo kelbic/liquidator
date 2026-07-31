@@ -347,15 +347,91 @@ class _FEth:                                       # у фейка НЕТ wait_f
         self.calls += 1
         if self.calls < 3:
             raise LookupError("not found")
-        return {"status": 1, "gasUsed": 115_000, "effectiveGasPrice": 50_000_000}
+        return {"status": 1, "gasUsed": 115_000, "effectiveGasPrice": 50_000_000,
+                "blockNumber": 49358741, "transactionIndex": 2929}
 _slept = []
 sf15 = SpecFireLive(rpc=types.SimpleNamespace(_web3=lambda _e=_FEth(): types.SimpleNamespace(eth=_e)),
                     cfg=cfg, shared=shared, ret_fn=lambda l: 0.0, dev_by={"BTC": 0.001},
                     build_fn=build_fn, send_fn=send_fn, log_fn=LOGS.append,
                     sleep=lambda s: _slept.append(s))
-_st15, _gu15 = sf15._receipt("0xh")
-assert _st15 == 1 and _slept == [sfl_mod.SPEC_FIRE_RECEIPT_POLL_SEC] * 2, (_st15, _slept)
-assert 0.005 < _gu15 < 0.02, _gu15
-print("UNIT_OK: receipt — ручной полл 1.0с, RPC не молотится")
+_r15 = sf15._receipt("0xh")
+assert _r15[0] == 1 and _slept == [sfl_mod.SPEC_FIRE_RECEIPT_POLL_SEC] * 2, (_r15, _slept)
+assert 0.005 < _r15[1] < 0.02 and _r15[2] == 49358741 and _r15[3] == 2929, _r15
+print("UNIT_OK: receipt — ручной полл 1.0с + blk/idx (метрика гонки плотностей из журнала)")
 
-print("=== ВСЕ SPEC-FIRE-LIVE ЮНИТЫ ПРОШЛИ (вкл. плотный режим предочереди) ===")
+# 15b) _collect пишет blk/idx в лог реверта; старые 2-кортежи receipt_fn не ломаются
+LOGS.clear()
+sf15b = make(receipt_fn=lambda h: (0, 0.011, 49358741, 2929))
+sf15b._collect("0xh", "0xbtc", "0xFAT", 1_500_000.0)
+assert any("blk=49358741 idx=2929" in m for m in LOGS), LOGS
+sf15c = make(receipt_fn=lambda h: (0, 0.011))          # прежний 2-кортеж — совместимость
+sf15c._collect("0xh", "0xbtc", "0xFAT", 1_500_000.0)
+print("UNIT_OK: idx пробы в журнале, 2-кортежные receipt_fn совместимы")
+
+# 16) LOSS-стоп: жертву разобрал конкурент (bs==0 -> _build='gone') — окно закрывается,
+#     кап не догорает ревертами по мёртвой цели
+_calls16 = {"n": 0}
+def build_gone(mid, b, d):
+    _calls16["n"] += 1
+    return {"calldata": "0xdead", "gas": 1} if _calls16["n"] == 1 else "gone"
+sent.clear(); LOGS.clear(); RET["v"] = -0.005
+old_rb = sfl_mod.SPEC_FIRE_REBUILD_SEC
+sfl_mod.SPEC_FIRE_REBUILD_SEC = 0.0                    # пересборка каждый раз — 'gone' со 2-й
+sf16 = make(build_fn=build_gone)
+sf16.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(1.3)
+sf16.handle_event({"event": "disarm", "feed": "BTC"})
+sfl_mod.SPEC_FIRE_REBUILD_SEC = old_rb
+assert len(sent) == 1, sent
+assert any("loss-stop" in m for m in LOGS), LOGS
+print("UNIT_OK: LOSS-стоп — разобранная цель снята, окно не жжёт кап")
+
+# 16b) LOSS-стоп при TOPK=2: мёртвая цель снята, огонь продолжается по живой
+sfl_mod.SPEC_FIRE_TOPK = 2
+sfl_mod.SPEC_FIRE_REBUILD_SEC = 0.0
+def build_fat_gone(mid, b, d):
+    return "gone" if b == "0xFAT" else {"calldata": b, "gas": 1}
+sent.clear(); LOGS.clear(); RET["v"] = -0.005
+sf16b = SpecFireLive(rpc=None, cfg=cfg, shared=shared2, ret_fn=lambda l: RET["v"],
+                     dev_by={"BTC": 0.0010}, build_fn=build_fat_gone, send_fn=send_fn,
+                     receipt_fn=receipt_fn, log_fn=LOGS.append)
+sf16b.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(1.2)
+sf16b.handle_event({"event": "disarm", "feed": "BTC"})
+sfl_mod.SPEC_FIRE_TOPK = old_k
+sfl_mod.SPEC_FIRE_REBUILD_SEC = old_rb
+assert len(sent) >= 1 and all(c == "0xFAT2" for c, _ in sent), sent
+assert any("loss-stop" in m for m in LOGS), LOGS
+print("UNIT_OK: LOSS-стоп при K=2 — мёртвая снята, живая под огнём")
+
+# 17) КАСКАДНЫЙ ПРОТОКОЛ БАКЕТА: не подписан (env 0) -> бустер мёртв; подписан ->
+#     кап поднимается на TTL и сам возвращается
+assert ex._SPECFIRE_CASCADE_GAS_USD == 0.0, "дефолт: протокол НЕ подписан"
+assert ex.specfire_cascade_boost(now=100.0) is False
+assert ex._specfire_cap(now=101.0) == ex._SPECFIRE_MAX_GAS_USD
+ex._SPECFIRE_CASCADE_GAS_USD = 100.0                   # «подпись владельца»
+assert ex.specfire_cascade_boost(ttl_sec=3600.0, now=200.0) is True
+assert ex._specfire_cap(now=200.0 + 3599.0) == 100.0, "каскадный кап при живом TTL"
+assert ex._specfire_cap(now=200.0 + 3601.0) == ex._SPECFIRE_MAX_GAS_USD, "TTL вышел -> штатный"
+ex.specfire_cascade_boost(ttl_sec=3600.0, now=200.0 + 3000.0)   # продление армом
+assert ex._specfire_cap(now=200.0 + 3601.0) == 100.0, "новый арм продлевает TTL"
+ex._SPECFIRE_CASCADE_GAS_USD = 0.0
+ex._SPECFIRE_CASCADE_UNTIL = 0.0
+print("UNIT_OK: каскад-бустер мёртв без подписи, с подписью TTL-буст и авто-возврат")
+
+# 18) каскад-детект: 4-й арм за час дёргает бустер (с подписью), лог троттлится
+ex._SPECFIRE_CASCADE_GAS_USD = 100.0
+ex._SPECFIRE_CASCADE_UNTIL = 0.0
+LOGS.clear(); RET["v"] = -0.0005                       # ниже порога: окна армятся, огня нет
+sf18 = make()
+for _ in range(sfl_mod.SPEC_FIRE_CASCADE_WINDOWS):
+    sf18.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+sf18.handle_event({"event": "disarm", "feed": "BTC"})
+assert ex._SPECFIRE_CASCADE_UNTIL > 0.0, "4 арма/час обязаны дёрнуть бустер"
+assert sum(1 for m in LOGS if "каскад-детект" in m) == 1, LOGS
+ex._SPECFIRE_CASCADE_GAS_USD = 0.0
+ex._SPECFIRE_CASCADE_UNTIL = 0.0
+print("UNIT_OK: каскад-детект — %d окон/час дёргают бустер, лог троттлится" %
+      sfl_mod.SPEC_FIRE_CASCADE_WINDOWS)
+
+print("=== ВСЕ SPEC-FIRE-LIVE ЮНИТЫ ПРОШЛИ (плотный режим + LOSS-стоп + каскад-протокол) ===")

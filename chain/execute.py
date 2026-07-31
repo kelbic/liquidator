@@ -312,7 +312,33 @@ _SPECFIRE_DAY = int(time.time() // 86400)   # UTC-день бакета: сут�
 # 31.07, решение владельца: сэкономленное на сплющенной tip-лестнице — в бюджет проб
 # ($10 -> $20 = ~9 плотных окон/сутки; всё ещё 4% дневного газ-лимита $500)
 _SPECFIRE_MAX_GAS_USD = float(os.environ.get("SPEC_FIRE_MAX_GAS_USD", "20"))
+# КАСКАДНЫЙ ПРОТОКОЛ БАКЕТА (ревью 31.07): в каскадный день armed-окна идут сериями и штатный
+# бакет сгорает к полудню — вечером самого дорогого дня слой стоит без патронов. При детекте
+# каскада (спам армов, см. spec_fire_live) бакет поднимается до CASCADE_GAS_USD на TTL; TTL
+# продлевается новыми армами, каскад кончился -> бакет сам возвращается к штатному.
+# 0 = протокол НЕ подписан владельцем -> бустер мёртв (капитал — только решением владельца).
+_SPECFIRE_CASCADE_GAS_USD = float(os.environ.get("SPEC_FIRE_CASCADE_GAS_USD", "0"))
+_SPECFIRE_CASCADE_UNTIL = 0.0
 _SPECFIRE_MIN_INTERVAL = float(os.environ.get("SPEC_FIRE_MIN_INTERVAL_SEC", "0.25"))
+
+
+def specfire_cascade_boost(ttl_sec: float = 3600.0, now=None):
+    """Детектор каскада дёргает бустер. True = буст активен (протокол подписан и TTL заведён)."""
+    global _SPECFIRE_CASCADE_UNTIL
+    if _SPECFIRE_CASCADE_GAS_USD <= 0:
+        return False
+    n = time.monotonic() if now is None else now
+    with _INFLIGHT_LOCK:
+        _SPECFIRE_CASCADE_UNTIL = max(_SPECFIRE_CASCADE_UNTIL, n + ttl_sec)
+    return True
+
+
+def _specfire_cap(now=None):
+    """Действующий кап бакета: каскадный при живом TTL, иначе штатный."""
+    n = time.monotonic() if now is None else now
+    if _SPECFIRE_CASCADE_GAS_USD > 0 and n < _SPECFIRE_CASCADE_UNTIL:
+        return _SPECFIRE_CASCADE_GAS_USD
+    return _SPECFIRE_MAX_GAS_USD
 
 
 def _specfire_roll_day_locked():
@@ -362,7 +388,7 @@ def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
     with _SEND_LOCK:
         with _INFLIGHT_LOCK:
             _specfire_roll_day_locked()
-            if (_SPECFIRE_GAS_USD >= _SPECFIRE_MAX_GAS_USD
+            if (_SPECFIRE_GAS_USD >= _specfire_cap(_now)
                     or _now - _SPECFIRE_LAST_TS < _SPECFIRE_MIN_INTERVAL
                     or _INFLIGHT > 0):
                 return None
