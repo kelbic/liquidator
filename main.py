@@ -550,7 +550,7 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     log.exception("hot_loop упал — self-heal перезапуск через %.0fс (backoff #%d)" % (_hw, _heal_n))
                     time.sleep(_hw)
         threading.Thread(target=_run_hot, daemon=True).start()
-        log.warning("HOT PATH ENABLED — preconf trigger live (tip=%.1f gwei, daily-loss<=$%.0f, repaid>=$%.0f)",
+        log.warning("HOT PATH ENABLED — preconf trigger live (tip=%.2f gwei, daily-loss<=$%.0f, repaid>=$%.0f)",
                     cfg.tip_gwei, cfg.max_daily_loss_usd, getattr(cfg, "hot_min_repaid_usd", 2000.0))
     if getattr(cfg, "predict_shadow", False):
         # PREDICT-слой (порт Katana v5), SHADOW: Binance WS + anchor/return-движок меряет lead/FP
@@ -619,10 +619,11 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                             ret_fn=lambda lbl: engine.ret(_l2s.get(lbl.upper(), lbl)),
                                             dev_by=_dev)
                         _handlers.append(_sfl.handle_event)
+                        from chain.execute import _SPECFIRE_MAX_GAS_USD as _sf_bucket
                         log.warning("SPEC-FIRE LIVE ENABLED — пробы по жиру >=$%.0fk при |ret|>=dev "
-                                    "(кап %d проб/окно, газ-бакет $%s)",
+                                    "(кап %d проб/окно, газ-бакет $%.0f)",
                                     SPEC_FIRE_MIN_REPAID_USD / 1e3, SPEC_FIRE_MAX_PROBES_WINDOW,
-                                    os.environ.get("SPEC_FIRE_MAX_GAS_USD", "10"))
+                                    _sf_bucket)
                     except Exception:
                         log.exception("spec-fire live не стартовал (опционален, остальные слои не задеты)")
                 _on_event = None
