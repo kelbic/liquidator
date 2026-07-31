@@ -1219,7 +1219,8 @@ def _revert_bucket(err_str: str) -> str:
 _LIQUIDATE_EVENT_SIG = None   # keccak сигнатуры события Morpho.Liquidate (лениво, нужен eth_utils)
 
 
-def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4, cfg=None, our_debt_usd=None):
+def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4, cfg=None, our_debt_usd=None,
+                 _lag_sleep=2.0, _sleep=time.sleep):
     """P2-12 submit-side телеметрия v2. Окно [наш−lookback .. наш]: транзит всегда <= нашего блока
     (реакция летит ПОСЛЕ него), а прежний одноблочный поиск давал ложное «реверт НЕ гонка», когда
     победитель сидел в блоке транзита, а мы приземлялись в +1..+2 (разбор 15:10 23.07). Победитель
@@ -1236,10 +1237,30 @@ def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4, cfg=No
         w3 = rpc._web3()
         topic_b = "0x" + borrower[2:].lower().rjust(64, "0")
         frm = max(0, int(block_number) - int(lookback))
-        logs = get_logs_fb(w3, {"fromBlock": frm, "toBlock": block_number,
-                                "address": _MORPHO_BLUE,
-                                "topics": [_LIQUIDATE_EVENT_SIG, None, None, topic_b]})
+        # 31.07: xray бежит через ~0.7с после майна — нода порой ЕЩЁ не отдаёт свежие блоки (тот же
+        # лаг, что дал reason='block not found' в реплее), и пустые логи выглядели как «не гонка»,
+        # хотя победитель сидел блоком раньше нас (проигрыш cbBTC $3.4k 14:07: победитель blk=-1
+        # idx=2928 tip=0.0034 — ложный вердикт скрыл первую боевую FCFS-эмпирику). Голова ноды
+        # обязана покрыть окно; не покрыла после ретрая — честный «xray неполон», не вердикт.
+        logs, head = [], None
+        for attempt in (0, 1):
+            try:
+                head = int(w3.eth.block_number)
+            except Exception:
+                head = None
+            logs = get_logs_fb(w3, {"fromBlock": frm, "toBlock": block_number,
+                                    "address": _MORPHO_BLUE,
+                                    "topics": [_LIQUIDATE_EVENT_SIG, None, None, topic_b]})
+            if logs or head is None or head >= int(block_number):
+                break
+            if attempt == 0:
+                _sleep(_lag_sleep)
         if not logs:
+            if head is not None and head < int(block_number):
+                if log:
+                    log.info("submit-xray: НЕПОЛОН — нода отстала (head=%s < %s), вердикт о гонке "
+                             "не выносим (реверт разбирать по reason)", head, block_number)
+                return
             if log:
                 log.info("submit-xray: borrower %s НЕ ликвидирован в [%d..%d] (наш idx=%s) — "
                          "реверт НЕ гонка за жертву (смотреть reason)",
@@ -1277,19 +1298,35 @@ def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4, cfg=No
             log.info("submit-xray fail: %s", type(e).__name__)
 
 
-def _revert_reason(rpc, tx_hash, block_number):
+_TRANSPORT_SIGNS = ("block not found", "-32001", "too many requests", "request timeout",
+                    "timed out", "timeout", "connection", "unavailable")
+
+
+def _revert_reason(rpc, tx_hash, block_number, _retry_sleep=1.5, _sleep=time.sleep):
     """Best-effort revert reason for a mined-but-reverted tx: replay it as eth_call at the mined block
     and surface the revert string/selector via _revert_bucket. DIAGNOSTIC ONLY (block end-state may
-    differ from what the tx saw mid-block) -> use as a bucket, not proof. Two RPC calls; reverts are
-    infrequent so the cost is negligible. Never raises -> failure to diagnose returns a tag, not an error."""
-    try:
-        w3 = rpc._web3()
-        tx = w3.eth.get_transaction(tx_hash)
-        rpc.eth_call({"to": tx["to"], "from": tx["from"], "data": tx["input"]},
-                     block=block_number if block_number is not None else "latest")
-        return "clean-on-replay (state moved / lost race)"
-    except Exception as e:
-        return _revert_bucket(str(e))
+    differ from what the tx saw mid-block) -> use as a bucket, not proof. Never raises.
+    31.07: реплей идёт через ~0.7с после майна — нода порой ещё НЕ видит блок, и транспортный отказ
+    (-32001 'block not found') печатался КАК причина реверта (проигрыш cbBTC 14:07). Транспортный
+    класс -> один ретрай после паузы (нода догоняет за секунды); не догнала — честный тег."""
+    last = ""
+    for attempt in (0, 1):
+        try:
+            w3 = rpc._web3()
+            tx = w3.eth.get_transaction(tx_hash)
+            rpc.eth_call({"to": tx["to"], "from": tx["from"], "data": tx["input"]},
+                         block=block_number if block_number is not None else "latest")
+            return "clean-on-replay (state moved / lost race)"
+        except Exception as e:
+            s = str(e)
+            if any(t in s.lower() for t in _TRANSPORT_SIGNS):
+                last = s
+                if attempt == 0:
+                    _sleep(_retry_sleep)
+                    continue
+                return "reason недоступен (нода отстала/транспорт: %s)" % s[:60]
+            return _revert_bucket(s)
+    return "reason недоступен (%s)" % last[:60]
 
 
 def _send_units_volley(rpc, w3, cfg, units, base_nonce, tip_wei, bcast_urls, log=None):
