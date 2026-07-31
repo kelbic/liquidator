@@ -309,7 +309,9 @@ _SPECFIRE_GAS_USD = 0.0
 _SPECFIRE_LAST_TS = 0.0
 _SPECFIRE_DAY = int(time.time() // 86400)   # UTC-день бакета: суточный сброс (был lifetime —
                                             # к вечернему каскаду волатильного дня бакет пуст)
-_SPECFIRE_MAX_GAS_USD = float(os.environ.get("SPEC_FIRE_MAX_GAS_USD", "10"))
+# 31.07, решение владельца: сэкономленное на сплющенной tip-лестнице — в бюджет проб
+# ($10 -> $20 = ~9 плотных окон/сутки; всё ещё 4% дневного газ-лимита $500)
+_SPECFIRE_MAX_GAS_USD = float(os.environ.get("SPEC_FIRE_MAX_GAS_USD", "20"))
 _SPECFIRE_MIN_INTERVAL = float(os.environ.get("SPEC_FIRE_MIN_INTERVAL_SEC", "0.25"))
 
 

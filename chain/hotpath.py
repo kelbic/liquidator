@@ -381,23 +381,35 @@ def cascade_active(now=None):
         return now < _CASCADE_UNTIL
 
 
+_TIP_LADDER_LEGACY = os.environ.get("TIP_LADDER_LEGACY", "0").lower() in ("1", "true", "yes")
+
+
 def dynamic_tip_gwei(cfg, debt_usd, now=None):
-    """PURE-ish (now инжектируем): tip по размеру приза, +1 ступень в активную каскад-давку. Лестница
-    (base, mid, big) монотонна; давка поднимает на одну и капается big — держим цену страховки
-    ограниченной ($26 на big=30 при 500k*1730), но в затор перебиваем толпу fee-сортировкой."""
-    du = float(debt_usd or 0.0)
+    """PURE-ish (now инжектируем). ЛЕСТНИЦА СПЛЮЩЕНА (31.07, решение владельца по гонке 14:07):
+    FCFS обслуживает по прибытию — tip места не покупает (наши 30 gwei легли блоком ПОЗЖЕ
+    победителя с 0.0034), ступени по размеру приза страховали несуществующий риск: страховка
+    ~$26 на big, промах $6.45 вместо $0.02, а net-гейт душил мелкие призы этой ценой. Теперь
+    всегда base; одна ступень tip_step_gwei (~$0.4 на выстрел) — ТОЛЬКО в активную каскад-давку,
+    где fee-сортировка доказуемо реальна (>=2 агрегаторов в блоке или проигрыш победителю с tip
+    выше нашего). Сэкономленное — в бюджет spec-проб: недостающий блок покупается плотностью
+    предочереди, не чаевыми. Откат: TIP_LADDER_LEGACY=1 = прежняя (base,mid,big)+1-в-давку."""
     base = float(cfg.tip_gwei)
-    mid = float(getattr(cfg, "tip_mid_gwei", 2.0))
-    big = float(getattr(cfg, "tip_big_gwei", 30.0))
-    if du >= getattr(cfg, "tip_big_repaid_usd", 20000.0):
-        stage = 2
-    elif du >= getattr(cfg, "tip_mid_repaid_usd", 2000.0):
-        stage = 1
-    else:
-        stage = 0
+    if _TIP_LADDER_LEGACY:
+        du = float(debt_usd or 0.0)
+        mid = float(getattr(cfg, "tip_mid_gwei", 2.0))
+        big = float(getattr(cfg, "tip_big_gwei", 30.0))
+        if du >= getattr(cfg, "tip_big_repaid_usd", 20000.0):
+            stage = 2
+        elif du >= getattr(cfg, "tip_mid_repaid_usd", 2000.0):
+            stage = 1
+        else:
+            stage = 0
+        if cascade_active(now):
+            stage = min(stage + 1, 2)
+        return (base, mid, big)[stage]
     if cascade_active(now):
-        stage = min(stage + 1, 2)
-    return (base, mid, big)[stage]
+        return max(base, float(getattr(cfg, "tip_step_gwei", 0.5)))
+    return base
 
 
 def _net_gate(profit_wei, debt_usd, debt_assets, cfg):

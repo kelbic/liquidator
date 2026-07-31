@@ -331,11 +331,13 @@ def test_get_logs_fallback():
 
 
 def test_dynamic_tip_and_net_gate():
-    # (M) ступени tip по призу + net-гейт видит цену страхового tip
+    # (M) СПЛЮЩЕННАЯ лестница (31.07): base для любого приза вне давки; net-гейт больше
+    # не душит призы страховкой ($57 на big при FCFS страховали несуществующий риск)
     import chain.hotpath as hp
 
     class _Cfg:
         tip_gwei = 0.05
+        tip_step_gwei = 0.5
         tip_mid_repaid_usd = 2000.0
         tip_mid_gwei = 2.0
         tip_big_repaid_usd = 20000.0
@@ -344,17 +346,25 @@ def test_dynamic_tip_and_net_gate():
         eth_price_usd = 3800.0
 
     c = _Cfg()
+    hp._CASCADE_UNTIL = 0.0
     assert hp.dynamic_tip_gwei(c, 100) == 0.05
-    assert hp.dynamic_tip_gwei(c, 1999) == 0.05
-    assert hp.dynamic_tip_gwei(c, 2000) == 2.0
-    assert hp.dynamic_tip_gwei(c, 19999) == 2.0
-    assert hp.dynamic_tip_gwei(c, 20000) == 30.0
+    assert hp.dynamic_tip_gwei(c, 2000) == 0.05
+    assert hp.dynamic_tip_gwei(c, 20000) == 0.05
     assert hp.dynamic_tip_gwei(c, None) == 0.05
-    # cost в гейте: рутина ~$0.095, big ~$57 — крупный приз платит страховку и гейт это видит
+    # cost в гейте одинаков для любого приза (~$0.095) — big больше не платит $57 страховки
     _, cost_small, _ = hp._net_gate(0, 100, 1, c)
     _, cost_big, _ = hp._net_gate(0, 50000, 1, c)
     assert abs(cost_small - 0.095) < 0.001
-    assert abs(cost_big - 57.0) < 0.1
+    assert abs(cost_big - 0.095) < 0.001
+    # legacy-откат сохраняет прежние ступени и цену страховки в гейте
+    hp._TIP_LADDER_LEGACY = True
+    try:
+        assert hp.dynamic_tip_gwei(c, 2000) == 2.0
+        assert hp.dynamic_tip_gwei(c, 20000) == 30.0
+        _, cost_leg, _ = hp._net_gate(0, 50000, 1, c)
+        assert abs(cost_leg - 57.0) < 0.1
+    finally:
+        hp._TIP_LADDER_LEGACY = False
 
 
 if __name__ == "__main__":

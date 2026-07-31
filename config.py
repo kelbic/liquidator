@@ -55,10 +55,14 @@ class Config:
     hot_min_repaid_usd: float = 75.0     # hot path fires on reaction prizes >= this (repaid USD).
                                          # 23.07: 450->75 — при tip 0.05 выстрел стоит ~$0.1, пыль $50-100
                                          # с бонусом $4-10 стала +EV (в паре с MIN_PROFIT_USD=2)
-    tip_mid_repaid_usd: float = 2000.0   # динамический tip (fee-сортировка ВНУТРИ фб-кадра в давку —
-    tip_mid_gwei: float = 2.0            # фэт-разведка 45д): приз >= mid -> страховой tip_mid_gwei,
-    tip_big_repaid_usd: float = 20000.0  # >= big -> tip_big_gwei (каскадные короли бидят 22-59);
-    tip_big_gwei: float = 30.0           # рутина остаётся на tip_gwei (канарейка: позиция не страдает)
+    tip_step_gwei: float = 0.5           # СПЛЮЩЕННАЯ лестница (31.07, решение владельца по гонке
+                                         # 14:07: FCFS — tip места не покупает, 30 gwei проиграли
+                                         # 0.0034): всегда tip_gwei; эта единственная ступень (~$0.4)
+                                         # — только в доказанную каскад-давку (cascade_active)
+    tip_mid_repaid_usd: float = 2000.0   # LEGACY-лестница (откат TIP_LADDER_LEGACY=1): приз >= mid
+    tip_mid_gwei: float = 2.0            # -> tip_mid_gwei, >= big -> tip_big_gwei, давка = +1 ступень
+    tip_big_repaid_usd: float = 20000.0  # (фэт-разведка 45д «каскадные короли бидят 22-59» описывала
+    tip_big_gwei: float = 30.0           # fee-рынок, которого в Base-FCFS нет — см. STATE 31.07)
     positions_from_cache: bool = False    # P1-6: слой 2 потребление (OFF до калибровки cache-divergence)
     fast_lane: bool = False               # P1-9: fast-lane без sim (OFF; контракт гарантирует исход)
     fast_lane_min_repaid_usd: float = 1000.0  # fast-lane только на призах >= этого repaid USD
@@ -142,6 +146,7 @@ class Config:
             predict_shadow=b("PREDICT_SHADOW"),
             price_from_feed=b("PRICE_FROM_FEED"),
             hot_min_repaid_usd=f("HOT_MIN_REPAID_USD", d.hot_min_repaid_usd),
+            tip_step_gwei=f("TIP_STEP_GWEI", d.tip_step_gwei),
             tip_mid_repaid_usd=f("TIP_MID_REPAID_USD", d.tip_mid_repaid_usd),
             tip_mid_gwei=f("TIP_MID_GWEI", d.tip_mid_gwei),
             tip_big_repaid_usd=f("TIP_BIG_REPAID_USD", d.tip_big_repaid_usd),
