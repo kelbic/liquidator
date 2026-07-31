@@ -48,10 +48,14 @@ SPEC_FIRE_DENSE_JITTER_SEC = float(os.environ.get("SPEC_FIRE_DENSE_JITTER_SEC", 
 # 4+ полных окна, WIN-cooldown (900с) рвёт серию раньше; окно и так стопится на confirmed/disarm.
 SPEC_FIRE_MAX_PROBES_WINDOW = int(os.environ.get("SPEC_FIRE_MAX_PROBES_WINDOW")
                                   or (150 if SPEC_FIRE_DENSE else 24))
-# КЭШ ПРОБЫ: _build на каждую пробу = 2×aggregate3 + роут — на плотном каденсе это душит
-# одноядерную VPS и RPC (эффект наблюдателя). Позиция/шары за секунды не меняются, плохой филл
-# ревертится min_profit-полом контракта -> собранный calldata переиспользуем REBUILD_SEC.
-SPEC_FIRE_REBUILD_SEC = float(os.environ.get("SPEC_FIRE_REBUILD_SEC", "5.0"))
+# КЭШ ПРОБЫ: _build на каждую пробу = 2×aggregate3 + роут — на плотном каденсе это душило бы
+# ядро и RPC (эффект наблюдателя). Позиция/шары за секунды не меняются, плохой филл ревертится
+# min_profit-полом контракта -> собранный calldata переиспользуем REBUILD_SEC.
+# 5.0 -> 2.5 (31.07, «го» kelbic после апгрейда Шарлотты до 2 ядер): 5с = 2.5 блока жизни
+# жертвы, проба могла стрелять устаревшими шарами/роутом; 2.5с = свежесть в один блок, защита
+# hot path больше не требует голодания (2-е ядро). Гарды на первом окне: load>1.5 или
+# деградация реакции -> откат SPEC_FIRE_REBUILD_SEC=5 (см. docs/ROLLBACKS.md).
+SPEC_FIRE_REBUILD_SEC = float(os.environ.get("SPEC_FIRE_REBUILD_SEC", "2.5"))
 # TIP-ГАРД: FCFS — tip НЕ покупает место (победитель 14:07 взял приз с tip 0.0034 против наших
 # 30). Проба обязана остаться копеечной, даже если боевой TIP_GWEI поднимут или сработает
 # каскадная ступень: жёсткий кап поверх cfg.tip_gwei.

@@ -226,6 +226,7 @@ assert _cov >= 64.0, _cov                 # p75 «первая проба -> т�
 _per_block = 2.0 / sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC
 assert _per_block >= 4.0, "плотность = рычаг: минимум 4 пробы на 2с-блок"
 assert sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC >= 0.25, "пол send-слоя SPEC_FIRE_MIN_INTERVAL_SEC"
+assert sfl_mod.SPEC_FIRE_REBUILD_SEC == 2.5, "свежесть пробы ~1 блок (2 ядра, «го» 31.07)"
 print("UNIT_OK: плотный каденс %d проб × %.2f±%.2fс = %.0f проб/блок, покрытие %.0fс (p75 64с)" % (
     sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW, sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC,
     sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC, _per_block, _cov))
