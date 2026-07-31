@@ -80,6 +80,7 @@ query Positions($keys: [String!], $first: Int!, $skip: Int!) {
     items {
       user { address }
       market { marketId }
+      healthFactor
       state { collateral collateralUsd borrowAssets borrowAssetsUsd borrowShares }
     }
   }
@@ -139,11 +140,19 @@ def parse_positions(payload: dict, lltv_by_key: dict, hf_ceiling: float = 1.0, m
         if collateral_usd < borrow_usd:
             continue  # залог < долга -> безнадёжный долг (изъятие не покрывает погашение); не наш
         hf = health_factor(collateral_usd, borrow_usd, lltv)
-        if hf <= hf_ceiling:
+        # 31.07: УНИЯ двух оценок. USD-деривация зависит от того, КАК API ценит экзотику в
+        # долларах: ночью 30->31.07 API сменил прайсинг msETH (маркет вместо фундаментала,
+        # долг -18%) -> деривация прыгнула 1.04->1.25 через потолок 1.10, и кластер wstETH/msETH
+        # с ON-CHAIN HF 1.006-1.015 ВЫПАЛ из кандидатов (реактивный путь ослеп на главном
+        # фронте). Поле healthFactor — независимая оценка того же индексера; берём кандидата,
+        # если ХОТЬ ОДНА <= потолка: недовключение = слепота к цели, перевключение бесплатно
+        # (боевой ассессмент on-chain всё равно решает). Храним минимум (ближайшую к флипу).
+        hf_api = _num(it.get("healthFactor"))
+        if hf <= hf_ceiling or (0 < hf_api <= hf_ceiling):
             out.append(Position(
                 market_id=market_id,
                 borrower=((it.get("user") or {}).get("address") or ""),
-                health_factor=hf,
+                health_factor=min(hf, hf_api) if hf_api > 0 else hf,
                 debt_assets=_int(st.get("borrowAssets")),
                 collateral_assets=_int(st.get("collateral")),
                 debt_usd=borrow_usd,
