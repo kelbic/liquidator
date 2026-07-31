@@ -30,7 +30,37 @@ log = logging.getLogger("liq.spec_fire_live")
 
 SPEC_FIRE_MIN_REPAID_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_USD", "500000"))
 SPEC_FIRE_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_INTERVAL_SEC", "0.7"))
-SPEC_FIRE_MAX_PROBES_WINDOW = int(os.environ.get("SPEC_FIRE_MAX_PROBES_WINDOW", "24"))
+# ПЛОТНЫЙ РЕЖИМ (31.07: первая боевая гонка cbBTC 14:07 проиграна ДЕНЬГАМИ — победитель сидел
+# в предочереди блока транзита idx 2928 с tip 0.0034, наша реакция 106мс легла блоком позже с
+# tip 30): в FCFS решает не скорость и не tip, а присутствие пробы в очереди МЕЖДУ транзитом и
+# спамом конкурента. Это гонка плотностей: P(win) ~ наш темп / (наш + конкурента). Хвост 2.0с
+# давал ~1 пробу на блок со случайной фазой — флип 14:07 упал между пробами. Плотный режим:
+# вся горячая фаза (|ret| >= порога) на DENSE_INTERVAL 0.5с (4 пробы/блок; пол send-слоя
+# SPEC_FIRE_MIN_INTERVAL_SEC=0.25 совместим), джиттер ±0.15 ломает подпись расписания.
+# Выравнивание фазы по границе 2с-блока НЕ строим: flashblocks каждые 200мс делают границу
+# бессмысленной — окно очереди скользящее, место покупает только плотность.
+# Откат без кода: SPEC_FIRE_DENSE=0 -> прежний burst/slow-каденс и кап 24.
+SPEC_FIRE_DENSE = os.environ.get("SPEC_FIRE_DENSE", "1").lower() not in ("0", "false", "no")
+SPEC_FIRE_DENSE_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_DENSE_INTERVAL_SEC", "0.5"))
+SPEC_FIRE_DENSE_JITTER_SEC = float(os.environ.get("SPEC_FIRE_DENSE_JITTER_SEC", "0.15"))
+# Кап окна в плотном режиме: 150 × 0.5с = 75с покрытия >= p75 «первая проба -> транзит» жирных
+# окон (64с, датасет 27.07). Цена худшего окна 150×$0.015 ~= $2.25 — суточный бакет $10 держит
+# 4+ полных окна, WIN-cooldown (900с) рвёт серию раньше; окно и так стопится на confirmed/disarm.
+SPEC_FIRE_MAX_PROBES_WINDOW = int(os.environ.get("SPEC_FIRE_MAX_PROBES_WINDOW")
+                                  or (150 if SPEC_FIRE_DENSE else 24))
+# КЭШ ПРОБЫ: _build на каждую пробу = 2×aggregate3 + роут — на плотном каденсе это душит
+# одноядерную VPS и RPC (эффект наблюдателя). Позиция/шары за секунды не меняются, плохой филл
+# ревертится min_profit-полом контракта -> собранный calldata переиспользуем REBUILD_SEC.
+SPEC_FIRE_REBUILD_SEC = float(os.environ.get("SPEC_FIRE_REBUILD_SEC", "5.0"))
+# TIP-ГАРД: FCFS — tip НЕ покупает место (победитель 14:07 взял приз с tip 0.0034 против наших
+# 30). Проба обязана остаться копеечной, даже если боевой TIP_GWEI поднимут или сработает
+# каскадная ступень: жёсткий кап поверх cfg.tip_gwei.
+SPEC_FIRE_TIP_CAP_GWEI = float(os.environ.get("SPEC_FIRE_TIP_CAP_GWEI", "0.1"))
+# TOP-K ротация (дефолт 1 = прежний top-1): в каскад флипаются несколько жертв — K>1 чередует
+# пробы по K самым жирным досягаемым целям (плотность НА ЦЕЛЬ делится на K — включать только
+# когда плотность на top-1 доказала себя).
+SPEC_FIRE_TOPK = max(1, int(os.environ.get("SPEC_FIRE_TOPK", "1")))
+SPEC_FIRE_RECEIPT_POLL_SEC = float(os.environ.get("SPEC_FIRE_RECEIPT_POLL_SEC", "1.0"))
 SPEC_FIRE_THRESHOLD = float(os.environ.get("SPEC_FIRE_THRESHOLD", "1.0"))     # ×dev
 # Predicted-HF гейт (24.07, ревью + live-данные): цена на транзите ~= текущий Binance mid,
 # значит проба имеет смысл ТОЛЬКО если этот транзит способен флипнуть цель:
@@ -68,6 +98,11 @@ SPEC_FIRE_POLL_SEC = float(os.environ.get("SPEC_FIRE_POLL_SEC", "0.15"))
 SPEC_FIRE_RECEIPT_TIMEOUT = float(os.environ.get("SPEC_FIRE_RECEIPT_TIMEOUT", "45"))
 
 
+def _probe_tip_wei(tip_gwei: float) -> int:
+    """Tip пробы: min(боевой, кап) — пробы НИКОГДА не наследуют каскадные ступени/эскалацию."""
+    return int(min(float(tip_gwei), SPEC_FIRE_TIP_CAP_GWEI) * 1e9)
+
+
 class SpecFireLive:
     """Потребитель событий PredictDriver + fire-петля на окно. Все внешние вызовы — через швы."""
 
@@ -82,6 +117,7 @@ class SpecFireLive:
         self._receipt_fn = receipt_fn             # шов: (hash) -> (status, gas_usd)|None
         self._log = log_fn or (lambda m: log.info("%s", m))
         self._now = now
+        self._sleep = sleep or time.sleep
         self._lock = threading.Lock()
         self._windows: dict = {}                  # feed -> stop Event
         self._armskip_ts: dict = {}               # feed -> ts последнего arm-skip-лога (троттлинг 300с)
@@ -138,7 +174,7 @@ class SpecFireLive:
         from chain.execute import send_spec_fire_probe
         from chain.hotpath import _fresh_basefee
         fb = _fresh_basefee()
-        tip = int(self.cfg.tip_gwei * 1e9)
+        tip = _probe_tip_wei(self.cfg.tip_gwei)
         seq = str(getattr(self.cfg, "sequencer_rpc", "") or "")
         bcast = [seq] if (seq and seq.lower() not in ("off", "none", "0")) else None
         return send_spec_fire_probe(self.rpc, self.cfg, calldata, gas, log=log,
@@ -146,22 +182,33 @@ class SpecFireLive:
                                     broadcast_raw_urls=bcast)
 
     def _receipt(self, h):
-        try:
-            r = self.rpc._web3().eth.wait_for_transaction_receipt(h, timeout=SPEC_FIRE_RECEIPT_TIMEOUT)
-            gas_usd = (int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
-                       * float(self.cfg.eth_price_usd) / 1e18)
-            return int(r.get("status") or 0), gas_usd
-        except Exception:
-            return None
+        """Ручной полл вместо wait_for_transaction_receipt: его дефолтный poll 0.1с при плотном
+        залпе (6-8 сборщиков параллельно) = 60+ req/с в RPC. Раз в RECEIPT_POLL_SEC достаточно —
+        Base подтверждает за 2-4с, таймаут ловит только дропы."""
+        w3 = self.rpc._web3()
+        deadline = self._now() + SPEC_FIRE_RECEIPT_TIMEOUT
+        while self._now() < deadline:
+            r = None
+            try:
+                r = w3.eth.get_transaction_receipt(h)
+            except Exception:
+                pass                              # not found / транспорт — ждём следующий полл
+            if r is not None:
+                gas_usd = (int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
+                           * float(self.cfg.eth_price_usd) / 1e18)
+                return int(r.get("status") or 0), gas_usd
+            self._sleep(SPEC_FIRE_RECEIPT_POLL_SEC)
+        return None
 
     # ---- выбор жирной цели (top-1 по долгу; та же фид/направление-семантика) ----
     # max_dist (доля, напр. 0.0033): reach-гейт — пропускать цели, чей флип дальше, чем
     # достаёт текущее движение (down: цена залога должна упасть на 1-1/HF; up: долг вырасти
     # на HF-1). Применяется ТОЛЬКО в момент огня — арм окна без гейта, иначе в настоящий
     # каскад окно не запустится вовсе (на арме ret всегда мал по построению).
-    def _top_fat(self, feed: str, direction: str, max_dist=None):
-        """-> (best|(mid, b, debt), hold_dist) — hold_dist = ближайшая отсечённая гейтом цель."""
-        best = None
+    def _top_fat(self, feed: str, direction: str, max_dist=None, k=1):
+        """-> (top-k список [(mid, b, debt)] по долгу, hold_dist) — hold_dist = ближайшая
+        отсечённая гейтом цель. Пустой список = досягаемого жира нет."""
+        elig = []
         hold_dist = None
         with self.shared.lock:
             groups = dict(self.shared.groups)
@@ -188,11 +235,11 @@ class SpecFireLive:
                             if hold_dist is None or dist < hold_dist:
                                 hold_dist = dist
                             continue
-                if best is None or d > best[2]:
-                    best = (mid, b, d)
-        return best, hold_dist
+                elig.append((mid, b, d))
+        elig.sort(key=lambda t: -t[2])
+        return elig[:k], hold_dist
 
-    def _collect(self, h, mid, borrower, debt_usd):
+    def _collect(self, h, mid, borrower, debt_usd, feed=""):
         from chain.execute import specfire_gas_add, mark_recent_send, canary_invalidate_nonce
         res = (self._receipt_fn or self._receipt)(h)
         if res is None:
@@ -205,6 +252,11 @@ class SpecFireLive:
             self.stats["wins"] += 1
             mark_recent_send(mid, borrower)               # жертва взята — глушим реактивный дубль
             self._cooldown_until = self._now() + SPEC_FIRE_WIN_COOLDOWN_SEC   # рвём паттерн «пробы->приз»
+            if feed:                                      # приз взят — окно не жжёт кап ревертами
+                with self._lock:
+                    stop = self._windows.pop(feed, None)
+                if stop is not None:
+                    stop.set()
             log.warning("SPECFIRE WIN!!! %s/%s debt=$%.0fk tx=%s gas=$%.2f — предочередь взята "
                         "(окна на паузе %.0fс)",
                         mid[:10], borrower[:10], debt_usd / 1e3, h, gas_usd, SPEC_FIRE_WIN_COOLDOWN_SEC)
@@ -216,6 +268,7 @@ class SpecFireLive:
         probes = 0
         last_fire = 0.0
         last_hold_log = 0.0
+        cache = {}      # (mid, b) -> (probe|None, built_ts): кэш пробы, см. SPEC_FIRE_REBUILD_SEC
         while not stop.is_set() and probes < SPEC_FIRE_MAX_PROBES_WINDOW:
             r = None
             try:
@@ -224,15 +277,18 @@ class SpecFireLive:
                 pass
             hot = (r is not None and ((direction == "down" and r <= -thr)
                                       or (direction == "up" and r >= thr)))
-            if probes < SPEC_FIRE_BURST_PROBES:
+            if SPEC_FIRE_DENSE:                    # вся горячая фаза плотно (гонка плотностей, 31.07)
+                _j = SPEC_FIRE_DENSE_JITTER_SEC
+                iv = max(0.25, SPEC_FIRE_DENSE_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
+            elif probes < SPEC_FIRE_BURST_PROBES:
                 iv = SPEC_FIRE_INTERVAL_SEC
             else:                                  # хвост с джиттером (см. SPEC_FIRE_TAIL_JITTER_SEC)
                 _j = SPEC_FIRE_TAIL_JITTER_SEC
                 iv = max(0.3, SPEC_FIRE_SLOW_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
             if hot and self._now() - last_fire >= iv:
                 reach = abs(r) + SPEC_FIRE_DIST_MARGIN_DEVS * self.dev_by.get(feed, 0.005)
-                tgt, hold_dist = self._top_fat(feed, direction, max_dist=reach)
-                if tgt is None:
+                tgts, hold_dist = self._top_fat(feed, direction, max_dist=reach, k=SPEC_FIRE_TOPK)
+                if not tgts:
                     if hold_dist is None:
                         break                              # жир ушёл из набора — окно нам не нужно
                     if self._now() - last_hold_log >= 10.0:   # жир есть, но флип вне досягаемости
@@ -241,9 +297,12 @@ class SpecFireLive:
                             feed, hold_dist * 100.0, reach * 100.0))
                     stop.wait(SPEC_FIRE_POLL_SEC)
                     continue
-                mid, b, d = tgt
+                mid, b, d = tgts[probes % len(tgts)]       # top-K ротация (K=1 -> прежний top-1)
                 try:
-                    probe = (self._build_fn or self._build)(mid, b, d)
+                    probe, built_ts = cache.get((mid, b), (None, 0.0))
+                    if probe is None or self._now() - built_ts >= SPEC_FIRE_REBUILD_SEC:
+                        probe = (self._build_fn or self._build)(mid, b, d)
+                        cache[(mid, b)] = (probe, self._now())
                     if probe is not None:
                         h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
                         if h is not None:
@@ -252,7 +311,7 @@ class SpecFireLive:
                             last_fire = self._now()
                             self._log("SPECFIRE probe #%d feed=%s %s/%s debt=$%.0fk ret=%.4f%% tx=%s" % (
                                 probes, feed, mid[:10], b[:10], d / 1e3, (r or 0) * 100.0, h))
-                            threading.Thread(target=self._collect, args=(h, mid, b, d),
+                            threading.Thread(target=self._collect, args=(h, mid, b, d, feed),
                                              daemon=True).start()
                     else:
                         self._log("SPECFIRE probe skip feed=%s %s/%s: нет свопа (роут/prearm)" % (
@@ -272,7 +331,7 @@ class SpecFireLive:
                 if self._now() < self._cooldown_until:     # WIN-пауза: приз взят, паттерн не палим
                     return None
                 best, hold_dist = self._top_fat(feed, direction, max_dist=SPEC_FIRE_ARM_MAX_DIST)
-                if best is None:
+                if not best:
                     if hold_dist is not None:              # жир есть, но заведомо вне окна — не палим
                         _n = self._now()                   # ни петлю, ни ончейн-паттерн
                         if _n - self._armskip_ts.get(feed, -1e9) >= 300.0:

@@ -377,11 +377,14 @@ def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
         base_nonce = _LOCAL_NONCE.get(bot)
         if base_nonce is None:
             base_nonce = _pending_nonce(w3, bot)
-        tip_wei = int(cfg.tip_gwei * 1e9)
+        # tip-гард плотного режима (31.07): переданный tip капнут вызывающим слоем
+        # (SPEC_FIRE_TIP_CAP_GWEI) — min_tip_wei обязан уважать кап, иначе send-слой
+        # поднимет пробу обратно до боевого cfg.tip_gwei (FCFS: tip места не покупает).
+        tip_wei = int(tip) if tip else int(cfg.tip_gwei * 1e9)
         _tx = {"to": cfg.liquidator_address, "data": calldata, "nonce": base_nonce, "gas": int(gas)}
         if max_fee is not None:
             _tx["maxFeePerGas"] = int(max_fee)
-            _tx["maxPriorityFeePerGas"] = int(tip) if tip else tip_wei
+            _tx["maxPriorityFeePerGas"] = tip_wei
         try:
             res = send_tx(rpc, cfg.wallet_key, _tx,
                           wait=False, min_tip_wei=tip_wei, broadcast_raw_urls=broadcast_raw_urls)

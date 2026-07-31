@@ -64,7 +64,7 @@ time.sleep(0.2)
 assert sf2.stats["windows_armed"] == 0 and not sent
 print("UNIT_OK: окно без жира не запускает петлю")
 
-# 2) ниже порога (|ret| < dev) — огня НЕТ; выше — пробы идут с каденсом
+# 2) ниже порога (|ret| < dev) — огня НЕТ; выше — пробы идут ПЛОТНО (дефолт DENSE 0.5±0.15)
 sent.clear(); RET["v"] = -0.0005          # 0.05% < dev 0.10%
 sf.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
 time.sleep(0.5)
@@ -73,8 +73,8 @@ RET["v"] = -0.0011                        # пробили dev вниз
 time.sleep(1.2)
 sf.handle_event({"event": "push", "feed": "BTC"})
 n1 = len(sent)
-assert 1 <= n1 <= 3, sent                 # каденс 0.7с: за ~1.2с максимум 2-3 пробы, не пулемёт
-print("UNIT_OK: до dev тишина, после dev пробы с каденсом (n=%d)" % n1)
+assert 1 <= n1 <= 4, sent                 # плотный каденс 0.5±0.15: за ~1.2с 2-3 пробы
+print("UNIT_OK: до dev тишина, после dev плотные пробы (n=%d за 1.2с)" % n1)
 
 # 3) push стопит окно; новых проб нет
 time.sleep(0.6)
@@ -89,20 +89,23 @@ sf.handle_event({"event": "disarm", "feed": "BTC"})
 assert not sent
 print("UNIT_OK: направление окна сверяется со знаком ret")
 
-# 5) кап проб на окно
+# 5) кап проб на окно (плотный режим, пол интервала 0.25с)
 sent.clear(); RET["v"] = -0.005
 old_cap = sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW
 sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW = 2
-old_iv = sfl_mod.SPEC_FIRE_INTERVAL_SEC
-sfl_mod.SPEC_FIRE_INTERVAL_SEC = 0.05
+old_div = sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC
+old_dj = sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC
+sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC = 0.05      # пол max(0.25, ...) удержит 0.25
+sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC = 0.0
 sf3 = make()
 sf3.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
 time.sleep(0.8)
 sf3.handle_event({"event": "disarm", "feed": "BTC"})
 assert len(sent) == 2, sent
 sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW = old_cap
-sfl_mod.SPEC_FIRE_INTERVAL_SEC = old_iv
-print("UNIT_OK: кап проб/окно соблюдён")
+sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC = old_div
+sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC = old_dj
+print("UNIT_OK: кап проб/окно соблюдён (и пол интервала 0.25с в плотном режиме)")
 
 # 6) WIN: receipt status=1 -> _RECENT_SENDS маркирован; revert -> НЕ маркирован
 ex._RECENT_SENDS.clear()
@@ -159,10 +162,12 @@ sf8.handle_event({"event": "disarm", "feed": "BTC"})
 assert len(sent) >= 1, "без HF гейт должен быть открыт (fail-open)"
 print("UNIT_OK: HF неизвестен -> fail-open (без hf_by поведение прежнее)")
 
-# 7d) двухфазный каденс: burst=2 быстрых, дальше медленный интервал (транзит на 22-31с позже dev)
+# 7d) ОТКАТ SPEC_FIRE_DENSE=0: прежний двухфазный каденс жив (burst=2 быстрых, дальше медленно)
 sent.clear(); RET["v"] = -0.005
+old_dense = sfl_mod.SPEC_FIRE_DENSE
 old_slow = sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC
 old_fast = sfl_mod.SPEC_FIRE_INTERVAL_SEC
+sfl_mod.SPEC_FIRE_DENSE = False
 sfl_mod.SPEC_FIRE_INTERVAL_SEC = 0.05
 sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC = 30.0        # медленная фаза не успеет за тест
 sf9 = make()
@@ -170,9 +175,10 @@ sf9.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
 time.sleep(0.9)
 sf9.handle_event({"event": "disarm", "feed": "BTC"})
 assert len(sent) == sfl_mod.SPEC_FIRE_BURST_PROBES == 2, sent
+sfl_mod.SPEC_FIRE_DENSE = old_dense
 sfl_mod.SPEC_FIRE_INTERVAL_SEC = old_fast
 sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC = old_slow
-print("UNIT_OK: burst-фаза = 2 пробы, дальше медленный каденс (растяжка на OCR-лаг)")
+print("UNIT_OK: откат DENSE=0 возвращает прежний burst/slow-каденс")
 
 # 8) send_spec_fire_probe: гейт inflight>0 молчит; газ-бакет стопит
 ex._INFLIGHT = 1
@@ -209,34 +215,147 @@ assert ex.specfire_gas_today() == 0.0, "смена UTC-суток обязана
 ex._SPECFIRE_GAS_USD = 0.0
 print("UNIT_OK: суточный сброс бакета + specfire_gas_today для общего kill-switch")
 
-# 10) КАДЕНС ПО ДАТАСЕТУ (27.07, 871 арм/462 транзита): кап 24, хвост 2.0с ±джиттер 0.3
-assert sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW == 24, sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW
-assert sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC == 2.0
-assert sfl_mod.SPEC_FIRE_TAIL_JITTER_SEC == 0.3
-_cov = sfl_mod.SPEC_FIRE_BURST_PROBES * sfl_mod.SPEC_FIRE_INTERVAL_SEC + \
-       (sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW - sfl_mod.SPEC_FIRE_BURST_PROBES) * sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC
-assert _cov >= 40.0, _cov                 # покрывает замеренную медиану «проба->транзит» 31с с запасом
-assert sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC <= 2.0, "одна проба на блок (2с) — плотнее не нужно"
-print("UNIT_OK: каденс %d проб × %.1f±%.1fс = покрытие %.0fс (медиана проба→транзит 31с)" % (
-    sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW, sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC,
-    sfl_mod.SPEC_FIRE_TAIL_JITTER_SEC, _cov))
+# 10) ДОКТРИНА ПЛОТНОГО РЕЖИМА (31.07, гонка 14:07 проиграна деньгами — гонка плотностей):
+#     дефолт DENSE=1, интервал 0.5±0.15 (4 пробы/блок), кап 150 = 75с покрытия >= p75 64с
+assert sfl_mod.SPEC_FIRE_DENSE is True
+assert sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC == 0.5
+assert sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC == 0.15
+assert sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW == 150, sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW
+_cov = sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW * sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC
+assert _cov >= 64.0, _cov                 # p75 «первая проба -> транзит» жирных окон = 64с
+_per_block = 2.0 / sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC
+assert _per_block >= 4.0, "плотность = рычаг: минимум 4 пробы на 2с-блок"
+assert sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC >= 0.25, "пол send-слоя SPEC_FIRE_MIN_INTERVAL_SEC"
+print("UNIT_OK: плотный каденс %d проб × %.2f±%.2fс = %.0f проб/блок, покрытие %.0fс (p75 64с)" % (
+    sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW, sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC,
+    sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC, _per_block, _cov))
 
-# 10b) джиттер реально ломает периодичность и не уводит интервал в опасную зону
+# 10b) джиттер плотного режима ломает периодичность, пол 0.25с не пробивается
 import statistics as _st
 _ivs = []
 for _ in range(400):
-    _j = sfl_mod.SPEC_FIRE_TAIL_JITTER_SEC
-    _ivs.append(max(0.3, sfl_mod.SPEC_FIRE_SLOW_INTERVAL_SEC + __import__("random").uniform(-_j, _j)))
-assert 1.7 <= min(_ivs) and max(_ivs) <= 2.3, (min(_ivs), max(_ivs))
-assert _st.stdev(_ivs) > 0.1, "джиттер должен реально разбрасывать"
-assert min(_ivs) > sfl_mod.SPEC_FIRE_INTERVAL_SEC, "хвост не должен опускаться до burst-темпа"
-print("UNIT_OK: джиттер в [%.2f..%.2f]с, σ=%.2f — расписание нечитаемо, burst не задет" % (
+    _j = sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC
+    _ivs.append(max(0.25, sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC + __import__("random").uniform(-_j, _j)))
+assert 0.35 <= min(_ivs) and max(_ivs) <= 0.65, (min(_ivs), max(_ivs))
+assert _st.stdev(_ivs) > 0.05, "джиттер должен реально разбрасывать"
+print("UNIT_OK: джиттер в [%.2f..%.2f]с, σ=%.2f — расписание нечитаемо" % (
     min(_ivs), max(_ivs), _st.stdev(_ivs)))
 
-# 10c) цена окна остаётся под суточным бакетом с большим запасом
-_probe_usd = 0.012
-assert sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW * _probe_usd < ex._SPECFIRE_MAX_GAS_USD / 10, "окно < 10% бакета"
-print("UNIT_OK: полное окно ~$%.2f против суточного бакета $%.0f" % (
+# 10c) цена худшего окна <= четверти суточного бакета (бакет держит 4+ полных окна,
+#      WIN-cooldown 900с рвёт серию раньше, окно и так стопится на confirmed/disarm)
+_probe_usd = 0.015
+assert sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW * _probe_usd <= ex._SPECFIRE_MAX_GAS_USD * 0.25, "окно <= 25% бакета"
+print("UNIT_OK: худшее окно ~$%.2f против суточного бакета $%.0f" % (
     sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW * _probe_usd, ex._SPECFIRE_MAX_GAS_USD))
 
-print("=== ВСЕ SPEC-FIRE-LIVE ЮНИТЫ ПРОШЛИ (вкл. каденс по датасету) ===")
+# 11) КЭШ ПРОБЫ: на плотном каденсе _build (2×aggregate3 + роут) зовётся РАЗ в REBUILD_SEC,
+#     не на каждую пробу; REBUILD_SEC=0 -> пересборка каждый раз
+_builds = {"n": 0}
+def build_cnt(mid, b, d):
+    _builds["n"] += 1
+    return {"calldata": "0xdeadbeef", "gas": 625_000}
+sent.clear(); RET["v"] = -0.005
+sf11 = make(build_fn=build_cnt)
+sf11.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.9)
+sf11.handle_event({"event": "disarm", "feed": "BTC"})
+assert len(sent) >= 2 and _builds["n"] == 1, (len(sent), _builds["n"])
+old_rb = sfl_mod.SPEC_FIRE_REBUILD_SEC
+sfl_mod.SPEC_FIRE_REBUILD_SEC = 0.0
+sent.clear(); _builds["n"] = 0
+sf11b = make(build_fn=build_cnt)
+sf11b.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.9)
+sf11b.handle_event({"event": "disarm", "feed": "BTC"})
+assert _builds["n"] == len(sent) >= 2, (len(sent), _builds["n"])
+sfl_mod.SPEC_FIRE_REBUILD_SEC = old_rb
+print("UNIT_OK: кэш пробы — build 1 раз на TTL, плотность не душит RPC/ядро")
+
+# 12) TIP-ГАРД: проба никогда не наследует каскадные ступени — кап 0.1 gwei поверх cfg
+from chain.spec_fire_live import _probe_tip_wei
+assert _probe_tip_wei(0.05) == int(0.05e9)        # боевой ниже капа — берём боевой
+assert _probe_tip_wei(30.0) == int(0.1e9)         # каскадная ступень 30 -> кап 0.1
+assert _probe_tip_wei(6.0) == int(0.1e9)          # старый TIP_GWEI=6 -> кап 0.1
+print("UNIT_OK: tip-гард — проба копеечная даже при поднятом боевом tip (FCFS)")
+
+# 12b) send-слой уважает капнутый tip и в min_tip_wei (иначе поднял бы обратно до cfg)
+import types as _t
+_cap = {}
+def _fake_send_tx(rpc, key, tx, wait=False, min_tip_wei=None, broadcast_raw_urls=None):
+    _cap.update(tx=tx, min_tip=min_tip_wei)
+    return {"hash": "0xh12"}
+_olds = (ex.account_for, ex.send_tx, ex.probe_allowed_by_reserve, ex.cached_balance_wei)
+ex.account_for = lambda w3, k: _t.SimpleNamespace(address="0xBOT")
+ex.send_tx = _fake_send_tx
+ex.probe_allowed_by_reserve = lambda bal, cost: True
+ex.cached_balance_wei = lambda rpc, a: 10**19
+ex._LOCAL_NONCE["0xBOT"] = 5
+ex._SPECFIRE_LAST_TS = 0.0
+_cfg30 = _t.SimpleNamespace(liquidator_address="0xLIQ", tip_gwei=30.0, wallet_key="k",
+                            gas_limit_est=500_000, eth_price_usd=1730.0)
+_rpcf = _t.SimpleNamespace(_web3=lambda: None)
+_h = ex.send_spec_fire_probe(_rpcf, _cfg30, "0xdata", 100_000,
+                             max_fee=10**9, tip=int(0.1e9))
+assert _h == "0xh12" and _cap["min_tip"] == int(0.1e9), _cap
+assert _cap["tx"]["maxPriorityFeePerGas"] == int(0.1e9) and _cap["tx"]["nonce"] == 5
+ex.account_for, ex.send_tx, ex.probe_allowed_by_reserve, ex.cached_balance_wei = _olds
+ex._LOCAL_NONCE.pop("0xBOT", None)
+ex._SPECFIRE_LAST_TS = 0.0
+print("UNIT_OK: send-слой шлёт пробу с капнутым tip (min_tip_wei не поднимает обратно)")
+
+# 13) WIN стопит СВОЁ окно: приз взят — остаток капа не жжётся ревертами
+sent.clear(); RET["v"] = -0.005
+ex._RECENT_SENDS.clear()
+sf13 = make(receipt_fn=lambda h: (1, 0.02))
+sf13.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(1.0)
+_n13 = len(sent)
+assert sf13.stats["wins"] >= 1 and _n13 <= 2, (sf13.stats, _n13)
+assert not sf13._windows, "после WIN окно обязано быть снято"
+time.sleep(0.7)
+assert len(sent) == _n13, "после WIN проб быть не должно"
+ex._RECENT_SENDS.clear()
+print("UNIT_OK: WIN снимает окно (кап не жжётся) + кулдаун армов")
+
+# 14) TOP-K ротация (K=2): пробы чередуются по двум самым жирным досягаемым целям
+old_k = sfl_mod.SPEC_FIRE_TOPK
+sfl_mod.SPEC_FIRE_TOPK = 2
+shared2 = types.SimpleNamespace(
+    lock=threading.Lock(),
+    groups={"0xbtc": ["0xFAT", "0xFAT2", "0xdust"]},
+    debt_by={("0xbtc", "0xFAT"): 1_500_000.0, ("0xbtc", "0xFAT2"): 1_200_000.0,
+             ("0xbtc", "0xdust"): 90_000.0},
+    by_id={"0xbtc": mk("cbBTC", "USDC")},
+)
+sent.clear(); RET["v"] = -0.005
+sf14 = SpecFireLive(rpc=None, cfg=cfg, shared=shared2, ret_fn=lambda l: RET["v"],
+                    dev_by={"BTC": 0.0010}, build_fn=lambda mid, b, d: {"calldata": b, "gas": 1},
+                    send_fn=send_fn, receipt_fn=receipt_fn, log_fn=LOGS.append)
+sf14.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(1.3)
+sf14.handle_event({"event": "disarm", "feed": "BTC"})
+assert len(sent) >= 2 and sent[0][0] == "0xFAT" and sent[1][0] == "0xFAT2", sent
+sfl_mod.SPEC_FIRE_TOPK = old_k
+print("UNIT_OK: top-K=2 чередует пробы по жирнейшим целям (дефолт K=1 = прежний top-1)")
+
+# 15) _receipt: ручной полл раз в RECEIPT_POLL_SEC (НЕ wait_for_transaction_receipt с его
+#     дефолтным 0.1с — 6-8 параллельных сборщиков дали бы 60+ req/с)
+class _FEth:                                       # у фейка НЕТ wait_for_transaction_receipt
+    def __init__(self):
+        self.calls = 0
+    def get_transaction_receipt(self, h):
+        self.calls += 1
+        if self.calls < 3:
+            raise LookupError("not found")
+        return {"status": 1, "gasUsed": 115_000, "effectiveGasPrice": 50_000_000}
+_slept = []
+sf15 = SpecFireLive(rpc=types.SimpleNamespace(_web3=lambda _e=_FEth(): types.SimpleNamespace(eth=_e)),
+                    cfg=cfg, shared=shared, ret_fn=lambda l: 0.0, dev_by={"BTC": 0.001},
+                    build_fn=build_fn, send_fn=send_fn, log_fn=LOGS.append,
+                    sleep=lambda s: _slept.append(s))
+_st15, _gu15 = sf15._receipt("0xh")
+assert _st15 == 1 and _slept == [sfl_mod.SPEC_FIRE_RECEIPT_POLL_SEC] * 2, (_st15, _slept)
+assert 0.005 < _gu15 < 0.02, _gu15
+print("UNIT_OK: receipt — ручной полл 1.0с, RPC не молотится")
+
+print("=== ВСЕ SPEC-FIRE-LIVE ЮНИТЫ ПРОШЛИ (вкл. плотный режим предочереди) ===")
