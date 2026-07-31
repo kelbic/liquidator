@@ -65,9 +65,29 @@ SPEC_FIRE_TIP_CAP_GWEI = float(os.environ.get("SPEC_FIRE_TIP_CAP_GWEI", "0.1"))
 # когда плотность на top-1 доказала себя).
 SPEC_FIRE_TOPK = max(1, int(os.environ.get("SPEC_FIRE_TOPK", "1")))
 SPEC_FIRE_RECEIPT_POLL_SEC = float(os.environ.get("SPEC_FIRE_RECEIPT_POLL_SEC", "1.0"))
-# КАСКАД-ДЕТЕКТ (ревью 31.07): столько армленных окон за час = каскадный день -> дёргаем
-# бустер бакета в execute (тот мёртв, пока владелец не подписал SPEC_FIRE_CASCADE_GAS_USD).
+# КАСКАД-ДЕТЕКТ, ГИБРИД (калибровка 31.07: армы — надежда, факты — подтверждение; 31.07 было
+# 44 арма/час при 5 ликвидациях за ДЕНЬ — армы одни не сигнал ни при каком пороге, а факты
+# разделяют штиль/каскад идеально: p90 штиля 3/час vs 11/час у мини-каскада 28.07):
+# бустер бакета дёргается только при АРМЫ >= CASCADE_WINDOWS/час И свежем факт-флаге.
+# Флаг пишет вотчер Вены (>=3 наших ликвидаций/час, blue-api + get_logs-фолбэк); нет/устарел
+# (> FACTS_TTL) -> fail-closed: бустер молчит (цена пропуска = штатный бакет $20, слепой
+# подъём хуже — боевой урок: API теряет ~8% событий и таймаутит именно в каскад).
+# Откат гибрида: SPEC_FIRE_HYBRID=0 = бустер по одним армам (как до калибровки).
 SPEC_FIRE_CASCADE_WINDOWS = int(os.environ.get("SPEC_FIRE_CASCADE_WINDOWS", "4"))
+SPEC_FIRE_HYBRID = os.environ.get("SPEC_FIRE_HYBRID", "1").lower() not in ("0", "false", "no")
+SPEC_FIRE_FACTS_FLAG = os.environ.get("SPEC_FIRE_FACTS_FLAG", "state/cascade_facts.flag")
+SPEC_FIRE_FACTS_TTL_SEC = float(os.environ.get("SPEC_FIRE_FACTS_TTL_SEC", "900"))
+
+
+def _facts_fresh(now_wall=None):
+    """True = факт-сигнал каскада действителен (флаг существует и mtime моложе TTL)."""
+    if not SPEC_FIRE_HYBRID:
+        return True
+    try:
+        age = (time.time() if now_wall is None else now_wall) - os.path.getmtime(SPEC_FIRE_FACTS_FLAG)
+        return 0 <= age <= SPEC_FIRE_FACTS_TTL_SEC or age < 0   # mtime в будущем = свежий (скью часов)
+    except OSError:
+        return False
 SPEC_FIRE_THRESHOLD = float(os.environ.get("SPEC_FIRE_THRESHOLD", "1.0"))     # ×dev
 # Predicted-HF гейт (24.07, ревью + live-данные): цена на транзите ~= текущий Binance mid,
 # значит проба имеет смысл ТОЛЬКО если этот транзит способен флипнуть цель:
@@ -368,14 +388,19 @@ class SpecFireLive:
                     stop = threading.Event()
                     self._windows[feed] = stop
                     self.stats["windows_armed"] += 1
-                _n = self._now()                           # каскад-детект: спам армов за час
+                _n = self._now()                           # каскад-детект (гибрид): армы И факты
                 self._arm_ts = [t for t in self._arm_ts if _n - t < 3600.0] + [_n]
                 if len(self._arm_ts) >= SPEC_FIRE_CASCADE_WINDOWS:
-                    from chain.execute import specfire_cascade_boost
-                    if specfire_cascade_boost() and _n - self._armskip_ts.get("_boost", -1e9) >= 300.0:
-                        self._armskip_ts["_boost"] = _n
-                        self._log("SPECFIRE каскад-детект: %d окон/час — бакет поднят до каскадного "
-                                  "(TTL 1ч, продлевается армами)" % len(self._arm_ts))
+                    if _facts_fresh():
+                        from chain.execute import specfire_cascade_boost
+                        if specfire_cascade_boost() and _n - self._armskip_ts.get("_boost", -1e9) >= 300.0:
+                            self._armskip_ts["_boost"] = _n
+                            self._log("SPECFIRE каскад-детект: %d окон/час + факт-флаг — бакет поднят "
+                                      "до каскадного (TTL 1ч, продлевается армами)" % len(self._arm_ts))
+                    elif _n - self._armskip_ts.get("_nofacts", -1e9) >= 300.0:
+                        self._armskip_ts["_nofacts"] = _n
+                        self._log("SPECFIRE каскад-армы (%d/час) БЕЗ факт-флага — бустер молчит "
+                                  "(fail-closed, штатный бакет)" % len(self._arm_ts))
                 self._log("SPECFIRE LIVE window feed=%s dir=%s — жир на прицеле, огонь при |ret|>=%.3f%%" % (
                     feed, direction, self.dev_by.get(feed, 0.005) * SPEC_FIRE_THRESHOLD * 100.0))
                 threading.Thread(target=self._window_loop, args=(feed, direction, stop),

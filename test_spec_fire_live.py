@@ -420,7 +420,13 @@ ex._SPECFIRE_CASCADE_GAS_USD = 0.0
 ex._SPECFIRE_CASCADE_UNTIL = 0.0
 print("UNIT_OK: каскад-бустер мёртв без подписи, с подписью TTL-буст и авто-возврат")
 
-# 18) каскад-детект: 4-й арм за час дёргает бустер (с подписью), лог троттлится
+# 18) каскад-детект (гибрид, калибровка 31.07): 4-й арм за час дёргает бустер ТОЛЬКО при
+#     свежем факт-флаге (детали гибрида/fail-closed — test_cascade_hybrid.py), лог троттлится
+import os as _os, tempfile as _tf
+_fd, _flag18 = _tf.mkstemp()
+_os.close(_fd)
+_old_flag18 = sfl_mod.SPEC_FIRE_FACTS_FLAG
+sfl_mod.SPEC_FIRE_FACTS_FLAG = _flag18
 ex._SPECFIRE_CASCADE_GAS_USD = 100.0
 ex._SPECFIRE_CASCADE_UNTIL = 0.0
 LOGS.clear(); RET["v"] = -0.0005                       # ниже порога: окна армятся, огня нет
@@ -428,11 +434,13 @@ sf18 = make()
 for _ in range(sfl_mod.SPEC_FIRE_CASCADE_WINDOWS):
     sf18.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
 sf18.handle_event({"event": "disarm", "feed": "BTC"})
-assert ex._SPECFIRE_CASCADE_UNTIL > 0.0, "4 арма/час обязаны дёрнуть бустер"
+assert ex._SPECFIRE_CASCADE_UNTIL > 0.0, "4 арма/час + факт-флаг обязаны дёрнуть бустер"
 assert sum(1 for m in LOGS if "каскад-детект" in m) == 1, LOGS
 ex._SPECFIRE_CASCADE_GAS_USD = 0.0
 ex._SPECFIRE_CASCADE_UNTIL = 0.0
-print("UNIT_OK: каскад-детект — %d окон/час дёргают бустер, лог троттлится" %
+_os.remove(_flag18)
+sfl_mod.SPEC_FIRE_FACTS_FLAG = _old_flag18
+print("UNIT_OK: каскад-детект — %d окон/час при свежем факт-флаге дёргают бустер" %
       sfl_mod.SPEC_FIRE_CASCADE_WINDOWS)
 
 print("=== ВСЕ SPEC-FIRE-LIVE ЮНИТЫ ПРОШЛИ (плотный режим + LOSS-стоп + каскад-протокол) ===")
