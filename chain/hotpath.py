@@ -84,6 +84,10 @@ def CU_TOP_KEY(kv):
 
 PRECONF_POLL_MIN_GAP = float(os.environ.get("PRECONF_POLL_MIN_GAP_SEC", "0"))
 PRECONF_REACTIVE_QUIET = float(os.environ.get("PRECONF_REACTIVE_QUIET_SEC", "1.2"))
+# Дробление fast-lane (01.08, «го» kelbic после гонки cbDOGE): полный сейз сверх капа
+# прямого роута раньше ронял fast в Kyber-block-loop (+0.4-0.9с, протухшая квота = panic) —
+# теперь режем repaid_shares до ёмкости пула, fast остаётся 0 RTT. Откат REACTIVE_PARTIAL=0.
+REACTIVE_PARTIAL = os.environ.get("REACTIVE_PARTIAL", "1").lower() not in ("0", "false", "no")
 _PRECONF_BUDGET_LOCK = threading.Lock()
 _PRECONF_LAST_REACTIVE = -1e9
 _PRECONF_LAST_POLL = -1e9
@@ -1091,6 +1095,18 @@ def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asse
         if seized == 0:
             return {"ok": False, "reason": "fast: seized=0"}
         swap = direct_swap(coll, loan, seized, liq, liq, repaid_assets=repaid_assets)
+        if swap is None and REACTIVE_PARTIAL:
+            from chain.execute import route_max_in, partial_shares_for_cap
+            _cap = route_max_in(coll, loan)   # дробление (01.08): сейз сверх ёмкости пула
+            _sp = partial_shares_for_cap(repaid_shares, seized, _cap) if _cap is not None else 0
+            if _sp > 0:
+                repaid_shares = _sp
+                repaid_assets = to_assets_up(_sp, tba, tbs)
+                seized = _seized_exact(_sp, _lif_wad, int(price), tba, tbs)
+                swap = direct_swap(coll, loan, seized, liq, liq, repaid_assets=repaid_assets)
+                if swap is not None:
+                    log.info("FAST partial %s/%s: сейз > кап %d — режем до %d shares",
+                             market_id[:10], borrower[:10], _cap, _sp)
         if swap is None:
             return {"ok": False, "reason": "fast: no direct route"}
         min_profit = repaid_assets * (_lif_wad - WAD) // WAD // 2

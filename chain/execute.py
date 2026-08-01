@@ -693,9 +693,24 @@ def univ3_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_asse
 
 def route_max_in(token_in, token_out):
     """Ёмкость прямого роута в единицах token_in: max_in, либо None (нет роута/роут без капа).
-    Потребитель — дробление spec-fire (01.08): сейз сверх капа режется до ёмкости пула."""
+    Потребители — дробление spec-fire и fast-lane (01.08): сейз сверх капа режется до пула."""
     r = _SWAP_ROUTES.get((token_in.lower(), token_out.lower()))
     return None if r is None else r.get("max_in")
+
+
+_PARTIAL_HEADROOM_PCT = int(os.environ.get("SPEC_FIRE_PARTIAL_HEADROOM_PCT", "95"))
+
+
+def partial_shares_for_cap(shares, seized, cap, headroom_pct=None):
+    """Сколько shares погасить, чтобы сейз влез в кап роута с запасом. 0 = дробить нечего
+    (сейз и так помещается) или нельзя (нулевые входы). Целочисленно, без float-дрейфа.
+    Канон дробления (урок cbDOGE 01.08): конкурент монетизирует кита ломтями по ёмкости
+    выхода — единственная тактика на тонких пулах (Kyber на таком ките отдаёт 21.5%)."""
+    hp = _PARTIAL_HEADROOM_PCT if headroom_pct is None else int(headroom_pct)
+    shares, seized, cap = int(shares), int(seized), int(cap)
+    if shares <= 0 or seized <= 0 or cap <= 0 or seized <= cap:
+        return 0
+    return shares * (cap * hp // 100) // seized
 
 
 def expected_seized(repaid_assets: int, lif: float, price: int) -> int:

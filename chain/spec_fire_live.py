@@ -81,21 +81,14 @@ SPEC_FIRE_RECEIPT_POLL_SEC = float(os.environ.get("SPEC_FIRE_RECEIPT_POLL_SEC", 
 # следующий срез. Kyber тут НЕ спасение (замер 25.07: на ките $80k cbDOGE отдаёт 21.5%
 # номинала). Откат: SPEC_FIRE_PARTIAL=0 = прежнее «только полный сайз».
 SPEC_FIRE_PARTIAL = os.environ.get("SPEC_FIRE_PARTIAL", "1").lower() not in ("0", "false", "no")
-SPEC_FIRE_PARTIAL_HEADROOM_PCT = int(os.environ.get("SPEC_FIRE_PARTIAL_HEADROOM_PCT", "95"))
 SPEC_FIRE_CASCADE_WINDOWS = int(os.environ.get("SPEC_FIRE_CASCADE_WINDOWS", "4"))
 SPEC_FIRE_HYBRID = os.environ.get("SPEC_FIRE_HYBRID", "1").lower() not in ("0", "false", "no")
 SPEC_FIRE_FACTS_FLAG = os.environ.get("SPEC_FIRE_FACTS_FLAG", "state/cascade_facts.flag")
 SPEC_FIRE_FACTS_TTL_SEC = float(os.environ.get("SPEC_FIRE_FACTS_TTL_SEC", "900"))
 
 
-def partial_shares_for_cap(shares, seized, cap, headroom_pct=None):
-    """Сколько shares погасить, чтобы сейз влез в кап роута с запасом. 0 = дробить нечего
-    (сейз и так помещается) или нельзя (нулевые входы). Целочисленно, без float-дрейфа."""
-    hp = SPEC_FIRE_PARTIAL_HEADROOM_PCT if headroom_pct is None else int(headroom_pct)
-    shares, seized, cap = int(shares), int(seized), int(cap)
-    if shares <= 0 or seized <= 0 or cap <= 0 or seized <= cap:
-        return 0
-    return shares * (cap * hp // 100) // seized
+# канон дробления живёт в chain.execute (общий для проб и fast-lane); ре-экспорт для юнитов
+from chain.execute import partial_shares_for_cap  # noqa: E402
 
 
 def _facts_fresh(now_wall=None):

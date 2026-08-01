@@ -1845,3 +1845,15 @@ LIF 1.1268 бит-в-бит). Наш реактивный: +2 блока, рев
 сайзом и упал в Kyber-block-loop + panic-underflow на протухшей квоте) и prearm-фильтр
 с учётом капов (полоса weETH $330-500k). Канарейка: следующее DOGE/XRP-окно должно дать
 «probe partial … режем до N shares» + probe # вместо «нет свопа».
+
+## 01.08 ~20:00 — «оба го»: дробление в реактиве + prearm cap-aware (хвосты гонки cbDOGE)
+1) prepare_fast (hotpath): сейз сверх капа прямого роута больше не роняет fast в
+Kyber-block-loop — repaid_shares режется до 95% ёмкости (общий канон partial_shares_for_cap,
+переехал в chain.execute; spec_fire_live ре-экспортирует). Лог «FAST partial … режем до N
+shares». Откат REACTIVE_PARTIAL=0.
+2) prearm: routed_at_size(coll, loan, seized) — пара «прикрыта прямым» только если сейз
+влезает в max_in; иначе Kyber греется (закрыта полоса weETH $330-500k и cbDOGE-киты).
+Откат PREARM_CAP_AWARE=0. Попутно задокументирован ИНЕРТНЫЙ символьный фильтр в _pick
+(символы против адресных ключей — всегда False; боевое решение всегда принимал
+window_loop): не чиним втихую, слот-динамика — отдельным пакетом при голодании top-K.
+Юниты: test_spec_fire_partial.py 6 блоков; полная сюита 28/28.

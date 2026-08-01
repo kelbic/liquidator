@@ -30,6 +30,10 @@ PREARM_TOP_K = int(os.environ.get("PREARM_TOP_K", "3"))
 # негретая цель $1-20k без статик-роута = пробы «нет свопа» весь боевой цикл (SOL-окно 01:06).
 PREARM_MIN_DEBT_USD = float(os.environ.get("PREARM_MIN_DEBT_USD", "1000"))
 PREARM_MAX_WARMS = int(os.environ.get("PREARM_MAX_WARMS", "40"))   # кап Kyber-вызовов на окно
+# CAP-AWARE (01.08, «го» kelbic после гонки cbDOGE): «роутнутая» пара считается прикрытой
+# прямым пулом ТОЛЬКО если фактический сейз влезает в её max_in. Слепота к капам не грела
+# Kyber для полосы weETH $330-500k и для cbDOGE-кита. Откат PREARM_CAP_AWARE=0.
+PREARM_CAP_AWARE = os.environ.get("PREARM_CAP_AWARE", "1").lower() not in ("0", "false", "no")
 
 _CACHE_LOCK = threading.Lock()
 _CACHE: dict = {}    # (token_in_lower, token_out_lower) -> {swap, amount_in, ts, mid, borrower}
@@ -61,6 +65,19 @@ def prearm_get(token_in: str, token_out: str, amount_in: int, now=None) -> dict 
 def prearm_clear() -> None:      # тестовый/аварийный сброс
     with _CACHE_LOCK:
         _CACHE.clear()
+
+
+def routed_at_size(coll: str, loan: str, seized: int) -> bool:
+    """True = прямой роут ЕСТЬ и фактический сейз влезает в его кап (греть Kyber незачем).
+    С PREARM_CAP_AWARE=0 — старая бинарная семантика «роут есть» без учёта max_in."""
+    from chain.execute import _SWAP_ROUTES
+    r = _SWAP_ROUTES.get((coll.lower(), loan.lower()))
+    if r is None:
+        return False
+    if not PREARM_CAP_AWARE:
+        return True
+    cap = r.get("max_in")
+    return cap is None or int(seized) <= int(cap)
 
 
 # токен -> predict-лейбл (копия семантики spec_fire: ведома ровно ОДНА нога => рынок feed-driven)
@@ -101,7 +118,7 @@ class PreArmWorker:
         repaid_assets = to_assets_up(bs, tba, tbs)
         seized = expected_seized(repaid_assets, lif_from_lltv(lltv_wad / 10**18), price)
         return {"coll": coll, "loan": loan, "seized": int(seized),
-                "routed": (coll.lower(), loan.lower()) in _SWAP_ROUTES}
+                "routed": routed_at_size(coll, loan, int(seized))}
 
     def _quote(self, coll, loan, seized):
         from chain.execute import kyber_swap
@@ -130,6 +147,11 @@ class PreArmWorker:
             # и негретая цель (uSOL без статик-роута) до Kyber не доходила: пробы spec-fire
             # скипались «нет свопа» весь боевой цикл. Фильтруем ДО среза top-K; проверка в
             # window_loop остаётся (свежее on-chain чтение — страховка от рассинхрона).
+            # NB (01.08, разбор cbDOGE): collateral_token/loan_token у Market — СИМВОЛЫ, а ключи
+            # _SWAP_ROUTES — адреса, так что этот фильтр инертен (всегда False) и слоты режет
+            # только top-K срез. Боевое решение принимает window_loop по адресам из
+            # _read_target (теперь cap-aware). Символьный фильтр не чиним втихую — менять
+            # слот-динамику отдельным пакетом, если top-K начнёт голодать.
             pair_routed = ((getattr(m, "collateral_token", "") or "").lower(),
                            (getattr(m, "loan_token", "") or "").lower()) in _SWAP_ROUTES
             for b in borrowers:

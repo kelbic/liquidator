@@ -108,4 +108,65 @@ finally:
      mc.encode_price_call) = _orig
 print("UNIT_OK: _build — частичка при капе, откат SPEC_FIRE_PARTIAL=0, без роута None")
 
+# 5) РЕАКТИВ: prepare_fast режет до капа вместо «fast: no direct route» (го 01.08);
+#    откат REACTIVE_PARTIAL=0 возвращает прежний отказ
+import chain.hotpath as hp
+
+cap2 = {}
+_orig2 = (hp._fresh_basefee, hp._net_gate, hp.dynamic_tip_gwei, dict(hp._FULL_PARAMS_CACHE),
+          ex.direct_swap, ex.encode_liquidate, ex.route_max_in, hp.REACTIVE_PARTIAL)
+
+
+def fake_direct2(coll, loan, seized, s, r, *, repaid_assets, **kw):
+    cap2.setdefault("seized_calls", []).append(int(seized))
+    return None if int(seized) > CAP else {"router": "0xR", "calldata": "0xAB"}
+
+
+def fake_encode2(mp, borrower, repaid_shares, router, cdata, min_profit):
+    cap2["shares"] = int(repaid_shares)
+    return "0xCD"
+
+
+hp._fresh_basefee = lambda: 10**7
+hp._net_gate = lambda mp_, du, da, c: (100.0, 1.0, 99.0)
+hp.dynamic_tip_gwei = lambda c, d: 0.05
+hp._FULL_PARAMS_CACHE["0xM"] = ("0xLOAN", "0xCOLL", "0xORCL", "0xIRM", 625 * 10**15)
+ex.direct_swap = fake_direct2
+ex.encode_liquidate = fake_encode2
+ex.route_max_in = lambda c, l: CAP
+
+cfg2 = types.SimpleNamespace(liquidator_address="0xLIQ", min_profit_usd=10.0,
+                             gas_limit_floor=3_000_000, gas_limit_est=500_000)
+state = (TBA, TBS, BS, 10**30)          # залог огромный — кап bad-debt не вмешивается
+try:
+    res = hp.prepare_fast(None, None, cfg2, "0xM", "0xB0B", 66_000.0, 66_000 * 10**6,
+                          10**36, state)
+    assert res.get("ok") is True and res.get("fast") is True, res
+    assert 0 < cap2["shares"] < BS, "fast-lane обязан дробить shares"
+    assert cap2["seized_calls"][0] > CAP and cap2["seized_calls"][-1] <= CAP, cap2["seized_calls"]
+
+    hp.REACTIVE_PARTIAL = False
+    cap2.clear()
+    res = hp.prepare_fast(None, None, cfg2, "0xM", "0xB0B", 66_000.0, 66_000 * 10**6,
+                          10**36, state)
+    assert res.get("ok") is False and res.get("reason") == "fast: no direct route", res
+    assert "shares" not in cap2
+finally:
+    (hp._fresh_basefee, hp._net_gate, hp.dynamic_tip_gwei, _pc,
+     ex.direct_swap, ex.encode_liquidate, ex.route_max_in, hp.REACTIVE_PARTIAL) = _orig2
+    hp._FULL_PARAMS_CACHE.clear()
+    hp._FULL_PARAMS_CACHE.update(_pc)
+print("UNIT_OK: prepare_fast — частичка вместо отказа, откат REACTIVE_PARTIAL=0")
+
+# 6) PREARM cap-aware: routed_at_size по боевой таблице cbDOGE; откат PREARM_CAP_AWARE=0
+import chain.prearm as pa2
+
+assert pa2.routed_at_size(CBDOGE, USDC, 50_000 * 10**8) is True, "сейз в капе — прямой прикрыт"
+assert pa2.routed_at_size(CBDOGE, USDC, 1_200_000 * 10**8) is False, "кит сверх капа — греть Kyber"
+assert pa2.routed_at_size("0x" + "11" * 20, USDC, 1) is False, "нет роута — не прикрыт"
+pa2.PREARM_CAP_AWARE = False
+assert pa2.routed_at_size(CBDOGE, USDC, 1_200_000 * 10**8) is True, "откат = старая бинарность"
+pa2.PREARM_CAP_AWARE = True
+print("UNIT_OK: prearm routed_at_size — кап учитывается, откат PREARM_CAP_AWARE=0")
+
 print("=== ВСЕ SPEC-FIRE-PARTIAL ЮНИТЫ ПРОШЛИ ===")
