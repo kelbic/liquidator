@@ -65,6 +65,15 @@ SPEC_FIRE_TIP_CAP_GWEI = float(os.environ.get("SPEC_FIRE_TIP_CAP_GWEI", "0.1"))
 # когда плотность на top-1 доказала себя).
 SPEC_FIRE_TOPK = max(1, int(os.environ.get("SPEC_FIRE_TOPK", "1")))
 SPEC_FIRE_RECEIPT_POLL_SEC = float(os.environ.get("SPEC_FIRE_RECEIPT_POLL_SEC", "1.0"))
+# ФОЛБЭК ЦЕЛИ (01.08, ревью гонки cbDOGE): топ-цель «нет свопа» монополизировала тик —
+# $4.1k-жертва в досягаемости И в капе пула не получила НИ ОДНОЙ пробы за три окна
+# (18:45-18:50), конкурент выиграл присутствием (tip 0.0055 < наших 0.05). Небилдящаяся
+# цель уходит на скамейку NOBUILD_RETRY_SEC (prearm/partial могут ожить в окне), тик
+# отдаётся следующей досягаемой (глубина списка FALLBACK_DEPTH; плотность по-прежнему
+# ротируется в top-K, хвост — только фолбэк). Откат SPEC_FIRE_BUILD_FALLBACK=0.
+SPEC_FIRE_BUILD_FALLBACK = os.environ.get("SPEC_FIRE_BUILD_FALLBACK", "1").lower() not in ("0", "false", "no")
+SPEC_FIRE_FALLBACK_DEPTH = int(os.environ.get("SPEC_FIRE_FALLBACK_DEPTH", "4"))
+SPEC_FIRE_NOBUILD_RETRY_SEC = float(os.environ.get("SPEC_FIRE_NOBUILD_RETRY_SEC", "10"))
 # КАСКАД-ДЕТЕКТ, ГИБРИД (калибровка 31.07: армы — надежда, факты — подтверждение; 31.07 было
 # 44 арма/час при 5 ликвидациях за ДЕНЬ — армы одни не сигнал ни при каком пороге, а факты
 # разделяют штиль/каскад идеально: p90 штиля 3/час vs 11/час у мини-каскада 28.07):
@@ -327,6 +336,7 @@ class SpecFireLive:
         last_hold_log = 0.0
         cache = {}      # (mid, b) -> (probe|None, built_ts): кэш пробы, см. SPEC_FIRE_REBUILD_SEC
         dead = set()    # LOSS-стоп: цели, разобранные конкурентом/погашенные (bs==0 на пересборке)
+        nobuild: dict = {}   # фолбэк (01.08): (mid, b) -> ts, до которого цель не пересобираем
         while not stop.is_set() and probes < SPEC_FIRE_MAX_PROBES_WINDOW:
             r = None
             try:
@@ -345,7 +355,8 @@ class SpecFireLive:
                 iv = max(0.3, SPEC_FIRE_SLOW_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
             if hot and self._now() - last_fire >= iv:
                 reach = abs(r) + SPEC_FIRE_DIST_MARGIN_DEVS * self.dev_by.get(feed, 0.005)
-                tgts, hold_dist = self._top_fat(feed, direction, max_dist=reach, k=SPEC_FIRE_TOPK)
+                _depth = max(SPEC_FIRE_TOPK, SPEC_FIRE_FALLBACK_DEPTH if SPEC_FIRE_BUILD_FALLBACK else 0)
+                tgts, hold_dist = self._top_fat(feed, direction, max_dist=reach, k=_depth)
                 if dead:
                     tgts = [t for t in tgts if (t[0], t[1]) not in dead]
                 if not tgts:
@@ -357,35 +368,51 @@ class SpecFireLive:
                             feed, hold_dist * 100.0, reach * 100.0))
                     stop.wait(SPEC_FIRE_POLL_SEC)
                     continue
-                mid, b, d = tgts[probes % len(tgts)]       # top-K ротация (K=1 -> прежний top-1)
-                try:
-                    probe, built_ts = cache.get((mid, b), (None, 0.0))
-                    if probe is None or self._now() - built_ts >= SPEC_FIRE_REBUILD_SEC:
-                        probe = (self._build_fn or self._build)(mid, b, d)
-                        if probe == "gone":       # LOSS-стоп (ревью 31.07): жертву разобрали —
-                            dead.add((mid, b))    # кап не догорает ревертами по мёртвой цели
-                            cache.pop((mid, b), None)
-                            self._log("SPECFIRE loss-stop feed=%s %s/%s: позиция разобрана "
-                                      "(конкурент/погашение) — цель снята" % (feed, mid[:10], b[:10]))
-                            continue
-                        cache[(mid, b)] = (probe, self._now())
-                    if probe is not None:
-                        h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
-                        if h is not None:
-                            probes += 1
-                            self.stats["probes"] += 1
-                            last_fire = self._now()
-                            self._log("SPECFIRE probe #%d feed=%s %s/%s debt=$%.0fk ret=%.4f%% tx=%s" % (
-                                probes, feed, mid[:10], b[:10], d / 1e3, (r or 0) * 100.0, h))
-                            threading.Thread(target=self._collect, args=(h, mid, b, d, feed),
-                                             daemon=True).start()
-                    else:
-                        self._log("SPECFIRE probe skip feed=%s %s/%s: нет свопа (роут/prearm)" % (
-                            feed, mid[:10], b[:10]))
-                        stop.wait(2.0)                     # не молотить чтениями без свопа
-                except Exception as e:
-                    self._log("SPECFIRE probe fail feed=%s: %s" % (feed, type(e).__name__))
-                    stop.wait(1.0)
+                # плотность ротируется по top-K как раньше; хвост списка — ТОЛЬКО фолбэк
+                # на небилдящиеся (01.08: топ-цель «нет свопа» не должна монополизировать тик)
+                head = tgts[:SPEC_FIRE_TOPK]
+                _rot = probes % len(head)
+                order = head[_rot:] + head[:_rot] + tgts[SPEC_FIRE_TOPK:]
+                sent = False
+                for mid, b, d in order:
+                    _t = self._now()
+                    if SPEC_FIRE_BUILD_FALLBACK and nobuild.get((mid, b), 0.0) > _t:
+                        continue                           # на скамейке — пересборка через RETRY_SEC
+                    try:
+                        probe, built_ts = cache.get((mid, b), (None, 0.0))
+                        if probe is None or _t - built_ts >= SPEC_FIRE_REBUILD_SEC:
+                            probe = (self._build_fn or self._build)(mid, b, d)
+                            if probe == "gone":   # LOSS-стоп (ревью 31.07): жертву разобрали —
+                                dead.add((mid, b))    # кап не догорает ревертами по мёртвой цели
+                                cache.pop((mid, b), None)
+                                self._log("SPECFIRE loss-stop feed=%s %s/%s: позиция разобрана "
+                                          "(конкурент/погашение) — цель снята" % (feed, mid[:10], b[:10]))
+                                continue
+                            cache[(mid, b)] = (probe, self._now())
+                        if probe is not None:
+                            h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
+                            if h is not None:
+                                probes += 1
+                                self.stats["probes"] += 1
+                                last_fire = self._now()
+                                self._log("SPECFIRE probe #%d feed=%s %s/%s debt=$%.0fk ret=%.4f%% tx=%s" % (
+                                    probes, feed, mid[:10], b[:10], d / 1e3, (r or 0) * 100.0, h))
+                                threading.Thread(target=self._collect, args=(h, mid, b, d, feed),
+                                                 daemon=True).start()
+                            sent = True                    # слот тика израсходован отправкой
+                            break
+                        nobuild[(mid, b)] = self._now() + SPEC_FIRE_NOBUILD_RETRY_SEC
+                        self._log("SPECFIRE probe skip feed=%s %s/%s: нет свопа (роут/prearm)%s" % (
+                            feed, mid[:10], b[:10],
+                            " — фолбэк к следующей цели" if SPEC_FIRE_BUILD_FALLBACK else ""))
+                        if not SPEC_FIRE_BUILD_FALLBACK:
+                            break                          # прежнее поведение: тик сгорает
+                    except Exception as e:
+                        self._log("SPECFIRE probe fail feed=%s: %s" % (feed, type(e).__name__))
+                        stop.wait(1.0)
+                        break
+                if not sent:
+                    stop.wait(2.0)                         # весь список без свопа — не молотить чтениями
             stop.wait(SPEC_FIRE_POLL_SEC)
 
     def handle_event(self, ev: dict):

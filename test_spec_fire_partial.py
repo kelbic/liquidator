@@ -169,4 +169,62 @@ assert pa2.routed_at_size(CBDOGE, USDC, 1_200_000 * 10**8) is True, "откат 
 pa2.PREARM_CAP_AWARE = True
 print("UNIT_OK: prearm routed_at_size — кап учитывается, откат PREARM_CAP_AWARE=0")
 
+# 7) ФОЛБЭК ЦЕЛИ в окне (ревью гонки cbDOGE): топ-цель «нет свопа» НЕ монополизирует тик —
+#    проба уходит следующей досягаемой; откат SPEC_FIRE_BUILD_FALLBACK=0 = прежний лок
+import threading
+import time as _time
+
+# боевой порог из .env Шарлотты (дефолт модуля $500k срезал бы обе цели ещё на арме)
+_orig_min_repaid = sfl_mod.SPEC_FIRE_MIN_REPAID_USD
+sfl_mod.SPEC_FIRE_MIN_REPAID_USD = 1000.0
+
+
+def mk(c, l):
+    return types.SimpleNamespace(collateral_token=c, loan_token=l)
+
+
+def run_window(build_fn, seconds=1.6):
+    shared = types.SimpleNamespace(
+        lock=threading.Lock(),
+        groups={"0xm1": ["0xFATWHALE", "0xSMALL"]},
+        debt_by={("0xm1", "0xFATWHALE"): 71_000.0, ("0xm1", "0xSMALL"): 4_100.0},
+        by_id={"0xm1": mk("cbDOGE", "USDC")})
+    sent, logs = [], []
+    cfgw = types.SimpleNamespace(liquidator_address="0xLIQ", gas_limit_est=500_000,
+                                 tip_gwei=0.05, sequencer_rpc="https://seq",
+                                 eth_price_usd=1730.0, fast_lane_max_repaid_usd=500_000.0)
+    sf = SpecFireLive(rpc=None, cfg=cfgw, shared=shared, ret_fn=lambda l: -0.01,
+                      dev_by={"DOGE": 0.005}, build_fn=build_fn,
+                      send_fn=lambda cd, g: (sent.append(cd), "0xH")[1],
+                      receipt_fn=lambda h: (0, 0.01), log_fn=logs.append)
+    sf.handle_event({"event": "arm", "feed": "DOGE", "dir": "down"})
+    _time.sleep(seconds)
+    sf.handle_event({"event": "disarm", "feed": "DOGE"})
+    _time.sleep(0.1)
+    return sent, logs
+
+
+builds = []
+def build_fallback(mid, b, d):
+    builds.append(b)
+    return None if b == "0xFATWHALE" else {"calldata": "0xCD", "gas": 100}
+
+sent, logs = run_window(build_fallback)
+assert "0xFATWHALE" in builds and "0xSMALL" in builds, builds
+assert sent, "фолбэк обязан отправить пробу по второй цели"
+assert any("нет свопа" in m and "фолбэк" in m for m in logs), logs[-3:]
+assert any("probe #1" in m and "0xSMALL" in m for m in logs), "проба именно по 0xSMALL"
+
+builds2 = []
+def build_lock(mid, b, d):
+    builds2.append(b)
+    return None
+
+sfl_mod.SPEC_FIRE_BUILD_FALLBACK = False
+sent2, logs2 = run_window(build_lock)
+sfl_mod.SPEC_FIRE_BUILD_FALLBACK = True
+sfl_mod.SPEC_FIRE_MIN_REPAID_USD = _orig_min_repaid
+assert not sent2 and set(builds2) == {"0xFATWHALE"}, (sent2, set(builds2))
+print("UNIT_OK: фолбэк цели — вторая цель получает пробу, откат возвращает top-1 лок")
+
 print("=== ВСЕ SPEC-FIRE-PARTIAL ЮНИТЫ ПРОШЛИ ===")
