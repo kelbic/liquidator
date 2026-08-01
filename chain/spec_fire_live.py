@@ -73,10 +73,29 @@ SPEC_FIRE_RECEIPT_POLL_SEC = float(os.environ.get("SPEC_FIRE_RECEIPT_POLL_SEC", 
 # (> FACTS_TTL) -> fail-closed: бустер молчит (цена пропуска = штатный бакет $20, слепой
 # подъём хуже — боевой урок: API теряет ~8% событий и таймаутит именно в каскад).
 # Откат гибрида: SPEC_FIRE_HYBRID=0 = бустер по одним армам (как до калибровки).
+# ДРОБЛЕНИЕ ПРОБЫ (01.08, проигранная гонка cbDOGE: сейз кита $80k > ёмкость прямого пула
+# ~$6.8k => direct_swap=None, prearm пару «роутнутой мелочью» не грел => «нет свопа» все 50с
+# лида; победитель взял $5.1k ЧАСТИЧКОЙ, подогнанной под глубину выхода — сейз/репей ровно
+# LIF). Если полный сейз не лезет в кап роута — режем repaid_shares до HEADROOM% капа: роут
+# снова 0 RTT, minProfit контракта скейлится с repaid, остаток жертвы лечится и ждёт
+# следующий срез. Kyber тут НЕ спасение (замер 25.07: на ките $80k cbDOGE отдаёт 21.5%
+# номинала). Откат: SPEC_FIRE_PARTIAL=0 = прежнее «только полный сайз».
+SPEC_FIRE_PARTIAL = os.environ.get("SPEC_FIRE_PARTIAL", "1").lower() not in ("0", "false", "no")
+SPEC_FIRE_PARTIAL_HEADROOM_PCT = int(os.environ.get("SPEC_FIRE_PARTIAL_HEADROOM_PCT", "95"))
 SPEC_FIRE_CASCADE_WINDOWS = int(os.environ.get("SPEC_FIRE_CASCADE_WINDOWS", "4"))
 SPEC_FIRE_HYBRID = os.environ.get("SPEC_FIRE_HYBRID", "1").lower() not in ("0", "false", "no")
 SPEC_FIRE_FACTS_FLAG = os.environ.get("SPEC_FIRE_FACTS_FLAG", "state/cascade_facts.flag")
 SPEC_FIRE_FACTS_TTL_SEC = float(os.environ.get("SPEC_FIRE_FACTS_TTL_SEC", "900"))
+
+
+def partial_shares_for_cap(shares, seized, cap, headroom_pct=None):
+    """Сколько shares погасить, чтобы сейз влез в кап роута с запасом. 0 = дробить нечего
+    (сейз и так помещается) или нельзя (нулевые входы). Целочисленно, без float-дрейфа."""
+    hp = SPEC_FIRE_PARTIAL_HEADROOM_PCT if headroom_pct is None else int(headroom_pct)
+    shares, seized, cap = int(shares), int(seized), int(cap)
+    if shares <= 0 or seized <= 0 or cap <= 0 or seized <= cap:
+        return 0
+    return shares * (cap * hp // 100) // seized
 
 
 def _facts_fresh(now_wall=None):
@@ -191,6 +210,18 @@ class SpecFireLive:
         if swap is None:
             hit = prearm_get(coll, loan, int(seized))
             swap = hit["swap"] if hit is not None else None
+        if swap is None and SPEC_FIRE_PARTIAL:
+            from chain.execute import route_max_in
+            cap = route_max_in(coll, loan)        # дробление (01.08): сейз сверх ёмкости пула
+            sp = partial_shares_for_cap(repaid_shares, seized, cap) if cap is not None else 0
+            if sp > 0:
+                ap = to_assets_up(sp, tba, tbs)
+                zp = expected_seized(ap, lif_from_lltv(lltv_wad / 10**18), price)
+                sw = direct_swap(coll, loan, zp, liq, liq, repaid_assets=ap)
+                if sw is not None:
+                    self._log("SPECFIRE probe partial %s/%s: сейз %d > кап %d — режем до "
+                              "%d shares" % (mid[:10], borrower[:10], seized, cap, sp))
+                    repaid_shares, repaid_assets, seized, swap = sp, ap, zp, sw
         if swap is None:
             return None                           # ни роута, ни прогретой квоты — пробу НЕ строим
         min_profit = int(repaid_assets) * SPEC_FIRE_MIN_PROFIT_BPS // 10000

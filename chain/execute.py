@@ -691,6 +691,13 @@ def univ3_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_asse
                        repaid_assets=repaid_assets, slippage_bps=slippage_bps)
 
 
+def route_max_in(token_in, token_out):
+    """Ёмкость прямого роута в единицах token_in: max_in, либо None (нет роута/роут без капа).
+    Потребитель — дробление spec-fire (01.08): сейз сверх капа режется до ёмкости пула."""
+    r = _SWAP_ROUTES.get((token_in.lower(), token_out.lower()))
+    return None if r is None else r.get("max_in")
+
+
 def expected_seized(repaid_assets: int, lif: float, price: int) -> int:
     """Collateral (wei) Morpho seizes for repaying `repaid_assets` (loan wei), per _liquidate:
     seized = mulDivDown(wMulDown(repaidAssets, LIF), ORACLE_PRICE_SCALE, price)."""
