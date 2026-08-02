@@ -1582,7 +1582,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                  # per-IP лимит на ЧАСТОТУ коннектов: фикс-3с реконнект при транзиентном сбое
                                  # Base превращал его в самоподдерживающийся 429-шторм на час (инцидент 07-21).
     last_fb_alert = 0.0          # monotonic of last degradation alert (anti-flood)
-    last_cu_alert = 0.0          # анти-флуд будильника по CU-квоте (раз в 6ч)
+    last_cu_alert = time.monotonic()   # CU-маркер: не раньше 6ч аптайма (бут-спайк резолва не сигнал)
     recon_ts = []                # monotonic'ы реконнектов hot-path ws; одиночный разрыв публичного
     last_recon_alert = 0.0       # Flashblocks-WS = НОРМА (роняет соединение раз в час-два) -> TG молчит,
                                  # алерт ТОЛЬКО на серию (3+ за 180с = реальная нестабильность фида/сети)
@@ -1666,20 +1666,20 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                 log.info("CU %s: %d CU/окно = %.0f CU/s (проекция %.1fM/мес) | %s",
                                          _host, _cu, _cu / _win, _proj,
                                          " ".join("%s×%d" % (m, n) for m, n in _top))
-                                # БУДИЛЬНИК по квоте (ревью #3): порядок эвакуации на dRPC (210M)
-                                # см. STATE «ПОРЯДОК ЭВАКУАЦИИ». Отправки/sim уезжают ПОСЛЕДНИМИ.
+                                # CU-маркер квоты — ЖУРНАЛ, не TG (02.08, kelbic: сообщения без
+                                # действия; сыпал бут-спайками после каждого рестарта и штормовой
+                                # утечкой ассесса на №2). Доктрина: алерт = исход, не предвестник;
+                                # исход покрыт — смерть №2 по квоте = COMBAT-FAILOVER свитч со
+                                # своей TG-строкой. Порядок эвакуации из STATE остаётся в маркере.
                                 if ("alchemy" in _host and _proj >= CU_ALERT_PROJ_M
                                         and time.monotonic() - last_cu_alert > 21600):
                                     last_cu_alert = time.monotonic()
-                                    try:
-                                        alerter.send_async(
-                                            "CU-квота: Alchemy проекция %.0fM/мес (порог %.0fM) — "
-                                            "эвакуация по порядку из STATE: 1) ассессмент+кэш на dRPC, "
-                                            "2) predict-полл, 3) диагностика; отправки/sim НЕ трогать. "
-                                            "Топ: %s" % (_proj, CU_ALERT_PROJ_M,
-                                                         " ".join("%s×%d" % (m, n) for m, n in _top[:3])))
-                                    except Exception:
-                                        pass
+                                    log.warning(
+                                        "CU-квота (журнальный маркер): %s проекция %.0fM/мес >= %.0fM — "
+                                        "порядок эвакуации: 1) ассессмент+кэш на dRPC, 2) predict-полл, "
+                                        "3) диагностика; отправки/sim НЕ трогать. Топ: %s",
+                                        _host, _proj, CU_ALERT_PROJ_M,
+                                        " ".join("%s×%d" % (m, n) for m, n in _top[:3]))
                         except Exception:
                             pass
                         _stg = stage_report()
