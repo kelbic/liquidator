@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 *.db
 .env
+# бэкапы .env с ключами (.env.bak.*, .env.bak_*) — жили untracked, git add -A мог зацепить;
+# .env.example трекается (gitignore не влияет на уже трекнутые)
+.env.*
 covered_markets.json
 *.bak
 
