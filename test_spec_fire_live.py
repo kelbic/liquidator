@@ -9,6 +9,10 @@ import chain.spec_fire_live as sfl_mod
 import chain.execute as ex
 from chain.spec_fire_live import SpecFireLive
 
+# файл тестирует ДО-owed семантику (каденс/кэш/гейты, disarm глушит окно безусловно);
+# peak-owed (02.08) делает disarm sticky при горячем ret — его контракты в test_peak_owed.py
+sfl_mod.SPEC_FIRE_PEAK_OWED = False
+
 LOGS = []
 
 

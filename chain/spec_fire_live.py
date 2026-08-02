@@ -123,6 +123,21 @@ SPEC_FIRE_THRESHOLD = float(os.environ.get("SPEC_FIRE_THRESHOLD", "1.0"))     # 
 # HF цели неизвестен -> fail-open.
 SPEC_FIRE_DIST_MARGIN_DEVS = float(os.environ.get("SPEC_FIRE_DIST_MARGIN_DEVS", "2.0"))
 SPEC_FIRE_ARM_MAX_DIST = float(os.environ.get("SPEC_FIRE_ARM_MAX_DIST", "0.03"))
+# PEAK-OWED fire-policy («го» kelbic 02.08, дизайн ревью): транзит оракула, заряженный на
+# пике (|ret| пробил dev), НЕ отменяется отскоком — едет на чейн 22-50с (shadow-леады) и
+# садится старой ценой. Старая политика глушила огонь по текущему ret и отдавала такие
+# посадки конкурентам («оконная рулетка», гонка cbDOGE 01.08 18:50: пик 18:49, транзит
+# +50с). Долг: каждый горячий тик продлевает owed_until на HOLD_SEC и задирает owed_ret до
+# пика; серая полоса гистерезиса (|ret| >= thr - OWED_BAND*dev) тоже продлевает — без неё
+# дрожание у порога съедало бы таймер («та же рулетка уровнем ниже», ревью). В долге огонь
+# живёт с reach по ПИКОВОМУ ret, disarm/falsepos окно не убивают (sticky), confirmed/push/
+# stale убивают как раньше. Каждый выстрел, который старая политика пропустила бы, помечен
+# [owed] в журнале + stats[owed_probes] — атрибуция бенчмарка, не спор версий.
+# Цена: реверты по невыехавшим транзитам (~$0.01/проба), кап проб/бакет прежние.
+# Откат: SPEC_FIRE_PEAK_OWED=0 (огонь только по текущему ret, disarm убивает окно).
+SPEC_FIRE_PEAK_OWED = os.environ.get("SPEC_FIRE_PEAK_OWED", "1") == "1"
+SPEC_FIRE_OWED_HOLD_SEC = float(os.environ.get("SPEC_FIRE_OWED_HOLD_SEC", "75"))
+SPEC_FIRE_OWED_BAND = float(os.environ.get("SPEC_FIRE_OWED_BAND", "0.3"))   # доля dev
 # Двухфазный каденс (по замеру 24.07: транзит приходит через 22-31с ПОСЛЕ пробития dev —
 # OCR-раунд оракула; старый каденс 0.7с выжигал кап за ~7с, за 22с до транзита): первые
 # BURST проб быстро (страховка от мгновенного/heartbeat-транзита), дальше медленно — кап 10
@@ -171,7 +186,9 @@ class SpecFireLive:
         self._armskip_ts: dict = {}               # feed -> ts последнего arm-skip-лога (троттлинг 300с)
         self._cooldown_until = 0.0                # WIN-пауза: до этого момента окна не армим
         self._arm_ts: list = []                   # ts армленных окон за час (каскад-детект)
-        self.stats = {"windows_armed": 0, "probes": 0, "wins": 0}
+        self.stats = {"windows_armed": 0, "probes": 0, "wins": 0,
+                      "owed_probes": 0, "sticky_windows": 0}   # peak-owed: would-have-fired учёт
+        self._owed: dict = {}                     # feed -> owed_until (peak-owed, пишет петля окна)
 
     # ---- боевые швы ----
     def _build(self, mid, borrower, debt_usd):
@@ -330,90 +347,121 @@ class SpecFireLive:
             self._log("SPECFIRE probe revert (healthy, ожидаемо) tx=%s gas=$%.3f%s" % (h, gas_usd, pos))
 
     def _window_loop(self, feed: str, direction: str, stop: threading.Event):
-        thr = self.dev_by.get(feed, 0.005) * SPEC_FIRE_THRESHOLD
+        dev = self.dev_by.get(feed, 0.005)
+        thr = dev * SPEC_FIRE_THRESHOLD
+        band = dev * SPEC_FIRE_OWED_BAND
         probes = 0
         last_fire = 0.0
         last_hold_log = 0.0
         cache = {}      # (mid, b) -> (probe|None, built_ts): кэш пробы, см. SPEC_FIRE_REBUILD_SEC
         dead = set()    # LOSS-стоп: цели, разобранные конкурентом/погашенные (bs==0 на пересборке)
         nobuild: dict = {}   # фолбэк (01.08): (mid, b) -> ts, до которого цель не пересобираем
-        while not stop.is_set() and probes < SPEC_FIRE_MAX_PROBES_WINDOW:
-            r = None
-            try:
-                r = self.ret_fn(feed)
-            except Exception:
-                pass
-            hot = (r is not None and ((direction == "down" and r <= -thr)
-                                      or (direction == "up" and r >= thr)))
-            if SPEC_FIRE_DENSE:                    # вся горячая фаза плотно (гонка плотностей, 31.07)
-                _j = SPEC_FIRE_DENSE_JITTER_SEC
-                iv = max(0.25, SPEC_FIRE_DENSE_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
-            elif probes < SPEC_FIRE_BURST_PROBES:
-                iv = SPEC_FIRE_INTERVAL_SEC
-            else:                                  # хвост с джиттером (см. SPEC_FIRE_TAIL_JITTER_SEC)
-                _j = SPEC_FIRE_TAIL_JITTER_SEC
-                iv = max(0.3, SPEC_FIRE_SLOW_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
-            if hot and self._now() - last_fire >= iv:
-                reach = abs(r) + SPEC_FIRE_DIST_MARGIN_DEVS * self.dev_by.get(feed, 0.005)
-                _depth = max(SPEC_FIRE_TOPK, SPEC_FIRE_FALLBACK_DEPTH if SPEC_FIRE_BUILD_FALLBACK else 0)
-                tgts, hold_dist = self._top_fat(feed, direction, max_dist=reach, k=_depth)
-                if dead:
-                    tgts = [t for t in tgts if (t[0], t[1]) not in dead]
-                if not tgts:
-                    if hold_dist is None:
-                        break                              # жир ушёл из набора — окно нам не нужно
-                    if self._now() - last_hold_log >= 10.0:   # жир есть, но флип вне досягаемости
-                        last_hold_log = self._now()           # движения — держим окно, НЕ жжём бакет
-                        self._log("SPECFIRE hold feed=%s: жир вне досягаемости (ближ. dist=%.2f%% > reach=%.2f%%)" % (
-                            feed, hold_dist * 100.0, reach * 100.0))
-                    stop.wait(SPEC_FIRE_POLL_SEC)
-                    continue
-                # плотность ротируется по top-K как раньше; хвост списка — ТОЛЬКО фолбэк
-                # на небилдящиеся (01.08: топ-цель «нет свопа» не должна монополизировать тик)
-                head = tgts[:SPEC_FIRE_TOPK]
-                _rot = probes % len(head)
-                order = head[_rot:] + head[:_rot] + tgts[SPEC_FIRE_TOPK:]
-                sent = False
-                for mid, b, d in order:
-                    _t = self._now()
-                    if SPEC_FIRE_BUILD_FALLBACK and nobuild.get((mid, b), 0.0) > _t:
-                        continue                           # на скамейке — пересборка через RETRY_SEC
-                    try:
-                        probe, built_ts = cache.get((mid, b), (None, 0.0))
-                        if probe is None or _t - built_ts >= SPEC_FIRE_REBUILD_SEC:
-                            probe = (self._build_fn or self._build)(mid, b, d)
-                            if probe == "gone":   # LOSS-стоп (ревью 31.07): жертву разобрали —
-                                dead.add((mid, b))    # кап не догорает ревертами по мёртвой цели
-                                cache.pop((mid, b), None)
-                                self._log("SPECFIRE loss-stop feed=%s %s/%s: позиция разобрана "
-                                          "(конкурент/погашение) — цель снята" % (feed, mid[:10], b[:10]))
-                                continue
-                            cache[(mid, b)] = (probe, self._now())
-                        if probe is not None:
-                            h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
-                            if h is not None:
-                                probes += 1
-                                self.stats["probes"] += 1
-                                last_fire = self._now()
-                                self._log("SPECFIRE probe #%d feed=%s %s/%s debt=$%.0fk ret=%.4f%% tx=%s" % (
-                                    probes, feed, mid[:10], b[:10], d / 1e3, (r or 0) * 100.0, h))
-                                threading.Thread(target=self._collect, args=(h, mid, b, d, feed),
-                                                 daemon=True).start()
-                            sent = True                    # слот тика израсходован отправкой
+        owed_until = 0.0     # peak-owed: до какого момента транзит «заряжен» (0 = долга нет)
+        owed_ret = 0.0       # пиковое |ret| горячей фазы — им меряем reach в долге
+        was_raw_hot = False
+        try:
+            while not stop.is_set() and probes < SPEC_FIRE_MAX_PROBES_WINDOW:
+                r = None
+                try:
+                    r = self.ret_fn(feed)
+                except Exception:
+                    pass
+                raw_hot = (r is not None and ((direction == "down" and r <= -thr)
+                                              or (direction == "up" and r >= thr)))
+                _n = self._now()
+                if raw_hot:
+                    owed_ret = max(owed_ret, abs(r))
+                    owed_until = _n + SPEC_FIRE_OWED_HOLD_SEC
+                elif (owed_until > _n and r is not None
+                        and ((direction == "down" and r <= -(thr - band))
+                             or (direction == "up" and r >= thr - band))):
+                    owed_until = _n + SPEC_FIRE_OWED_HOLD_SEC   # серая полоса: долг продлевается
+                owed_fire = (SPEC_FIRE_PEAK_OWED and not raw_hot
+                             and owed_until > _n and owed_ret > 0.0)
+                if was_raw_hot and not raw_hot and owed_fire:
+                    self._log("SPECFIRE peak-owed feed=%s: отскок с пика %.2f%% — транзит заряжен, "
+                              "огонь ещё %.0fс (полоса %.2f%%)" % (
+                                  feed, owed_ret * 100.0, owed_until - _n, (thr - band) * 100.0))
+                was_raw_hot = raw_hot
+                self._owed[feed] = owed_until if SPEC_FIRE_PEAK_OWED else 0.0
+                hot = raw_hot or owed_fire
+                if SPEC_FIRE_DENSE:                    # вся горячая фаза плотно (гонка плотностей, 31.07)
+                    _j = SPEC_FIRE_DENSE_JITTER_SEC
+                    iv = max(0.25, SPEC_FIRE_DENSE_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
+                elif probes < SPEC_FIRE_BURST_PROBES:
+                    iv = SPEC_FIRE_INTERVAL_SEC
+                else:                                  # хвост с джиттером (см. SPEC_FIRE_TAIL_JITTER_SEC)
+                    _j = SPEC_FIRE_TAIL_JITTER_SEC
+                    iv = max(0.3, SPEC_FIRE_SLOW_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
+                if hot and self._now() - last_fire >= iv:
+                    _eff_r = max(abs(r or 0.0), owed_ret if owed_fire else 0.0)
+                    reach = _eff_r + SPEC_FIRE_DIST_MARGIN_DEVS * dev   # в долге меряем по пику
+                    _depth = max(SPEC_FIRE_TOPK, SPEC_FIRE_FALLBACK_DEPTH if SPEC_FIRE_BUILD_FALLBACK else 0)
+                    tgts, hold_dist = self._top_fat(feed, direction, max_dist=reach, k=_depth)
+                    if dead:
+                        tgts = [t for t in tgts if (t[0], t[1]) not in dead]
+                    if not tgts:
+                        if hold_dist is None:
+                            break                              # жир ушёл из набора — окно нам не нужно
+                        if self._now() - last_hold_log >= 10.0:   # жир есть, но флип вне досягаемости
+                            last_hold_log = self._now()           # движения — держим окно, НЕ жжём бакет
+                            self._log("SPECFIRE hold feed=%s: жир вне досягаемости (ближ. dist=%.2f%% > reach=%.2f%%)" % (
+                                feed, hold_dist * 100.0, reach * 100.0))
+                        stop.wait(SPEC_FIRE_POLL_SEC)
+                        continue
+                    # плотность ротируется по top-K как раньше; хвост списка — ТОЛЬКО фолбэк
+                    # на небилдящиеся (01.08: топ-цель «нет свопа» не должна монополизировать тик)
+                    head = tgts[:SPEC_FIRE_TOPK]
+                    _rot = probes % len(head)
+                    order = head[_rot:] + head[:_rot] + tgts[SPEC_FIRE_TOPK:]
+                    sent = False
+                    for mid, b, d in order:
+                        _t = self._now()
+                        if SPEC_FIRE_BUILD_FALLBACK and nobuild.get((mid, b), 0.0) > _t:
+                            continue                           # на скамейке — пересборка через RETRY_SEC
+                        try:
+                            probe, built_ts = cache.get((mid, b), (None, 0.0))
+                            if probe is None or _t - built_ts >= SPEC_FIRE_REBUILD_SEC:
+                                probe = (self._build_fn or self._build)(mid, b, d)
+                                if probe == "gone":   # LOSS-стоп (ревью 31.07): жертву разобрали —
+                                    dead.add((mid, b))    # кап не догорает ревертами по мёртвой цели
+                                    cache.pop((mid, b), None)
+                                    self._log("SPECFIRE loss-stop feed=%s %s/%s: позиция разобрана "
+                                              "(конкурент/погашение) — цель снята" % (feed, mid[:10], b[:10]))
+                                    continue
+                                cache[(mid, b)] = (probe, self._now())
+                            if probe is not None:
+                                h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
+                                if h is not None:
+                                    probes += 1
+                                    self.stats["probes"] += 1
+                                    last_fire = self._now()
+                                    _om = ""
+                                    if owed_fire:              # would-have-fired: старая политика молчала бы
+                                        self.stats["owed_probes"] += 1
+                                        _om = " [owed пик=%.2f%% ещё %.0fс]" % (
+                                            owed_ret * 100.0, max(0.0, owed_until - self._now()))
+                                    self._log("SPECFIRE probe #%d feed=%s %s/%s debt=$%.0fk ret=%.4f%%%s tx=%s" % (
+                                        probes, feed, mid[:10], b[:10], d / 1e3, (r or 0) * 100.0, _om, h))
+                                    threading.Thread(target=self._collect, args=(h, mid, b, d, feed),
+                                                     daemon=True).start()
+                                sent = True                    # слот тика израсходован отправкой
+                                break
+                            nobuild[(mid, b)] = self._now() + SPEC_FIRE_NOBUILD_RETRY_SEC
+                            self._log("SPECFIRE probe skip feed=%s %s/%s: нет свопа (роут/prearm)%s" % (
+                                feed, mid[:10], b[:10],
+                                " — фолбэк к следующей цели" if SPEC_FIRE_BUILD_FALLBACK else ""))
+                            if not SPEC_FIRE_BUILD_FALLBACK:
+                                break                          # прежнее поведение: тик сгорает
+                        except Exception as e:
+                            self._log("SPECFIRE probe fail feed=%s: %s" % (feed, type(e).__name__))
+                            stop.wait(1.0)
                             break
-                        nobuild[(mid, b)] = self._now() + SPEC_FIRE_NOBUILD_RETRY_SEC
-                        self._log("SPECFIRE probe skip feed=%s %s/%s: нет свопа (роут/prearm)%s" % (
-                            feed, mid[:10], b[:10],
-                            " — фолбэк к следующей цели" if SPEC_FIRE_BUILD_FALLBACK else ""))
-                        if not SPEC_FIRE_BUILD_FALLBACK:
-                            break                          # прежнее поведение: тик сгорает
-                    except Exception as e:
-                        self._log("SPECFIRE probe fail feed=%s: %s" % (feed, type(e).__name__))
-                        stop.wait(1.0)
-                        break
-                if not sent:
-                    stop.wait(2.0)                         # весь список без свопа — не молотить чтениями
-            stop.wait(SPEC_FIRE_POLL_SEC)
+                    if not sent:
+                        stop.wait(2.0)                         # весь список без свопа — не молотить чтениями
+                stop.wait(SPEC_FIRE_POLL_SEC)
+        finally:
+            self._owed.pop(feed, None)   # окно закрыто — долг не переживает петлю
 
     def handle_event(self, ev: dict):
         try:
@@ -457,6 +505,15 @@ class SpecFireLive:
                 threading.Thread(target=self._window_loop, args=(feed, direction, stop),
                                  daemon=True, name="specfire-%s" % feed).start()
             elif kind in ("confirmed", "push", "disarm", "falsepos", "stale"):
+                if (SPEC_FIRE_PEAK_OWED and kind in ("disarm", "falsepos")
+                        and self._owed.get(feed, 0.0) > self._now()
+                        and feed in self._windows):
+                    # sticky: транзит заряжен на пике — отскок предикта окно не убивает;
+                    # confirmed/push (транзит сел) и stale (фид умер) закрывают как раньше
+                    self.stats["sticky_windows"] += 1
+                    self._log("SPECFIRE sticky feed=%s: %s при заряженном транзите — окно живёт "
+                              "ещё %.0fс" % (feed, kind, self._owed[feed] - self._now()))
+                    return None
                 with self._lock:
                     stop = self._windows.pop(feed, None)
                 if stop is not None:
