@@ -619,6 +619,8 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                             ret_fn=lambda lbl: engine.ret(_l2s.get(lbl.upper(), lbl)),
                                             dev_by=_dev)
                         _handlers.append(_sfl.handle_event)
+                        from chain.failover import set_windows_probe
+                        set_windows_probe(lambda: len(_sfl._windows))   # назад-свитч не посреди окна
                         from chain.execute import _SPECFIRE_MAX_GAS_USD as _sf_bucket
                         log.warning("SPEC-FIRE LIVE ENABLED — пробы по жиру >=$%.0fk при |ret|>=dev "
                                     "(кап %d проб/окно, газ-бакет $%.0f)",
@@ -766,6 +768,9 @@ def main():
     guard = KillSwitch(cfg.max_daily_loss_usd, cfg.max_daily_gas_usd, cfg.max_inflight)
     markets = load_covered_markets(cfg.covered_markets_path)
     rpc = BaseRpc(cfg.rpc_url, cfg.chain_id) if cfg.rpc_url else None
+    if rpc is not None:
+        from chain.failover import build_failover
+        rpc = build_failover(rpc, cfg, alerter)   # без COMBAT_FAILOVER_URLS вернёт rpc как был
     ctx_cache: dict = {}   # immutable per-market params (oracle, lltv_wad), filled on first sight
 
     log.info("liquidator start: mode=%s chain=%s markets=%d rpc=%s",

@@ -682,6 +682,9 @@ def _spawn_cache_refresh(*, cache_rpc, shared, bn):
     accumulated count — n/running are the live signal of preconf strain (correlate with
     src=confirmed). Called only from the single feed-loop thread => no lock around check-then-set."""
     global _CACHE_REFRESH_THREAD, _CACHE_REFRESH_STARTED, _CACHE_SKIP_N, _CACHE_SKIP_LOG_TS
+    from chain.failover import bg_shed
+    if bg_shed():
+        return                                    # бой уехал на ключ bg — фон уступает (ревью 02.08, усл.3)
     if (_CACHE_REFRESH_MIN_INTERVAL > 0 and _CACHE_REFRESH_STARTED
             and time.monotonic() - _CACHE_REFRESH_STARTED < _CACHE_REFRESH_MIN_INTERVAL):
         return                                    # интервал-гейт (см. _CACHE_REFRESH_MIN_INTERVAL): тихий skip

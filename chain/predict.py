@@ -333,7 +333,14 @@ class PredictDriver:
                 events += self.engine.on_mid(sym, mid, wall)   # recovered-mid ДО пуша этого шага
                 continue
             fresh[sym] = mid
-        if ((self._last_poll is None or (self._now() - self._last_poll) >= self.poll_interval)
+        _pi = self.poll_interval
+        try:                                       # бой на ключе bg -> полл прореживается х4
+            from chain.failover import bg_shed     # (ревью 02.08, усл.3; арм/дизарм на Binance-WS)
+            if bg_shed():
+                _pi *= 4.0
+        except Exception:
+            pass
+        if ((self._last_poll is None or (self._now() - self._last_poll) >= _pi)
                 and self._now() >= self._poll_backoff_until):
             self._last_poll = self._now()
             events += self._poll(wall, stale)
