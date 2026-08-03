@@ -110,7 +110,7 @@ except Exception as e:
 # его протухший пульс всплывёт здесь — в сводке, которую человек читает каждый день.
 try:
     from heartbeat import age_sec
-    from analysis.heartbeat_check import REGISTRY, SELF_THRESHOLD_SEC
+    from analysis.heartbeat_check import _host_registry, REGISTRY, SELF_THRESHOLD_SEC
 
     def _fmt_age(a):
         if a is None:
@@ -118,7 +118,9 @@ try:
         return "%.0fс" % a if a < 120 else "%.0fм" % (a / 60) if a < 7200 else "%.1fч" % (a / 3600)
 
     parts = []
-    for name in list(REGISTRY) + ["heartbeat-check"]:
+    # пер-хостовый реестр (03.08): сырой REGISTRY показывал usde-watch 84.7ч⚠️ по мёртвому
+    # локальному файлу — вотчер с 30.07 живёт на Вене (HB_WATCH_SKIP), надзор там свой
+    for name in list(_host_registry()) + ["heartbeat-check"]:
         a = age_sec(name)
         thr = REGISTRY[name][1] if name in REGISTRY else SELF_THRESHOLD_SEC
         parts.append(name + " " + _fmt_age(a) + (" ⚠️" if a is None or a > thr else ""))
