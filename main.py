@@ -623,6 +623,22 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                         _handlers.append(_sfl.handle_event)
                         from chain.failover import set_windows_probe
                         set_windows_probe(lambda: len(_sfl._windows))   # назад-свитч не посреди окна
+                        # PENDING-DETECT (пакет A, 04.08): детект транзитов по формируемому блоку
+                        # на ОТДЕЛЬНОМ бесключевом провайдере; handoff в окно атомарным флагом.
+                        try:
+                            from chain.pending_detect import PendingDetect, PENDING_DETECT, PENDING_TIER1_HZ
+                            if PENDING_DETECT:
+                                _pl = {row["label"].upper(): proxies[sym]
+                                       for sym, row in FEEDS_BASE.items() if sym in proxies}
+                                _pd = PendingDetect(cfg, _sfl, _pl)
+                                if _pd.start() is not None:
+                                    _sfl.pending_healthy_fn = _pd.healthy   # A3: кипэлайв лестницы
+                                    log.warning("PENDING-DETECT ENABLED — ярус-1 %.0f Гц по %d фидам, "
+                                                "провайдеры %s (Alchemy запрещён кодом)",
+                                                PENDING_TIER1_HZ, len(_pl),
+                                                [u.split('//', 1)[-1].split('/', 1)[0] for u in _pd.urls])
+                        except Exception:
+                            log.exception("pending-detect не стартовал (опционален, окна на полной каденсии)")
                         from chain.execute import _SPECFIRE_MAX_GAS_USD as _sf_bucket
                         log.warning("SPEC-FIRE LIVE ENABLED — пробы по жиру >=$%.0fk при |ret|>=dev "
                                     "(кап %d проб/окно, газ-бакет $%.0f)",

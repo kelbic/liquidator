@@ -94,6 +94,22 @@ SPEC_FIRE_CASCADE_WINDOWS = int(os.environ.get("SPEC_FIRE_CASCADE_WINDOWS", "4")
 SPEC_FIRE_HYBRID = os.environ.get("SPEC_FIRE_HYBRID", "1").lower() not in ("0", "false", "no")
 SPEC_FIRE_FACTS_FLAG = os.environ.get("SPEC_FIRE_FACTS_FLAG", "state/cascade_facts.flag")
 SPEC_FIRE_FACTS_TTL_SEC = float(os.environ.get("SPEC_FIRE_FACTS_TTL_SEC", "900"))
+# ПАКЕТ B — SCHED (план ревьювера 04.08): дыра 18:50:15→39 = 7 проб ушли в XRP-окно ($16k),
+# пока рвался DOGE-кит ($71k); fallback 3870d89 починил лок ЦЕЛИ внутри окна, но не расписание
+# МЕЖДУ окнами. Пробный слот (общий $-бакет + send-интервал) достаётся окну с самой богатой
+# доступной (не на nobuild-скамейке) жертвой; бедное окно уступает тик БЕЗ расхода капа.
+# Ничья -> round-robin по временным слотам. Заявка протухает за PRIO_TTL (окно остыло/умерло —
+# никто не голодает по мёртвой заявке). pending-handoff арбитра НЕ спрашивает: подтверждённый
+# флип главнее богатства. Откат: SPEC_FIRE_SCHED=0 (прежний FCFS окон).
+SPEC_FIRE_SCHED = os.environ.get("SPEC_FIRE_SCHED", "1").lower() not in ("0", "false", "no")
+SPEC_FIRE_PRIO_TTL_SEC = float(os.environ.get("SPEC_FIRE_PRIO_TTL_SEC", "3.0"))
+# ПАКЕТ A — швы pending-detect (chain/pending_detect.py): handoff-флаг живёт FRESH_SEC (протухший
+# = детект устарел на блоки, не стреляем вслепую); при ЗДОРОВОМ pending-цикле on-chain пробы
+# растягиваются до KEEPALIVE (A3: детект несёт бесплатный pending-ярус, газ проб падает ~7×;
+# 3.5с < 4с — B3-гейт «пробел топ-1 < 4с» держится и в кипэлайве). Нездоровый pending (health-
+# gate в PendingDetect) -> pending_healthy_fn=False -> полная каденсия сама собой (A6).
+PENDING_FIRE_FRESH_SEC = float(os.environ.get("PENDING_FIRE_FRESH_SEC", "2.0"))
+PENDING_KEEPALIVE_SEC = float(os.environ.get("PENDING_KEEPALIVE_SEC", "3.5"))
 
 
 # канон дробления живёт в chain.execute (общий для проб и fast-lane); ре-экспорт для юнитов
@@ -187,8 +203,14 @@ class SpecFireLive:
         self._cooldown_until = 0.0                # WIN-пауза: до этого момента окна не армим
         self._arm_ts: list = []                   # ts армленных окон за час (каскад-детект)
         self.stats = {"windows_armed": 0, "probes": 0, "wins": 0,
-                      "owed_probes": 0, "sticky_windows": 0}   # peak-owed: would-have-fired учёт
+                      "owed_probes": 0, "sticky_windows": 0,   # peak-owed: would-have-fired учёт
+                      "pending_fires": 0}                      # A2: выстрелы по pending-handoff
         self._owed: dict = {}                     # feed -> owed_until (peak-owed, пишет петля окна)
+        self._prio: dict = {}                     # feed -> (claim_debt, ts): заявки на слот (пакет B)
+        self.probe_board: dict = {}               # feed -> (mid, b, debt, calldata, gas, ts): свежая
+                                                  # проба окна для яруса-2 pending (читает PendingDetect)
+        self.pending_fire: dict = {}              # feed -> (mid, b, debt, ts): атомарный handoff (A2)
+        self.pending_healthy_fn = None            # () -> bool: pending-цикл жив (A3-кипэлайв)
 
     # ---- боевые швы ----
     def _build(self, mid, borrower, debt_usd):
@@ -320,6 +342,24 @@ class SpecFireLive:
         elig.sort(key=lambda t: -t[2])
         return elig[:k], hold_dist
 
+    def _prio_ok(self, feed: str, claim: float) -> bool:
+        """Пакет B (B1): True = слот наш — нет более богатой СВЕЖЕЙ заявки другого окна.
+        Ничья -> round-robin по временным слотам DENSE-интервала (детерминированно, без
+        координации). Заявки пишутся окнами GIL-атомарными присваиваниями (без лока —
+        ноль общих локов с fire-путём, инвариант A4)."""
+        if not SPEC_FIRE_SCHED:
+            return True
+        n = self._now()
+        fresh = {f: d for f, (d, ts) in list(self._prio.items()) if n - ts <= SPEC_FIRE_PRIO_TTL_SEC}
+        fresh[feed] = claim
+        mx = max(fresh.values())
+        if claim < mx:
+            return False
+        tied = sorted(f for f, d in fresh.items() if d >= mx)
+        if len(tied) <= 1:
+            return True
+        return tied[int(n / max(0.25, SPEC_FIRE_DENSE_INTERVAL_SEC)) % len(tied)] == feed
+
     def _collect(self, h, mid, borrower, debt_usd, feed=""):
         from chain.execute import specfire_gas_add, mark_recent_send, canary_invalidate_nonce
         res = (self._receipt_fn or self._receipt)(h)
@@ -359,8 +399,42 @@ class SpecFireLive:
         owed_until = 0.0     # peak-owed: до какого момента транзит «заряжен» (0 = долга нет)
         owed_ret = 0.0       # пиковое |ret| горячей фазы — им меряем reach в долге
         was_raw_hot = False
+        gaps: list = []      # B3: пробелы проб горячей фазы (p95 в close-строке — метрика-гейт <4с)
+        gap_t0 = None
+        last_yield_log = 0.0
         try:
             while not stop.is_set() and probes < SPEC_FIRE_MAX_PROBES_WINDOW:
+                pf = self.pending_fire.pop(feed, None)
+                if pf is not None and self._now() - pf[3] <= PENDING_FIRE_FRESH_SEC:
+                    # A2: handoff от pending-detect — жертва флипнута в ФОРМИРУЕМОМ блоке.
+                    # Стреляем вне очереди: без ret-гейта, без интервала, без арбитра (B).
+                    # Тот же send-шов (send_spec_fire_probe, единый nonce) — fire-путь не менялся.
+                    _pm, _pb, _pd = pf[0], pf[1], pf[2]
+                    try:
+                        probe, _bts = cache.get((_pm, _pb), (None, 0.0))
+                        if not isinstance(probe, dict):
+                            probe = (self._build_fn or self._build)(_pm, _pb, _pd)
+                            if isinstance(probe, dict):
+                                cache[(_pm, _pb)] = (probe, self._now())
+                        if isinstance(probe, dict):
+                            h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
+                            if h is not None:
+                                probes += 1
+                                self.stats["probes"] += 1
+                                self.stats["pending_fires"] += 1
+                                last_fire = self._now()
+                                if gap_t0 is not None:
+                                    gaps.append(last_fire - gap_t0)
+                                gap_t0 = last_fire
+                                self._log("SPECFIRE probe #%d feed=%s %s/%s debt=$%.0fk "
+                                          "[pending-handoff] tx=%s" % (
+                                              probes, feed, _pm[:10], _pb[:10], _pd / 1e3, h))
+                                threading.Thread(target=self._collect, args=(h, _pm, _pb, _pd, feed),
+                                                 daemon=True).start()
+                    except Exception as e:
+                        self._log("SPECFIRE pending-handoff fail feed=%s: %s" % (feed, type(e).__name__))
+                    stop.wait(SPEC_FIRE_POLL_SEC)
+                    continue
                 r = None
                 try:
                     r = self.ret_fn(feed)
@@ -385,6 +459,10 @@ class SpecFireLive:
                 was_raw_hot = raw_hot
                 self._owed[feed] = owed_until if SPEC_FIRE_PEAK_OWED else 0.0
                 hot = raw_hot or owed_fire
+                if hot and gap_t0 is None:
+                    gap_t0 = self._now()               # B3: старт горячей фазы — лаг до первой пробы тоже пробел
+                elif not hot:
+                    gap_t0 = None
                 if SPEC_FIRE_DENSE:                    # вся горячая фаза плотно (гонка плотностей, 31.07)
                     _j = SPEC_FIRE_DENSE_JITTER_SEC
                     iv = max(0.25, SPEC_FIRE_DENSE_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
@@ -393,6 +471,12 @@ class SpecFireLive:
                 else:                                  # хвост с джиттером (см. SPEC_FIRE_TAIL_JITTER_SEC)
                     _j = SPEC_FIRE_TAIL_JITTER_SEC
                     iv = max(0.3, SPEC_FIRE_SLOW_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
+                if self.pending_healthy_fn is not None:
+                    try:
+                        if self.pending_healthy_fn():  # A3: pending жив и детектит — on-chain пробы
+                            iv = max(iv, PENDING_KEEPALIVE_SEC)   # в кипэлайв (газ ~7× вниз)
+                    except Exception:
+                        pass
                 if hot and self._now() - last_fire >= iv:
                     _eff_r = max(abs(r or 0.0), owed_ret if owed_fire else 0.0)
                     reach = _eff_r + SPEC_FIRE_DIST_MARGIN_DEVS * dev   # в долге меряем по пику
@@ -407,6 +491,19 @@ class SpecFireLive:
                             last_hold_log = self._now()           # движения — держим окно, НЕ жжём бакет
                             self._log("SPECFIRE hold feed=%s: жир вне досягаемости (ближ. dist=%.2f%% > reach=%.2f%%)" % (
                                 feed, hold_dist * 100.0, reach * 100.0))
+                        stop.wait(SPEC_FIRE_POLL_SEC)
+                        continue
+                    _t0 = self._now()                  # пакет B: заявка = жир первой ДОСТУПНОЙ цели
+                    _avail = [t for t in tgts          # (nobuild-скамейка не претендует — иначе
+                              if not (SPEC_FIRE_BUILD_FALLBACK                # чужое окно голодает
+                                      and nobuild.get((t[0], t[1]), 0.0) > _t0)]   # по нашей несобираемой)
+                    _claim = _avail[0][2] if _avail else tgts[0][2]
+                    self._prio[feed] = (_claim, _t0)
+                    if not self._prio_ok(feed, _claim):
+                        if _t0 - last_yield_log >= 10.0:
+                            last_yield_log = _t0
+                            self._log("SPECFIRE yield feed=%s: слот у более богатого окна "
+                                      "(наш жир $%.0fk)" % (feed, _claim / 1e3))
                         stop.wait(SPEC_FIRE_POLL_SEC)
                         continue
                     # плотность ротируется по top-K как раньше; хвост списка — ТОЛЬКО фолбэк
@@ -430,12 +527,20 @@ class SpecFireLive:
                                               "(конкурент/погашение) — цель снята" % (feed, mid[:10], b[:10]))
                                     continue
                                 cache[(mid, b)] = (probe, self._now())
+                                if isinstance(probe, dict):
+                                    # доска проб (A1 ярус-2): pending-цикл дергает eth_call
+                                    # ЭТОЙ пробы по формируемому блоку — та же семантика
+                                    self.probe_board[feed] = (mid, b, d, probe["calldata"],
+                                                              probe["gas"], self._now())
                             if probe is not None:
                                 h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
                                 if h is not None:
                                     probes += 1
                                     self.stats["probes"] += 1
                                     last_fire = self._now()
+                                    if gap_t0 is not None:
+                                        gaps.append(last_fire - gap_t0)
+                                    gap_t0 = last_fire
                                     _om = ""
                                     if owed_fire:              # would-have-fired: старая политика молчала бы
                                         self.stats["owed_probes"] += 1
@@ -462,6 +567,14 @@ class SpecFireLive:
                 stop.wait(SPEC_FIRE_POLL_SEC)
         finally:
             self._owed.pop(feed, None)   # окно закрыто — долг не переживает петлю
+            self._prio.pop(feed, None)   # заявка на слот снята (пакет B)
+            self.probe_board.pop(feed, None)
+            _g = sorted(gaps)
+            # close-строка: B3-метрика (gap p95 горячей фазы) + кумулятивные счётчики (C5:
+            # owed_probes/sticky_windows/pending_fires видны grep'ом без маркеров)
+            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s stats=%s" % (
+                feed, probes,
+                ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—", self.stats))
 
     def handle_event(self, ev: dict):
         try:
