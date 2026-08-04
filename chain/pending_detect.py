@@ -45,7 +45,16 @@ PENDING_DETECT = os.environ.get("PENDING_DETECT", "1").lower() not in ("0", "fal
 PENDING_RPC_URLS = os.environ.get("PENDING_RPC_URLS",
                                   "https://mainnet.base.org,https://base-pokt.nodies.app")
 PENDING_TIER1_HZ = float(os.environ.get("PENDING_TIER1_HZ", "4.0"))
-PENDING_HC_FAILS = int(os.environ.get("PENDING_HC_FAILS", "3"))
+# СТРАЙП по провайдерам (боевой урок 04.08 07:20, первое же окно): base.org режет выдержанные
+# 4Гц (19/24 запросов = 429; A0-залп это НЕ ловит — лимит по ОКНУ времени, не по RTT). Каждый
+# тик уходит СЛЕДУЮЩЕМУ живому провайдеру (round-robin), 429 = кулдаун RL_COOLDOWN этому
+# провайдеру (не «смерть»), транспорт-фейлы DEAD_FAILS подряд = кулдаун DEAD_COOLDOWN. При
+# 3 провайдерах каждый видит ~1.3Гц — под публичные лимиты. Все остыли -> тик пропущен ->
+# healthy() гаснет -> лестница on-chain проб сама на полной каденсии (A3/A6 без изменений).
+PENDING_RL_COOLDOWN_SEC = float(os.environ.get("PENDING_RL_COOLDOWN_SEC", "5.0"))
+PENDING_DEAD_FAILS = int(os.environ.get("PENDING_DEAD_FAILS", "3"))
+PENDING_DEAD_COOLDOWN_SEC = float(os.environ.get("PENDING_DEAD_COOLDOWN_SEC", "30.0"))
+PENDING_HC_FAILS = int(os.environ.get("PENDING_HC_FAILS", "3"))   # легаси-алиас (тесты/откат)
 PENDING_STALE_SEC = float(os.environ.get("PENDING_STALE_SEC", "3.0"))
 PENDING_BOARD_MAX_AGE_SEC = float(os.environ.get("PENDING_BOARD_MAX_AGE_SEC", "10.0"))
 PENDING_HANDOFF_CD_SEC = float(os.environ.get("PENDING_HANDOFF_CD_SEC", "5.0"))
@@ -60,6 +69,10 @@ _HDRS = {"Content-Type": "application/json",
 
 class _Revert(Exception):
     """eth_call вернул execution-ошибку (реверт) — семантика 'мимо', НЕ сбой транспорта."""
+
+
+class _RateLimited(Exception):
+    """429/rate-limit: провайдер жив, но остывает — тик уходит следующему в страйпе."""
 
 
 class PendingDetect:
@@ -79,8 +92,10 @@ class PendingDetect:
                 log.error("PENDING: url отклонён КОДОМ — Alchemy в pending-цикле запрещён (%s…)", u[:34])
                 continue
             self.urls.append(u)
-        self._idx = 0                      # текущий провайдер (ротация по health-gate)
-        self._cycle_fails = 0              # циклы подряд без ЕДИНОГО успешного запроса
+        self._rr = 0                       # round-robin страйпа запросов по провайдерам
+        self._cool: dict = {}              # idx -> ts, до которого провайдер остывает (429/смерть)
+        self._pfails: dict = {}            # idx -> транспорт-фейлы подряд (сброс успехом)
+        self._errlog_ts = 0.0              # троттлинг причин ошибок в лог (урок дебага 07:20)
         self._healthy_ts = -1e9
         self._base: dict = {}              # label -> (roundId, updatedAt) базлайн pending
         self._handoff_cd: dict = {}        # label -> ts, до которого handoff не повторяем
@@ -92,7 +107,7 @@ class PendingDetect:
         self._stop = threading.Event()
         self._last_stats = (0.0, 0)
         self.stats = {"t1": 0, "t2": 0, "handoffs": 0, "suppressed": 0, "errors": 0,
-                      "failovers": 0, "reqs": {}}
+                      "failovers": 0, "rl429": 0, "reqs": {}}
 
     # ---- транспорт ----
     def _http_post(self, url: str, body: bytes) -> dict:
@@ -100,38 +115,68 @@ class PendingDetect:
         with urllib.request.urlopen(req, timeout=PENDING_HTTP_TIMEOUT) as resp:
             return json.loads(resp.read())
 
-    def _rpc(self, method: str, params: list):
-        url = self.urls[self._idx]
-        host = url.split("//", 1)[-1].split("/", 1)[0]
-        self.stats["reqs"][host] = self.stats["reqs"].get(host, 0) + 1
-        out = self._http(url, json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode())
-        if "error" in out:
-            raise _Revert(str(out["error"])[:120])   # RPC-level = execution/реверт, не транспорт
-        return out.get("result")
+    def _pick(self):
+        """Следующий НЕостывающий провайдер (страйп round-robin). None = все на кулдауне."""
+        n = self._now()
+        for k in range(len(self.urls)):
+            i = (self._rr + k) % len(self.urls)
+            if self._cool.get(i, 0.0) <= n:
+                self._rr = i + 1
+                return i
+        return None
 
-    def _fail_cycle(self):
-        self._cycle_fails += 1
-        if self._cycle_fails >= PENDING_HC_FAILS and len(self.urls) > 1:
-            self._idx = (self._idx + 1) % len(self.urls)
-            self._cycle_fails = 0
-            self.stats["failovers"] += 1
-            self._log("PENDING health-gate: провайдер мёртв — ротация на %s"
-                      % self.urls[self._idx].split("//", 1)[-1].split("/", 1)[0])
+    def _host(self, i):
+        return self.urls[i].split("//", 1)[-1].split("/", 1)[0]
+
+    def _rpc(self, method: str, params: list, idx: int):
+        """Один запрос через провайдера idx. 429 -> RL-кулдаун провайдеру + _RateLimited;
+        прочий транспорт -> счётчик фейлов, DEAD_FAILS подряд -> длинный кулдаун. Причина
+        уходит в лог троттлированно (урок 07:20: «мёртв» без причины не дебажится)."""
+        url = self.urls[idx]
+        host = self._host(idx)
+        self.stats["reqs"][host] = self.stats["reqs"].get(host, 0) + 1
+        try:
+            out = self._http(url, json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode())
+        except Exception as e:
+            n = self._now()
+            if getattr(e, "code", None) == 429:
+                self._cool[idx] = n + PENDING_RL_COOLDOWN_SEC
+                self.stats["rl429"] = self.stats.get("rl429", 0) + 1
+                raise _RateLimited(host)
+            self._pfails[idx] = self._pfails.get(idx, 0) + 1
+            if self._pfails[idx] >= PENDING_DEAD_FAILS:
+                self._cool[idx] = n + PENDING_DEAD_COOLDOWN_SEC
+                self._pfails[idx] = 0
+                self.stats["failovers"] += 1
+                if n - self._errlog_ts >= 30.0:
+                    self._errlog_ts = n
+                    self._log("PENDING провайдер %s остыл на %.0fс: %s: %s" % (
+                        host, PENDING_DEAD_COOLDOWN_SEC, type(e).__name__, str(e)[:60]))
+            raise
+        self._pfails[idx] = 0
+        if "error" in out:
+            err = str(out["error"])[:120]
+            if "429" in err or "rate" in err.lower():
+                self._cool[idx] = self._now() + PENDING_RL_COOLDOWN_SEC
+                self.stats["rl429"] = self.stats.get("rl429", 0) + 1
+                raise _RateLimited(host)
+            raise _Revert(err)                       # execution-ошибка (реверт) — данные, не транспорт
+        return out.get("result")
 
     # ---- публичное здоровье (A3: его читает лестница on-chain проб) ----
     def healthy(self) -> bool:
         return self._now() - self._healthy_ts <= PENDING_STALE_SEC
 
     # ---- ярусы ----
-    def _read_round(self, proxy: str, tag: str):
-        res = self._rpc("eth_call", [{"to": proxy, "data": _LATEST_ROUND_DATA}, tag])
+    def _read_round(self, proxy: str, tag: str, idx: int):
+        res = self._rpc("eth_call", [{"to": proxy, "data": _LATEST_ROUND_DATA}, tag], idx)
         raw = bytes.fromhex((res or "0x")[2:])
         if len(raw) < 160:
             raise _Revert("short latestRoundData")
         return (int.from_bytes(raw[0:32], "big"), int.from_bytes(raw[96:128], "big"))
 
-    def _liquidated_sealed(self, borrower: str) -> bool:
+    def _liquidated_sealed(self, borrower: str, idx: int) -> bool:
         """A2-подавление: Liquidate-event жертвы уже в ЗАПЕЧАТАННОМ чейне = конкурент успел.
         Fail-open (не смогли проверить -> стреляем; цена ошибки = один реверт ~$0.01)."""
         try:
@@ -140,11 +185,11 @@ class PendingDetect:
                 self._liq_sig = "0x" + keccak(
                     text="Liquidate(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)").hex()
             from chain.execute import _MORPHO_BLUE
-            head = int(self._rpc("eth_blockNumber", []), 16)
+            head = int(self._rpc("eth_blockNumber", [], idx), 16)
             logs = self._rpc("eth_getLogs", [{
                 "fromBlock": hex(max(0, head - 3)), "toBlock": "latest", "address": _MORPHO_BLUE,
                 "topics": [self._liq_sig, None, None,
-                           "0x" + borrower[2:].lower().rjust(64, "0")]}])
+                           "0x" + borrower[2:].lower().rjust(64, "0")]}], idx)
             return bool(logs)
         except Exception:
             return False
@@ -159,15 +204,21 @@ class PendingDetect:
                 or self._handoff_cd.get(label, 0.0) > n
                 or self._sup_until.get((mid, b), 0.0) > n):
             return
+        idx = self._pick()
+        if idx is None:
+            return                          # все провайдеры остывают — накроет on-chain лестница
         self.stats["t2"] += 1
         try:
             self._rpc("eth_call", [{"from": self.cfg.wallet_address,
                                     "to": self.cfg.liquidator_address,
-                                    "data": calldata}, "pending"])
+                                    "data": calldata}, "pending"], idx)
         except _Revert:
             return                          # 'healthy' — ЭТОТ транзит жертву не флипнул
+        except _RateLimited:
+            return                          # тик потерян, страйп уведёт следующий к другому провайдеру
         # успех: жертва ликвидируема в формируемом блоке
-        if self._liquidated_sealed(b):
+        _si = self._pick()
+        if self._liquidated_sealed(b, _si if _si is not None else idx):
             self.stats["suppressed"] += 1
             self._sup_until[(mid, b)] = n + PENDING_SUPPRESS_SEC
             self._log("PENDING suppress feed=%s %s/%s: Liquidate-event уже в чейне — конкурент "
@@ -180,32 +231,36 @@ class PendingDetect:
                     "блоке, огонь передан окну", label, mid[:10], b[:10], debt / 1e3)
 
     def _cycle(self, feeds: list) -> bool:
-        """Один тик яруса-1 по всем армленным окнам. True = был хотя бы один успешный запрос."""
+        """Один тик яруса-1 по всем армленным окнам. Каждый фид — через СЛЕДУЮЩЕГО живого
+        провайдера страйпа (429-кулдауны разводят каденс под публичные лимиты).
+        True = был хотя бы один успешный запрос."""
         ok = False
         for lbl in feeds:
             proxy = self.proxies.get(lbl)
             if not proxy:
                 continue
+            idx = self._pick()
+            if idx is None:
+                break                       # все провайдеры остывают — тик пропущен, healthy угаснет
             try:
-                cur = self._read_round(proxy, "pending")
+                cur = self._read_round(proxy, "pending", idx)
                 self.stats["t1"] += 1
                 ok = True
                 base = self._base.get(lbl)
                 if base is None:
                     # первый тик окна: транзит мог УЖЕ сидеть в формируемом блоке — сверяем
                     # pending против запечатанного latest, расхождение = сразу ярус-2
-                    sealed = self._read_round(proxy, "latest")
+                    sealed = self._read_round(proxy, "latest", idx)
                     self._base[lbl] = cur
                     if cur != sealed:
                         self._tier2(lbl)
                 elif cur != base:
                     self._base[lbl] = cur
                     self._tier2(lbl)
-            except _Revert:
-                self.stats["errors"] += 1   # RPC-ошибка данных — не транспорт, провайдера не виним
+            except (_Revert, _RateLimited):
+                self.stats["errors"] += 1   # данные/лимит — тик фида потерян, цикл живёт
             except Exception:
-                self.stats["errors"] += 1
-                return ok or False          # транспорт: цикл рвём, health-gate решает
+                self.stats["errors"] += 1   # транспорт: кулдаун навесил _rpc, идём к следующему фиду
         return ok
 
     def _maybe_stats(self):
@@ -215,10 +270,10 @@ class PendingDetect:
         if n - ts >= PENDING_STATS_SEC and total > seen:
             self._last_stats = (n, total)
             self._log("PENDING stats: t1=%d t2=%d handoffs=%d suppressed=%d errors=%d "
-                      "failovers=%d reqs=%s healthy=%s" % (
+                      "rl429=%d failovers=%d reqs=%s healthy=%s" % (
                           self.stats["t1"], self.stats["t2"], self.stats["handoffs"],
-                          self.stats["suppressed"], self.stats["errors"], self.stats["failovers"],
-                          self.stats["reqs"], self.healthy()))
+                          self.stats["suppressed"], self.stats["errors"], self.stats["rl429"],
+                          self.stats["failovers"], self.stats["reqs"], self.healthy()))
 
     def _loop(self):
         period = 1.0 / max(0.5, PENDING_TIER1_HZ)
@@ -233,9 +288,6 @@ class PendingDetect:
                 t0 = self._now()
                 if self._cycle(feeds):
                     self._healthy_ts = self._now()
-                    self._cycle_fails = 0
-                else:
-                    self._fail_cycle()
                 for k in list(self._base):
                     if k not in feeds:
                         self._base.pop(k, None)

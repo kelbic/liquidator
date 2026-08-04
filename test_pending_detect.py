@@ -116,19 +116,37 @@ assert p3.stats["suppressed"] == 1 and p3.stats["handoffs"] == 0 and not sfl3.pe
 assert any("suppress" in m for m in LOGS)
 print("OK 5: подавление post-Liquidate-event")
 
-# 6) ХАОС (A6): все провайдеры мертвы -> ротация -> healthy()=False -> лестница на полной каденсии
+# 6) ХАОС (A6): все провайдеры мертвы -> кулдауны -> тик пропущен -> healthy()=False
 def dead_http(url, body):
     raise OSError("blackhole")
 p4, _ = mk_pd(dead_http)
-for _ in range(pd_mod.PENDING_HC_FAILS):
-    if not p4._cycle(["BTC"]):
-        p4._fail_cycle()
-assert p4.stats["failovers"] == 1 and p4._idx == 1        # ротация на backup
+for _ in range(2 * pd_mod.PENDING_DEAD_FAILS):            # страйп по 2 провайдерам
+    p4._cycle(["BTC"])
+assert p4.stats["failovers"] == 2                         # оба остыли (DEAD_COOLDOWN)
+assert p4._pick() is None                                 # тик пропускается целиком
+assert p4._cycle(["BTC"]) is False
 NOW["t"] += pd_mod.PENDING_STALE_SEC + 1
 assert p4.healthy() is False                              # маячок протух
 # сторона окна: нездоровый pending НЕ растягивает каденс (интервал остаётся плотным)
 assert sfl_mod.PENDING_KEEPALIVE_SEC > sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC
-print("OK 6: хаос-тест — ротация провайдера, healthy=False, кипэлайв не включается")
+print("OK 6: хаос-тест — кулдауны обоих, тик пропущен, healthy=False")
+
+# 6b) 429-СТРАЙП (боевой урок 07:20): rate-limit = кулдаун провайдеру, НЕ смерть слоя —
+# следующий тик уходит соседнему провайдеру и слой остаётся healthy
+import urllib.error
+_good = FakeHttp()
+def rl_http(url, body):
+    if "prov1" in url:
+        raise urllib.error.HTTPError(url, 429, "Too Many Requests", None, None)
+    return _good(url, body)
+p6, _ = mk_pd(rl_http)
+assert p6._cycle(["BTC"]) is False and p6.stats["rl429"] == 1   # prov1 остыл на RL_COOLDOWN
+assert p6._cycle(["BTC"]) is True                               # страйп увёл на prov2 — успех
+p6._healthy_ts = NOW["t"]
+assert p6.healthy() is True
+NOW["t"] += pd_mod.PENDING_RL_COOLDOWN_SEC + 1
+assert p6._cool.get(0, 0.0) <= NOW["t"]                         # prov1 вернулся после кулдауна
+print("OK 6b: 429 = кулдаун и страйп, слой жив на соседнем провайдере")
 
 # 7) Kill-switch PENDING_DETECT=0 семантика: пустой список провайдеров -> start() = None
 p5, _ = mk_pd(FakeHttp(), urls=["https://base-mainnet.g.alchemy.com/v2/K"])
