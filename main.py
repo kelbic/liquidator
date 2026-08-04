@@ -33,7 +33,9 @@ from chain.simulate import assess_candidates_batched, estimate
 
 # API USD-approx wide net; the precise on-chain HF makes the real call. Loose on purpose
 # (API prices lag the oracle) so nothing near liquidation is missed before on-chain confirm.
-HF_API_CEILING = 1.10
+# 1.10 -> 1.15 (04.08, ревью cbBTC-полки): за горизонтом 1.10 лежала СТЕНА-2 ($29.1M на
+# дист 10-12%) — при BTC ±2% она вплывала в набор «сюрпризом». Откат: HF_API_CEILING=1.10.
+HF_API_CEILING = float(os.environ.get("HF_API_CEILING", "1.15"))
 # Base gas is tiny; these are monitor placeholders for the paper PnL. Execute computes real
 # gas from the live base fee + a competitive sequencer tip.
 GAS_USD_EST = 0.10

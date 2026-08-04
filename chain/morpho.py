@@ -13,6 +13,7 @@ API, so the position query only needs `marketId` to map a position back to its l
 from __future__ import annotations
 import json
 import logging
+import os
 import urllib.request
 import urllib.error
 import time
@@ -65,8 +66,10 @@ API_SKIP_MAX = 10000
 # hf<=1.15 = 1368 строк (1.20 -> 3196, 1.25 -> 4898). Ordered by BorrowShares desc -> упор в
 # кап/бюджет режет ПЫЛЬ, не китов. Сбой добавки НЕ роняет refresh (try/except в positions_at_risk).
 # Серверного пола по долгу НЕТ (borrowAssetsUsd_gte -> 400, проверено) — пол клиентский (parse).
-MEGA_HF_FILTER = 1.15
-MEGA_HF_MAX_PAGES = 3      # 3000 строк ~ 2.2x сегодняшнего набора; упор в кап логируется
+# 1.15 -> 1.20 (04.08, потолок клиента поднят до 1.15 — запас +0.05 сохраняем; замер 07-10:
+# 1.20 = 3196 строк, потому и страниц 3 -> 4, чтобы кап не резал систематически)
+MEGA_HF_FILTER = float(os.environ.get("MEGA_HF_FILTER", "1.20"))
+MEGA_HF_MAX_PAGES = int(os.environ.get("MEGA_HF_MAX_PAGES", "4"))
 MEGA_HF_BUDGET_SEC = 8.0   # мягкий бюджет добавки: API-затык не должен раздувать refresh-цикл
 
 # marketUniqueKey is keccak(loanToken,collateralToken,oracle,irm,lltv); token/oracle
