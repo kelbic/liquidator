@@ -554,6 +554,22 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
         threading.Thread(target=_run_hot, daemon=True).start()
         log.warning("HOT PATH ENABLED — preconf trigger live (tip=%.2f gwei, daily-loss<=$%.0f, repaid>=$%.0f)",
                     cfg.tip_gwei, cfg.max_daily_loss_usd, getattr(cfg, "hot_min_repaid_usd", 2000.0))
+    # LIVE-CAP вотчер (04.08, weETH tail): держит живой кап капнутых роутов, пока на паре
+    # есть кандидат >= $25k — реактивный путь стреляет в непредсказуемый момент (peg-пары
+    # predict не армит), а протухший статик-кап ошибается в обе стороны (04.08: пул weETH
+    # плоский до 260 при статик 160 и seize жертвы 168). Слой опционален, огневой путь не
+    # трогает; откаты ROUTE_LIVE_CAP=0 (потребление) / LIVE_CAP_WATCH=0 (вотчер).
+    try:
+        from chain.route_depth import (RouteDepthWatcher, LIVE_CAP_MIN_DEBT_USD,
+                                       LIVE_CAP_REFRESH_SEC)
+        _rdw = RouteDepthWatcher(_bg_read_rpc, shared)   # фоновое чтение = bg-RPC (CU 25.07);
+        # 429-шторм на bg -> fail-open в статик; горячий перемер в prearm-окне идёт боевым rpc
+        if _rdw.start() is not None:
+            log.warning("LIVE-CAP WATCHER ENABLED — глубина капнутых роутов "
+                        "(долг>=$%.0fk, замер раз в %.0fс на роут)",
+                        LIVE_CAP_MIN_DEBT_USD / 1e3, LIVE_CAP_REFRESH_SEC)
+    except Exception:
+        log.exception("live-cap вотчер не стартовал (опционален, статик-капы в силе)")
     if getattr(cfg, "predict_shadow", False):
         # PREDICT-слой (порт Katana v5), SHADOW: Binance WS + anchor/return-движок меряет lead/FP
         # на живом потоке (PREDICT-строки в лог), НИЧЕГО не стреляет и fire-путь не трогает.

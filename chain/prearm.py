@@ -69,14 +69,16 @@ def prearm_clear() -> None:      # тестовый/аварийный сбро�
 
 def routed_at_size(coll: str, loan: str, seized: int) -> bool:
     """True = прямой роут ЕСТЬ и фактический сейз влезает в его кап (греть Kyber незачем).
-    С PREARM_CAP_AWARE=0 — старая бинарная семантика «роут есть» без учёта max_in."""
-    from chain.execute import _SWAP_ROUTES
+    С PREARM_CAP_AWARE=0 — старая бинарная семантика «роут есть» без учёта max_in.
+    04.08: кап ЖИВОЙ (route_max_in = замер глубины с TTL, фолбэк статик) — сегодняшний пул
+    до 260 weETH покрывает сейз 168, которому статик 160 навязал бы Kyber-прогрев."""
+    from chain.execute import _SWAP_ROUTES, route_max_in
     r = _SWAP_ROUTES.get((coll.lower(), loan.lower()))
     if r is None:
         return False
     if not PREARM_CAP_AWARE:
         return True
-    cap = r.get("max_in")
+    cap = route_max_in(coll, loan)
     return cap is None or int(seized) <= int(cap)
 
 
@@ -175,6 +177,17 @@ class PreArmWorker:
                     tgt = (self._read_fn or self._read_target)(mid, b)
                     if tgt is None:
                         continue
+                    # 04.08 live-cap: горячее окно = самое время перемерить глубину капнутого
+                    # роута цели (rate-limit внутри maybe_refresh). Свежий кап может вернуть
+                    # цель прямому пулу (routed=True) — тогда Kyber-прогрев не нужен.
+                    try:
+                        from chain.route_depth import maybe_refresh
+                        if maybe_refresh(self.rpc, tgt["coll"], tgt["loan"],
+                                         log_fn=self._log) is not None:
+                            tgt["routed"] = routed_at_size(tgt["coll"], tgt["loan"],
+                                                           tgt["seized"])
+                    except Exception:
+                        pass                     # замер опционален, прогрев важнее
                     fl_max = float(getattr(self.cfg, "fast_lane_max_repaid_usd", 500000.0) or 500000.0)
                     if tgt["routed"] and d < fl_max:
                         continue                     # direct_swap и так 0 RTT — греть нечего

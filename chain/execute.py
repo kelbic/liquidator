@@ -661,6 +661,48 @@ for _coll, _fee in UNIV3_PATHS.items():   # существующие UniV3-пу�
 ROUTE_COLLATERALS = {c for (c, _l) in _SWAP_ROUTES}   # scope слоя 2 (кэш позиций) и fast-lane
 
 
+# --- LIVE-CAP (04.08, weETH tail): ёмкость тонких CL-пулов ПОДВИЖНА (ts=1 weETH/WETH:
+# 24.07 обрыв 210 weETH, утром того же дня ~100, 04.08 обрыв ~300 при liq 5.66e24 vs
+# 2.23e24). Статик max_in ошибается в ОБЕ стороны: занижен — жир уходит Kyber-block-loop'ом
+# (0.4-0.9с RTT в гонке; сегодня seize 168 weETH > статик 160 при плоском пуле до 260),
+# завышен — сайз бьёт в осушенный пул. Живой замер (chain/route_depth) кладёт сюда
+# переопределение с TTL; протухло/выключено — статик. Откат ROUTE_LIVE_CAP=0. ---
+ROUTE_LIVE_CAP = os.environ.get("ROUTE_LIVE_CAP", "1").lower() not in ("0", "false", "no")
+LIVE_CAP_TTL_SEC = float(os.environ.get("LIVE_CAP_TTL_SEC", "600"))
+LIVE_CAP_GROW_MAX = float(os.environ.get("LIVE_CAP_GROW_MAX", "2.0"))  # рост капа: x от статик
+_LIVE_CAPS_LOCK = threading.Lock()
+_LIVE_CAPS: dict = {}    # (tin_lower, tout_lower) -> (cap_wei, expires_monotonic)
+
+
+def set_live_cap(token_in, token_out, cap_wei, now=None):
+    """Живой кап от замера глубины. Рост ограничен LIVE_CAP_GROW_MAX*статик (кривая квота не
+    надует кап), спад не ограничен вплоть до 0 (осушенный пул -> Kyber). Роут без статик-капа
+    замеру не подлежит — вызов игнорируется. Возвращает применённый кап или None."""
+    key = (token_in.lower(), token_out.lower())
+    r = _SWAP_ROUTES.get(key)
+    if r is None or r.get("max_in") is None:
+        return None
+    cap = min(int(cap_wei), int(r["max_in"] * LIVE_CAP_GROW_MAX))
+    with _LIVE_CAPS_LOCK:
+        _LIVE_CAPS[key] = (cap, (time.monotonic() if now is None else now) + LIVE_CAP_TTL_SEC)
+    return cap
+
+
+def _effective_cap(key, now=None):
+    """Кап роута с учётом live-переопределения. Чтение без лока (GIL-атомарный dict.get —
+    горячий путь проб/fast-lane не должен спорить за лок вотчера)."""
+    r = _SWAP_ROUTES.get(key)
+    if r is None:
+        return None
+    static = r.get("max_in")
+    if static is None or not ROUTE_LIVE_CAP:
+        return static
+    e = _LIVE_CAPS.get(key)
+    if e is not None and (time.monotonic() if now is None else now) < e[1]:
+        return e[0]
+    return static
+
+
 def direct_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_assets, slippage_bps=100):
     """Drop-in for kyber_swap на прямых маршрутах, NO in-race quote. P1-8 fix: token_out ЧЕСТНЫЙ
     ключ маршрута (раньше univ3_swap хардкодил USDC-выход — для EURC-рынка контракт получил бы
@@ -673,7 +715,8 @@ def direct_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_ass
     # пер-роутный кап (24.07): выше ёмкости одиночного пула (обрыв слиппажа) отдаём None ->
     # caller падает на Kyber-агрегат (глубже, но серверный RTT — уже НЕ fast-lane). Защищает
     # wstETH/weETH от исполнения мега-сайза в тонкий пул. Кап в единицах token_in.
-    _cap = r.get("max_in")
+    # 04.08: кап живой (_effective_cap) — свежий замер глубины важнее статик-константы.
+    _cap = _effective_cap((token_in.lower(), token_out.lower()))
     if _cap is not None and int(amount_in) > int(_cap):
         return None
     if r["style"] == "v1":     # Slipstream: v1-форма с deadline
@@ -692,10 +735,10 @@ def univ3_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_asse
 
 
 def route_max_in(token_in, token_out):
-    """Ёмкость прямого роута в единицах token_in: max_in, либо None (нет роута/роут без капа).
-    Потребители — дробление spec-fire и fast-lane (01.08): сейз сверх капа режется до пула."""
-    r = _SWAP_ROUTES.get((token_in.lower(), token_out.lower()))
-    return None if r is None else r.get("max_in")
+    """Ёмкость прямого роута в единицах token_in: живой кап (замер глубины, TTL) либо статик
+    max_in, либо None (нет роута/роут без капа). Потребители — дробление spec-fire и fast-lane
+    (01.08): сейз сверх капа режется до пула; prearm cap-aware (04.08)."""
+    return _effective_cap((token_in.lower(), token_out.lower()))
 
 
 _PARTIAL_HEADROOM_PCT = int(os.environ.get("SPEC_FIRE_PARTIAL_HEADROOM_PCT", "95"))
