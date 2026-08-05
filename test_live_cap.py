@@ -277,4 +277,19 @@ assert _sent11 and ex._effective_cap(KEY) == 240 * 10**18             # без �
 sfl_mod.SPEC_FIRE_REBUILD_SEC = _rb
 print("OK 11: spec-fire — резерв один раз на жертву, release при пересборке, Kyber без списания")
 
+# ---- 12) У10 (ревью 05.08): ОДИНОЧНАЯ 222-цель против реального капа 80 (доска 05.08),
+#          не только каскад: ломоть в пул + consume + хвост в Kyber-прогрев ----
+_LIVE_CAPS.clear()
+set_live_cap(_WEETH, _UNIV3_WETH, 80 * 10**18)
+seize222 = int(222.4 * 10**18)
+assert direct_swap(_WEETH, _UNIV3_WETH, seize222, SND, RCP, repaid_assets=1) is None   # полный не лезет
+sp = partial_shares_for_cap(1000, seize222, route_max_in(_WEETH, _UNIV3_WETH))
+assert 0 < sp <= 1000 * (80 * 95 // 100) // 222, sp                   # ломоть ~34% позиции
+sl = seize222 * sp // 1000
+assert direct_swap(_WEETH, _UNIV3_WETH, sl, SND, RCP, repaid_assets=1) is not None     # ломоть в пул
+nc = ex.consume_live_cap(_WEETH, _UNIV3_WETH, sl)
+assert nc is not None and nc < 10 * 10**18, nc                        # остаток < хедрума
+assert pa.routed_at_size(_WEETH, _UNIV3_WETH, seize222) is False      # хвост греется Kyber'ом
+print("OK 12: У10 — одиночная 222-цель: ломоть 76 в пул, consume, хвост Kyber")
+
 print("\nВСЕ БЛОКИ LIVE-CAP: OK")

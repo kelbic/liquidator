@@ -678,6 +678,10 @@ _CACHE_REFRESH_MIN_INTERVAL = float(os.environ.get("POSITION_CACHE_MIN_INTERVAL_
 # главный рычаг (lead med 67с = 2 цикла прогрева до транзита). Откат: QUIET=0 (одна скорость).
 _CACHE_QUIET_INTERVAL = float(os.environ.get("POSITION_CACHE_QUIET_INTERVAL_SEC", "120"))
 _CACHE_BOOST_UNTIL = 0.0
+# ревью 05.08 (а): в predict-armed окне кэш = боевые данные (sizing fast-lane) — буст-циклы
+# едут на боевом ключе (Alchemy №2, 429=0), штиль остаётся на bg (там кэш = резерв-слой,
+# ошибки терпимы). Нагрузка на боевой: ~22 вызова/30с ТОЛЬКО в окнах. Откат =0 — всё на bg.
+_CACHE_COMBAT_BOOST = os.environ.get("POSITION_CACHE_COMBAT_RPC", "1").lower() not in ("0", "false", "no")
 
 
 def cache_boost(sec: float = 90.0):
@@ -686,7 +690,7 @@ def cache_boost(sec: float = 90.0):
     _CACHE_BOOST_UNTIL = max(_CACHE_BOOST_UNTIL, time.monotonic() + sec)
 
 
-def _spawn_cache_refresh(*, cache_rpc, shared, bn):
+def _spawn_cache_refresh(*, cache_rpc, shared, bn, combat_rpc=None):
     """Re-entrancy guard for the Layer-2 driver (plan #3). The driver used to be spawned as a NEW
     thread EVERY block while one cycle takes 1.9-2.4s ~= block time: any RTT degradation =>
     overlapping cycles => thread pile-up => self-load on the battle preconf exactly at cascade
@@ -714,9 +718,13 @@ def _spawn_cache_refresh(*, cache_rpc, shared, bn):
             _CACHE_SKIP_N = 0
             _CACHE_SKIP_LOG_TS = now
         return
+    _use_rpc = cache_rpc                          # ревью 05.08 (а): буст-цикл -> боевой ключ
+    if (_CACHE_COMBAT_BOOST and combat_rpc is not None
+            and time.monotonic() < _CACHE_BOOST_UNTIL):
+        _use_rpc = combat_rpc
     _CACHE_REFRESH_STARTED = time.monotonic()
     _CACHE_REFRESH_THREAD = threading.Thread(target=_refresh_position_caches, daemon=True,
-                                             kwargs=dict(cache_rpc=cache_rpc, shared=shared, bn=bn))
+                                             kwargs=dict(cache_rpc=_use_rpc, shared=shared, bn=bn))
     _CACHE_REFRESH_THREAD.start()
 
 
@@ -1769,7 +1777,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         # Layer 2, measurement phase (C temporary — see STATE.md): fills _POSITION_CACHE +
                         # logs refresh-miss/cycle timing. Does NOT touch reads_fn — read_positions_cached
                         # is not wired into _process_transmit yet, so this has zero effect on hot-path behavior.
-                        _spawn_cache_refresh(cache_rpc=_bg_rpc, shared=shared, bn=bn)   # фоновый рефреш -> бесплатный bg-RPC (CU-замер 25.07)
+                        _spawn_cache_refresh(cache_rpc=_bg_rpc, shared=shared, bn=bn,   # штиль -> bg-RPC (CU-замер 25.07);
+                                             combat_rpc=rpc)                            # буст-окно -> боевой (ревью 05.08 (а))
                     idx = d.get("index"); txs = extract_txs(d); now = time.time()
                     for _raw, _to in txs:                        # SHADOW слоя 1: декод transmit из фида (log-only)
                         if _raw and FORWARD_SEL in _raw:

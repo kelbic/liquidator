@@ -67,23 +67,33 @@ def measure_route_cap(rpc, token_in, token_out, batch_fn=None, log_fn=None):
              % (token_in[:8], token_out[:8], type(e).__name__))
         return None
     ok0, d0 = res[0]
-    if not ok0 or len(d0) < 32:
+    rungs = []           # сырая лестница для SHRINK-телеметрии (ревью 05.08: спор «80 vs 300»
+    if not ok0 or len(d0) < 32:                        # решается в секунду сырыми ступенями)
         cap = 0          # базовая квота ревертнула: пул мёртв -> прямой роут закрыт, Kyber
+        rungs.append("base:REV")
     else:
         base = int.from_bytes(d0[:32], "big") / sizes[0]
         cap = 0
         for (ok, d), s in zip(res[1:], sizes[1:]):
             if not ok or len(d) < 32:
+                rungs.append("%.6g:REV" % (s / 1e18))
                 break                                  # реверт ступени = данные: дальше хуже
             ratio = int.from_bytes(d[:32], "big") / s
-            if base <= 0 or (1.0 - ratio / base) * 100.0 > LIVE_CAP_MAX_IMPACT_PCT:
+            imp = (1.0 - ratio / base) * 100.0 if base > 0 else 100.0
+            rungs.append("%.6g:%.2f%%" % (s / 1e18, imp))
+            if base <= 0 or imp > LIVE_CAP_MAX_IMPACT_PCT:
                 break                                  # AMM-импакт монотонен по размеру
             cap = s
         if cap == 0:
             cap = static // 10   # даже 0.25x не тянет: крошечный прямой сайз, остальное Kyber
+    from chain.execute import _effective_cap
+    prev = _effective_cap((token_in.lower(), token_out.lower()))
     eff = set_live_cap(token_in, token_out, cap)
     _log("LIVECAP %s->%s: static=%d live=%s (x%.2f)"
          % (token_in[:8], token_out[:8], static, eff, (eff or 0) / static))
+    if prev and eff is not None and eff * 2 <= prev:   # сжатие >=x2 — сырые ступени в журнал
+        _log("LIVECAP SHRINK %s->%s: %d -> %d, ступени=[%s]"
+             % (token_in[:8], token_out[:8], prev, eff, " ".join(rungs)))
     return eff
 
 

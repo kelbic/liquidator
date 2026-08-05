@@ -471,38 +471,62 @@ _FLASHBLOCK_FALLBACK_AFTER = 3   # consecutive flashblocks failures (no blocks) 
 _FB_AUTO_RETURN = os.environ.get("FLASHBLOCK_AUTO_RETURN", "1").lower() not in ("0", "false", "no")
 _FB_RETRY_SEC = float(os.environ.get("FLASHBLOCK_RETRY_SEC", "600"))
 _FB_RETRY_MAX_SEC = float(os.environ.get("FLASHBLOCK_RETRY_MAX_SEC", "3600"))
+_FB_STABLE_SEC = float(os.environ.get("FLASHBLOCK_STABLE_SEC", "30"))
 
 
 class FbAutoReturn:
     """Проба возврата на flashblocks из newHeads-фолбэка. Проба = штатный connect-путь петли
     с fails=AFTER-1: одна неудача -> немедленный тихий откат на newHeads (без TG — человек тут
-    не действует), следующая проба по x2-бэкоффу 600с..3600с; успех (первый блок) сбрасывает."""
-    def __init__(self, base=None, cap=None, enabled=None):
+    не действует), следующая проба по x2-бэкоффу 600с..3600с. Гистерезис (ревью 05.08): успех
+    объявляется только после stable_sec НЕПРЕРЫВНОГО потока блоков — хлопающий источник не
+    спамит TG и не сбрасывает бэкофф. Счётчики fallback/restore — в лог-строки эпизодов."""
+    def __init__(self, base=None, cap=None, enabled=None, stable_sec=None):
         self.base = _FB_RETRY_SEC if base is None else base
         self.cap = _FB_RETRY_MAX_SEC if cap is None else cap
         self.enabled = _FB_AUTO_RETURN if enabled is None else enabled
+        self.stable_sec = _FB_STABLE_SEC if stable_sec is None else stable_sec
         self.delay = self.base
         self.next_at = None        # None = не в фолбэке, проб нет
         self.probing = False
+        self.first_blk_ts = None   # первый блок текущей пробы (отсчёт стабилизации)
+        self.n_fallbacks = 0
+        self.n_restores = 0
 
     def on_fallback(self, now):
         """Настоящий фолбэк (не проба): новый эпизод, таймер с базы."""
+        self.n_fallbacks += 1
         self.delay = self.base
         self.next_at = now + self.delay
         self.probing = False
+        self.first_blk_ts = None
 
     def due(self, now):
         return bool(self.enabled and self.next_at is not None and now >= self.next_at)
 
     def on_probe(self, now):
         self.probing = True
+        self.first_blk_ts = None
         self.delay = min(self.delay * 2, self.cap)
         self.next_at = now + self.delay
+
+    def on_block(self, now):
+        """Блок пришёл во время пробы. True = поток стабилен stable_sec -> возврат состоялся."""
+        if not self.probing:
+            return False
+        if self.first_blk_ts is None:
+            self.first_blk_ts = now
+            return False
+        if now - self.first_blk_ts >= self.stable_sec:
+            self.n_restores += 1
+            self.on_success()
+            return True
+        return False
 
     def on_success(self):
         self.delay = self.base
         self.next_at = None
         self.probing = False
+        self.first_blk_ts = None
 # TG-гигиена 07-10 (решение владельца): одиночный ws-обрыв block-лупа самолечится за 3с и является
 # фоном Base-эндпоинта (~раз в 1-3ч) — БОЛЬШЕ НЕ ПЕЙДЖИТ, только журнал. TG получает СЕРИЮ
 # (флаппинг: >=_RECON_SERIES_N за окно — эндпоинт болен, но до fallback не дошло) и сам fallback
@@ -814,12 +838,18 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
             async with websockets.connect(url, **conn_kw) as ws:
                 log.info("block source=%s connected — loop (mode=%s)", active, cfg.mode)
                 async for blk in gen(ws):
-                    fails = 0   # blocks are flowing on this source
-                    if fbret.probing and active == "flashblocks":
-                        fbret.on_success()
-                        log.info("flashblocks auto-return: источник ВЕРНУЛСЯ (newHeads -> flashblocks)")
-                        alerter.send_async("\U00002705 flashblocks восстановлен (авто-возврат)",
-                                           key="fbreturn")
+                    # Гистерезис пробы (05.08): до подтверждённой стабильности fails НЕ сбрасываем —
+                    # хлопающий источник (аптайм < stable_sec) валится в тихий probe-fail с бэкоффом,
+                    # а не в пинг-понг 3с-реконнектов (урок 07-21: per-IP лимит flashblocks).
+                    if not fbret.probing:
+                        fails = 0   # blocks are flowing on this source
+                    elif active == "flashblocks" and fbret.on_block(time.monotonic()):
+                        fails = 0
+                        log.info("flashblocks auto-return: источник ВЕРНУЛСЯ, стабилен %.0fс "
+                                 "(fallback#%d restore#%d)", fbret.stable_sec,
+                                 fbret.n_fallbacks, fbret.n_restores)
+                        alerter.send_async("\U00002705 flashblocks восстановлен (авто-возврат, "
+                                           "стабилен %.0fс)" % fbret.stable_sec, key="fbreturn")
                     if _assess_async:
                         if _offer_latest(_assess_q, blk):
                             _skip_n += 1
@@ -849,7 +879,8 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                  max(0.0, fbret.next_at - time.monotonic()))
                     else:                        # настоящий фолбэк: TG + старт таймера проб
                         fbret.on_fallback(time.monotonic())
-                        log.error("flashblocks feed unstable — FALLING BACK to newHeads")
+                        log.error("flashblocks feed unstable — FALLING BACK to newHeads "
+                                  "(fallback#%d restore#%d)", fbret.n_fallbacks, fbret.n_restores)
                         alerter.send_async("\U0001F504 flashblocks -> newHeads fallback", key="fbfallback")
             await asyncio.sleep(3)
 

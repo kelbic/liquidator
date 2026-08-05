@@ -69,4 +69,22 @@ hp._CACHE_QUIET_INTERVAL = _q
 hp._CACHE_BOOST_UNTIL = 0.0
 print("OK 6: откат QUIET=0 — прежний одноcкоростной каденс")
 
+# ---- 7) гистерезис (ревью 05.08): успех только после stable_sec потока; хлопающий источник
+#         не объявляет возврат и не сбрасывает бэкофф; счётчики fallback/restore ----
+fbh = FbAutoReturn(base=600.0, cap=3600.0, enabled=True, stable_sec=30.0)
+fbh.on_fallback(0.0)
+assert fbh.n_fallbacks == 1
+fbh.on_probe(600.0)
+assert fbh.on_block(700.0) is False        # первый блок — старт отсчёта, не успех
+assert fbh.on_block(720.0) is False        # 20с < 30с
+assert fbh.on_block(731.0) is True         # стабилен 31с — возврат состоялся
+assert fbh.n_restores == 1 and not fbh.probing and fbh.next_at is None and fbh.delay == 600.0
+fbh.on_fallback(1000.0)
+fbh.on_probe(1600.0)
+assert fbh.on_block(1700.0) is False and fbh.on_block(1720.0) is False
+fbh.probing = False                        # петля: обрыв до stable -> тихий probe-fail
+assert fbh.n_restores == 1 and fbh.n_fallbacks == 2   # restore НЕ засчитан
+assert fbh.due(1600.0 + fbh.delay)         # следующая проба строго по бэкоффу
+print("OK 7: гистерезис 30с + счётчики (хлоп не считается возвратом)")
+
 print("\nВСЕ БЛОКИ FB-AUTO-RETURN/BG-CU: OK")
