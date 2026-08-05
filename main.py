@@ -577,9 +577,15 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
     import websockets
     _bg_read_rpc = rpc                            # ассессмент читаем с бесплатного bg-RPC (CU 25.07)
     try:
-        _u = str(getattr(cfg, "bg_rpc_url", "") or "")
+        # 05.08 страйп: массовая нога (ассессмент ×96/окно + route-depth) едет на ключ №2,
+        # чтобы её квота-шторм не топил триггерную ногу (preconf/predict/кэш на ключе №1).
+        # Пусто => ключ №1 (прежнее поведение). Откат: BG_RPC_URL_2= (пусто).
+        _u = str(getattr(cfg, "bg_rpc_url2", "") or "") or str(getattr(cfg, "bg_rpc_url", "") or "")
         if _u and _u != cfg.rpc_url:
             _bg_read_rpc = BaseRpc(_u, cfg.chain_id, request_timeout=10)
+            if getattr(cfg, "bg_rpc_url2", ""):
+                log.info("bg-страйп: ассессмент+route-depth -> ключ №2 (%s…)",
+                         _u.split("//")[-1].split("/")[0])
     except Exception:
         _bg_read_rpc = rpc
     shared = _Shared(markets)

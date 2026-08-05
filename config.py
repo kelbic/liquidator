@@ -85,6 +85,12 @@ class Config:
     # при его отказе вызыватели штатно падают на RPC_URL (поведение как раньше, только дороже).
     # Пусто => RPC_URL (прежнее поведение). Откат: BG_RPC_URL= (пусто).
     bg_rpc_url: str = "https://mainnet.base.org"
+    # 05.08 страйп bg-ключей (условие (в) ревью): ВТОРАЯ нога фоновых чтений. Забирает МАССУ —
+    # block-loop ассессмент (доминанта ×96/окно ≈ половина bg-CU) + вотчер глубины роутов; на
+    # первой ноге остаются триггер-критичные preconf-цены, predict-полл и штиль-кэш позиций —
+    # ключ-квота массы больше не топит детект. Пусто => всё на bg_rpc_url (прежнее поведение).
+    # Откат: BG_RPC_URL_2= (пусто).
+    bg_rpc_url2: str = ""
     preconf_rpc: str = "https://mainnet-preconf.base.org"   # pre-confirmed price source for the hot path
     sequencer_rpc: str = "https://mainnet-sequencer.base.org"  # SEND-3: параллельный raw-broadcast; "off" = выкл
     candidates_snapshot_path: str = "candidates_snapshot.json"  # warm-start: последний candidate set (P0-1)
@@ -164,6 +170,7 @@ class Config:
             canary_min_interval_sec=f("CANARY_MIN_INTERVAL_SEC", d.canary_min_interval_sec),
             canary_max_gas_usd=f("CANARY_MAX_GAS_USD", d.canary_max_gas_usd),
             bg_rpc_url=s("BG_RPC_URL", d.bg_rpc_url),
+            bg_rpc_url2=s("BG_RPC_URL_2", d.bg_rpc_url2),
             preconf_rpc=s("PRECONF_RPC", d.preconf_rpc),
             sequencer_rpc=s("SEQUENCER_RPC", d.sequencer_rpc),
             candidates_snapshot_path=s("CANDIDATES_SNAPSHOT_PATH", d.candidates_snapshot_path),

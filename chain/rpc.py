@@ -36,6 +36,14 @@ def _caller_tag() -> str:
 def rpc_usage_note(method: str, url: str = ""):
     import os as _os
     host = (url.split("//")[-1].split("/")[0] or "?") if url else "?"
+    # 05.08 страйп bg-ключей: два ключа на одном хосте (lb.drpc.live) сливались в одну CU-строку —
+    # различаем стабильным crc-тегом пути (сам ключ в лог НЕ попадает). Alchemy-алерт ниже матчится
+    # подстрокой ("alchemy" in host) — тег его не ломает.
+    if url:
+        _path = url.split("//")[-1].split("/", 1)
+        if len(_path) > 1 and _path[1].strip("/"):
+            import zlib as _zlib
+            host = "%s#%04x" % (host, _zlib.crc32(_path[1].encode()) & 0xffff)
     key = method
     if (_os.environ.get("CU_ATTRIBUTION") or "").lower() in ("1", "true", "yes", "on"):
         try:
