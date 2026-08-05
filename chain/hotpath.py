@@ -1555,7 +1555,9 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
         if _bg_url and _bg_url != cfg.rpc_url:
             from chain.rpc import BaseRpc as _BR
             _bg_rpc = _BR(_bg_url, cfg.chain_id, request_timeout=10)
-            log.info("фоновые чтения -> %s (Alchemy остаётся денежному пути)", _bg_url)
+            # 05.08: только хост — полный URL нёс ключ в журнал (гигиена ключей, как crc-тег CU)
+            log.info("фоновые чтения -> %s… (Alchemy остаётся денежному пути)",
+                     _bg_url.split("//")[-1].split("/")[0])
     except Exception:
         _bg_rpc = rpc
 
