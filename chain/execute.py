@@ -741,6 +741,55 @@ def route_max_in(token_in, token_out):
     return _effective_cap((token_in.lower(), token_out.lower()))
 
 
+# consume-хук (05.08): списание на ОТПРАВКЕ, не на стройке — пробы строятся спекулятивно
+# на кэше 2.5с. Сим каскада 04.08: A=222.4 и B=167.9 оба строились по полному капу 240 ->
+# tx B ревертит по minOut в осушенном A пуле (в батче = реверт юнита). Реверт нашей tx
+# недооценивает кап до ближайшего замера вотчера (<=120с на капнутых парах с долгом) или
+# TTL — консервативно. Откат LIVE_CAP_CONSUME=0.
+LIVE_CAP_CONSUME = os.environ.get("LIVE_CAP_CONSUME", "1").lower() not in ("0", "false", "no")
+
+
+def consume_live_cap(token_in, token_out, amount_in, now=None):
+    """Списать отправленный direct-сайз из живого капа: следующая стройка видит остаток пула.
+    База = текущий эффективный кап (живой либо статик); срок — существующий TTL живой записи
+    либо новый LIVE_CAP_TTL_SEC. Возвращает новый кап или None (нет капнутого роута/выключено)."""
+    if not (ROUTE_LIVE_CAP and LIVE_CAP_CONSUME):
+        return None
+    key = (token_in.lower(), token_out.lower())
+    r = _SWAP_ROUTES.get(key)
+    if r is None or r.get("max_in") is None:
+        return None
+    _now = time.monotonic() if now is None else now
+    with _LIVE_CAPS_LOCK:
+        cur = _effective_cap(key, now=_now)
+        e = _LIVE_CAPS.get(key)
+        exp = e[1] if (e is not None and e[1] > _now) else _now + LIVE_CAP_TTL_SEC
+        new = max(0, int(cur) - int(amount_in))
+        _LIVE_CAPS[key] = (new, exp)
+    return new
+
+
+def release_live_cap(token_in, token_out, amount_in, now=None):
+    """Вернуть СВОЙ резерв перед пересборкой той же цели (spec-fire: healthy-реверты пул не
+    трогают — свой расход не должен резать свой же сайз до партиала). Ограничен той же
+    границей LIVE_CAP_GROW_MAX*статик, что и замер; протухшая/перезаписанная замером запись
+    возврату не подлежит (замер = истина). Возвращает новый кап или None (no-op)."""
+    if not (ROUTE_LIVE_CAP and LIVE_CAP_CONSUME):
+        return None
+    key = (token_in.lower(), token_out.lower())
+    r = _SWAP_ROUTES.get(key)
+    if r is None or r.get("max_in") is None:
+        return None
+    _now = time.monotonic() if now is None else now
+    with _LIVE_CAPS_LOCK:
+        e = _LIVE_CAPS.get(key)
+        if e is None or e[1] <= _now:
+            return None
+        new = min(int(e[0]) + int(amount_in), int(r["max_in"] * LIVE_CAP_GROW_MAX))
+        _LIVE_CAPS[key] = (new, e[1])
+    return new
+
+
 _PARTIAL_HEADROOM_PCT = int(os.environ.get("SPEC_FIRE_PARTIAL_HEADROOM_PCT", "95"))
 
 
@@ -1662,6 +1711,14 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
             _LOCAL_NONCE[bot] = base_nonce + len(sent)
     if sent:                                                 # фоновая сверка nonce с RPC (вне лока)
         threading.Thread(target=_reconcile_nonce, args=(w3, bot), daemon=True).start()
+    for _unit, _h in sent:                                   # consume-хук (05.08): отправленный direct-сайз
+        for _mid, _b, _p in _unit:                           # списывает живой кап — следующая стройка видит
+            _sm = _p.get("swap_meta")                        # остаток пула, а не полный кап
+            if _sm:
+                _nc = consume_live_cap(_sm[0], _sm[1], _sm[2])
+                if _nc is not None and log:
+                    log.info("LIVECAP consume %s->%s: -%d -> %d (dispatch %s/%s)",
+                             _sm[0][:8], _sm[1][:8], _sm[2], _nc, _mid[:10], _b[:10])
 
     if not wait_receipts:
         _inflight_add(-len(sent))    # -1 на tx (юнит); receipts не отслеживаются -> не копим фантомный inflight

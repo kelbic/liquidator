@@ -242,12 +242,15 @@ class SpecFireLive:
               "irm": irm, "lltv": lltv_wad}
         fl_max = float(getattr(self.cfg, "fast_lane_max_repaid_usd", 500000.0) or 500000.0)
         swap = None
+        swap_meta = None                          # consume-хук (05.08): только direct-сайз списывает кап
         if debt_usd >= fl_max:                    # мега: обрыв одиночного пула -> сперва PREARM (Kyber)
             hit = prearm_get(coll, loan, int(seized))
             if hit is not None:
                 swap = hit["swap"]
         if swap is None:
             swap = direct_swap(coll, loan, seized, liq, liq, repaid_assets=repaid_assets)
+            if swap is not None:
+                swap_meta = (coll, loan, int(seized))
         if swap is None:
             hit = prearm_get(coll, loan, int(seized))
             swap = hit["swap"] if hit is not None else None
@@ -263,12 +266,44 @@ class SpecFireLive:
                     self._log("SPECFIRE probe partial %s/%s: сейз %d > кап %d — режем до "
                               "%d shares" % (mid[:10], borrower[:10], seized, cap, sp))
                     repaid_shares, repaid_assets, seized, swap = sp, ap, zp, sw
+                    swap_meta = (coll, loan, int(zp))
         if swap is None:
             return None                           # ни роута, ни прогретой квоты — пробу НЕ строим
         min_profit = int(repaid_assets) * SPEC_FIRE_MIN_PROFIT_BPS // 10000
         calldata = encode_liquidate(mp, borrower, repaid_shares, swap["router"],
                                     swap["calldata"], min_profit)
-        return {"calldata": calldata, "gas": int(self.cfg.gas_limit_est * 125 // 100)}
+        return {"calldata": calldata, "gas": int(self.cfg.gas_limit_est * 125 // 100),
+                "swap_meta": swap_meta}
+
+    def _consume_cap(self, spent, key, probe):
+        """Consume-хук (05.08): ПЕРВАЯ успешная отправка цели списывает её direct-сайз из
+        живого капа — резерв «для других» строек (сим каскада 04.08: B ревертил minOut в
+        осушенном A пуле). Повторные пробы той же цели не списывают повторно: healthy-реверты
+        пул не трогают, а плотный каденс 0.5с обрушил бы кап в ноль за секунды."""
+        try:
+            sm = probe.get("swap_meta") if isinstance(probe, dict) else None
+            if not sm or key in spent:
+                return
+            from chain.execute import consume_live_cap
+            nc = consume_live_cap(sm[0], sm[1], sm[2])
+            if nc is not None:
+                spent[key] = sm
+                self._log("SPECFIRE LIVECAP consume %s->%s: -%d -> %d (%s/%s)" % (
+                    sm[0][:8], sm[1][:8], sm[2], nc, key[0][:10], key[1][:10]))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _release_cap(spent, key):
+        """Возврат своего резерва перед пересборкой той же цели: свой расход не должен резать
+        свой же сайз до партиала. После отправки новой пробы резерв берётся заново."""
+        res = spent.pop(key, None)
+        if res is not None:
+            try:
+                from chain.execute import release_live_cap
+                release_live_cap(*res)
+            except Exception:
+                pass
 
     def _send(self, calldata, gas):
         from chain.execute import send_spec_fire_probe
@@ -394,6 +429,7 @@ class SpecFireLive:
         last_fire = 0.0
         last_hold_log = 0.0
         cache = {}      # (mid, b) -> (probe|None, built_ts): кэш пробы, см. SPEC_FIRE_REBUILD_SEC
+        cap_spent: dict = {}   # (mid, b) -> swap_meta: свой резерв живого капа (consume-хук 05.08)
         dead = set()    # LOSS-стоп: цели, разобранные конкурентом/погашенные (bs==0 на пересборке)
         nobuild: dict = {}   # фолбэк (01.08): (mid, b) -> ts, до которого цель не пересобираем
         owed_until = 0.0     # peak-owed: до какого момента транзит «заряжен» (0 = долга нет)
@@ -413,12 +449,14 @@ class SpecFireLive:
                     try:
                         probe, _bts = cache.get((_pm, _pb), (None, 0.0))
                         if not isinstance(probe, dict):
+                            self._release_cap(cap_spent, (_pm, _pb))
                             probe = (self._build_fn or self._build)(_pm, _pb, _pd)
                             if isinstance(probe, dict):
                                 cache[(_pm, _pb)] = (probe, self._now())
                         if isinstance(probe, dict):
                             h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
                             if h is not None:
+                                self._consume_cap(cap_spent, (_pm, _pb), probe)
                                 probes += 1
                                 self.stats["probes"] += 1
                                 self.stats["pending_fires"] += 1
@@ -519,6 +557,7 @@ class SpecFireLive:
                         try:
                             probe, built_ts = cache.get((mid, b), (None, 0.0))
                             if probe is None or _t - built_ts >= SPEC_FIRE_REBUILD_SEC:
+                                self._release_cap(cap_spent, (mid, b))
                                 probe = (self._build_fn or self._build)(mid, b, d)
                                 if probe == "gone":   # LOSS-стоп (ревью 31.07): жертву разобрали —
                                     dead.add((mid, b))    # кап не догорает ревертами по мёртвой цели
@@ -535,6 +574,7 @@ class SpecFireLive:
                             if probe is not None:
                                 h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
                                 if h is not None:
+                                    self._consume_cap(cap_spent, (mid, b), probe)
                                     probes += 1
                                     self.stats["probes"] += 1
                                     last_fire = self._now()

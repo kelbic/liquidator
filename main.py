@@ -464,6 +464,45 @@ def _hot_subset(groups, hf_cache):
 
 _FLASHBLOCK_URL = "wss://mainnet.flashblocks.base.org/ws"
 _FLASHBLOCK_FALLBACK_AFTER = 3   # consecutive flashblocks failures (no blocks) -> fall back to newHeads
+# 05.08: фолбэк был ОДНОСТОРОННИМ до рестарта — после шторма бот жил на newHeads (~2.1с медленнее
+# реакции), пока человек не рестартовал в тихое окно (04.08: 2 часа на newHeads). Авто-возврат =
+# периодическая проба flashblocks; бэкофф щедрый (урок 07-21: фиксированные 3с реконнекта на
+# per-IP лимите flashblocks = самоподдерживающийся 429-шторм на час). Откат FLASHBLOCK_AUTO_RETURN=0.
+_FB_AUTO_RETURN = os.environ.get("FLASHBLOCK_AUTO_RETURN", "1").lower() not in ("0", "false", "no")
+_FB_RETRY_SEC = float(os.environ.get("FLASHBLOCK_RETRY_SEC", "600"))
+_FB_RETRY_MAX_SEC = float(os.environ.get("FLASHBLOCK_RETRY_MAX_SEC", "3600"))
+
+
+class FbAutoReturn:
+    """Проба возврата на flashblocks из newHeads-фолбэка. Проба = штатный connect-путь петли
+    с fails=AFTER-1: одна неудача -> немедленный тихий откат на newHeads (без TG — человек тут
+    не действует), следующая проба по x2-бэкоффу 600с..3600с; успех (первый блок) сбрасывает."""
+    def __init__(self, base=None, cap=None, enabled=None):
+        self.base = _FB_RETRY_SEC if base is None else base
+        self.cap = _FB_RETRY_MAX_SEC if cap is None else cap
+        self.enabled = _FB_AUTO_RETURN if enabled is None else enabled
+        self.delay = self.base
+        self.next_at = None        # None = не в фолбэке, проб нет
+        self.probing = False
+
+    def on_fallback(self, now):
+        """Настоящий фолбэк (не проба): новый эпизод, таймер с базы."""
+        self.delay = self.base
+        self.next_at = now + self.delay
+        self.probing = False
+
+    def due(self, now):
+        return bool(self.enabled and self.next_at is not None and now >= self.next_at)
+
+    def on_probe(self, now):
+        self.probing = True
+        self.delay = min(self.delay * 2, self.cap)
+        self.next_at = now + self.delay
+
+    def on_success(self):
+        self.delay = self.base
+        self.next_at = None
+        self.probing = False
 # TG-гигиена 07-10 (решение владельца): одиночный ws-обрыв block-лупа самолечится за 3с и является
 # фоном Base-эндпоинта (~раз в 1-3ч) — БОЛЬШЕ НЕ ПЕЙДЖИТ, только журнал. TG получает СЕРИЮ
 # (флаппинг: >=_RECON_SERIES_N за окно — эндпоинт болен, но до fallback не дошло) и сам fallback
@@ -670,8 +709,11 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                 _h(ev)
                             except Exception:
                                 log.exception("predict on_event handler упал (изолирован)")
+                # 05.08 bg-CU: полл latestRoundData 2с -> 4с (~11M CU/мес с bg-ключа; confirmed-
+                # метка грубеет на ±2с при lead med 67с — незаметно). Откат PREDICT_POLL_SEC=2.
                 drv = PredictDriver(engine, mid_fn=pf.mid, poll_fn=make_poll_fn(_bg, proxies),
                                     on_event=_on_event,
+                                    poll_interval=float(os.environ.get("PREDICT_POLL_SEC", "4.0")),
                                     log=lambda m: log.info("%s", m))
                 drv.start()
                 log.warning("PREDICT SHADOW ENABLED — %d feeds (%s), меряет lead/FP, не стреляет",
@@ -758,13 +800,26 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
     active = cfg.block_source if cfg.block_source in ("flashblocks", "newheads") else "newheads"
     fails = 0
     recon_ts: list[float] = []   # моменты ws-обрывов для серия-гейта TG (см. _RECON_SERIES_N)
+    fbret = FbAutoReturn()       # авто-возврат flashblocks (05.08)
     while True:
+        if (active == "newheads" and cfg.block_source == "flashblocks"
+                and fbret.due(time.monotonic())):
+            active = "flashblocks"
+            fails = _FLASHBLOCK_FALLBACK_AFTER - 1   # одна неудача пробы -> немедленный откат
+            fbret.on_probe(time.monotonic())
+            log.info("flashblocks auto-return: проба возврата (при неудаче следующая через %.0fс)",
+                     fbret.delay)
         url, conn_kw, gen = _source_params(cfg, active)
         try:
             async with websockets.connect(url, **conn_kw) as ws:
                 log.info("block source=%s connected — loop (mode=%s)", active, cfg.mode)
                 async for blk in gen(ws):
                     fails = 0   # blocks are flowing on this source
+                    if fbret.probing and active == "flashblocks":
+                        fbret.on_success()
+                        log.info("flashblocks auto-return: источник ВЕРНУЛСЯ (newHeads -> flashblocks)")
+                        alerter.send_async("\U00002705 flashblocks восстановлен (авто-возврат)",
+                                           key="fbreturn")
                     if _assess_async:
                         if _offer_latest(_assess_q, blk):
                             _skip_n += 1
@@ -787,8 +842,15 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                 fails += 1
                 if fails >= _FLASHBLOCK_FALLBACK_AFTER:
                     active = "newheads"; fails = 0
-                    log.error("flashblocks feed unstable — FALLING BACK to newHeads")
-                    alerter.send_async("\U0001F504 flashblocks -> newHeads fallback", key="fbfallback")
+                    if fbret.probing:            # неудачная проба возврата — тихо, по бэкоффу
+                        fbret.probing = False
+                        log.info("flashblocks auto-return: не вернулись (%s) — следующая проба "
+                                 "через %.0fс", type(e).__name__,
+                                 max(0.0, fbret.next_at - time.monotonic()))
+                    else:                        # настоящий фолбэк: TG + старт таймера проб
+                        fbret.on_fallback(time.monotonic())
+                        log.error("flashblocks feed unstable — FALLING BACK to newHeads")
+                        alerter.send_async("\U0001F504 flashblocks -> newHeads fallback", key="fbfallback")
             await asyncio.sleep(3)
 
 

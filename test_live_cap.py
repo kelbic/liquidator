@@ -176,4 +176,105 @@ finally:
     rd.maybe_refresh = _orig_mr
 print("OK 8: prearm-окно перемеряет кап и НЕ греет Kyber, когда живой пул покрывает сейз")
 
+# ---- 9) consume/release (05.08): списание на отправке, возврат своего резерва, границы ----
+_LIVE_CAPS.clear()
+set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18, now=1000.0)
+c = ex.consume_live_cap(_WEETH, _UNIV3_WETH, 168 * 10**18, now=1001.0)
+assert c == 72 * 10**18, c                                            # сим 04.08: A ушёл — B видит остаток
+assert ex._effective_cap(KEY, now=1002.0) == 72 * 10**18
+assert ex.consume_live_cap(_WEETH, _UNIV3_WETH, 100 * 10**18, now=1003.0) == 0   # пол = 0
+r = ex.release_live_cap(_WEETH, _UNIV3_WETH, 168 * 10**18, now=1004.0)
+assert r == 168 * 10**18, r                                           # свой резерв вернулся
+assert ex.release_live_cap(_WEETH, _UNIV3_WETH, 10**24, now=1005.0) == int(STATIC * ex.LIVE_CAP_GROW_MAX)
+assert ex._effective_cap(KEY, now=1000.0 + ex.LIVE_CAP_TTL_SEC + 1) == STATIC    # TTL записи сохранён
+_LIVE_CAPS.clear()
+c = ex.consume_live_cap(_WEETH, _UNIV3_WETH, 60 * 10**18, now=2000.0)
+assert c == STATIC - 60 * 10**18, c                                   # база без живой записи = статик
+assert ex.release_live_cap(_WEETH, _UNIV3_WETH, 1, now=2000.0 + ex.LIVE_CAP_TTL_SEC + 1) is None  # протухла
+assert ex.consume_live_cap("0x" + "ab" * 20, _UNIV3_WETH, 1) is None  # нет роута — no-op
+ex.LIVE_CAP_CONSUME = False
+assert ex.consume_live_cap(_WEETH, _UNIV3_WETH, 1) is None            # откат LIVE_CAP_CONSUME=0
+ex.LIVE_CAP_CONSUME = True
+print("OK 9: consume/release — списание/возврат/границы/откат")
+
+# ---- 10) dispatch_liquidations списывает swap_meta отправленных юнитов; dedup не двоит ----
+from eth_account import Account
+_LIVE_CAPS.clear()
+ex._RECENT_SENDS.clear()
+set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18)
+_key10 = "0x" + "11" * 32
+_bot10 = Account.from_key(_key10).address
+ex._LOCAL_NONCE[_bot10] = 7
+_w3s = types.SimpleNamespace(eth=types.SimpleNamespace(account=Account,
+                                                       get_transaction_count=lambda *a, **k: 7))
+_rpc10 = types.SimpleNamespace(_web3=lambda: _w3s)
+_cfg10 = types.SimpleNamespace(wallet_key=_key10, tip_gwei=0.05, sequencer_rpc="",
+                               batch_liquidate=False, liquidator_address="0x" + "33" * 20)
+_sent10 = []
+def _send10(rpc, key, tx, **kw):
+    _sent10.append(tx)
+    return {"hash": "0x" + "aa" * 32}
+_prep10 = {"ok": True, "calldata": "0x", "net_usd": 1.0,
+           "swap_meta": (_WEETH, _UNIV3_WETH, 168 * 10**18)}
+res10 = ex.dispatch_liquidations(_rpc10, _cfg10, [("0xm1", "0xb1", _prep10)],
+                                 send_fn=_send10, wait_receipts=False)
+assert len(_sent10) == 1 and res10 and res10[0]["sent"]
+assert ex._effective_cap(KEY) == 72 * 10**18                          # расход на отправке
+res10b = ex.dispatch_liquidations(_rpc10, _cfg10, [("0xm1", "0xb1", _prep10)],
+                                  send_fn=_send10, wait_receipts=False)
+assert len(_sent10) == 1 and not res10b[0]["sent"]                    # dedup: без второй отправки
+assert ex._effective_cap(KEY) == 72 * 10**18                          # и без второго списания
+ex._RECENT_SENDS.clear()
+print("OK 10: dispatch — consume отправленного юнита, dedup не двоит")
+
+# ---- 11) spec-fire окно: резерв один раз на жертву; release перед пересборкой (не копит);
+#          проба без swap_meta капа не трогает ----
+import chain.spec_fire_live as sfl_mod
+from chain.spec_fire_live import SpecFireLive
+sfl_mod.SPEC_FIRE_PEAK_OWED = False
+_rb = sfl_mod.SPEC_FIRE_REBUILD_SEC
+sfl_mod.SPEC_FIRE_REBUILD_SEC = 0.0            # пересборка каждый тик => release+consume каждый раз
+_LIVE_CAPS.clear()
+set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18)
+_logs11: list = []
+_sent11: list = []
+_shared11 = types.SimpleNamespace(
+    lock=threading.Lock(), groups={"0xbtc": ["0xFAT"]},
+    debt_by={("0xbtc", "0xFAT"): 1_500_000.0},
+    by_id={"0xbtc": types.SimpleNamespace(collateral_token="cbBTC", loan_token="USDC")})
+_cfg11 = types.SimpleNamespace(liquidator_address="0xLIQ", gas_limit_est=500_000, tip_gwei=0.05,
+                               sequencer_rpc="https://seq", eth_price_usd=1730.0,
+                               fast_lane_max_repaid_usd=500_000.0)
+def _build11(mid, b, d):
+    return {"calldata": "0xdead", "gas": 625_000,
+            "swap_meta": (_WEETH, _UNIV3_WETH, 168 * 10**18)}
+def _send11(calldata, gas):
+    _sent11.append(calldata)
+    return "0xh%d" % len(_sent11)
+sf11 = SpecFireLive(rpc=None, cfg=_cfg11, shared=_shared11, ret_fn=lambda lbl: -0.0011,
+                    dev_by={"BTC": 0.0010}, build_fn=_build11, send_fn=_send11,
+                    receipt_fn=lambda h: (0, 0.011), log_fn=_logs11.append)
+sf11.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(1.4)
+sf11.handle_event({"event": "disarm", "feed": "BTC"})
+time.sleep(0.3)
+_ncons = sum(1 for m in _logs11 if "LIVECAP consume" in m)
+assert len(_sent11) >= 2, _sent11                                     # плотный каденс: >=2 пробы
+assert _ncons == len(_sent11), (_ncons, len(_sent11), _logs11)        # release перед КАЖДОЙ пересборкой
+assert ex._effective_cap(KEY) == 72 * 10**18                          # ...а списание нетто ОДНО
+_LIVE_CAPS.clear()
+set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18)
+_sent11.clear()
+sf11b = SpecFireLive(rpc=None, cfg=_cfg11, shared=_shared11, ret_fn=lambda lbl: -0.0011,
+                     dev_by={"BTC": 0.0010},
+                     build_fn=lambda m, b, d: {"calldata": "0x", "gas": 1},   # Kyber/prearm: без меты
+                     send_fn=_send11, receipt_fn=lambda h: (0, 0.011), log_fn=_logs11.append)
+sf11b.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.9)
+sf11b.handle_event({"event": "disarm", "feed": "BTC"})
+time.sleep(0.3)
+assert _sent11 and ex._effective_cap(KEY) == 240 * 10**18             # без меты кап не тронут
+sfl_mod.SPEC_FIRE_REBUILD_SEC = _rb
+print("OK 11: spec-fire — резерв один раз на жертву, release при пересборке, Kyber без списания")
+
 print("\nВСЕ БЛОКИ LIVE-CAP: OK")

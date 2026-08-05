@@ -671,6 +671,19 @@ _CACHE_SKIP_LOG_TS = 0.0
 # кэша (POSITIONS_FROM_CACHE=1) при stale-записи дочитывает живьём (см. read_positions_cached),
 # так что редкий refresh НЕ теряет жертв. 0 = старое поведение (каждый блок).
 _CACHE_REFRESH_MIN_INTERVAL = float(os.environ.get("POSITION_CACHE_MIN_INTERVAL_SEC", "30"))
+# 05.08 bg-CU: цикл 30с×22 рынка = ~40M CU/мес на bg-ключе — главный кормилец собственного
+# 429-шторма, при том что записи живут до 6с (раздача), а цикл 30с -> хит-рейт <=20%: в штиль
+# это резерв-слой (stale-фолбэк при live-fail), не ускоритель. Двухскоростной каденс: штиль =
+# QUIET (120с), predict-armed окно (prearm жив) = боевой MIN (30с) через cache_boost() — PRE-ARM
+# главный рычаг (lead med 67с = 2 цикла прогрева до транзита). Откат: QUIET=0 (одна скорость).
+_CACHE_QUIET_INTERVAL = float(os.environ.get("POSITION_CACHE_QUIET_INTERVAL_SEC", "120"))
+_CACHE_BOOST_UNTIL = 0.0
+
+
+def cache_boost(sec: float = 90.0):
+    """Продлить боевой каденс кэша позиций (зовёт prearm-окно каждый проход, ~5с)."""
+    global _CACHE_BOOST_UNTIL
+    _CACHE_BOOST_UNTIL = max(_CACHE_BOOST_UNTIL, time.monotonic() + sec)
 
 
 def _spawn_cache_refresh(*, cache_rpc, shared, bn):
@@ -685,8 +698,11 @@ def _spawn_cache_refresh(*, cache_rpc, shared, bn):
     from chain.failover import bg_shed
     if bg_shed():
         return                                    # бой уехал на ключ bg — фон уступает (ревью 02.08, усл.3)
-    if (_CACHE_REFRESH_MIN_INTERVAL > 0 and _CACHE_REFRESH_STARTED
-            and time.monotonic() - _CACHE_REFRESH_STARTED < _CACHE_REFRESH_MIN_INTERVAL):
+    _iv = _CACHE_REFRESH_MIN_INTERVAL             # двухскоростной каденс (05.08): штиль -> QUIET
+    if _CACHE_QUIET_INTERVAL > _iv and time.monotonic() >= _CACHE_BOOST_UNTIL:
+        _iv = _CACHE_QUIET_INTERVAL
+    if (_iv > 0 and _CACHE_REFRESH_STARTED
+            and time.monotonic() - _CACHE_REFRESH_STARTED < _iv):
         return                                    # интервал-гейт (см. _CACHE_REFRESH_MIN_INTERVAL): тихий skip
     t = _CACHE_REFRESH_THREAD
     if t is not None and t.is_alive():
@@ -985,6 +1001,8 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         from chain.execute import swap_plan
         swap_token, swap_amount, unwrap = swap_plan(rpc, coll, seized)
         swap = direct_swap(swap_token, loan, swap_amount, liq, liq, repaid_assets=repaid_assets)
+        # consume-хук (05.08): метаданные direct-сайза для списания живого капа на отправке
+        _swap_meta = (swap_token, loan, int(swap_amount)) if swap is not None else None
         if swap is None:                       # market outside direct routes -> Kyber fallback (unchanged)
             swap = kyber_swap(swap_token, loan, swap_amount, liq, liq, slippage_bps=slippage_bps)
 
@@ -1049,7 +1067,7 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
                  # сырые компоненты для batch-энкодера + debt для per-item USD в receipt-цикле (prep["calldata"] = одиночный вызов)
                  "mp": mp, "borrower": borrower, "repaid_shares": repaid_shares, "swap_target": swap["router"],
                  "swap_calldata": swap["calldata"], "min_profit": min_profit_final, "debt_usd": debt_usd,
-                 "debt_assets": debt_assets, "unwrap_target": unwrap}
+                 "debt_assets": debt_assets, "unwrap_target": unwrap, "swap_meta": _swap_meta}
         _fb = _fresh_basefee()
         if _fb is not None:                                   # SEND-2: fee из fb-хедера (0 Alchemy-RTT в send)
             _tip = int(dynamic_tip_gwei(cfg, debt_usd) * 1e9)   # каскадная страховка по призу
@@ -1126,9 +1144,11 @@ def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asse
                            int(getattr(cfg, "gas_limit_floor", 3_000_000) or 3_000_000)),
                 "net_usd": net_usd, "profit_usd": profit_usd, "cost_usd": cost_usd,
                 "max_fee": _fb * 2 + _tip, "tip": _tip, "fast": True,
-                # сырые компоненты для batch-энкодера + debt для per-item USD в receipt-цикле
+                # сырые компоненты для batch-энкодера + debt для per-item USD в receipt-цикле;
+                # swap_meta — direct-сайз для consume-хука живого капа (fast-lane всегда direct)
                 "mp": mp, "borrower": borrower, "repaid_shares": repaid_shares, "swap_target": swap["router"],
-                "swap_calldata": swap["calldata"], "min_profit": min_profit, "debt_usd": debt_usd, "debt_assets": debt_assets}
+                "swap_calldata": swap["calldata"], "min_profit": min_profit, "debt_usd": debt_usd,
+                "debt_assets": debt_assets, "swap_meta": (coll, loan, int(seized))}
     except Exception as e:
         return {"ok": False, "reason": f"fast error: {type(e).__name__}: {str(e)[:80]}"}
 

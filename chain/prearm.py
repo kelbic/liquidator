@@ -170,6 +170,11 @@ class PreArmWorker:
         warms = 0
         while not stop.is_set() and warms < PREARM_MAX_WARMS:
             t0 = time.monotonic()
+            try:                                 # 05.08 bg-CU: predict-armed окно -> кэш позиций
+                from chain.hotpath import cache_boost   # на боевом каденсе (lead med 67с = 2 цикла
+                cache_boost()                    # прогрева до транзита), в штиль цикл разрежен
+            except Exception:
+                pass
             for mid, b, d in self._pick(feed, direction):
                 if stop.is_set() or warms >= PREARM_MAX_WARMS:
                     break
