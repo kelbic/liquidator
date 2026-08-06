@@ -64,6 +64,14 @@ SPEC_FIRE_TIP_CAP_GWEI = float(os.environ.get("SPEC_FIRE_TIP_CAP_GWEI", "0.1"))
 # пробы по K самым жирным досягаемым целям (плотность НА ЦЕЛЬ делится на K — включать только
 # когда плотность на top-1 доказала себя).
 SPEC_FIRE_TOPK = max(1, int(os.environ.get("SPEC_FIRE_TOPK", "1")))
+# EDGE-СЛОТ («го» kelbic 06.08, проигранная гонка №2 cbXRP 05.08): все 119 проб плотного
+# режима легли в top-1-ПО-ДОЛГУ ($33k, dist 0.63%), а флипнулась БЛИЖАЙШАЯ-по-dist мелочь
+# ($1.5k, 0 проб) — победитель взял её в блоке флипа (idx=4729), хотя наши пробы сидели
+# ГЛУБЖЕ в предочереди (idx 1-3). Ранг по долгу максимизирует размер приза, но P(флип)
+# максимальна у кромки: ближайшая-по-dist досягаемая цель получает ГАРАНТИРОВАННЫЙ слот в
+# ротации (head = top-K по долгу + edge; плотность на цель делится, 4 пробы/блок хватает
+# на двоих). Откат SPEC_FIRE_EDGE_SLOT=0 = прежний чистый ранг по долгу.
+SPEC_FIRE_EDGE_SLOT = os.environ.get("SPEC_FIRE_EDGE_SLOT", "1").lower() not in ("0", "false", "no")
 SPEC_FIRE_RECEIPT_POLL_SEC = float(os.environ.get("SPEC_FIRE_RECEIPT_POLL_SEC", "1.0"))
 # ФОЛБЭК ЦЕЛИ (01.08, ревью гонки cbDOGE): топ-цель «нет свопа» монополизировала тик —
 # $4.1k-жертва в досягаемости И в капе пула не получила НИ ОДНОЙ пробы за три окна
@@ -344,10 +352,13 @@ class SpecFireLive:
     # на HF-1). Применяется ТОЛЬКО в момент огня — арм окна без гейта, иначе в настоящий
     # каскад окно не запустится вовсе (на арме ret всегда мал по построению).
     def _top_fat(self, feed: str, direction: str, max_dist=None, k=1):
-        """-> (top-k список [(mid, b, debt)] по долгу, hold_dist) — hold_dist = ближайшая
-        отсечённая гейтом цель. Пустой список = досягаемого жира нет."""
+        """-> (top-k список [(mid, b, debt)] по долгу, hold_dist, edge) — hold_dist =
+        ближайшая отсечённая гейтом цель; edge = ближайшая-по-dist ДОСЯГАЕМАЯ цель
+        (кандидат edge-слота ротации; None = dist ни у кого не вычислим). Пустой
+        список = досягаемого жира нет."""
         elig = []
         hold_dist = None
+        edge_d, edge_t = None, None
         with self.shared.lock:
             groups = dict(self.shared.groups)
             debt_by = dict(self.shared.debt_by)
@@ -365,6 +376,7 @@ class SpecFireLive:
                 d = float(debt_by.get((mid, b), 0.0) or 0.0)
                 if d < SPEC_FIRE_MIN_REPAID_USD:
                     continue
+                dist = None
                 if max_dist is not None:
                     hf = float(hf_by.get((mid, b), 0.0) or 0.0)
                     if hf > 1.0:                  # HF неизвестен/битый -> fail-open
@@ -373,9 +385,13 @@ class SpecFireLive:
                             if hold_dist is None or dist < hold_dist:
                                 hold_dist = dist
                             continue
+                    elif 0.0 < hf <= 1.0:         # уже за флипом — ближе кромки не бывает
+                        dist = 0.0
                 elig.append((mid, b, d))
+                if dist is not None and (edge_d is None or dist < edge_d):
+                    edge_d, edge_t = dist, (mid, b, d)
         elig.sort(key=lambda t: -t[2])
-        return elig[:k], hold_dist
+        return elig[:k], hold_dist, edge_t
 
     def _prio_ok(self, feed: str, claim: float) -> bool:
         """Пакет B (B1): True = слот наш — нет более богатой СВЕЖЕЙ заявки другого окна.
@@ -519,9 +535,15 @@ class SpecFireLive:
                     _eff_r = max(abs(r or 0.0), owed_ret if owed_fire else 0.0)
                     reach = _eff_r + SPEC_FIRE_DIST_MARGIN_DEVS * dev   # в долге меряем по пику
                     _depth = max(SPEC_FIRE_TOPK, SPEC_FIRE_FALLBACK_DEPTH if SPEC_FIRE_BUILD_FALLBACK else 0)
-                    tgts, hold_dist = self._top_fat(feed, direction, max_dist=reach, k=_depth)
+                    tgts, hold_dist, edge = self._top_fat(feed, direction, max_dist=reach, k=_depth)
+                    if not SPEC_FIRE_EDGE_SLOT:
+                        edge = None
                     if dead:
                         tgts = [t for t in tgts if (t[0], t[1]) not in dead]
+                        if edge is not None and (edge[0], edge[1]) in dead:
+                            edge = None
+                    if not tgts and edge is not None:
+                        tgts = [edge]              # весь top-K мёртв, кромка жива — окно держит её
                     if not tgts:
                         if hold_dist is None:
                             break                              # жир ушёл из набора — окно нам не нужно
@@ -545,10 +567,15 @@ class SpecFireLive:
                         stop.wait(SPEC_FIRE_POLL_SEC)
                         continue
                     # плотность ротируется по top-K как раньше; хвост списка — ТОЛЬКО фолбэк
-                    # на небилдящиеся (01.08: топ-цель «нет свопа» не должна монополизировать тик)
+                    # на небилдящиеся (01.08: топ-цель «нет свопа» не должна монополизировать тик).
+                    # edge-слот (06.08): ближайшая-по-dist цель входит в head наравне с жиром
                     head = tgts[:SPEC_FIRE_TOPK]
+                    tail = tgts[SPEC_FIRE_TOPK:]
+                    if edge is not None and all(t[:2] != edge[:2] for t in head):
+                        head = head + [edge]
+                        tail = [t for t in tail if t[:2] != edge[:2]]
                     _rot = probes % len(head)
-                    order = head[_rot:] + head[:_rot] + tgts[SPEC_FIRE_TOPK:]
+                    order = head[_rot:] + head[:_rot] + tail
                     sent = False
                     for mid, b, d in order:
                         _t = self._now()
@@ -586,6 +613,8 @@ class SpecFireLive:
                                         self.stats["owed_probes"] += 1
                                         _om = " [owed пик=%.2f%% ещё %.0fс]" % (
                                             owed_ret * 100.0, max(0.0, owed_until - self._now()))
+                                    if edge is not None and (mid, b) == (edge[0], edge[1]):
+                                        _om += " [edge]"       # проба edge-слота (кромка по dist)
                                     self._log("SPECFIRE probe #%d feed=%s %s/%s debt=$%.0fk ret=%.4f%%%s tx=%s" % (
                                         probes, feed, mid[:10], b[:10], d / 1e3, (r or 0) * 100.0, _om, h))
                                     threading.Thread(target=self._collect, args=(h, mid, b, d, feed),
@@ -624,7 +653,7 @@ class SpecFireLive:
                 direction = ev.get("dir") or "down"
                 if self._now() < self._cooldown_until:     # WIN-пауза: приз взят, паттерн не палим
                     return None
-                best, hold_dist = self._top_fat(feed, direction, max_dist=SPEC_FIRE_ARM_MAX_DIST)
+                best, hold_dist, _ = self._top_fat(feed, direction, max_dist=SPEC_FIRE_ARM_MAX_DIST)
                 if not best:
                     if hold_dist is not None:              # жир есть, но заведомо вне окна — не палим
                         _n = self._now()                   # ни петлю, ни ончейн-паттерн
