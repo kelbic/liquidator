@@ -43,6 +43,12 @@ INCLUDE_MARKETS = frozenset({
     # HF<=1.15 в кандидат-сет (фоновый CU). ОБЯЗАН быть и в MEGA_MARKETS (morpho.py) —
     # без bounded-фетча пагинация роняет candidate refresh (инцидент WETH 27.07).
     "0xd4a903dc6d949519060c7707f9604fdc9772c046e05c2e3a8fce0bd7196e4109",   # cbXRP/USDC $34.6M
+    # USDe/USDC («го» владельца 06.08): книга $293M, 130 позиций (киты, НЕ мега по пагинации),
+    # утилизация 92%, APR 6.4% и растёт — таймер-класс с дозаправкой; ближайший кит $20M на
+    # HF 1.0053, ETA ~30 дн чистого начисления. LLTV 0.915 -> бонус 2.617%. Выход USDe->USDC
+    # замерен Kyber 06.08: $1M = 0.13% импакта, обрыв между $1M и $5M — жатва срезами ~$1M
+    # (SPEC_FIRE_PARTIAL/live-cap режут сейз под ёмкость). usde-watch (Вена) пасёт ETA/APR.
+    "0x54cf9be57fdfa6457a660991907434ff9d295c465a603a50126ff647d50b7354",   # USDe/USDC $293M
 })
 # collateral our swap venue (KyberSwap) cannot exit -> liquidation would revert; don't waste a slot.
 # Pendle PT tokens trade on Pendle's own AMM, not the DEXs Kyber aggregates.

@@ -88,6 +88,21 @@ PRECONF_REACTIVE_QUIET = float(os.environ.get("PRECONF_REACTIVE_QUIET_SEC", "1.2
 # прямого роута раньше ронял fast в Kyber-block-loop (+0.4-0.9с, протухшая квота = panic) —
 # теперь режем repaid_shares до ёмкости пула, fast остаётся 0 RTT. Откат REACTIVE_PARTIAL=0.
 REACTIVE_PARTIAL = os.environ.get("REACTIVE_PARTIAL", "1").lower() not in ("0", "false", "no")
+# Хедж preconf-СИМА (06.08, prep=1 13:30:56): 429/таймаут preconf в горячие секунды транзита —
+# транспортный отказ, не он-чейн вердикт, а skip терял жертву (взял конкурент). Путь ЦЕНЫ
+# хеджирован дочиткой с 23.07 — сим получает тот же паттерн: одиночный ретрай через
+# confirmed-rpc (block=latest; после транзита confirmed уже видит флип). Откат HOT_SIM_CONFIRMED_RETRY=0.
+HOT_SIM_CONFIRMED_RETRY = os.environ.get("HOT_SIM_CONFIRMED_RETRY", "1").lower() not in ("0", "false", "no")
+_SIM_TRANSPORT_MARKS = ("429", "Too Many Requests", "timed out", "timeout", "Connection",
+                        "Max retries", "502", "503", "504")
+
+
+def _sim_transport_err(err: str) -> bool:
+    """Транспортная ошибка сима (не реверт контракта) -> кандидат на дочитку confirmed."""
+    e = err or ""
+    return any(m in e for m in _SIM_TRANSPORT_MARKS)
+
+
 _PRECONF_BUDGET_LOCK = threading.Lock()
 _PRECONF_LAST_REACTIVE = -1e9
 _PRECONF_LAST_POLL = -1e9
@@ -1036,6 +1051,10 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
             _est_thread = threading.Thread(target=_do_estimate, daemon=True)
             _est_thread.start()
         sim = simulate_tx(preconf_rpc, liq, bot, cd0, block="pending")        # (2) preconf-pending gate
+        if not sim["ok"] and HOT_SIM_CONFIRMED_RETRY and _sim_transport_err(str(sim.get("error") or "")):
+            log.info("HOT sim-хедж %s/%s: транспорт preconf (%s) — дочитка confirmed",
+                     market_id[:10], borrower[:10], str(sim.get("error"))[:60])
+            sim = simulate_tx(rpc, liq, bot, cd0, block="latest")
         if not sim["ok"]:
             # DIAG: логируем ВСЕ sim-revert'ы (не только Panic/seized) с бакетом причины + calldata+блок для форка.
             try:
