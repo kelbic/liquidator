@@ -36,6 +36,24 @@ FEEDS_BASE: dict = {
     "XRPUSDT":  {"label": "XRP",  "dev": 0.0050, "collateral": "cbXRP"},
     "SOLUSDT":  {"label": "SOL",  "dev": 0.0050, "collateral": "SOL"},
 }
+# Порог арма = arm_ratio × dev. ДЕФОЛТ 0.9 = прежнее поведение бит-в-бит.
+# ЗАМЕР 06.08 (14 дней журнала, каскад cbXRP 23:35): у альтов dev=0.5% ⇒ арм 0.45%, зазор до
+# РЕАЛЬНОГО триггера оракула (замерен на чейне: раунды 2929-2932 дали −0.50/−0.55/−0.52%)
+# всего 0.05пп — меньше базис-шума «оракул vs Binance-mid» (в том каскаде 0.07пп: наш ret
+# −0.4319% против оракульных −0.5010%). Итог: транзит фаерит, пока окно НЕ армлено.
+# Неармленных push с |ret|>=0.30%: альты 152 за 14д (ADA 47, XRP 31, SOL 31, DOGE 23, LTC 20)
+# против BTC 2 и ETH 3 — у BTC/ETH (dev 0.1/0.15%) зазор велик, калибровка здорова.
+# Снижение ratio для альтов = решение владельца (fire-policy): армы бесплатны, но открывают
+# окна для платных проб; расход по-прежнему держат fire-гейт и суточный бакет.
+_ARM_RATIO_DEFAULT = float(os.environ.get("PREDICT_ARM_RATIO", "0.9"))
+_DISARM_RATIO = float(os.environ.get("PREDICT_DISARM_RATIO", "0.7"))
+
+
+def _arm_ratio(label: str) -> float:
+    """Пер-фидовый переопределяемый коэффициент арма: PREDICT_ARM_RATIO_XRP=0.65 и т.п."""
+    return float(os.environ.get(f"PREDICT_ARM_RATIO_{(label or '').upper()}", _ARM_RATIO_DEFAULT))
+
+
 HOLD_SEC = 600.0        # falsepos-кап: релиз таймером только если цена отклонена, а пуша всё нет
 MID_STALE_SEC = float(os.environ.get("PREDICT_MID_STALE_SEC", "30.0"))
 # бэкофф полла агрегаторов при серии отказов (шторм 30.07): после AFTER подряд — 5с*2^n, кап 30с
@@ -143,8 +161,12 @@ class PredictEngine:
         self.feeds: dict = {}
         for sym, row in (feeds_cfg or FEEDS_BASE).items():
             dev = float(row["dev"])
+            arm_pct = dev * _arm_ratio(row["label"])
+            # Гистерезис обязан пережить любой arm_ratio: при arm_ratio 0.65 фиксированный
+            # disarm 0.7×dev оказался бы ВЫШЕ арма — окно армилось бы и гасло на одном тике.
+            disarm_pct = min(dev * _DISARM_RATIO, arm_pct * 0.85)
             self.feeds[sym.upper()] = Feed(sym.upper(), row["label"],
-                                           arm_pct=dev * 0.9, disarm_pct=dev * 0.7)
+                                           arm_pct=arm_pct, disarm_pct=disarm_pct)
 
     def ret(self, symbol: str):
         f = self.feeds.get(symbol.upper())
