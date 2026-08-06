@@ -77,13 +77,28 @@ RET["v"] = -0.0011                        # пробили dev вниз
 time.sleep(1.2)
 sf.handle_event({"event": "push", "feed": "BTC"})
 n1 = len(sent)
-assert 1 <= n1 <= 4, sent                 # плотный каденс 0.5±0.15: за ~1.2с 2-3 пробы
-print("UNIT_OK: до dev тишина, после dev плотные пробы (n=%d за 1.2с)" % n1)
+# EV-плотность (06.08): жир $1.5M в фикстуре -> каденс 0.12±0.04, квант петли 0.15с -> ~8 проб
+assert 5 <= n1 <= 12, sent
+print("UNIT_OK: до dev тишина, после dev EV-плотные пробы (n=%d за 1.2с)" % n1)
 
 # 3) push стопит окно; новых проб нет
 time.sleep(0.6)
 assert len(sent) == n1
 print("UNIT_OK: push останавливает огонь")
+
+# 3b) EV-плотность off -> штатный DENSE-каденс 0.5±0.15 (за ~1.2с 2-3 пробы)
+sfl_mod.SPEC_FIRE_EV_DENSITY = False
+sent.clear(); RET["v"] = -0.0005
+sf_ev = make()
+sf_ev.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.3)
+RET["v"] = -0.0011
+time.sleep(1.2)
+sf_ev.handle_event({"event": "push", "feed": "BTC"})
+n_off = len(sent)
+assert 1 <= n_off <= 4, sent
+sfl_mod.SPEC_FIRE_EV_DENSITY = True
+print("UNIT_OK: откат SPEC_FIRE_EV_DENSITY=0 -> штатный каденс (n=%d за 1.2с)" % n_off)
 
 # 4) dir=up не стреляет на ret<0 (направление сверяется)
 sent.clear(); RET["v"] = -0.002
@@ -93,7 +108,7 @@ sf.handle_event({"event": "disarm", "feed": "BTC"})
 assert not sent
 print("UNIT_OK: направление окна сверяется со знаком ret")
 
-# 5) кап проб на окно (плотный режим, пол интервала 0.25с)
+# 5) кап проб на окно (плотный режим, пол интервала 0.25с; EV-режим гасим — его кап в 5b)
 sent.clear(); RET["v"] = -0.005
 old_cap = sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW
 sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW = 2
@@ -101,6 +116,7 @@ old_div = sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC
 old_dj = sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC
 sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC = 0.05      # пол max(0.25, ...) удержит 0.25
 sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC = 0.0
+sfl_mod.SPEC_FIRE_EV_DENSITY = False
 sf3 = make()
 sf3.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
 time.sleep(0.8)
@@ -109,7 +125,20 @@ assert len(sent) == 2, sent
 sfl_mod.SPEC_FIRE_MAX_PROBES_WINDOW = old_cap
 sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC = old_div
 sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC = old_dj
+sfl_mod.SPEC_FIRE_EV_DENSITY = True
 print("UNIT_OK: кап проб/окно соблюдён (и пол интервала 0.25с в плотном режиме)")
+
+# 5b) EV-кап (06.08): жир в окне -> кап = SPEC_FIRE_FAT_CAP, каденс жирный
+sent.clear(); RET["v"] = -0.005
+old_fcap = sfl_mod.SPEC_FIRE_FAT_CAP
+sfl_mod.SPEC_FIRE_FAT_CAP = 3
+sf3b = make()
+sf3b.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
+time.sleep(0.8)
+sf3b.handle_event({"event": "disarm", "feed": "BTC"})
+assert len(sent) == 3, sent
+sfl_mod.SPEC_FIRE_FAT_CAP = old_fcap
+print("UNIT_OK: EV-кап жирного окна соблюдён (FAT_CAP)")
 
 # 6) WIN: receipt status=1 -> _RECENT_SENDS маркирован; revert -> НЕ маркирован
 ex._RECENT_SENDS.clear()

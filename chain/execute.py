@@ -311,7 +311,9 @@ _SPECFIRE_DAY = int(time.time() // 86400)   # UTC-день бакета: сут�
                                             # к вечернему каскаду волатильного дня бакет пуст)
 # 31.07, решение владельца: сэкономленное на сплющенной tip-лестнице — в бюджет проб
 # ($10 -> $20 = ~9 плотных окон/сутки; всё ещё 4% дневного газ-лимита $500)
-_SPECFIRE_MAX_GAS_USD = float(os.environ.get("SPEC_FIRE_MAX_GAS_USD", "20"))
+# 06.08 EV-плотность («го» kelbic): жирное окно (каденс 0.12с, кап 600) жжёт до ~$9 —
+# $40 держит 4 жирных + штатные, 8% дневного газ-лимита. Откат: SPEC_FIRE_MAX_GAS_USD=20.
+_SPECFIRE_MAX_GAS_USD = float(os.environ.get("SPEC_FIRE_MAX_GAS_USD", "40"))
 # КАСКАДНЫЙ ПРОТОКОЛ БАКЕТА (ревью 31.07): в каскадный день armed-окна идут сериями и штатный
 # бакет сгорает к полудню — вечером самого дорогого дня слой стоит без патронов. При детекте
 # каскада (спам армов, см. spec_fire_live) бакет поднимается до CASCADE_GAS_USD на TTL; TTL
@@ -319,7 +321,9 @@ _SPECFIRE_MAX_GAS_USD = float(os.environ.get("SPEC_FIRE_MAX_GAS_USD", "20"))
 # 0 = протокол НЕ подписан владельцем -> бустер мёртв (капитал — только решением владельца).
 _SPECFIRE_CASCADE_GAS_USD = float(os.environ.get("SPEC_FIRE_CASCADE_GAS_USD", "0"))
 _SPECFIRE_CASCADE_UNTIL = 0.0
-_SPECFIRE_MIN_INTERVAL = float(os.environ.get("SPEC_FIRE_MIN_INTERVAL_SEC", "0.25"))
+# Пол — анти-раннауэй, не бюджет: расход держит бакет выше. 0.25 -> 0.10 (06.08):
+# EV-каденс жирных окон 0.12с обязан проходить. Откат: SPEC_FIRE_MIN_INTERVAL_SEC=0.25.
+_SPECFIRE_MIN_INTERVAL = float(os.environ.get("SPEC_FIRE_MIN_INTERVAL_SEC", "0.10"))
 
 
 def specfire_cascade_boost(ttl_sec: float = 3600.0, now=None):

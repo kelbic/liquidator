@@ -48,6 +48,37 @@ SPEC_FIRE_DENSE_JITTER_SEC = float(os.environ.get("SPEC_FIRE_DENSE_JITTER_SEC", 
 # 4+ полных окна, WIN-cooldown (900с) рвёт серию раньше; окно и так стопится на confirmed/disarm.
 SPEC_FIRE_MAX_PROBES_WINDOW = int(os.environ.get("SPEC_FIRE_MAX_PROBES_WINDOW")
                                   or (150 if SPEC_FIRE_DENSE else 24))
+# EV-ПЛОТНОСТЬ (06.08, «го» kelbic; вскрытие $65.6k cbBTC 27.07): победитель держал 10-17
+# проб/блок против наших 4 и взял приз $2,879 пробой idx+8 после транзита; наша реакция
+# (детект суб-блочно, send 510мс) легла ревертом −$6.55 — реакция не бьёт предочередь,
+# место покупает только плотность. Плотность = функция размера добычи: жирная цель
+# (долг >= FAT_DEBT_USD) в досягаемости тика переключает каденс DENSE 0.5с -> 0.12с
+# (квант петли SPEC_FIRE_POLL_SEC=0.15 даёт ~13 проб/блок — паритет с лучшим замеренным
+# конкурентом) и кап окна 150 -> 600 (~90с горячей фазы). Худшее жирное окно 600×$0.015
+# ~= $9 против приза >=$1.5k при долге $50k. Сопряжённо: пол send-слоя 0.25 -> 0.10 и
+# бакет 20 -> 40 (execute.py). Откат: SPEC_FIRE_EV_DENSITY=0 (см. docs/ROLLBACKS.md).
+SPEC_FIRE_EV_DENSITY = os.environ.get("SPEC_FIRE_EV_DENSITY", "1").lower() not in ("0", "false", "no")
+SPEC_FIRE_FAT_DEBT_USD = float(os.environ.get("SPEC_FIRE_FAT_DEBT_USD", "50000"))
+SPEC_FIRE_FAT_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_FAT_INTERVAL_SEC", "0.12"))
+SPEC_FIRE_FAT_JITTER_SEC = float(os.environ.get("SPEC_FIRE_FAT_JITTER_SEC", "0.04"))
+SPEC_FIRE_FAT_CAP = int(os.environ.get("SPEC_FIRE_FAT_CAP", "600"))
+
+
+def _tgts_fat(tgts) -> bool:
+    """Жир в досягаемости тика -> EV-каденс/кап окна."""
+    return SPEC_FIRE_EV_DENSITY and any(t[2] >= SPEC_FIRE_FAT_DEBT_USD for t in tgts)
+
+
+def _window_cap(fat_mode: bool) -> int:
+    return SPEC_FIRE_FAT_CAP if (SPEC_FIRE_EV_DENSITY and fat_mode) else SPEC_FIRE_MAX_PROBES_WINDOW
+
+
+def _dense_interval(fat_mode: bool) -> float:
+    if SPEC_FIRE_EV_DENSITY and fat_mode:
+        _j = SPEC_FIRE_FAT_JITTER_SEC
+        return max(0.10, SPEC_FIRE_FAT_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
+    _j = SPEC_FIRE_DENSE_JITTER_SEC
+    return max(0.25, SPEC_FIRE_DENSE_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
 # КЭШ ПРОБЫ: _build на каждую пробу = 2×aggregate3 + роут — на плотном каденсе это душило бы
 # ядро и RPC (эффект наблюдателя). Позиция/шары за секунды не меняются, плохой филл ревертится
 # min_profit-полом контракта -> собранный calldata переиспользуем REBUILD_SEC.
@@ -492,8 +523,9 @@ class SpecFireLive:
         gaps: list = []      # B3: пробелы проб горячей фазы (p95 в close-строке — метрика-гейт <4с)
         gap_t0 = None
         last_yield_log = 0.0
+        fat_mode = False     # EV-плотность (06.08): жир в досягаемости -> каденс 0.12с, кап 600
         try:
-            while not stop.is_set() and probes < SPEC_FIRE_MAX_PROBES_WINDOW:
+            while not stop.is_set() and probes < _window_cap(fat_mode):
                 pf = self.pending_fire.pop(feed, None)
                 if pf is not None and self._now() - pf[3] <= PENDING_FIRE_FRESH_SEC:
                     # A2: handoff от pending-detect — жертва флипнута в ФОРМИРУЕМОМ блоке.
@@ -556,8 +588,7 @@ class SpecFireLive:
                 elif not hot:
                     gap_t0 = None
                 if SPEC_FIRE_DENSE:                    # вся горячая фаза плотно (гонка плотностей, 31.07)
-                    _j = SPEC_FIRE_DENSE_JITTER_SEC
-                    iv = max(0.25, SPEC_FIRE_DENSE_INTERVAL_SEC + (random.uniform(-_j, _j) if _j > 0 else 0.0))
+                    iv = _dense_interval(fat_mode)     # EV-плотность: жир решает каденс (06.08)
                 elif probes < SPEC_FIRE_BURST_PROBES:
                     iv = SPEC_FIRE_INTERVAL_SEC
                 else:                                  # хвост с джиттером (см. SPEC_FIRE_TAIL_JITTER_SEC)
@@ -582,6 +613,13 @@ class SpecFireLive:
                             edge = None
                     if not tgts and edge is not None:
                         tgts = [edge]              # весь top-K мёртв, кромка жива — окно держит её
+                    _fat_now = _tgts_fat(tgts)
+                    if _fat_now and not fat_mode:
+                        self._log("SPECFIRE ev-density feed=%s: жир $%.0fk в досягаемости — "
+                                  "каденс %.2fс, кап %d" % (
+                                      feed, max(t[2] for t in tgts) / 1e3,
+                                      SPEC_FIRE_FAT_INTERVAL_SEC, SPEC_FIRE_FAT_CAP))
+                    fat_mode = _fat_now
                     if not tgts:
                         if hold_dist is None:
                             break                              # жир ушёл из набора — окно нам не нужно
