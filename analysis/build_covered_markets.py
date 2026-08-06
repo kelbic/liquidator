@@ -49,6 +49,14 @@ INCLUDE_MARKETS = frozenset({
     # замерен Kyber 06.08: $1M = 0.13% импакта, обрыв между $1M и $5M — жатва срезами ~$1M
     # (SPEC_FIRE_PARTIAL/live-cap режут сейз под ёмкость). usde-watch (Вена) пасёт ETA/APR.
     "0x54cf9be57fdfa6457a660991907434ff9d295c465a603a50126ff647d50b7354",   # USDe/USDC $293M
+    # stkWELL/USDC («го» владельца 06.08, префлайт покрытия): книга ~$47k, фронт $20.5k на
+    # HF 1.13, LLTV 0.625 -> бонус 12.68%. Оракул 0xc842d95b…1722 = Chainlink через OEV-враппер
+    # (delay 10с, на замере НИКЕМ не используется) — транзит даёт детерминированную стартовую
+    # линию updatedAt+10с, гонка без предочереди. Гарды префлайта: выход Kyber мерен до ~$30k
+    # (сейзы выше — только срезами SPEC_FIRE_PARTIAL); экономику считать ТОЛЬКО по amountOut
+    # квоты (Kyber-USD у stkWELL врёт в ×26 — minProfit по котировке, не по priceUsd);
+    # УБРАТЬ ИЗ ПОКРЫТИЯ при первом чужом OEV-tx на враппере (значит delay-линию начали жать).
+    "0xb3920b96dec75b6a1144b71f963f30236fb200f3e33e93c2e9c0d222c1fa53c2",   # stkWELL/USDC
 })
 # collateral our swap venue (KyberSwap) cannot exit -> liquidation would revert; don't waste a slot.
 # Pendle PT tokens trade on Pendle's own AMM, not the DEXs Kyber aggregates.
