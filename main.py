@@ -708,6 +708,9 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                         _handlers.append(_sfl.handle_event)
                         from chain.failover import set_windows_probe
                         set_windows_probe(lambda: len(_sfl._windows))   # назад-свитч не посреди окна
+                        # WS-handoff (06.08): транзит из recv-петли -> pending_fire армленному окну
+                        from chain.hotpath import set_ws_transmit_hook
+                        set_ws_transmit_hook(_sfl.note_ws_transmit)
                         # PENDING-DETECT (пакет A, 04.08): детект транзитов по формируемому блоку
                         # на ОТДЕЛЬНОМ бесключевом провайдере; handoff в окно атомарным флагом.
                         try:

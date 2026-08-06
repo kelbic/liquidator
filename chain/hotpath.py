@@ -400,6 +400,20 @@ def cascade_active(now=None):
         return now < _CASCADE_UNTIL
 
 
+# ---- WS-handoff в spec-fire (разбор pending-детекта 06.08) ----
+# Транзит, увиденный recv-петлёй в формируемом блоке, — самый ранний сигнал в процессе
+# (~200мс суб-кадры). Хук отдаёт его spec-fire: армленное окно с готовой пробой стреляет
+# вне конвейера реактива (see spec_fire_live.note_ws_transmit). Модульный шов по образцу
+# failover.set_windows_probe; отсутствие хука = поведение до 06.08.
+_WS_TRANSMIT_HOOK = None
+
+
+def set_ws_transmit_hook(fn):
+    """fn(mids, src) — вызывается на каждый детект транзита из _process_transmit."""
+    global _WS_TRANSMIT_HOOK
+    _WS_TRANSMIT_HOOK = fn
+
+
 _TIP_LADDER_LEGACY = os.environ.get("TIP_LADDER_LEGACY", "0").lower() in ("1", "true", "yes")
 
 
@@ -1312,6 +1326,11 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         if stats is not None:
             stats["proceed"] += 1
     note_transmit_for_cascade(agg, block, log=log)   # давка: >=2 агрегаторов в блоке -> tip +1 ступень
+    if _WS_TRANSMIT_HOOK is not None:
+        try:                            # handoff вне очереди: окно с готовой пробой не ждёт конвейера
+            _WS_TRANSMIT_HOOK(feeds.get(agg) or (), subidx)
+        except Exception:
+            pass                        # handoff опционален — реактивный путь не задевается
     with shared.lock:
         groups = dict(shared.groups); debt_by = dict(shared.debt_by); debt_assets_by = dict(shared.debt_assets_by)
 

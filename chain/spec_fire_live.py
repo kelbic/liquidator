@@ -118,6 +118,17 @@ SPEC_FIRE_PRIO_TTL_SEC = float(os.environ.get("SPEC_FIRE_PRIO_TTL_SEC", "3.0"))
 # gate в PendingDetect) -> pending_healthy_fn=False -> полная каденсия сама собой (A6).
 PENDING_FIRE_FRESH_SEC = float(os.environ.get("PENDING_FIRE_FRESH_SEC", "2.0"))
 PENDING_KEEPALIVE_SEC = float(os.environ.get("PENDING_KEEPALIVE_SEC", "3.5"))
+# WS-handoff (разбор 06.08, «го на пендинг детект»): источник детекта для A2 — НЕ полл
+# сторонних "pending" (у base.org/nodies/dRPC это алиас latest — ярус-1 слеп до запечатывания,
+# 0 handoff за всю жизнь слоя; замер pd_probe 06.08), а СОБСТВЕННАЯ recv-петля flashblocks:
+# она уже видит transmit в формируемом блоке (~200мс суб-кадры) и зовёт _process_transmit.
+# note_ws_transmit() ставит pending_fire армленному окну с досягаемой доской -> окно стреляет
+# ГОТОВОЙ пробой за <=SPEC_FIRE_POLL_SEC, минуя конвейер реактива (гонка №3: победитель бил
+# in-block, наша реакция структурно +1 блок). Кулдаун гасит дубли feed/bare/poll-источников
+# одного транзита. Откат: PENDING_WS_HANDOFF=0 (см. docs/ROLLBACKS.md).
+PENDING_WS_HANDOFF = os.environ.get("PENDING_WS_HANDOFF", "1").lower() not in ("0", "false", "no")
+PENDING_WS_CD_SEC = float(os.environ.get("PENDING_WS_CD_SEC", "2.0"))
+PENDING_WS_BOARD_MAX_AGE_SEC = float(os.environ.get("PENDING_WS_BOARD_MAX_AGE_SEC", "10.0"))
 
 
 # канон дробления живёт в chain.execute (общий для проб и fast-lane); ре-экспорт для юнитов
@@ -219,6 +230,33 @@ class SpecFireLive:
                                                   # проба окна для яруса-2 pending (читает PendingDetect)
         self.pending_fire: dict = {}              # feed -> (mid, b, debt, ts): атомарный handoff (A2)
         self.pending_healthy_fn = None            # () -> bool: pending-цикл жив (A3-кипэлайв)
+        self._ws_handoff_ts: dict = {}            # feed -> ts последнего WS-handoff (кулдаун дублей)
+
+    def note_ws_transmit(self, mids, src="ws"):
+        """WS-handoff (06.08): recv-петля увидела transmit в ФОРМИРУЕМОМ блоке — если он бьёт
+        по рынку доски армленного окна, ставим pending_fire (A2, тот же потребитель в петле
+        окна, единый nonce). O(1)-словарные операции, зовётся с нити _process_transmit (не
+        recv). mids = рынки транслирующего агрегатора. Возврат True = handoff поставлен."""
+        if not PENDING_WS_HANDOFF or not mids:
+            return False
+        n = self._now()
+        hit = False
+        mids_l = {str(m).lower() for m in mids}
+        for feed in list(self._windows):
+            board = self.probe_board.get(feed)
+            if not board:
+                continue
+            mid, b, debt = board[0], board[1], board[2]
+            if mid.lower() not in mids_l or n - board[5] > PENDING_WS_BOARD_MAX_AGE_SEC:
+                continue
+            if n - self._ws_handoff_ts.get(feed, -1e9) < PENDING_WS_CD_SEC:
+                continue
+            self._ws_handoff_ts[feed] = n
+            self.pending_fire[feed] = (mid, b, debt, n)
+            hit = True
+            self._log("SPECFIRE ws-handoff feed=%s %s/%s src=%s — транзит армленного фида "
+                      "в формируемом блоке, огонь окну" % (feed, mid[:10], b[:10], src))
+        return hit
 
     # ---- боевые швы ----
     def _build(self, mid, borrower, debt_usd):
