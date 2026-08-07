@@ -34,6 +34,16 @@ from analysis.contestation import _gql, _loan_price, _Q          # noqa: E402
 OPEN_RE = re.compile(r"^(\d+)\.\d+.*SPECFIRE LIVE window feed=(\S+)")
 CLOSE_RE = re.compile(r"^(\d+)\.\d+.*SPECFIRE window close feed=(\S+) probes=(\d+)")
 HOLD_RE = re.compile(r"^(\d+)\.\d+.*SPECFIRE hold feed=(\S+).*dist=([\d.]+)%.*reach=([\d.]+)%")
+# ВТОРОЙ БОЕВОЙ ПУТЬ. Первая версия разбора считала только окна SPECFIRE и отнесла каскад
+# 06.08 23:35 ($67.6k, четыре ликвидации в одном блоке) к «окна не было» — хотя горячий путь
+# отработал полностью: HOT ready FAST по четырём целям и `dispatch: sent n=4`. Залповый флот и
+# горячий диспатч — РАЗНЫЕ пути, и мерить явку по одному из них значит записывать проигранную
+# гонку в неувиденные. Инструмент, который мислейблит, хуже отсутствующего.
+DISPATCH_RE = re.compile(r"^(\d+)\.\d+.*dispatch: sent nonce=(\d+) n=(\d+)")
+READY_RE = re.compile(r"^(\d+)\.\d+.*HOT ready FAST \S+ hf=")
+# Каскад разбирается за секунды, а метка времени ликвидации — метка БЛОКА: допуск должен
+# покрывать разбор блока и лаг индексатора, но не соседнее событие.
+HOT_TOL_SEC = 90
 
 
 def _journal(days: int):
@@ -42,7 +52,7 @@ def _journal(days: int):
         ["journalctl", "-u", "liquidator-bot", "-o", "short-unix", "--no-pager",
          "--since", "%d days ago" % days],
         capture_output=True, text=True, errors="replace").stdout
-    opens, closes, holds = [], [], []
+    opens, closes, holds, disp, ready = [], [], [], [], []
     for ln in out.splitlines():
         m = OPEN_RE.match(ln)
         if m:
@@ -55,7 +65,15 @@ def _journal(days: int):
         m = HOLD_RE.match(ln)
         if m:
             holds.append((int(m.group(1)), m.group(2), float(m.group(3)), float(m.group(4))))
-    return opens, closes, holds
+            continue
+        m = DISPATCH_RE.match(ln)
+        if m:
+            disp.append((int(m.group(1)), int(m.group(2)), int(m.group(3))))
+            continue
+        m = READY_RE.match(ln)
+        if m:
+            ready.append(int(m.group(1)))
+    return opens, closes, holds, disp, ready
 
 
 # Потолок длительности окна. Строка `SPECFIRE window close` появилась в логе только 04.08, а
@@ -145,7 +163,7 @@ def run(cfg, days: int = 7, min_repaid_usd: float = 1000.0) -> None:
         skip += 100
 
     big = [r for r in rows if r["repaid_usd"] >= min_repaid_usd]
-    opens, closes, holds = _journal(days)
+    opens, closes, holds, disp, ready = _journal(days)
     wins, dropped = _windows(opens, closes)
     med = sorted(w["t1"] - w["t0"] for w in wins if not w["open_ended"])
 
@@ -176,18 +194,21 @@ def run(cfg, days: int = 7, min_repaid_usd: float = 1000.0) -> None:
     print("окон со стрельбой: %d из %d (%.0f%%), проб суммарно: %d"
           % (fired, len(wins), 100.0 * fired / len(wins), sum(w["probes"] or 0 for w in wins)))
 
+    print("горячий путь: диспатчей %d, HOT ready FAST %d" % (len(disp), len(ready)))
+
     cats = {"оспорено": [], "окно было, не стреляли": [], "окна не было": [], "вне ленты": []}
     for r in big:
         if r["ts"] < cutoff:
             cats["вне ленты"].append(r)
             continue
+        r["hot"] = [d for d in disp if abs(d[0] - r["ts"]) <= HOT_TOL_SEC]
         hit = [w for w in wins if w["t0"] <= r["ts"] <= w["t1"] and _feed_matches(w["feed"], r["pair"])]
-        if not hit:
-            cats["окна не было"].append(r)
-        elif any((w["probes"] or 0) > 0 for w in hit):
-            cats["оспорено"].append(r)
-        else:
+        if r["hot"] or any((w["probes"] or 0) > 0 for w in hit):
+            cats["оспорено"].append(r)      # залп ИЛИ горячий диспатч — оба суть участие в гонке
+        elif hit:
             cats["окно было, не стреляли"].append(r)
+        else:
+            cats["окна не было"].append(r)
 
     print("\n--- ЧЕСТНЫЙ ЗНАМЕНАТЕЛЬ ---")
     inside = len(big) - len(cats["вне ленты"])
@@ -200,10 +221,12 @@ def run(cfg, days: int = 7, min_repaid_usd: float = 1000.0) -> None:
 
     if cats["оспорено"]:
         print("\n  win-rate по ОСПОРЕННЫМ: 0/%d  <- вот настоящий знаменатель" % len(cats["оспорено"]))
-        for r in cats["оспорено"][:10]:
-            print("    %s %-16s $%-10s победитель %s"
+        for r in cats["оспорено"][:12]:
+            # каким путём участвовали — залповым или горячим: лечатся они по-разному
+            how = "горячий n=%d" % sum(d[2] for d in r["hot"]) if r.get("hot") else "залп"
+            print("    %s %-16s $%-9s [%-12s] победитель %s"
                   % (time.strftime("%m-%d %H:%M", time.gmtime(r["ts"])), r["pair"],
-                     "%.0f" % r["repaid_usd"], r["liq"][:14]))
+                     "%.0f" % r["repaid_usd"], how, r["liq"][:14]))
     else:
         print("\n  ОСПОРЕННЫХ ГОНОК НЕТ: мы не проигрывали — нас в этих гонках не было.")
         print("  «0 побед» на таком знаменателе не измеряет ни скорость, ни флот.")
