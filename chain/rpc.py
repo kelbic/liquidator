@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 
 # ---- РЕДАКЦИЯ СЕКРЕТОВ В ЛОГЕ (07.08: журнал отдавал полный drpc-URL с ключом в пути ~600
 # строк/сутки — текст исключения RPC несёт URL целиком, а его печатали как есть). Режем ТОЛЬКО
@@ -73,6 +74,37 @@ CU_COST = {"eth_call": 26, "eth_getBalance": 19, "eth_blockNumber": 10, "eth_cha
            "eth_gasPrice": 19, "eth_syncing": 10, "net_version": 0, "web3_clientVersion": 0}
 _USAGE: dict = {}
 _USAGE_LOCK = threading.Lock()
+
+# ---- скользящий ФАКТ расхода (07.08). Тревогу по квоте вешали на проекцию ОДНОГО окна, а она
+# спайкует: max расходится с фактическим расходом суток в 6.7-40 раз, тогда как СРЕДНЕЕ проекций
+# совпадает с фактом на 0.1-1.5%. Копим измеренные CU и измеренное время, проекцию считаем с
+# накопленного — так порог означает «мы столько ТРАТИМ», а не «в одном окне был всплеск».
+_CU_ROLL: dict = {}
+_CU_ROLL_LOCK = threading.Lock()
+CU_ROLL_WINDOW_SEC = 3600.0
+
+
+def cu_rolling_add(host: str, cu: float, win_sec: float):
+    """Добавить замер и вернуть (проекция M CU/мес по накопленному, покрытые секунды).
+
+    Покрытые секунды возвращаются наружу не для красоты: по ним вызывающий решает, накоплено ли
+    достаточно, чтобы порогу вообще можно было верить. Бут-спайк резолва отсекается требованием
+    span, а НЕ временем аптайма — сторож, который слепнет от рестарта, сторожит рестарты, а не
+    квоту (07.08: 21 рестарт за сутки => шестичасовая защёлка не сработала ни разу именно в те
+    сутки, когда расход был максимальным за неделю).
+    """
+    now = time.monotonic()
+    with _CU_ROLL_LOCK:
+        q = _CU_ROLL.setdefault(host, [])
+        q.append((now, float(cu), float(win_sec)))
+        cut = now - CU_ROLL_WINDOW_SEC
+        while q and q[0][0] < cut:
+            q.pop(0)
+        total_cu = sum(x[1] for x in q)
+        span = sum(x[2] for x in q)
+    if span <= 0:
+        return (0.0, 0.0)
+    return (total_cu / span * 86400 * 30 / 1e6, span)
 
 
 def _caller_tag() -> str:

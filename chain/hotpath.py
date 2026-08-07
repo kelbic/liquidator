@@ -46,6 +46,10 @@ _STAGE_LOCK = threading.Lock()
 _STAGES: dict = {}
 STAGE_WINDOW_SEC = float(os.environ.get("STAGE_WINDOW_SEC", "3600"))
 CU_ALERT_PROJ_M = float(os.environ.get("CU_ALERT_PROJ_M", "26"))   # проекция M CU/мес -> TG-будильник
+# Сколько измеренного времени должно накопиться, прежде чем порогу можно верить. Это замена
+# защёлке «не раньше 6ч аптайма»: та глушила сторожа рестартами (07.08 — 21 рестарт, 0 тревог
+# в сутки максимального расхода), а требование span глушится только отсутствием ИЗМЕРЕНИЙ.
+CU_ALERT_MIN_SPAN_SEC = float(os.environ.get("CU_ALERT_MIN_SPAN_SEC", "900"))
 
 
 def stage_note(name: str, ms: float, now=None):
@@ -719,6 +723,19 @@ _CACHE_BOOST_UNTIL = 0.0
 # едут на боевом ключе (Alchemy №2, 429=0), штиль остаётся на bg (там кэш = резерв-слой,
 # ошибки терпимы). Нагрузка на боевой: ~22 вызова/30с ТОЛЬКО в окнах. Откат =0 — всё на bg.
 _CACHE_COMBAT_BOOST = os.environ.get("POSITION_CACHE_COMBAT_RPC", "1").lower() not in ("0", "false", "no")
+# 07.08 ЗАМЕР ПРОТИВ ЗАМЫСЛА. «~22 вызова/30с ТОЛЬКО в окнах» — так задумано; по журналу за
+# сутки вышло 45 399 вызовов = 35M CU/мес на боевом ключе при лимите 30M (53% всего расхода
+# Alchemy). Причина не в логике, а в частоте: prearm-петля зовёт cache_boost() БЕЗУСЛОВНО на
+# каждом проходе и продлевает буст на 90с, а predict-окна идут почти встык -> буст держался
+# 72% суток. Слово «окно» в замысле означало событие более редкое, чем оно оказалось.
+# Бюджет — секунды скользящего часа, в которые разрешён боевой каденс. Сверх бюджета цикл
+# уходит на ТИХИЙ каденс и на фоновый ключ: это РЕЗАНИЕ расхода, а не перекладывание его на
+# соседний ключ (dRPC оплачен не щедрее). Настоящее окно живёт ~2 мин = 4 цикла, окон ~3.3/ч
+# => ~13 циклов/ч против бюджета в 20: редкие окна обслуживаются полностью, круглосуточный
+# помол — нет. 0 = без бюджета (прежнее поведение).
+_CACHE_COMBAT_BUDGET_SEC_H = float(os.environ.get("POSITION_CACHE_COMBAT_BUDGET_SEC_H", "600"))
+_CACHE_COMBAT_SPEND: list = []            # monotonic'ы циклов, съеденных боевым ключом за час
+_CACHE_BUDGET_LOG_TS = 0.0
 
 
 def cache_boost(sec: float = 90.0):
@@ -739,8 +756,24 @@ def _spawn_cache_refresh(*, cache_rpc, shared, bn, combat_rpc=None):
     from chain.failover import bg_shed
     if bg_shed():
         return                                    # бой уехал на ключ bg — фон уступает (ревью 02.08, усл.3)
+    global _CACHE_BUDGET_LOG_TS
     _iv = _CACHE_REFRESH_MIN_INTERVAL             # двухскоростной каденс (05.08): штиль -> QUIET
-    if _CACHE_QUIET_INTERVAL > _iv and time.monotonic() >= _CACHE_BOOST_UNTIL:
+    _boosting = time.monotonic() < _CACHE_BOOST_UNTIL
+    if _boosting and _CACHE_COMBAT_BUDGET_SEC_H > 0:
+        # Бюджет считаем в СЕКУНДАХ БОЕВОГО КАДЕНСА, а не в числе циклов: интервал настраиваемый,
+        # и счёт по циклам разъехался бы с расходом при первой же смене MIN.
+        _cut = time.monotonic() - 3600.0
+        while _CACHE_COMBAT_SPEND and _CACHE_COMBAT_SPEND[0] < _cut:
+            _CACHE_COMBAT_SPEND.pop(0)
+        _spent = len(_CACHE_COMBAT_SPEND) * max(1.0, _CACHE_REFRESH_MIN_INTERVAL)
+        if _spent >= _CACHE_COMBAT_BUDGET_SEC_H:
+            _boosting = False                     # бюджет часа выбран -> тихий каденс и фон-ключ
+            if time.monotonic() - _CACHE_BUDGET_LOG_TS >= 600.0:
+                _CACHE_BUDGET_LOG_TS = time.monotonic()
+                log.info("DIAG cache-boost бюджет часа выбран (%.0fс из %.0fс) — каденс %.0fс "
+                         "на фоновом ключе", _spent, _CACHE_COMBAT_BUDGET_SEC_H,
+                         _CACHE_QUIET_INTERVAL)
+    if _CACHE_QUIET_INTERVAL > _iv and not _boosting:
         _iv = _CACHE_QUIET_INTERVAL
     if (_iv > 0 and _CACHE_REFRESH_STARTED
             and time.monotonic() - _CACHE_REFRESH_STARTED < _iv):
@@ -756,9 +789,9 @@ def _spawn_cache_refresh(*, cache_rpc, shared, bn, combat_rpc=None):
             _CACHE_SKIP_LOG_TS = now
         return
     _use_rpc = cache_rpc                          # ревью 05.08 (а): буст-цикл -> боевой ключ
-    if (_CACHE_COMBAT_BOOST and combat_rpc is not None
-            and time.monotonic() < _CACHE_BOOST_UNTIL):
+    if _CACHE_COMBAT_BOOST and combat_rpc is not None and _boosting:
         _use_rpc = combat_rpc
+        _CACHE_COMBAT_SPEND.append(time.monotonic())   # платит бюджет только БОЕВОЙ ключ
     _CACHE_REFRESH_STARTED = time.monotonic()
     _CACHE_REFRESH_THREAD = threading.Thread(target=_refresh_position_caches, daemon=True,
                                              kwargs=dict(cache_rpc=_use_rpc, shared=shared, bn=bn))
@@ -1704,7 +1737,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                  # per-IP лимит на ЧАСТОТУ коннектов: фикс-3с реконнект при транзиентном сбое
                                  # Base превращал его в самоподдерживающийся 429-шторм на час (инцидент 07-21).
     last_fb_alert = 0.0          # monotonic of last degradation alert (anti-flood)
-    last_cu_alert = time.monotonic()   # CU-маркер: не раньше 6ч аптайма (бут-спайк резолва не сигнал)
+    last_cu_alert = 0.0          # бут-спайк отсекает CU_ALERT_MIN_SPAN_SEC, а не аптайм: сторож,
+                                 # слепнущий от рестарта, сторожит рестарты, а не квоту (07.08)
     recon_ts = []                # monotonic'ы реконнектов hot-path ws; одиночный разрыв публичного
     last_recon_alert = 0.0       # Flashblocks-WS = НОРМА (роняет соединение раз в час-два) -> TG молчит,
                                  # алерт ТОЛЬКО на серию (3+ за 180с = реальная нестабильность фида/сети)
@@ -1778,24 +1812,31 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         _re_thread.start()
                     if time.monotonic() - last_stats >= HOT_STATS_SEC:
                         try:                       # учёт CU (25.07): кто жжёт квоту Alchemy
-                            from chain.rpc import rpc_usage_take, rpc_usage_cu
+                            from chain.rpc import rpc_usage_take, rpc_usage_cu, cu_rolling_add
                             _snap = rpc_usage_take()
                             _win = max(1e-9, time.monotonic() - last_stats)
                             for _host, _ms in sorted(_snap.items()):
                                 _cu = rpc_usage_cu({_host: _ms})
                                 _top = sorted(_ms.items(), key=lambda kv: -CU_TOP_KEY(kv))[:6]
                                 _proj = _cu / _win * 86400 * 30 / 1e6
-                                log.info("CU %s: %d CU/окно = %.0f CU/s (проекция %.1fM/мес) | %s",
-                                         _host, _cu, _cu / _win, _proj,
+                                _roll = cu_rolling_add(_host, _cu, _win)
+                                log.info("CU %s: %d CU/окно = %.0f CU/s (проекция %.1fM/мес, "
+                                         "скольз.%.0fмин %.1fM/мес) | %s",
+                                         _host, _cu, _cu / _win, _proj, _roll[1] / 60.0, _roll[0],
                                          " ".join("%s×%d" % (m, n) for m, n in _top))
                                 # CU-маркер квоты — ЖУРНАЛ, не TG (02.08, kelbic: сообщения без
                                 # действия; сыпал бут-спайками после каждого рестарта и штормовой
                                 # утечкой ассесса на №2). Доктрина: алерт = исход, не предвестник;
                                 # исход покрыт — смерть №2 по квоте = COMBAT-FAILOVER свитч со
                                 # своей TG-строкой. Порядок эвакуации из STATE остаётся в маркере.
-                                if ("alchemy" in _host and _proj >= CU_ALERT_PROJ_M
+                                # Порог берём со СКОЛЬЗЯЩЕЙ величины, а не с одного окна: замер
+                                # 07.08 — max проекции расходится с фактом в 6.7-40 раз (одиночное
+                                # окно спайкует), а СРЕДНЕЕ проекций совпадает с фактом на 0.1-1.5%.
+                                if ("alchemy" in _host and _roll[0] >= CU_ALERT_PROJ_M
+                                        and _roll[1] >= CU_ALERT_MIN_SPAN_SEC
                                         and time.monotonic() - last_cu_alert > 21600):
                                     last_cu_alert = time.monotonic()
+                                    _proj = _roll[0]
                                     log.warning(
                                         "CU-квота (журнальный маркер): %s проекция %.0fM/мес >= %.0fM — "
                                         "порядок эвакуации: 1) ассессмент+кэш на dRPC, 2) predict-полл, "
