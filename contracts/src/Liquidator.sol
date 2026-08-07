@@ -43,6 +43,11 @@ interface IERC4626 {
     function redeem(uint256 shares, address receiver, address owner) external returns (uint256);
 }
 
+/// @dev Morpho oracle wrapper (collateral price in loan units, 1e36 scale).
+interface IOracle {
+    function price() external view returns (uint256);
+}
+
 /// @title Liquidator — zero-capital Morpho Blue liquidations on Base.
 /// @notice Flow (verified against Morpho.sol): liquidate() seizes collateral to THIS contract,
 /// then Morpho calls onMorphoLiquidate where we swap collateral->loanToken (generic aggregator
@@ -63,6 +68,27 @@ contract Liquidator {
     /// deficit). Keys are add/remove-able only by owner.
     mapping(address => bool) public isAuthorized;
 
+    /// @notice v5 (stateful board): owner arms a full liquidation plan BEFORE the window; volley
+    /// EOAs then probe with <=1 byte of calldata (fallback). The probe never reveals the target
+    /// (v4 probes carry full liquidate args readable by competitors in our healthy-reverts) and a
+    /// healthy probe is a cheap SILENT no-op: `triggerPrice` is checked against the market oracle
+    /// BEFORE the plan (with its KB-scale swapCallData) is ever copied out of storage — copying on
+    /// every probe would cost ~2100 gas/word and dwarf the v4 calldata cost it replaces.
+    /// Morpho stays the authority on liquidatability: the trigger is only a gas filter, the actual
+    /// attempt runs through this.liquidate -> Morpho, and a healthy revert is swallowed.
+    struct Plan {
+        MarketParams mp;
+        address borrower;
+        uint256 repaidShares;
+        address swapTarget;
+        bytes swapCallData;
+        uint256 minProfit;
+        address unwrapTarget;     // packs with `deadline` into one slot
+        uint64 deadline;          // unix ts; 0 = no plan. TTL: stale routes must not execute.
+        uint256 triggerPrice;     // oracle-wrapper units (1e36); 0 = no filter (fail-open)
+    }
+    Plan private _plan;
+
     /// @dev Swap context handed to the callback via Morpho's `data`.
     struct SwapData {
         address swapTarget;       // aggregator router (0x/1inch/Odos/KyberSwap)
@@ -79,12 +105,19 @@ contract Liquidator {
     error CannotRepay();
     error ProfitTooLow(uint256 got, uint256 min);
     error ERC20OpFailed();
+    error BadDeadline();
 
     event Liquidated(address indexed borrower, address indexed loanToken, uint256 profit);
     event OwnerChanged(address indexed from, address indexed to);
     event AuthorizedChanged(address indexed who, bool ok);
     /// @notice A batch item that reverted (reason = first 4 bytes of the revert data).
     event BatchItemFailed(uint256 indexed i, address indexed borrower, bytes4 reason);
+    /// @notice v5: deliberately content-free — probe txs and arm/disarm must not leak the target
+    /// (the setPlan calldata is public regardless, but events are the cheap thing to read).
+    event PlanSet(uint64 deadline);
+    event PlanCleared();
+    /// @notice v5: plan consumed by a successful probe (borrower is public knowledge by then).
+    event PlanExecuted(address indexed borrower, uint256 profit);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -128,6 +161,75 @@ contract Liquidator {
     function setAuthorized(address who, bool ok) external onlyOwner {
         isAuthorized[who] = ok;
         emit AuthorizedChanged(who, ok);
+    }
+
+    // --- v5 stateful board -------------------------------------------------------------------
+
+    /// @notice Arm (or re-arm, overwriting) the plan. Owner-only: the swap route in the plan is
+    /// therefore always our own — same trust line as liquidate()'s onlyOwnerOrSelf.
+    /// @param deadline plan TTL as unix ts; must be in the future.
+    /// @param triggerPrice fire filter in ORACLE-WRAPPER units (1e36-scaled collateral-in-loan,
+    /// NOT the Chainlink feed the predictor watches): probe attempts only when price() <= trigger.
+    /// 0 disables the filter (every authorized probe attempts) — fail-open by construction.
+    function setPlan(
+        MarketParams calldata mp,
+        address borrower,
+        uint256 repaidShares,
+        address swapTarget,
+        bytes calldata swapCallData,
+        uint256 minProfit,
+        address unwrapTarget,
+        uint64 deadline,
+        uint256 triggerPrice
+    ) external onlyOwner {
+        if (deadline <= block.timestamp) revert BadDeadline();
+        _plan = Plan({
+            mp: mp, borrower: borrower, repaidShares: repaidShares, swapTarget: swapTarget,
+            swapCallData: swapCallData, minProfit: minProfit, unwrapTarget: unwrapTarget,
+            deadline: deadline, triggerPrice: triggerPrice
+        });
+        emit PlanSet(deadline);
+    }
+
+    /// @notice Disarm. Also implicit on successful execution (one-shot).
+    function clearPlan() external onlyOwner {
+        delete _plan;
+        emit PlanCleared();
+    }
+
+    /// @notice Cheap bot-side arming check (full plan content stays out of view calls too).
+    function planInfo() external view returns (address borrower, uint64 deadline, uint256 triggerPrice) {
+        return (_plan.borrower, _plan.deadline, _plan.triggerPrice);
+    }
+
+    /// @notice v5 probe entry: <=1 byte of calldata, silent no-op unless everything lines up.
+    /// Order is cost-ordered and every ambiguity fails OPEN toward attempting:
+    ///   no/expired plan -> return; unauthorized -> return (griefers can't consume the plan);
+    ///   trigger set and oracle says healthy -> return WITHOUT touching the KB-scale plan bytes;
+    ///   trigger zero OR oracle reverts -> attempt anyway (Morpho hits the same oracle and is
+    ///   the real authority); Morpho-healthy -> revert swallowed, plan RETAINED for the next probe.
+    /// No nonReentrant here for the same proven reason as batchLiquidate: the external self-call
+    /// takes the lock itself; a reentrant probe during the swap lands in the try -> Reentrant ->
+    /// caught -> no-op. >1 byte means a mistyped ABI call — revert loudly, never silently no-op.
+    fallback() external {
+        if (msg.data.length > 1) revert();
+        uint64 dl = _plan.deadline;
+        if (dl == 0 || block.timestamp > dl) return;
+        if (msg.sender != owner && !isAuthorized[msg.sender]) return;
+        uint256 trig = _plan.triggerPrice;
+        if (trig != 0) {
+            try IOracle(_plan.mp.oracle).price() returns (uint256 px) {
+                if (px > trig) return;            // healthy by price: plan bytes never loaded
+            } catch {}                            // oracle broken -> filter off, Morpho decides
+        }
+        Plan memory p = _plan;
+        try this.liquidate(
+            p.mp, p.borrower, p.repaidShares, p.swapTarget, p.swapCallData, p.minProfit,
+            p.unwrapTarget
+        ) returns (uint256 profit) {
+            delete _plan;                         // one-shot: next volley leg is a 2-SLOAD no-op
+            emit PlanExecuted(p.borrower, profit);
+        } catch {}                                // healthy / CannotRepay / raced: plan retained
     }
 
     /// @notice Liquidate `borrower` on market `mp`, repaying `repaidShares` of debt, swapping the
