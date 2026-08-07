@@ -712,20 +712,42 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
             base_fee = int(w3.eth.get_block("latest").get("baseFeePerGas") or 0)
         max_fee = base_fee * _VOLLEY_PRESIGN_MAXFEE_MULT + tip_wei
         st = _VOLLEY_LADDER.get(addr)
-        if st and st["gas"] == int(gas) and st["max_fee"] >= max_fee and len(st["q"]) >= depth:
+        compat = bool(st and st["gas"] == int(gas) and st["max_fee"] >= max_fee)
+        if compat and len(st["q"]) >= depth:
             return len(st["q"])          # годная лестница уже есть — подпись не жжём
-        # nonce берём с ЦЕПИ: локальный счётчик мог уехать вперёд после NO-RECEIPT
-        nonce = int(start_nonce) if start_nonce is not None else _pending_nonce(w3, addr)
         acct = account_for(w3, key)
-        q = []
-        for i in range(depth):
-            t = {"from": addr, "to": cfg.liquidator_address, "data": V2_PROBE_CALLDATA,
-                 "nonce": nonce + i, "gas": int(gas), "chainId": rpc.chain_id,
-                 "maxFeePerGas": max_fee, "maxPriorityFeePerGas": tip_wei}
-            signed = acct.sign_transaction(t)
-            raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-            h = getattr(signed, "hash", None)
-            q.append((nonce + i, "0x" + bytes(raw).hex(), h.hex() if h is not None else None))
+
+        def _sign_run(n0, count):
+            out = []
+            for i in range(count):
+                t = {"from": addr, "to": cfg.liquidator_address, "data": V2_PROBE_CALLDATA,
+                     "nonce": n0 + i, "gas": int(gas), "chainId": rpc.chain_id,
+                     "maxFeePerGas": max_fee, "maxPriorityFeePerGas": tip_wei}
+                signed = acct.sign_transaction(t)
+                raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+                h = getattr(signed, "hash", None)
+                out.append((n0 + i, "0x" + bytes(raw).hex(), h.hex() if h is not None else None))
+            return out
+
+        if compat and start_nonce is None:
+            # ДОТОЧКА СКЛАДА, а не пересборка. Две причины, и вторая важнее первой:
+            #  1) уже подписанное не переподписываем — подпись это 4мс CPU на пробу, а фоновое
+            #     пополнение обязано уступать огню;
+            #  2) продолжать надо с ХВОСТА очереди (или с локального счётчика, если склад
+            #     выбран досуха). Пересборка от pending-nonce здесь была бы прямой ДЫРОЙ:
+            #     pending отстаёт от уже разосланных проб, и новая лестница начиналась бы
+            #     с занятых номеров — вся нога повисла бы до закрытия дыры.
+            nxt = (st["q"][-1][0] + 1) if st["q"] else max(int(_VOLLEY_NONCE.get(addr, 0)),
+                                                           _pending_nonce(w3, addr))
+            st["q"].extend(_sign_run(nxt, depth - len(st["q"])))
+            st["ts"] = time.monotonic()
+            if log:
+                log.info("VOLLEY склад %s доточен до %d проб (с nonce %d)",
+                         addr[:10], len(st["q"]), nxt)
+            return len(st["q"])
+        # полная сборка: nonce берём с ЦЕПИ — локальный счётчик мог уехать после NO-RECEIPT
+        nonce = int(start_nonce) if start_nonce is not None else _pending_nonce(w3, addr)
+        q = _sign_run(nonce, depth)
         _VOLLEY_LADDER[addr] = {"q": q, "gas": int(gas), "max_fee": max_fee, "ts": time.monotonic()}
         _VOLLEY_NONCE[addr] = nonce      # локальный счётчик и лестница выходят из одной точки
         if log:
@@ -815,6 +837,39 @@ def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5):
         return True, None
     except Exception as e:
         return False, type(e).__name__
+
+
+def batch_receipts(url: str, hashes, timeout: int = 5):
+    """Партия eth_getTransactionReceipt ОДНИМ HTTP-запросом -> {hash: receipt|None}.
+
+    При сотнях проб в секунду поштучный полл — это и есть тот самый шторм, который мы себе
+    уже устраивали. Батч JSON-RPC стоит один round-trip на всю партию. Ошибка транспорта
+    возвращает пустой словарь: «не знаю» != «дропнуто», приговор выносит таймаут коллектора.
+    """
+    out = {}
+    if not hashes:
+        return out
+    try:
+        s = _seq_session(url)
+        if s is None:
+            return out
+        payload = [{"jsonrpc": "2.0", "id": i, "method": "eth_getTransactionReceipt",
+                    "params": [h]} for i, h in enumerate(hashes)]
+        resp = s.post(url, json=payload, timeout=timeout).json()
+        if isinstance(resp, dict):                 # узел ответил одиночной ошибкой на батч
+            return out
+        for item in resp:
+            try:
+                i = int(item.get("id"))
+            except Exception:
+                continue
+            if 0 <= i < len(hashes) and not item.get("error"):
+                r = item.get("result")
+                if r is not None:
+                    out[hashes[i]] = r
+    except Exception:
+        return out
+    return out
 
 
 def _post_raw_tx(url: str, raw_hex: str, timeout: int = 5):

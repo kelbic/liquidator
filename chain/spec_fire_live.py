@@ -823,6 +823,91 @@ class SpecFireLive:
         except Exception as e:
             self._log("SPECFIRE доска prearm fail feed=%s: %s" % (feed, type(e).__name__))
 
+    # ---- движок огня (#32, 07.08): постоянный пул вместо порождения залпа на тик ----
+    def _engine(self):
+        """Ленивый подъём движка. Выключен -> None, и путь залпа идёт как прежде бит-в-бит."""
+        from chain import fire_engine as _fe
+        if not _fe.ENGINE_ON:
+            return None
+        eng = getattr(self, "_fire_engine", None)
+        if eng is not None:
+            return eng
+        with self._lock:
+            eng = getattr(self, "_fire_engine", None)
+            if eng is not None:
+                return eng
+            from chain import execute as _ex
+            seq = str(getattr(self.cfg, "sequencer_rpc", "") or "")
+            bcast = [seq] if (seq and seq.lower() not in ("off", "none", "0")) else None
+            rpc_url = getattr(self.cfg, "rpc_url", None) or seq
+
+            def _legs():
+                return [a for a, _k in (self._volley_accounts_fn or _ex.volley_accounts)()]
+
+            def _send(addr):
+                return _ex.send_presigned_probe(self.rpc, self.cfg, addr, log=log,
+                                                broadcast_raw_urls=bcast)
+
+            def _refill(addr):
+                for a, k in (self._volley_accounts_fn or _ex.volley_accounts)():
+                    if a == addr:
+                        _ex.presign_ladder(self.rpc, self.cfg, addr, k,
+                                           SPEC_FIRE_V2_FIRE_GAS, log=log)
+                        return
+
+            col = _fe.ReceiptCollector(
+                receipts_fn=lambda hs: _ex.batch_receipts(rpc_url, hs),
+                on_result=self._engine_result, on_timeout=self._engine_timeout,
+                log=self._log)
+            eng = _fe.FireEngine(legs_fn=_legs, send_fn=_send, collector=col,
+                                 refill_fn=_refill, depth_fn=_ex.ladder_depth, log=self._log)
+            self._fire_engine = eng
+            eng.start()
+            return eng
+
+    def _engine_result(self, meta, h, r):
+        """Исход пробы движка. Вердикт победы — ТОЛЬКО по событию Liquidated (см. LIQUIDATED_TOPIC0):
+        у пробы доски status=1 бывает и у холостой, и у неудачной попытки."""
+        from chain.execute import volley_gas_add
+        addr, tgt = (meta or (None, None))
+        try:
+            gas_usd = (int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
+                       * float(self.cfg.eth_price_usd) / 1e18)
+        except Exception:
+            gas_usd = 0.0
+        volley_gas_add(gas_usd)
+        if _receipt_has_win(r, self.cfg.liquidator_address) is not True:
+            self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
+            return
+        feed, mid, b, dbt = (tgt if tgt else ("", "?", "?", 0.0))
+        from chain.execute import mark_recent_send
+        self.stats["wins"] += 1
+        mark_recent_send(mid, b)
+        self._cooldown_until = self._now() + SPEC_FIRE_WIN_COOLDOWN_SEC
+        eng = getattr(self, "_fire_engine", None)
+        if eng is not None:
+            eng.disarm()                 # приз взят — огонь гасим немедленно, не ждём TTL
+        if feed:
+            with self._lock:
+                stop = self._windows.pop(feed, None)
+            if stop is not None:
+                stop.set()
+        log.warning("SPECFIRE WIN!!! [движок %s] %s/%s debt=$%.0fk tx=%s gas=$%.2f — "
+                    "план доски исполнен (окна на паузе %.0fс)",
+                    (addr or "?")[:10], str(mid)[:10], str(b)[:10], (dbt or 0) / 1e3, h,
+                    gas_usd, SPEC_FIRE_WIN_COOLDOWN_SEC)
+
+    def _engine_timeout(self, meta, h):
+        """Квитанции нет за таймаут: nonce ноги под вопросом — склад этой ноги сбрасываем,
+        иначе вся её лестница висит за возможной дырой."""
+        from chain.execute import volley_invalidate_nonce, invalidate_ladder
+        addr = (meta or (None, None))[0]
+        if addr:
+            volley_invalidate_nonce(addr)
+            invalidate_ladder(addr)
+            self._log("SPECFIRE движок NO-RECEIPT eoa=%s tx=%s — склад ноги сброшен" % (
+                addr[:10], h))
+
     def _volley(self, probe, mid, b, d, feed, simultaneous=False):
         """Залп вслед за успешной пробой главного кошелька: тот же calldata на v4 от каждого
         залпового EOA. Огонь и ожидания — в daemon-тредах: петля окна не тормозится ни на мс.
@@ -846,6 +931,14 @@ class SpecFireLive:
         board = self._board_live(mid, b)
         _cd = _ex.V2_PROBE_CALLDATA if board else probe["calldata"]
         _gas = SPEC_FIRE_V2_FIRE_GAS if board else probe["gas"]
+        # ДВИЖОК ОГНЯ: план уже в контракте, значит пробе не нужен ни этот тик, ни эти треды —
+        # тик лишь ПРОДЛЕВАЕТ право стрелять постоянному пулу. Порождать залп больше не нужно.
+        # Только для доски: у V1 калдата зависит от цели, а склад подписан под 1 байт.
+        if board:
+            eng = self._engine()
+            if eng is not None:
+                eng.keepalive(target=(feed, mid, b, d))
+                return
 
         def _leg(i, addr, key, mf, tip, bcast, wait_sec):
             try:

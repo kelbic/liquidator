@@ -36,6 +36,11 @@ class _FakeEth:
     def get_block(self, _b):
         return {"baseFeePerGas": BASEFEE}
 
+    def get_transaction_count(self, _a, _blk="pending"):
+        # ПОДТЕКАЮЩИЙ pending: узел ещё не увидел разосланные пробы. Ровно эта отсталость
+        # и делает пересборку лестницы от pending дырой в nonce (см. тест доточки).
+        return self._outer.pending_nonce
+
     def send_raw_transaction(self, raw):
         self._outer.sent.append(raw)
         if self._outer.fail_next:
@@ -56,6 +61,7 @@ class _FakeRpc:
         self.sent = []
         self.fail_next = False
         self.fail_msg = "connection reset"
+        self.pending_nonce = 0
 
     def _web3(self):
         return _FakeW3(self)
@@ -231,6 +237,37 @@ try:
 finally:
     ex._post_raw_sync = _real_post
 print("UNIT_OK: боевая рассылка идёт в секвенсер (32.5мс), нога Alchemy с пути убрана")
+
+# ---- 10. ДОТОЧКА СКЛАДА: nonce продолжается с ХВОСТА, а не от подтекающего pending ----
+# Движок огня пополняет склад ФОНОМ. Если пополнение пересоберёт лестницу от pending-nonce,
+# оно выдаст УЖЕ ЗАНЯТЫЕ номера: узел не видел разосланных проб, его счётчик отстал. Такая
+# лестница — прямая дыра, вешающая ногу целиком.
+rpc = fresh()
+rpc.pending_nonce = 50                       # узел «знает» только про 50 — он отстал
+ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=5, start_nonce=50)
+for _ in range(3):
+    ex.send_presigned_probe(rpc, cfg, ADDR)  # 50,51,52 ушли; узел всё ещё думает, что nonce=50
+_kept = list(ex._VOLLEY_LADDER[ADDR]["q"])
+assert [e[0] for e in _kept] == [53, 54]
+n = ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=5)   # без start_nonce = боевой вызов фона
+_q = ex._VOLLEY_LADDER[ADDR]["q"]
+assert [e[0] for e in _q] == [53, 54, 55, 56, 57], "доточка обязана продолжать с хвоста: %s" % [
+    e[0] for e in _q]
+assert _q[0] is _kept[0] and _q[1] is _kept[1], "уже подписанное переподписывать нельзя (CPU)"
+assert [_nonce_of(e[1]) for e in _q] == [53, 54, 55, 56, 57], "и в САМИХ БАЙТАХ тоже подряд"
+print("UNIT_OK: доточка склада продолжает с хвоста %s — pending отстал, дыры нет" % (
+    [e[0] for e in _q],))
+
+# позитивный контроль: склад выбран ДОСУХА — продолжаем с локального счётчика, а не с pending
+for _ in range(5):
+    ex.send_presigned_probe(rpc, cfg, ADDR)
+assert ex.ladder_depth(ADDR) == 0
+assert rpc.pending_nonce == 50, "узел по-прежнему отстал — в этом весь смысл проверки"
+ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=3)
+_q = ex._VOLLEY_LADDER[ADDR]["q"]
+assert [e[0] for e in _q] == [58, 59, 60], "с пустого склада — от локального счётчика: %s" % [
+    e[0] for e in _q]
+print("UNIT_OK: пустой склад продолжает с локального счётчика (58..60), не с отставшего pending")
 
 ex.invalidate_ladder(ADDR)
 assert ex.ladder_depth(ADDR) == 0
