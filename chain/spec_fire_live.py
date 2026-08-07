@@ -145,6 +145,26 @@ SPEC_FIRE_VOLLEY_PARALLEL = os.environ.get(
 # N участков покрытия); по детекту бьём разом. Откат: SPEC_FIRE_VOLLEY_DETECT_SYNC=0.
 SPEC_FIRE_VOLLEY_DETECT_SYNC = os.environ.get(
     "SPEC_FIRE_VOLLEY_DETECT_SYNC", "1").lower() not in ("0", "false", "no")
+# ФАЗОВЫЙ ГЕЙТ ПО РЕШЁТКЕ OCR («го» kelbic 07.08; замер analysis/push_hazard.py — 2520 пушей
+# за 7д + проверка объекта в знаменателе). Пуш садится не когда угодно, а на границе
+# 30-секундного раунда от ПРЕДЫДУЩЕГО пуша: точно на узле BTC 79%/ETH 76%/ADA 57%, в ±2с — 96%
+# у BTC/ETH. Деградация по РАССТОЯНИЮ, не по фиду: гэп <1800с держит 92-100%, дальше фаза
+# уплывает (~2с/час, скью часов L2), у альтов медианный гэп 4600-8000с — они почти всегда за
+# горизонтом и гейт для них сам выключится. Значит 24 секунды из каждых 30 в горячей фазе
+# доказуемо холостые: замеренный эффект ×1.15 на ТОМ ЖЕ газе (против ×1.19 за ТРОЙНОЙ газ у
+# «просто больше проб»). Решётка проверена на КРУПНЫХ движениях отдельно (внутрифидовые
+# квартили: пул рангов 87/91/90/90 при контроле 90/90/89/89; BTC/ETH верхний квартиль 96/97%) —
+# гейт не слепнет там, где приз. Замер считан «на пуш», а не «на приз»: живые счётчики
+# lattice_hits/misses закрывают этот предел нашим собственным потоком.
+# ВСЕ ГАРДЫ FAIL-OPEN (сомнение => стреляем как раньше): мало пушей, решётка не подтверждена
+# онлайн, фаза протухла. Откат: SPEC_FIRE_LATTICE_GATE=0.
+SPEC_FIRE_LATTICE_GATE = os.environ.get(
+    "SPEC_FIRE_LATTICE_GATE", "1").lower() not in ("0", "false", "no")
+SPEC_FIRE_LATTICE_P = float(os.environ.get("SPEC_FIRE_LATTICE_P_SEC", "30"))
+SPEC_FIRE_LATTICE_TOL = float(os.environ.get("SPEC_FIRE_LATTICE_TOL_SEC", "2"))
+SPEC_FIRE_LATTICE_MAX_AGE = float(os.environ.get("SPEC_FIRE_LATTICE_MAX_AGE_SEC", "1800"))
+SPEC_FIRE_LATTICE_MIN_N = int(os.environ.get("SPEC_FIRE_LATTICE_MIN_N", "12"))
+SPEC_FIRE_LATTICE_MIN_FRAC = float(os.environ.get("SPEC_FIRE_LATTICE_MIN_FRAC", "0.80"))
 # ФОЛБЭК ЦЕЛИ (01.08, ревью гонки cbDOGE): топ-цель «нет свопа» монополизировала тик —
 # $4.1k-жертва в досягаемости И в капе пула не получила НИ ОДНОЙ пробы за три окна
 # (18:45-18:50), конкурент выиграл присутствием (tip 0.0055 < наших 0.05). Небилдящаяся
@@ -299,7 +319,10 @@ class SpecFireLive:
         self.stats = {"windows_armed": 0, "probes": 0, "wins": 0,
                       "owed_probes": 0, "sticky_windows": 0,   # peak-owed: would-have-fired учёт
                       "pending_fires": 0,                      # A2: выстрелы по pending-handoff
-                      "volley_probes": 0}                      # каскадный тир: ноги залпа (07.08)
+                      "volley_probes": 0,                      # каскадный тир: ноги залпа (07.08)
+                      "lattice_skips": 0,                      # фазовый гейт: тики без огня
+                      "lattice_hits": 0, "lattice_misses": 0}  # пуш в фазе / вне фазы (живой валидатор)
+        self._push_ts: dict = {}                  # feed -> метки севших пушей (решётка OCR, 07.08)
         self._owed: dict = {}                     # feed -> owed_until (peak-owed, пишет петля окна)
         self._prio: dict = {}                     # feed -> (claim_debt, ts): заявки на слот (пакет B)
         self.probe_board: dict = {}               # feed -> (mid, b, debt, calldata, gas, ts): свежая
@@ -565,6 +588,60 @@ class SpecFireLive:
         return (len([t for t in self._arm_ts if n - t < 3600.0]) >= SPEC_FIRE_CASCADE_WINDOWS
                 and _facts_fresh())
 
+    def note_push(self, feed, t=None):
+        """Отметить севший оракульный апдейт: буфер меток кормит фазовый гейт И его же
+        онлайн-валидатор. Дедуп 5с — confirmed и push об одном апдейте приходят парой."""
+        t = self._now() if t is None else float(t)
+        ts = self._push_ts.setdefault(feed, [])
+        if ts and t - ts[-1] < 5.0:
+            return
+        if ts and self._lattice_ready(feed):
+            # был ли гейт открыт В СЕКУНДУ ПУША — считаем ДО добавления метки. Это и есть
+            # закрытие предела «замер на пуш, а не на приз»: счётчик живой и наш.
+            key = "lattice_hits" if self._gate_open(feed, now=t) else "lattice_misses"
+            self.stats[key] = self.stats.get(key, 0) + 1
+            if key == "lattice_misses":
+                self._log("SPECFIRE решётка: пуш feed=%s ВНЕ фазы (+%.1fс от узла) — "
+                          "попадания %d, промахи %d" % (
+                              feed, (t - ts[-1]) % SPEC_FIRE_LATTICE_P,
+                              self.stats.get("lattice_hits", 0),
+                              self.stats.get("lattice_misses", 0)))
+        ts.append(t)
+        if len(ts) > 64:
+            del ts[:-64]
+
+    def _lattice_frac(self, feed) -> float:
+        """Доля гэпов, легших на решётку (±TOL). Считаем ТОЛЬКО по гэпам в пределах горизонта:
+        за MAX_AGE фаза уплывает, и такие гэпы не свидетельствуют ни за, ни против."""
+        ts = self._push_ts.get(feed) or []
+        gaps = [b - a for a, b in zip(ts, ts[1:]) if 0 < b - a <= SPEC_FIRE_LATTICE_MAX_AGE]
+        if len(gaps) < SPEC_FIRE_LATTICE_MIN_N:
+            return -1.0
+        ok = 0
+        for g in gaps:
+            ph = g % SPEC_FIRE_LATTICE_P
+            if min(ph, SPEC_FIRE_LATTICE_P - ph) <= SPEC_FIRE_LATTICE_TOL:
+                ok += 1
+        return ok / float(len(gaps))
+
+    def _lattice_ready(self, feed) -> bool:
+        """Решётка подтверждена НАШИМ потоком: хватает гэпов И доля выше порога. Пока не
+        подтверждена — гейт не действует (fail-open), но счётчики уже не считаются."""
+        return self._lattice_frac(feed) >= SPEC_FIRE_LATTICE_MIN_FRAC
+
+    def _gate_open(self, feed, now=None) -> bool:
+        """Открыт ли фазовый слот. Любое сомнение -> True (стреляем как раньше)."""
+        if not SPEC_FIRE_LATTICE_GATE:
+            return True
+        ts = self._push_ts.get(feed) or []
+        if not ts or not self._lattice_ready(feed):
+            return True                                   # решётка не доказана нашим потоком
+        age = (self._now() if now is None else now) - ts[-1]
+        if age < 0 or age > SPEC_FIRE_LATTICE_MAX_AGE:
+            return True                                   # фаза уплыла — гейт снимается
+        ph = age % SPEC_FIRE_LATTICE_P
+        return min(ph, SPEC_FIRE_LATTICE_P - ph) <= SPEC_FIRE_LATTICE_TOL
+
     def _volley(self, probe, mid, b, d, feed, simultaneous=False):
         """Залп вслед за успешной пробой главного кошелька: тот же calldata на v4 от каждого
         залпового EOA. Огонь и ожидания — в daemon-тредах: петля окна не тормозится ни на мс.
@@ -753,6 +830,13 @@ class SpecFireLive:
                             iv = max(iv, PENDING_KEEPALIVE_SEC)   # в кипэлайв (газ ~7× вниз)
                     except Exception:
                         pass
+                if hot and self._now() - last_fire >= iv and not self._gate_open(feed):
+                    # фазовый гейт: секунда доказуемо холостая (пуш садится на узел решётки).
+                    # Патроны не тратим — когда слот откроется, условие интервала уже выполнено
+                    # и проба уйдёт сразу, т.е. бюджет сам стягивается в живые секунды.
+                    self.stats["lattice_skips"] += 1
+                    stop.wait(SPEC_FIRE_POLL_SEC)
+                    continue
                 if hot and self._now() - last_fire >= iv:
                     _eff_r = max(abs(r or 0.0), owed_ret if owed_fire else 0.0)
                     reach = _eff_r + SPEC_FIRE_DIST_MARGIN_DEVS * dev   # в долге меряем по пику
@@ -918,6 +1002,8 @@ class SpecFireLive:
                 threading.Thread(target=self._window_loop, args=(feed, direction, stop),
                                  daemon=True, name="specfire-%s" % feed).start()
             elif kind in ("confirmed", "push", "disarm", "falsepos", "stale"):
+                if kind in ("confirmed", "push"):
+                    self.note_push(feed)          # решётка OCR: метка севшего апдейта
                 if (SPEC_FIRE_PEAK_OWED and kind in ("disarm", "falsepos")
                         and self._owed.get(feed, 0.0) > self._now()
                         and feed in self._windows):
