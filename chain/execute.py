@@ -166,12 +166,30 @@ def pop_fast_lane_trip() -> str | None:
         return m
 
 
-def _fl_record(is_fast: bool, status, threshold: int, log=None):
+def _fl_record(is_fast: bool, status, threshold: int, log=None, xray=None):
     """Учёт исхода ЗАМАЙНЕННОЙ fast-lane tx для breaker'а. status==1 -> сброс серии; status!=1 (реверт)
     -> инкремент; при достижении порога -> disable + one-shot TG-msg. status is None (timeout, исход
-    неизвестен) НЕ считаем. Idempotent после disable (флаг уже стоит)."""
+    неизвестен) НЕ считаем. Idempotent после disable (флаг уже стоит).
+
+    `xray` — вердикт `_submit_xray`. ПРОИГРАННУЮ ГОНКУ («race»: жертву забрал конкурент, его tx
+    видна в логах Morpho) не считаем вовсе: замысел брейкера с самого начала был «устойчивый
+    шторм, не разовый lost-race», но отличить одно от другого код не умел, хотя вердикт уже
+    вычислялся рядом и выбрасывался. Цена ошибки была измерена 07.08 в 17:00: три подряд
+    проигранные гонки в каскаде (реверты по $0.01-0.11) выключили fast-lane ровно в тот момент,
+    когда в ТОМ ЖЕ блоке оставались цели на $30890 и $16489. Реверты в каскаде — норма для
+    проигравшего, а не признак поломки.
+
+    Серию при этом НЕ сбрасываем: смесь проигранных гонок и настоящих дефектов обязана
+    накапливаться, иначе брейкер перестанет срабатывать вообще. `not-race`/`unknown` считаем —
+    консервативно, это и есть тот шторм, ради которого брейкер сделан.
+    """
     global _FL_CONSEC_REVERTS, _FL_DISABLED, _FL_TRIP_MSG
     if not is_fast or status is None:
+        return
+    if status != 1 and xray == "race":
+        if log:
+            log.info("II.6 breaker: реверт = проигранная гонка (xray нашёл победителя) — "
+                     "серия не растёт (%d/%d)", _FL_CONSEC_REVERTS, threshold)
         return
     with _INFLIGHT_LOCK:
         if status == 1:
@@ -1954,12 +1972,12 @@ def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4, cfg=No
                 if log:
                     log.info("submit-xray: НЕПОЛОН — нода отстала (head=%s < %s), вердикт о гонке "
                              "не выносим (реверт разбирать по reason)", head, block_number)
-                return
+                return "unknown"
             if log:
                 log.info("submit-xray: borrower %s НЕ ликвидирован в [%d..%d] (наш idx=%s) — "
                          "реверт НЕ гонка за жертву (смотреть reason)",
                          borrower[:10], frm, block_number, our_index)
-            return
+            return "not-race"
         w = logs[0]                                     # самый ранний Liquidate = победитель
         wblk, widx = w.get("blockNumber"), w.get("transactionIndex")
         wtx = w.get("transactionHash")
@@ -1987,9 +2005,11 @@ def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4, cfg=No
                 note_race_loss_for_cascade(float(tip_s), our_tip, log=log)
             except Exception:
                 pass
+        return "race"
     except Exception as e:
         if log:
             log.info("submit-xray fail: %s", type(e).__name__)
+    return "unknown"
 
 
 _TRANSPORT_SIGNS = ("block not found", "-32001", "too many requests", "request timeout",
@@ -2304,8 +2324,11 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                     row["revert_reason"] = reason
                     if log:
                         log.warning("liquidate revert %s/%s reason=%s tx=%s", mid[:10], borrower[:10], reason, h)
-                    _submit_xray(rpc, borrower, _blk, _txi, log, cfg=cfg, our_debt_usd=prep.get("debt_usd"))
-                _fl_record(prep.get("fast"), status, getattr(cfg, "fast_lane_max_consec_reverts", 3), log)
+                    _xr = _submit_xray(rpc, borrower, _blk, _txi, log, cfg=cfg,
+                                       our_debt_usd=prep.get("debt_usd"))
+                    row["xray"] = _xr
+                _fl_record(prep.get("fast"), status, getattr(cfg, "fast_lane_max_consec_reverts", 3),
+                           log, xray=row.get("xray"))
                 results.append(row)
             else:                                             # --- батч: per-item ТОЛЬКО из событий ---
                 gas_total = int(rcpt.get("gasUsed") or 0) * int(rcpt.get("effectiveGasPrice") or 0) * cfg.eth_price_usd / 1e18
