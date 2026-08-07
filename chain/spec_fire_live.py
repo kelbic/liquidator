@@ -165,6 +165,20 @@ SPEC_FIRE_LATTICE_TOL = float(os.environ.get("SPEC_FIRE_LATTICE_TOL_SEC", "2"))
 SPEC_FIRE_LATTICE_MAX_AGE = float(os.environ.get("SPEC_FIRE_LATTICE_MAX_AGE_SEC", "1800"))
 SPEC_FIRE_LATTICE_MIN_N = int(os.environ.get("SPEC_FIRE_LATTICE_MIN_N", "12"))
 SPEC_FIRE_LATTICE_MIN_FRAC = float(os.environ.get("SPEC_FIRE_LATTICE_MIN_FRAC", "0.80"))
+# --- v5 stateful board (07.08): armed-план в контракте, ноги залпа пробят 1 байтом ---
+# Мотив уточнён разведкой 07.08: конкурент держит стену 2592 tx от 2592 EOA в ОДНОМ блоке.
+# 1-байт калдаты делает такую плотность дешёвой и попутно не палит цель (наши сегодняшние
+# healthy-реверты несут полные аргументы liquidate и читаются кем угодно).
+# ВЫКЛЮЧЕНО по умолчанию: включать только после деплоя v5 (у v4 нет fallback -> пробы
+# ревертят). OFF = V1 бит-в-бит, ни одной новой tx.
+SPEC_FIRE_V2_BOARD = os.environ.get("SPEC_FIRE_V2_BOARD", "0").lower() not in ("0", "false", "no")
+SPEC_FIRE_V2_PLAN_TTL_SEC = int(os.environ.get("SPEC_FIRE_V2_PLAN_TTL_SEC", "900"))
+SPEC_FIRE_V2_REARM_SEC = float(os.environ.get("SPEC_FIRE_V2_REARM_SEC", "240"))
+SPEC_FIRE_V2_PROBE_GAS = int(os.environ.get("SPEC_FIRE_V2_PROBE_GAS", "260000"))
+SPEC_FIRE_V2_TRIGGER_MARGIN_BPS = int(os.environ.get("SPEC_FIRE_V2_TRIGGER_MARGIN_BPS", "30"))
+# Пауза между отправкой setPlan и доверием к доске: пока запись не села в блок, однобайтовая
+# нога попадает в пустой сторадж и тихо возвращается. 6с = 3 блока Base с запасом.
+SPEC_FIRE_V2_BOARD_SETTLE_SEC = float(os.environ.get("SPEC_FIRE_V2_BOARD_SETTLE_SEC", "6"))
 # ФОЛБЭК ЦЕЛИ (01.08, ревью гонки cbDOGE): топ-цель «нет свопа» монополизировала тик —
 # $4.1k-жертва в досягаемости И в капе пула не получила НИ ОДНОЙ пробы за три окна
 # (18:45-18:50), конкурент выиграл присутствием (tip 0.0055 < наших 0.05). Небилдящаяся
@@ -321,8 +335,13 @@ class SpecFireLive:
                       "pending_fires": 0,                      # A2: выстрелы по pending-handoff
                       "volley_probes": 0,                      # каскадный тир: ноги залпа (07.08)
                       "lattice_skips": 0,                      # фазовый гейт: тики без огня
-                      "lattice_hits": 0, "lattice_misses": 0}  # пуш в фазе / вне фазы (живой валидатор)
+                      "lattice_hits": 0, "lattice_misses": 0,  # пуш в фазе / вне фазы (живой валидатор)
+                      "board_arms": 0, "board_probes": 0,      # v5 доска: записей плана / 1-байт проб
+                      "board_fails": 0}                        # арм не удался -> ноги ушли на V1
         self._push_ts: dict = {}                  # feed -> метки севших пушей (решётка OCR, 07.08)
+        self._board: dict = {}                    # v5 доска: {"key": (mid,b), "until": ts, "armed_ts": ts}
+        self._board_lock = threading.Lock()       # арм доски — одна запись за раз (nonce главного)
+        self._board_arm_fn = None                 # шов юнитов: (calldata, gas, tag) -> hash|None
         self._owed: dict = {}                     # feed -> owed_until (peak-owed, пишет петля окна)
         self._prio: dict = {}                     # feed -> (claim_debt, ts): заявки на слот (пакет B)
         self.probe_board: dict = {}               # feed -> (mid, b, debt, calldata, gas, ts): свежая
@@ -373,7 +392,7 @@ class SpecFireLive:
                                    (_MORPHO_BLUE, encode_position_call(m32, borrower))])
         loan, coll, oracle, irm, lltv_wad = decode_id_to_market_params(r1[0][1])
         mk = decode_market(r1[1][1]); tba, tbs = mk[2], mk[3]
-        bs, _ = decode_position(r1[2][1])
+        bs, coll_amt = decode_position(r1[2][1])
         if bs == 0:
             return "gone"                         # позиция разобрана (конкурент/погашение) — LOSS-стоп
         price = decode_price(aggregate3(self.rpc, [(oracle, encode_price_call())])[0][1])
@@ -417,8 +436,24 @@ class SpecFireLive:
         min_profit = int(repaid_assets) * SPEC_FIRE_MIN_PROFIT_BPS // 10000
         calldata = encode_liquidate(mp, borrower, repaid_shares, swap["router"],
                                     swap["calldata"], min_profit)
+        # v5 доска: сырые компоненты того же выстрела + порог цены оракула-обёртки.
+        # Morpho здоров, пока collateral*price*lltv >= borrowed*1e36*1e18, значит граница
+        # price = borrowed*1e54/(collateral*lltv). Долг РАСТЁТ с начислением, т.е. настоящая
+        # граница со временем ползёт ВВЕРХ — замороженный порог занижается и начал бы гасить
+        # огонь (fail-closed). Поэтому запас: фильтр чуть свободнее правды, лишняя проба
+        # дешевле пропущенного приза.
+        trigger = 0
+        try:
+            if coll_amt and lltv_wad:
+                _b = int(repaid_assets) * 10**54 // (int(coll_amt) * int(lltv_wad))
+                trigger = _b * (10000 + SPEC_FIRE_V2_TRIGGER_MARGIN_BPS) // 10000
+        except Exception:
+            trigger = 0                           # не посчитали -> 0 = фильтра нет (fail-open)
         return {"calldata": calldata, "gas": int(self.cfg.gas_limit_est * 125 // 100),
-                "swap_meta": swap_meta}
+                "swap_meta": swap_meta,
+                "plan": {"mp": mp, "borrower": borrower, "repaid_shares": repaid_shares,
+                         "router": swap["router"], "swap_calldata": swap["calldata"],
+                         "min_profit": min_profit, "trigger": int(trigger)}}
 
     def _consume_cap(self, spent, key, probe):
         """Consume-хук (05.08): ПЕРВАЯ успешная отправка цели списывает её direct-сайз из
@@ -642,6 +677,88 @@ class SpecFireLive:
         ph = age % SPEC_FIRE_LATTICE_P
         return min(ph, SPEC_FIRE_LATTICE_P - ph) <= SPEC_FIRE_LATTICE_TOL
 
+    def _board_ready(self, mid, b) -> bool:
+        """Доска армлена ИМЕННО под эту цель и ещё жива? Только тогда 1-байт проба осмысленна."""
+        if not SPEC_FIRE_V2_BOARD:
+            return False
+        st = self._board
+        return bool(st and st.get("key") == (mid, b)
+                    and self._now() < st.get("until", 0.0))
+
+    def _arm_board(self, probe, mid, b, feed) -> bool:
+        """Записать armed-план в контракт (owner-tx с главного кошелька). Возврат: доска готова?
+
+        Вызывается ЗАРАНЕЕ (пока окно взведено, но горячая фаза не началась) — плану надо сесть
+        в блок ДО того, как полетят однобайтовые ноги, иначе они бьют в пустую доску.
+        Идемпотентно: если та же цель уже армлена и не протухла — молчим. Любая осечка = False,
+        и залп уходит по V1 с полной калдатой (деградация, а не отказ от огня)."""
+        if not SPEC_FIRE_V2_BOARD or not isinstance(probe, dict):
+            return False
+        plan = probe.get("plan")
+        if not plan:
+            return False
+        if not self._board_lock.acquire(blocking=False):
+            return self._board_ready(mid, b)      # другой поток уже пишет — не толкаемся
+        try:
+            if self._board_ready(mid, b):
+                st = self._board
+                if self._now() - st.get("armed_ts", 0.0) < SPEC_FIRE_V2_REARM_SEC:
+                    return True                   # свежая и та же цель — переписывать нечего
+            import chain.execute as _ex
+            dl = int(time.time()) + SPEC_FIRE_V2_PLAN_TTL_SEC
+            cd = _ex.encode_set_plan(
+                plan["mp"], plan["borrower"], plan["repaid_shares"], plan["router"],
+                plan["swap_calldata"], plan["min_profit"], dl, plan["trigger"])
+            # газ: запись плана пишет KB-скейл роут в сторадж — считаем по длине калдаты,
+            # 22 газа/байт с запасом (16 калдата + ~6 на слово стораджа) плюс постоянная часть
+            gas = 120_000 + 22 * (len(cd) // 2)
+            h = (self._board_arm_fn or (lambda c, g, tag: _ex.send_board_tx(
+                self.rpc, self.cfg, c, g, log=log, tag=tag)))(cd, gas, "setPlan")
+            if h is None:
+                self.stats["board_fails"] += 1
+                return False
+            self._board = {"key": (mid, b), "armed_ts": self._now(),
+                           # доска считается годной только ПОСЛЕ того, как tx могла сесть;
+                           # до этого 1-байт пробы ушли бы в пустоту (плана в сторадже нет)
+                           "until": self._now() + SPEC_FIRE_V2_PLAN_TTL_SEC - 30.0,
+                           "ready_at": self._now() + SPEC_FIRE_V2_BOARD_SETTLE_SEC}
+            self.stats["board_arms"] += 1
+            self._log("SPECFIRE доска armed feed=%s %s/%s trigger=%s TTL=%dс tx=%s" % (
+                feed, mid[:10], b[:10],
+                ("%.4g" % (plan["trigger"] / 1e36)) if plan["trigger"] else "нет(fail-open)",
+                SPEC_FIRE_V2_PLAN_TTL_SEC, h))
+            return True
+        except Exception as e:
+            self.stats["board_fails"] += 1
+            self._log("SPECFIRE доска arm fail feed=%s: %s" % (feed, type(e).__name__))
+            return False
+        finally:
+            self._board_lock.release()
+
+    def _board_live(self, mid, b) -> bool:
+        """Доска армлена, ПРОТУХНУТЬ не успела И запись уже могла сесть в блок."""
+        st = self._board
+        return bool(self._board_ready(mid, b) and self._now() >= st.get("ready_at", 0.0))
+
+    def _prearm_board(self, feed, direction, dev):
+        """Положить план по самой жирной достижимой цели ЗАРАНЕЕ — пока окно взведено, но
+        горячая фаза не началась. Именно ради этого запаса времени доска и существует: запись
+        успевает сесть, и к моменту огня ноги залпа уже несут 1 байт вместо полной калдаты.
+        Крутится в своём треде — петля окна не ждёт RPC сборки."""
+        try:
+            reach = dev * (SPEC_FIRE_THRESHOLD + SPEC_FIRE_DIST_MARGIN_DEVS)
+            tgts, _hold, _edge = self._top_fat(feed, direction, max_dist=reach, k=1)
+            if not tgts:
+                return                             # жира в досягаемости нет — план ни к чему
+            mid, b, d = tgts[0]
+            if self._board_ready(mid, b):
+                return
+            probe = (self._build_fn or self._build)(mid, b, d)
+            if isinstance(probe, dict):
+                self._arm_board(probe, mid, b, feed)
+        except Exception as e:
+            self._log("SPECFIRE доска prearm fail feed=%s: %s" % (feed, type(e).__name__))
+
     def _volley(self, probe, mid, b, d, feed, simultaneous=False):
         """Залп вслед за успешной пробой главного кошелька: тот же calldata на v4 от каждого
         залпового EOA. Огонь и ожидания — в daemon-тредах: петля окна не тормозится ни на мс.
@@ -660,20 +777,27 @@ class SpecFireLive:
         if not accts:
             return
         sync = bool(simultaneous) and SPEC_FIRE_VOLLEY_DETECT_SYNC
+        # v5 доска: план УЖЕ в контракте под ЭТУ цель и запись успела сесть -> ноги несут 1 байт
+        # (цель не палится, газ калдаты ~в 200 раз меньше). Иначе — прежний полный calldata.
+        board = self._board_live(mid, b)
+        _cd = _ex.V2_PROBE_CALLDATA if board else probe["calldata"]
+        _gas = SPEC_FIRE_V2_PROBE_GAS if board else probe["gas"]
 
         def _leg(i, addr, key, mf, tip, bcast, wait_sec):
             try:
                 if wait_sec > 0:
                     self._sleep(wait_sec)
                 h = (self._volley_send_fn or _ex.send_volley_probe)(
-                    self.rpc, self.cfg, addr, key, probe["calldata"], probe["gas"],
+                    self.rpc, self.cfg, addr, key, _cd, _gas,
                     log=log, max_fee=mf, tip=tip, broadcast_raw_urls=bcast)
                 if h is None:
                     return
                 self.stats["volley_probes"] += 1
-                self._log("SPECFIRE volley leg=%d/%d%s eoa=%s feed=%s %s/%s tx=%s" % (
-                    i + 1, len(accts), " [sync]" if sync else "", addr[:10], feed,
-                    mid[:10], b[:10], h))
+                if board:
+                    self.stats["board_probes"] += 1
+                self._log("SPECFIRE volley leg=%d/%d%s%s eoa=%s feed=%s %s/%s tx=%s" % (
+                    i + 1, len(accts), " [sync]" if sync else "", " [доска]" if board else "",
+                    addr[:10], feed, mid[:10], b[:10], h))
                 threading.Thread(target=self._collect_volley, args=(h, mid, b, d, feed, addr),
                                  daemon=True).start()
             except Exception as e:
@@ -751,6 +875,7 @@ class SpecFireLive:
         gap_t0 = None
         last_yield_log = 0.0
         fat_mode = False     # EV-плотность (06.08): жир в досягаемости -> каденс 0.12с, кап 600
+        next_board_try = 0.0  # v5 доска: когда снова пробовать положить/переложить план
         try:
             while not stop.is_set() and probes < _window_cap(fat_mode):
                 pf = self.pending_fire.pop(feed, None)
@@ -813,6 +938,12 @@ class SpecFireLive:
                 was_raw_hot = raw_hot
                 self._owed[feed] = owed_until if SPEC_FIRE_PEAK_OWED else 0.0
                 hot = raw_hot or owed_fire
+                if SPEC_FIRE_V2_BOARD and _n >= next_board_try:
+                    # доску армим ЗАРАНЕЕ и переармливаем по каденсу (роут протухает так же,
+                    # как у обычной пробы). Свой тред: сборка плана не крадёт мс у огня.
+                    next_board_try = _n + SPEC_FIRE_V2_REARM_SEC
+                    threading.Thread(target=self._prearm_board, args=(feed, direction, dev),
+                                     daemon=True, name="board-%s" % feed).start()
                 if hot and gap_t0 is None:
                     gap_t0 = self._now()               # B3: старт горячей фазы — лаг до первой пробы тоже пробел
                 elif not hot:

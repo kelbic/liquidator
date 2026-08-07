@@ -435,6 +435,40 @@ def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
         return res["hash"]
 
 
+def send_board_tx(rpc, cfg, calldata: str, gas: int, log=None, tag="board"):
+    """v5 stateful board: УПРАВЛЯЮЩАЯ tx владельца (setPlan/clearPlan) с главного кошелька.
+
+    Не проба и не выстрел: своих $-бакетов не трогает, но обязана делить _SEND_LOCK/_LOCAL_NONCE
+    с боевым путём — иначе разъедется nonce главного кошелька (тот же инвариант, что у канарейки).
+    Гейт _INFLIGHT>0: боевая tx главнее — план подождёт, у него TTL секунды-минуты, а выстрел
+    ждать не может. Тип-2 fee по свежему basefee: доска армится ЗАРАНЕЕ, торопиться нечем,
+    поэтому tip обычный боевой, а не капнутый пробный."""
+    with _SEND_LOCK:
+        with _INFLIGHT_LOCK:
+            if _INFLIGHT > 0:
+                return None
+        w3 = rpc._web3()
+        bot = account_for(w3, cfg.wallet_key).address
+        base_nonce = _LOCAL_NONCE.get(bot)
+        if base_nonce is None:
+            base_nonce = _pending_nonce(w3, bot)
+        tip_wei = int(cfg.tip_gwei * 1e9)
+        fb = _fresh_basefee()
+        _tx = {"to": cfg.liquidator_address, "data": calldata, "nonce": base_nonce, "gas": int(gas)}
+        if fb is not None:
+            _tx["maxFeePerGas"] = int(fb * 2 + tip_wei)
+            _tx["maxPriorityFeePerGas"] = tip_wei
+        try:
+            res = send_tx(rpc, cfg.wallet_key, _tx, wait=False, min_tip_wei=tip_wei)
+        except Exception as e:
+            _LOCAL_NONCE.pop(bot, None)
+            if log:
+                log.info("BOARD %s send fail: %s", tag, type(e).__name__)
+            return None
+        _LOCAL_NONCE[bot] = base_nonce + 1
+        return res["hash"]
+
+
 def canary_invalidate_nonce(rpc, cfg):
     """Канарейка не замайнилась за timeout (возможно дропнута) -> _LOCAL_NONCE впереди чейна ->
     следующая tx уйдёт в дыру. Инвалидируем (как timeout-ветка dispatch, II нонс-фикс)."""
@@ -1117,6 +1151,54 @@ def encode_liquidate(mp: dict, borrower: str, repaid_shares: int, swap_target: s
          borrower, int(repaid_shares), swap_target, cd, int(min_profit), unwrap_target],
     )
     return "0x" + (selector + args).hex()
+
+
+# --- v5 stateful board (07.08): owner армит план ДО окна, залповые ноги пробят 1 байтом ---
+_SET_PLAN_SIG = ("setPlan((address,address,address,address,uint256),"
+                 "address,uint256,address,bytes,uint256,address,uint64,uint256)")
+_CLEAR_PLAN_SIG = "clearPlan()"
+_PLAN_INFO_SIG = "planInfo()"
+# Проба-доска: <=1 байта калдаты падает в fallback() контракта. Один байт, не ноль — нулевая
+# калдата у многих кошельков/релеев трактуется как простой перевод ETH.
+V2_PROBE_CALLDATA = "0x01"
+
+
+def encode_set_plan(mp: dict, borrower: str, repaid_shares: int, swap_target: str,
+                    swap_calldata: str, min_profit: int, deadline: int, trigger_price: int,
+                    unwrap_target: str = ZERO_ADDR) -> str:
+    """ABI-encode Liquidator.setPlan(...). Те же аргументы, что у liquidate(), плюс TTL плана
+    и triggerPrice (в юнитах ОРАКУЛА-ОБЁРТКИ рынка, 1e36; 0 = фильтра нет)."""
+    from eth_abi import encode
+    from eth_utils import keccak
+    selector = keccak(text=_SET_PLAN_SIG)[:4]
+    cd = bytes.fromhex(swap_calldata[2:] if swap_calldata.startswith("0x") else swap_calldata)
+    args = encode(
+        ["(address,address,address,address,uint256)", "address", "uint256", "address", "bytes",
+         "uint256", "address", "uint64", "uint256"],
+        [(mp["loanToken"], mp["collateralToken"], mp["oracle"], mp["irm"], int(mp["lltv"])),
+         borrower, int(repaid_shares), swap_target, cd, int(min_profit), unwrap_target,
+         int(deadline), int(trigger_price)],
+    )
+    return "0x" + (selector + args).hex()
+
+
+def encode_clear_plan() -> str:
+    from eth_utils import keccak
+    return "0x" + keccak(text=_CLEAR_PLAN_SIG)[:4].hex()
+
+
+def read_plan_info(rpc, liquidator_address: str):
+    """(borrower, deadline, triggerPrice) с контракта. None, если чтение не удалось ИЛИ контракт
+    не знает planInfo (v4) — вызывающий обязан трактовать None как «доски нет»."""
+    from eth_abi import decode as abi_decode
+    from eth_utils import keccak
+    try:
+        raw = rpc._web3().eth.call({"to": liquidator_address,
+                                    "data": "0x" + keccak(text=_PLAN_INFO_SIG)[:4].hex()})
+        b, dl, tp = abi_decode(["address", "uint64", "uint256"], bytes(raw))
+        return b, int(dl), int(tp)
+    except Exception:
+        return None
 
 
 # --- batch: N targets in ONE tx (cascade capture). Контракт: batchLiquidate(LiquidationItem[]) ---
