@@ -175,6 +175,20 @@ SPEC_FIRE_V2_BOARD = os.environ.get("SPEC_FIRE_V2_BOARD", "0").lower() not in ("
 SPEC_FIRE_V2_PLAN_TTL_SEC = int(os.environ.get("SPEC_FIRE_V2_PLAN_TTL_SEC", "900"))
 SPEC_FIRE_V2_REARM_SEC = float(os.environ.get("SPEC_FIRE_V2_REARM_SEC", "240"))
 SPEC_FIRE_V2_PROBE_GAS = int(os.environ.get("SPEC_FIRE_V2_PROBE_GAS", "260000"))
+# ЛИМИТ ГАЗА ПРОБЫ ДОСКИ — считается от ВЫИГРЫША, а не от no-op'а (замер 07.08, #32).
+# Однобайтовая проба почти всегда тихий no-op (18.6k), но в тот единственный раз, когда
+# триггер сработал, ОНА ЖЕ исполняет весь план. Три измеренных числа задают лимит:
+#   709 038 — реальная ликвидация со свопом (исполнитель конкурента, блок 49642833);
+#   +214 941 — надбавка нашего пути: план на 2KB копируется из ХОЛОДНОГО стораджа
+#              (форк-замер testFireGasFallbackVsDirectHeavyRoute: 449 983 против 235 042);
+#   2 470 096 — фактический расход на ките $1.5M (форк-экзамен 25.07, из-за него главный
+#              путь огня и держит gas_limit_floor=4M).
+# Прежние 260k (и 625k у V1-пробы) не покрывают ни одного из этих случаев, а OOG внутри
+# fallback ГЛОТАЕТСЯ try/catch: tx успешна, план цел, приз ушёл — без следа в журнале.
+# На Base платим за ИСПОЛЬЗОВАННЫЙ газ, поэтому запас в лимите почти бесплатен; его
+# единственная цена — резерв maxFee x limit на балансе ноги, и он разведён с расходом
+# отдельно (см. _VOLLEY_EXPECTED_GAS в execute: гейт по худшему случаю, декремент по факту).
+SPEC_FIRE_V2_FIRE_GAS = int(os.environ.get("SPEC_FIRE_V2_FIRE_GAS", "3000000"))
 SPEC_FIRE_V2_TRIGGER_MARGIN_BPS = int(os.environ.get("SPEC_FIRE_V2_TRIGGER_MARGIN_BPS", "30"))
 # Пауза между отправкой setPlan и доверием к доске: пока запись не села в блок, однобайтовая
 # нога попадает в пустой сторадж и тихо возвращается. 6с = 3 блока Base с запасом.
@@ -785,12 +799,7 @@ class SpecFireLive:
         # (цель не палится, газ калдаты ~в 200 раз меньше). Иначе — прежний полный calldata.
         board = self._board_live(mid, b)
         _cd = _ex.V2_PROBE_CALLDATA if board else probe["calldata"]
-        # Газ 1-байт пробы: НЕ константа 260k. Отфильтрованный no-op стоит 18.6k, но при
-        # сработавшем триггере ЭТА ЖЕ проба исполняет полную ликвидацию плана — реальные роуты
-        # 500-700k. OOG на выигрыше глотается try/catch контракта МОЛЧА (tx успешна, план цел,
-        # приз ушёл) и виден только в единственный момент, который имеет значение. План знает
-        # газ своего роута (probe["gas"]) — берём максимум; неиспользованный лимит бесплатен.
-        _gas = max(SPEC_FIRE_V2_PROBE_GAS, int(probe.get("gas") or 0)) if board else probe["gas"]
+        _gas = SPEC_FIRE_V2_FIRE_GAS if board else probe["gas"]
 
         def _leg(i, addr, key, mf, tip, bcast, wait_sec):
             try:

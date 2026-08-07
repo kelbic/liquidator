@@ -504,6 +504,14 @@ _VOLLEY_BAL_TTL = 60.0
 # что для 4 жирных ног 0.003 ETH разумно, а для флота из десятков это мёртвый капитал БОЛЬШЕ
 # самого флота: 70 ног x 0.003 = 0.21 ETH заперто, при том что проба стоит ~0.0000024 ETH.
 _VOLLEY_BAL_FLOOR_WEI = int(float(os.environ.get("SPEC_FIRE_VOLLEY_FLOOR_ETH", "0.003")) * 10**18)
+# ГЕЙТ И РАСХОД — РАЗНЫЕ ВЕЛИЧИНЫ (замер 07.08, #32). Лимит газа пробы доски считается от
+# ВЫИГРЫША (3M: ликвидация кита 2.47M + копия плана из холодного стораджа 215k), но реальная
+# проба — тихий no-op на ~40k. Если списывать с кэша баланса весь лимит x maxFee, нога при
+# 3M замолкает после ~28 проб (0.005 ETH запаса / 0.00018) — это ДВА блока, то есть флот
+# глушил бы сам себя ровно в каскаде, ради которого и строится. Поэтому:
+#   гейт     — по ХУДШЕМУ случаю: нога обязана быть способна оплатить полный выигрыш;
+#   декремент— по ОЖИДАЕМОМУ: no-op, а не лимит (истину всё равно вернёт refresh кэша).
+_VOLLEY_EXPECTED_GAS = int(os.environ.get("SPEC_FIRE_VOLLEY_EXPECTED_GAS", "45000"))
 
 
 def volley_accounts():
@@ -620,8 +628,10 @@ def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, lo
                 pass                      # чтение упало: живём старым кэшем; без кэша молчим
         if bal is None:
             return None
-        _cost = int(gas) * int(max_fee if max_fee else int(cfg.tip_gwei * 1e9) * 3)
-        if bal[0] - _cost < _VOLLEY_BAL_FLOOR_WEI:
+        _px = int(max_fee if max_fee else int(cfg.tip_gwei * 1e9) * 3)
+        _worst = int(gas) * _px              # гейт: нога обязана потянуть ПОЛНЫЙ выигрыш
+        _spend = _VOLLEY_EXPECTED_GAS * _px  # декремент: реальный расход тихой пробы
+        if bal[0] - _worst < _VOLLEY_BAL_FLOOR_WEI:
             if log:
                 log.info("VOLLEY %s молчит: патрон на поле %.4f ETH (долив — решение владельца)",
                          addr[:10], bal[0] / 1e18)
@@ -643,7 +653,7 @@ def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, lo
                 log.info("VOLLEY send fail %s: %s", addr[:10], type(e).__name__)
             return None
         _VOLLEY_NONCE[addr] = nonce + 1
-        bal[0] -= _cost                  # пессимистично до receipt; $-учёт — volley_gas_add
+        bal[0] -= _spend                 # по ФАКТУ no-op'а, не по лимиту; истину вернёт refresh
         with _INFLIGHT_LOCK:
             _VOLLEY_PROBES += 1
         return res["hash"]

@@ -297,6 +297,47 @@ contract V5PlanForkTest is Test {
         assertLt(g2, 10_000, "post-consume probe must be a 1-SLOAD-class no-op");
     }
 
+    /// @notice ГАЗ ОГНЯ: сколько стоит ВЫИГРЫШНАЯ проба против прямого вызова liquidate().
+    /// Мотив (#32): бот оценивает газ на ПРЯМОМ пути (probe["gas"] от estimate_gas), а нога
+    /// доски исполняет план ЧЕРЕЗ fallback — и там KB-скейл роут копируется из ХОЛОДНОГО
+    /// стораджа (2048 байт = 64 слова x 2100 газа), чего в прямой оценке нет вовсе.
+    /// Если лимит ноги взят из прямой оценки, выигрышная проба ляжет OOG — и ляжет МОЛЧА:
+    /// вызов обёрнут try/catch, tx вернётся успешной, план останется цел, приз уйдёт.
+    /// Тест меряет ОБА пути на ОДНОМ состоянии (снапшот) и печатает дельту как число.
+    function testFireGasFallbackVsDirectHeavyRoute() public {
+        bytes memory route = _fatSwapData();          // боевой KB-скейл роут
+        _arm(route, address(swapper), trigger);
+        oracle.setPrice(1.8e36);
+        uint256 snap = vm.snapshotState();
+
+        // (1) огонь ЧЕРЕЗ ДОСКУ: 1 байт калдаты, план из холодного стораджа
+        (bool okFb, uint256 gFallback) = _probe(volley);
+        assertTrue(okFb, "fallback fire reverted");
+        assertEq(_shares(), 0, "fallback path did not liquidate");
+
+        // (2) то же самое ПРЯМЫМ вызовом на том же состоянии: роут приезжает КАЛДАТОЙ
+        vm.revertToState(snap);
+        vm.cool(address(liq));
+        vm.cool(address(oracle));
+        uint256 g0 = gasleft();
+        liq.liquidate(mp, borrower, _shares(), address(swapper), route, 0, address(0));
+        uint256 gDirect = g0 - gasleft();
+        assertEq(_shares(), 0, "direct path did not liquidate");
+
+        console2.log("gas fire via fallback (cold plan, 2KB route):", gFallback);
+        console2.log("gas fire via direct liquidate (2KB calldata):", gDirect);
+        console2.log("delta fallback-direct (cold plan storage):  ", gFallback - gDirect);
+
+        // Главное утверждение: путь доски ДОРОЖЕ прямого — значит лимит, снятый с прямой
+        // оценки, недостаточен по построению, и формула бота обязана нести запас.
+        assertGt(gFallback, gDirect, "fallback must cost MORE (cold plan copy) - else this test is blind");
+
+        // Запас, который кладёт бот (max(V2_PROBE_GAS=260k, probe.gas)), обязан покрывать дельту
+        // с полем. Числа берём из ЭТОГО замера, а не из головы.
+        uint256 delta = gFallback - gDirect;
+        assertLt(delta, 260_000, "delta outgrew V2_PROBE_GAS constant - raise it in the bot");
+    }
+
     function testOwnerCanProbe() public {
         _arm(_swapData(), address(swapper), trigger);
         oracle.setPrice(1.8e36);

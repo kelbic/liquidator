@@ -207,6 +207,71 @@ print("UNIT_OK: боевая tx в полёте — нога молчит")
 assert ex.send_volley_probe(None, cfg, "0xNOPE", "k", "0x", 100000) is None
 print("UNIT_OK: незагруженный EOA (нет лока) — нога молчит")
 
+# ---- ГЕЙТ ПО ХУДШЕМУ СЛУЧАЮ vs РАСХОД ПО ФАКТУ (замер 07.08, #32) ----
+# Лимит газа пробы доски считается от ВЫИГРЫША (3M), а тратит она ~45k. Если списывать с
+# кэша баланса весь лимит, нога замолкает после ~28 проб — два блока, то есть флот глушит
+# себя ровно в каскаде. Здесь проверяется РАЗВЕДЁННОСТЬ этих величин: гейт по худшему,
+# декремент по факту.
+_ADDR = "0xDEEP"
+ex._VOLLEY_LOCKS[_ADDR] = _real_threading.Lock()
+ex._VOLLEY_NONCE[_ADDR] = 7          # nonce задан: _pending_nonce тянет web3, которого тут нет
+_MAXFEE = int(0.06e9)
+_LIMIT = 3_000_000
+_sent_n = [0]
+
+
+class _FakeW3:
+    class eth:
+        @staticmethod
+        def get_balance(a):
+            raise AssertionError("баланс обязан браться из кэша, а не с RPC в горячем пути")
+
+
+class _FakeRpc:
+    chain_id = 8453
+
+    def _web3(self):
+        return _FakeW3()
+
+
+def _fake_send_tx(rpc, key, tx, **kw):
+    _sent_n[0] += 1
+    return {"hash": "0xdeep%d" % _sent_n[0]}
+
+
+_orig_send_tx = ex.send_tx
+ex.send_tx = _fake_send_tx
+try:
+    # (1) нога с балансом НИЖЕ пола+худшего случая обязана молчать: выигрыш ей не оплатить
+    ex._VOLLEY_BAL[_ADDR] = [ex._VOLLEY_BAL_FLOOR_WEI + _LIMIT * _MAXFEE - 1, time.monotonic()]
+    assert ex.send_volley_probe(_FakeRpc(), cfg, _ADDR, "k", "0x01", _LIMIT,
+                                max_fee=_MAXFEE, tip=int(0.05e9)) is None,         "нога, не способная оплатить полный выигрыш, обязана молчать"
+    print("UNIT_OK: гейт по ХУДШЕМУ случаю — нога без денег на выигрыш не стреляет")
+
+    # (2) боевая нога (0.008 ETH) обязана выдержать ЗАЛП, а не 28 проб
+    ex._VOLLEY_BAL[_ADDR] = [int(0.008e18), time.monotonic()]
+    _sent_n[0] = 0
+    _fired = 0
+    for _ in range(200):
+        if ex.send_volley_probe(_FakeRpc(), cfg, _ADDR, "k", "0x01", _LIMIT,
+                                max_fee=_MAXFEE, tip=int(0.05e9)) is None:
+            break
+        _fired += 1
+    # 13 проб/блок на ногу: меньше 100 подряд = нога садится быстрее, чем живёт окно
+    assert _fired >= 100, ("нога замолчала после %d проб — при лимите от выигрыша "
+                           "декремент обязан считаться по факту, иначе флот глушит себя" % _fired)
+    print("UNIT_OK: расход по ФАКТУ — нога держит %d проб подряд (лимит газа 3M)" % _fired)
+
+    # (3) позитивный контроль: списание всё же происходит (иначе тест прошёл бы и на нуле)
+    assert ex._VOLLEY_BAL[_ADDR][0] < int(0.008e18), "декремент обязан быть, просто не по лимиту"
+    print("UNIT_OK: позитивный контроль — баланс кэша всё-таки убывает")
+finally:
+    ex.send_tx = _orig_send_tx
+    ex._VOLLEY_BAL.pop(_ADDR, None)
+    ex._VOLLEY_NONCE.pop(_ADDR, None)
+    ex._VOLLEY_LOCKS.pop(_ADDR, None)
+
+
 _saved_env = {k: os.environ.get(k) for k in
               ("SPEC_FIRE_EOA_KEY_2", "SPEC_FIRE_EOA_KEY_3",
                "SPEC_FIRE_EOA_KEY_4", "SPEC_FIRE_EOA_KEY_5")}
