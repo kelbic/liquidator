@@ -61,10 +61,24 @@ def _log():
     return logging.getLogger("test-hot-incr")
 
 
+class SyncThread:                      # детерминизм: "тред" исполняется в момент .start()
+    def __init__(self, target=None, args=(), daemon=None):
+        self._t, self._a = target, args
+
+    def start(self):
+        self._t(*self._a)
+
+    def join(self, timeout=None):
+        pass
+
+
 _orig_flips = hp._flips
 hp._flips = lambda price, lltv, tba, tbs, positions: [
     (b, types.SimpleNamespace(hf=0.98), du) for (b, bs, col, du) in positions]
 _orig_flag = hp.HOT_DISPATCH_INCREMENTAL
+_real_threading = hp.threading
+hp.threading = types.SimpleNamespace(Thread=SyncThread, Lock=_real_threading.Lock,
+                                     Event=_real_threading.Event)
 try:
     # 1. ON (дефолт кода): каждая готовая цель уходит ДО prepare следующей
     assert _orig_flag is True, "дефолт HOT_DISPATCH_INCREMENTAL должен быть ON"
@@ -98,5 +112,29 @@ try:
 finally:
     hp._flips = _orig_flips
     hp.HOT_DISPATCH_INCREMENTAL = _orig_flag
+    hp.threading = _real_threading
+
+# 4. ЖИВЫЕ треды: receipt-ожидание внутри dispatch (боевой замер 07.08: ~4с/tx) не должно
+# сериализовать цели — два dispatch по 0.5с обязаны идти внахлёст (e2e ~0.5с, не ~1.0с)
+hp._flips = lambda price, lltv, tba, tbs, positions: [
+    (b, types.SimpleNamespace(hf=0.98), du) for (b, bs, col, du) in positions]
+try:
+    import time as _time
+    ev = []
+    kw = _mk_env(ev)
+    kw["log"] = _log()
+    _slow = kw["dispatch_fn"]
+    def _slow_dispatch(rpc, cfg, ready, log=None, max_inflight=None):
+        _time.sleep(0.5)                       # receipt-ожидание
+        return _slow(rpc, cfg, ready, log=log, max_inflight=max_inflight)
+    kw["dispatch_fn"] = _slow_dispatch
+    _t0 = _time.perf_counter()
+    res = hp._process_transmit(AGG, 103, 0, _time.time(), **kw)
+    _el = _time.perf_counter() - _t0
+    assert len(res) == 2 and all(r["sent"] for r in res), res
+    assert _el < 0.95, "dispatch-треды сериализовались: e2e=%.2fс (ожидание ~0.5с)" % _el
+    print("UNIT_OK: receipt-ожидания идут внахлёст (e2e=%.2fс при 2×0.5с)" % _el)
+finally:
+    hp._flips = _orig_flips
 
 print("ПРОШЛИ: инкрементальный hot-dispatch")

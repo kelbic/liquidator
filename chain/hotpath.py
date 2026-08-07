@@ -1397,11 +1397,14 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     _canary_fired = False                        # ранний выстрел на hint-рынке (см. ниже) — один на транзит
     _t_read_total = 0.0; _t_prep_total = 0.0; _t_flips_total = 0.0   # DIAG latency: read=340-call, sim=prepare_hot
     _incr_results = []                           # инкрементальный dispatch (HOT_DISPATCH_INCREMENTAL)
-    _incr_state = {"blocked": None, "t_send": 0.0}
+    _incr_state = {"blocked": None, "t_send": 0.0, "threads": [], "rlock": threading.Lock()}
 
     def _dispatch_ready_now(item):
         """Готовая цель уходит немедленно; kill-switch перед КАЖДЫМ сендом (та же GuardState,
-        что у батч-пути). Блок = стоп дальнейших сендов этого транзита (алерт один раз)."""
+        что у батч-пути). Блок = стоп дальнейших сендов этого транзита (алерт один раз).
+        Сенд+receipt — в своём треде: wait_receipts внутри dispatch (до ~4с на tx, боевой замер
+        07.08) НЕ должен тормозить симы следующих целей (иначе вернули бы половину барьера);
+        nonce-серийность держит _SEND_LOCK внутри dispatch. Receipts дожидаемся в конце (журнал)."""
         if _incr_state["blocked"]:
             return
         from chain.execute import current_inflight, specfire_gas_today
@@ -1414,9 +1417,21 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             log.error("HOT kill switch engaged: %s — инкрементальный dispatch остановлен", blocked)
             alerter.send_async("\U0001F6D1 hot path halted: %s" % blocked, key="hot-killswitch")
             return
-        _ds1 = time.perf_counter()
-        _incr_results.extend(dispatch_fn(rpc, cfg, [item], log=log, max_inflight=cfg.max_inflight))
-        _incr_state["t_send"] += (time.perf_counter() - _ds1) * 1000.0
+
+        def _run(it=item):
+            _ds1 = time.perf_counter()
+            try:
+                r = dispatch_fn(rpc, cfg, [it], log=log, max_inflight=cfg.max_inflight)
+            except Exception as e:                # bare-тред: исключение не должно пропасть молча
+                log.error("HOT incr-dispatch error %s/%s: %s: %s",
+                          it[0][:10], it[1][:10], type(e).__name__, str(e)[:80])
+                r = []
+            with _incr_state["rlock"]:
+                _incr_results.extend(r)           # t_send = СУММА по тредам (может превышать wall)
+                _incr_state["t_send"] += (time.perf_counter() - _ds1) * 1000.0
+        _th = threading.Thread(target=_run, daemon=True)
+        _incr_state["threads"].append(_th)
+        _th.start()
     for mid in feeds.get(agg, []):
         om = meta.get(mid)
         borrowers = groups.get(mid, [])
@@ -1539,7 +1554,9 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             _maybe_canary(agg, block, subidx, rpc, cfg, log, t0=t)   # ⭐ нет ликвидации -> пробить гонку
         return []
 
-    if HOT_DISPATCH_INCREMENTAL:                             # сенды уже ушли по готовности (см. выше)
+    if HOT_DISPATCH_INCREMENTAL:                             # сенды уже ушли по готовности (см. выше);
+        for _th in _incr_state["threads"]:                   # ждём только receipts для журнала (кап >
+            _th.join(timeout=150.0)                          # 120с receipt-таймаута dispatch)
         results = _incr_results
         _t_send = _incr_state["t_send"]
     else:
