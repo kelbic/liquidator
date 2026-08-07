@@ -2,7 +2,64 @@
 the runtime-import check (see docs/WORKFLOW.md). Phase 1 reads only."""
 from __future__ import annotations
 
+import re
 import threading
+
+# ---- РЕДАКЦИЯ СЕКРЕТОВ В ЛОГЕ (07.08: журнал отдавал полный drpc-URL с ключом в пути ~600
+# строк/сутки — текст исключения RPC несёт URL целиком, а его печатали как есть). Режем ТОЛЬКО
+# внутри URL и только после authority: хост обязан остаться (без него не понять, какой контур
+# отвалился), хэши tx и адреса — тоже (без них вскрытие гонки невозможно).
+_URL_RE = re.compile(r"https?://[^\s'\"<>,)]*")
+_AUTHORITY_RE = re.compile(r"(https?://[^/?#]*)(.*)", re.S)
+_SECRET_SEG_RE = re.compile(r"([/=])([A-Za-z0-9_\-]{20,})")
+
+
+def _redact_one_url(u: str) -> str:
+    m = _AUTHORITY_RE.match(u)
+    if not m:
+        return u
+    return m.group(1) + _SECRET_SEG_RE.sub(lambda x: x.group(1) + "<ключ скрыт>", m.group(2))
+
+
+def redact(s) -> str:
+    """Убрать ключи провайдеров из произвольной строки перед печатью."""
+    try:
+        return _URL_RE.sub(lambda m: _redact_one_url(m.group(0)), str(s))
+    except Exception:
+        return "<строка не поддалась редакции>"
+
+
+class RedactingFilter:
+    """Фильтр логгера: последний рубеж, а не замена аккуратности на местах.
+
+    Ставится на корневой хендлер, поэтому закрывает и те строки, которых сегодня ещё нет.
+    Правит record.msg/args, а не готовую строку: хендлер форматирует запись сам, и подмена
+    результата format() до него бы не дошла.
+    """
+
+    def filter(self, record) -> bool:
+        try:
+            if isinstance(record.msg, str) and "://" in record.msg:
+                record.msg = redact(record.msg)
+            if record.args:
+                if isinstance(record.args, dict):
+                    record.args = {k: (redact(v) if isinstance(v, str) and "://" in v else v)
+                                   for k, v in record.args.items()}
+                else:
+                    record.args = tuple(
+                        redact(a) if isinstance(a, str) and "://" in a else a
+                        for a in record.args)
+            if record.exc_info:
+                # traceback хендлер рендерит отдельно от msg и кэширует в exc_text; рендерим
+                # сами и отдаём уже отредактированным, иначе log.exception() пронесёт URL мимо.
+                if not record.exc_text:
+                    import traceback
+                    record.exc_text = "".join(traceback.format_exception(*record.exc_info))
+                record.exc_text = redact(record.exc_text)
+        except Exception:
+            pass
+        return True
+
 
 # ---- учёт CU (25.07: Alchemy №2 сжёг 7.1M/30M за ~2 суток => ~8 дней до нуля; пик 558 CU/s
 # против лимита 500). Считаем ВЫЗОВЫ ПО МЕТОДАМ на каждом URL, чтобы резать по факту, а не на

@@ -48,6 +48,14 @@ HEARTBEAT_SEC = 300
 def setup_logging(level: str):
     logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(message)s")
+    # Ключ провайдера живёт в ПУТИ URL, а текст исключения RPC несёт URL целиком — до 07.08
+    # журнал отдавал оба drpc-ключа всякому, у кого есть доступ к хосту. Фильтр вешаем на
+    # ХЕНДЛЕР, а не на логгер: у logging фильтры логгера не применяются к записям, всплывшим
+    # от дочерних логгеров, а «liq.*» пишут все модули бота.
+    from chain.rpc import RedactingFilter
+    for h in logging.getLogger().handlers:
+        if not any(isinstance(f, RedactingFilter) for f in h.filters):
+            h.addFilter(RedactingFilter())
 
 
 def _empty_summary(n_markets: int) -> dict:

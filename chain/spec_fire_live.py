@@ -28,6 +28,21 @@ from chain.spec_fire import _label_of
 
 log = logging.getLogger("liq.spec_fire_live")
 
+# Дефекты кода, которые бой не переживёт НИКОГДА: их нельзя показывать как осечку связи.
+_CODE_BUGS = (NameError, AttributeError, TypeError, ImportError, KeyError, IndexError)
+
+
+def _diag(e) -> str:
+    """Класс исключения + его текст (отредактированный от ключей).
+
+    Голый type(e).__name__ прятал арм доски пять суток: строка «доска arm fail: NameError»
+    читается как операционная осечка, из-за которой залп разумно откатился на V1, — а на деле
+    это была необъявленная переменная, то есть путь не мог сработать ни разу и ни у кого.
+    """
+    from chain.rpc import redact
+    tag = " ДЕФЕКТ КОДА" if isinstance(e, _CODE_BUGS) else ""
+    return "%s%s: %s" % (type(e).__name__, tag, redact(e)[:200])
+
 SPEC_FIRE_MIN_REPAID_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_USD", "500000"))
 SPEC_FIRE_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_INTERVAL_SEC", "0.7"))
 # ПЛОТНЫЙ РЕЖИМ (31.07: первая боевая гонка cbBTC 14:07 проиграна ДЕНЬГАМИ — победитель сидел
@@ -794,7 +809,7 @@ class SpecFireLive:
             return True
         except Exception as e:
             self.stats["board_fails"] += 1
-            self._log("SPECFIRE доска arm fail feed=%s: %s" % (feed, type(e).__name__))
+            self._log("SPECFIRE доска arm fail feed=%s: %s" % (feed, _diag(e)))
             return False
         finally:
             self._board_lock.release()
@@ -829,7 +844,7 @@ class SpecFireLive:
                 # на огонь даёт только keepalive из горячего тика.
                 self._engine()
         except Exception as e:
-            self._log("SPECFIRE доска prearm fail feed=%s: %s" % (feed, type(e).__name__))
+            self._log("SPECFIRE доска prearm fail feed=%s: %s" % (feed, _diag(e)))
 
     # ---- движок огня (#32, 07.08): постоянный пул вместо порождения залпа на тик ----
     def _engine(self):

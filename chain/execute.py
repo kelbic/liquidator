@@ -453,6 +453,7 @@ def send_board_tx(rpc, cfg, calldata: str, gas: int, log=None, tag="board"):
         if base_nonce is None:
             base_nonce = _pending_nonce(w3, bot)
         tip_wei = int(cfg.tip_gwei * 1e9)
+        from chain.hotpath import _fresh_basefee   # локально: hotpath тянет execute обратно
         fb = _fresh_basefee()
         _tx = {"to": cfg.liquidator_address, "data": calldata, "nonce": base_nonce, "gas": int(gas)}
         if fb is not None:
