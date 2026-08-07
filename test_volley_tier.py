@@ -120,7 +120,12 @@ try:
     # сдвиг НАКОПЛЕННЫЙ: нога i ждёт (i+1)*PHASE от начала залпа. Прежний цикл спал PHASE
     # перед каждой, но добавлял к шагу блокировку send_tx (замер: 60мс p50) — расписание
     # задавала сеть. Тред на ногу => фаза снова наша.
-    assert SLEEPS == [sfl_mod.SPEC_FIRE_VOLLEY_PHASE_SEC * (i + 1) for i in range(2)], SLEEPS
+    # ...и с приходом ФЛОТА (07.08) сдвиг стал КОМПЕНСИРОВАННЫМ: нога спит не «свой шаг», а
+    # «свой шаг минус уже прошедшее с начала залпа». Иначе внутри пачки (ноги режутся на
+    # пачки, чтобы 70 тредов не задушили два ядра) сдвиги накапливались бы поверх времени
+    # отправки — и расписание снова задавала бы сеть. Отсюда допуск, а не равенство.
+    _want = [sfl_mod.SPEC_FIRE_VOLLEY_PHASE_SEC * (i + 1) for i in range(2)]
+    assert len(SLEEPS) == 2 and all(0 <= w - s < 0.02 for s, w in zip(SLEEPS, _want)), SLEEPS
     assert abs(ex.volley_gas_today() - g0 - 0.022) < 1e-9    # 2 ноги × $0.011
     assert abs(ex.specfire_gas_today() - s0 - 0.022) < 1e-9  # kill-switch видит залп
     assert sf.stats["volley_probes"] == 2
@@ -171,7 +176,12 @@ try:
     VLEGS.clear()
     SLEEPS.clear()
     sf._volley(PROBE, "0xbtc", "0xFAT", 1.5e6, "BTC", simultaneous=True)
-    assert SLEEPS == [sfl_mod.SPEC_FIRE_VOLLEY_PHASE_SEC * (i + 1) for i in range(2)], SLEEPS
+    # ...и с приходом ФЛОТА (07.08) сдвиг стал КОМПЕНСИРОВАННЫМ: нога спит не «свой шаг», а
+    # «свой шаг минус уже прошедшее с начала залпа». Иначе внутри пачки (ноги режутся на
+    # пачки, чтобы 70 тредов не задушили два ядра) сдвиги накапливались бы поверх времени
+    # отправки — и расписание снова задавала бы сеть. Отсюда допуск, а не равенство.
+    _want = [sfl_mod.SPEC_FIRE_VOLLEY_PHASE_SEC * (i + 1) for i in range(2)]
+    assert len(SLEEPS) == 2 and all(0 <= w - s < 0.02 for s, w in zip(SLEEPS, _want)), SLEEPS
     sfl_mod.SPEC_FIRE_VOLLEY_DETECT_SYNC = True
     print("UNIT_OK: откат SPEC_FIRE_VOLLEY_DETECT_SYNC=0 — лесенка по детекту")
 finally:

@@ -179,6 +179,10 @@ SPEC_FIRE_V2_TRIGGER_MARGIN_BPS = int(os.environ.get("SPEC_FIRE_V2_TRIGGER_MARGI
 # Пауза между отправкой setPlan и доверием к доске: пока запись не села в блок, однобайтовая
 # нога попадает в пустой сторадж и тихо возвращается. 6с = 3 блока Base с запасом.
 SPEC_FIRE_V2_BOARD_SETTLE_SEC = float(os.environ.get("SPEC_FIRE_V2_BOARD_SETTLE_SEC", "6"))
+# Флот (07.08): ног может быть десятки. Тред-на-ногу при 70 ногах на ДВУХЪЯДЕРНОЙ машине —
+# это ровно тот эффект наблюдателя, на который у нас есть задокументированные инциденты.
+# Поэтому ноги режутся на пачки: не больше N тредов на залп, каждый ведёт свою долю ног.
+SPEC_FIRE_VOLLEY_MAX_THREADS = int(os.environ.get("SPEC_FIRE_VOLLEY_MAX_THREADS", "8"))
 # ФОЛБЭК ЦЕЛИ (01.08, ревью гонки cbDOGE): топ-цель «нет свопа» монополизировала тик —
 # $4.1k-жертва в досягаемости И в капе пула не получила НИ ОДНОЙ пробы за три окна
 # (18:45-18:50), конкурент выиграл присутствием (tip 0.0055 < наших 0.05). Небилдящаяся
@@ -812,17 +816,29 @@ class SpecFireLive:
                 mf = (fb * 2 + tip) if fb is not None else None
                 seq = str(getattr(self.cfg, "sequencer_rpc", "") or "")
                 bcast = [seq] if (seq and seq.lower() not in ("off", "none", "0")) else None
-                for i, (addr, key) in enumerate(accts):
-                    if SPEC_FIRE_VOLLEY_PARALLEL:
-                        # сдвиг НАКОПЛЕННЫЙ: тред ноги отсыпает свой слот сам, соседей не держит
-                        threading.Thread(
-                            target=_leg,
-                            args=(i, addr, key, mf, tip, bcast,
-                                  0.0 if sync else SPEC_FIRE_VOLLEY_PHASE_SEC * (i + 1)),
-                            daemon=True, name="volley-leg%d" % (i + 1)).start()
-                    else:                                 # прежний путь: сдвиг ПЕРЕД каждой ногой
+                if not SPEC_FIRE_VOLLEY_PARALLEL:          # прежний путь: сдвиг ПЕРЕД каждой ногой
+                    for i, (addr, key) in enumerate(accts):
                         _leg(i, addr, key, mf, tip, bcast,
                              0.0 if sync else SPEC_FIRE_VOLLEY_PHASE_SEC)
+                    return
+                # Флот: ног может быть десятки, а ядер два. Тред-на-ногу тут душит боевой контур,
+                # поэтому ноги режутся на ПАЧКИ — не больше MAX_THREADS тредов на залп. Внутри
+                # пачки ноги идут подряд, но КАЖДАЯ держит свой накопленный сдвиг от начала залпа
+                # (сдвиг считается по индексу ноги, а не по позиции в пачке) — расстановка фаз
+                # остаётся той же, что при треде-на-ногу.
+                n = len(accts)
+                nthr = max(1, min(SPEC_FIRE_VOLLEY_MAX_THREADS, n))
+                t0 = self._now()
+
+                def _batch(idxs):
+                    for i in idxs:
+                        addr, key = accts[i]
+                        want = 0.0 if sync else SPEC_FIRE_VOLLEY_PHASE_SEC * (i + 1)
+                        _leg(i, addr, key, mf, tip, bcast, max(0.0, want - (self._now() - t0)))
+
+                for t in range(nthr):
+                    threading.Thread(target=_batch, args=(range(t, n, nthr),),
+                                     daemon=True, name="volley-b%d" % (t + 1)).start()
             except Exception as e:
                 self._log("SPECFIRE volley fail feed=%s: %s" % (feed, type(e).__name__))
 

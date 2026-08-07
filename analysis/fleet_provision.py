@@ -1,0 +1,132 @@
+"""Генерация и заправка ФЛОТА залповых EOA — В ОСТАНОВЛЕННОМ ОКНЕ БОТА
+(общий кошелёк = общий nonce-поток; при живом боте заправка рвала бы _LOCAL_NONCE).
+
+Зачем. Замер 07.08 (блок 49642833): у конкурента 2592 tx от 2592 РАЗНЫХ EOA в ОДНОМ блоке —
+2590 холостых зондов ровно по 27260 газа плюс один исполнитель на 709k с логами. Вся стена
+стоила ~0.0036 ETH. Плотность упирается не в деньги и не в код, а в ЧИСЛО ключей: у нас 4.
+
+Насыщение. При окне победы W=0.5-2.2мс лишними становятся пробы плотнее ~1/W ≈ 900 в блок.
+Каждая нога даёт ~13 проб/блок (каденс 0.15с при блоке 2с), значит ~70 ног — это уже потолок
+полезности, а не 2592. Больше ставить незачем: сверх насыщения платим за то же покрытие.
+
+Идемпотентен и ПРЕРЫВАЕМ БЕЗОПАСНО: ключи пишутся в keyfile ДО первой отправки ETH (падение
+после перевода не теряет ключи — иначе ETH ушёл бы на адрес, приватки которого мы не знаем).
+Уже заправленные пропускаются, так что повторный запуск просто дозаправляет.
+
+  N=70 FUND_ETH=0.0015 venv/bin/python analysis/fleet_provision.py
+  DRY=1 ... — только смета, без транзакций
+
+Приватники НЕ печатаются никогда. keyfile создаётся 0600 и живёт ТОЛЬКО на боевой машине.
+"""
+import os
+import sys
+
+ENV_PATH = "/root/liquidator/.env"
+KEYFILE = os.environ.get("KEYFILE", "/root/liquidator/.fleet_keys")
+N = int(os.environ.get("N", "70"))
+FUND_ETH = float(os.environ.get("FUND_ETH", "0.0015"))
+DRY = os.environ.get("DRY", "").lower() in ("1", "true", "yes")
+# сколько ОСТАВИТЬ на главном кошельке при любом раскладе: патронный резерв под сам выстрел
+# (GAS_BULLET_RESERVE_ETH) плюс запас на управляющие tx доски. Флот НЕ имеет права его съесть.
+KEEP_ETH = float(os.environ.get("KEEP_ETH", "0.15"))
+
+
+def load_env(path):
+    env = {}
+    for line in open(path):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = v
+    return env
+
+
+def main():
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            if os.readlink("/proc/%s/cwd" % p) == "/root/liquidator":
+                with open("/proc/%s/cmdline" % p, "rb") as f:
+                    if b"main.py" in f.read():
+                        print("GATE-FAIL: бот жив (PID %s) — стоп перед заправкой" % p)
+                        sys.exit(1)
+        except OSError:
+            continue
+
+    env = load_env(ENV_PATH)
+    from web3 import Web3
+    from eth_account import Account
+    w3 = Web3(Web3.HTTPProvider(env["RPC_URL"]))
+    acct = Account.from_key(env["WALLET_KEY"])
+    bot = acct.address
+    bal0 = w3.eth.get_balance(bot)
+    print("главный кошелёк=%s баланс=%.5f ETH" % (bot, bal0 / 1e18))
+
+    # 1. ключи: реюз существующего keyfile + дозагенерить до N. ЗАПИСЬ ДО ЛЮБОЙ ОТПРАВКИ.
+    keys = []
+    if os.path.exists(KEYFILE):
+        mode = os.stat(KEYFILE).st_mode & 0o077
+        assert not mode, "keyfile %s имеет права %o — поправь на 0600" % (KEYFILE, mode)
+        keys = [l.strip() for l in open(KEYFILE) if l.strip() and not l.startswith("#")]
+        print("keyfile: реюз %d ключей" % len(keys))
+    need = max(0, N - len(keys))
+    if need:
+        if DRY:
+            print("DRY: сгенерировал бы %d новых ключей" % need)
+        else:
+            keys += [Account.create().key.hex() for _ in range(need)]
+            fd = os.open(KEYFILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write("\n".join(keys) + "\n")
+            os.chmod(KEYFILE, 0o600)
+            print("keyfile: +%d новых, всего %d (записаны ДО отправки ETH)" % (need, len(keys)))
+    addrs = [Account.from_key(k).address for k in keys[:N]]
+
+    # 2. смета: флот не имеет права съесть патронный резерв главного кошелька
+    fund_wei = int(FUND_ETH * 1e18)
+    todo = [a for a in addrs if w3.eth.get_balance(a) < fund_wei]
+    need_wei = len(todo) * (fund_wei + 21000 * int(0.06e9))
+    print("к заправке: %d из %d ног по %.4f ETH => %.5f ETH" % (
+        len(todo), len(addrs), FUND_ETH, need_wei / 1e18))
+    print("останется на главном: %.5f ETH (порог KEEP=%.3f)" % (
+        (bal0 - need_wei) / 1e18, KEEP_ETH))
+    if bal0 - need_wei < KEEP_ETH * 1e18:
+        print("СТОП: заправка съела бы патронный резерв. Уменьши N или FUND_ETH, "
+              "либо пополни главный кошелёк.")
+        sys.exit(2)
+    if DRY:
+        print("DRY: транзакций не отправлено")
+        return
+
+    # 3. заправка
+    nonce = w3.eth.get_transaction_count(bot, "pending")
+    tip = int(0.05e9)
+    sent = 0
+    for a in todo:
+        base = int(w3.eth.get_block("latest")["baseFeePerGas"])
+        tx = {"from": bot, "to": a, "value": fund_wei, "gas": 21000, "nonce": nonce,
+              "chainId": 8453, "maxFeePerGas": base * 2 + tip, "maxPriorityFeePerGas": tip}
+        signed = acct.sign_transaction(tx)
+        raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+        h = w3.eth.send_raw_transaction(raw)
+        nonce += 1
+        sent += 1
+        if sent % 10 == 0 or sent == len(todo):
+            print("  заправлено %d/%d (последняя tx=%s)" % (sent, len(todo), h.hex()))
+    # ждём только ПОСЛЕДНЮЮ: nonce последовательны, значит её приём подтверждает все прежние
+    w3.eth.wait_for_transaction_receipt(h, timeout=300)
+
+    # 4. приёмка: считаем по ЦЕПИ, а не по числу отправленных tx
+    ok = sum(1 for a in addrs if w3.eth.get_balance(a) >= fund_wei)
+    bal1 = w3.eth.get_balance(bot)
+    print("ИТОГ: заправлено по цепи %d/%d ног, потрачено %.5f ETH, на главном %.5f ETH" % (
+        ok, len(addrs), (bal0 - bal1) / 1e18, bal1 / 1e18))
+    if ok < len(addrs):
+        print("часть ног недозаправлена — повтори запуск (идемпотентно)")
+    print("ДАЛЬШЕ: SPEC_FIRE_EOA_KEYFILE=%s и SPEC_FIRE_VOLLEY_FLOOR_ETH в .env, затем рестарт"
+          % KEYFILE)
+
+
+if __name__ == "__main__":
+    main()

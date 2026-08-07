@@ -500,30 +500,66 @@ _VOLLEY_NONCE: dict = {}        # addr -> следующий nonce (пер-EOA, 
 _VOLLEY_LOCKS: dict = {}        # addr -> Lock
 _VOLLEY_BAL: dict = {}          # addr -> [balance_wei, monotonic_ts] (кэш патрона, TTL 60с)
 _VOLLEY_BAL_TTL = 60.0
-_VOLLEY_BAL_FLOOR_WEI = int(0.003e18)   # патрон на исходе -> нога молчит (долив решает владелец)
+# Пол патрона на ногу: ниже него нога молчит (долив — решение владельца). Настраиваемый, потому
+# что для 4 жирных ног 0.003 ETH разумно, а для флота из десятков это мёртвый капитал БОЛЬШЕ
+# самого флота: 70 ног x 0.003 = 0.21 ETH заперто, при том что проба стоит ~0.0000024 ETH.
+_VOLLEY_BAL_FLOOR_WEI = int(float(os.environ.get("SPEC_FIRE_VOLLEY_FLOOR_ETH", "0.003")) * 10**18)
 
 
 def volley_accounts():
-    """Залповые EOA из env: SPEC_FIRE_EOA_KEY_2.. подряд до первого пропуска.
-    Ключи НЕ логируются нигде; адреса — можно."""
+    """Залповые EOA: сперва именованные SPEC_FIRE_EOA_KEY_2.. (подряд до первого пропуска),
+    затем ФЛОТ из SPEC_FIRE_EOA_KEYFILE — по одной приватке на строку.
+
+    Файл, а не env-имена, потому что плотность упирается в ЧИСЛО ног: замер 07.08 показал у
+    конкурента 2592 tx от 2592 EOA в одном блоке (2590 холостых зондов по 27260 газа + один
+    исполнитель на 709k). Восемь env-переменных такую стену не опишут.
+
+    Файл обязан быть 0600 и жить ТОЛЬКО на боевой машине. Ключи НЕ логируются нигде — ни при
+    ошибке, ни при отладке; наружу идут только адреса и счётчики.
+    """
     global _VOLLEY_ACCTS
     if _VOLLEY_ACCTS is None:
         accs = []
+        seen = set()
         try:
             from eth_account import Account
+
+            def _add(k):
+                k = (k or "").strip()
+                if not k or k.startswith("#"):
+                    return
+                a = Account.from_key(k)
+                if a.address in seen:
+                    return                          # дубль ключа = один nonce-поток на две ноги
+                seen.add(a.address)
+                accs.append((a.address, k))
+                _VOLLEY_LOCKS.setdefault(a.address, threading.Lock())
+
             for i in range(2, 10):
                 k = os.environ.get("SPEC_FIRE_EOA_KEY_%d" % i)
                 if not k:
                     break
-                a = Account.from_key(k)
-                accs.append((a.address, k))
-                _VOLLEY_LOCKS.setdefault(a.address, threading.Lock())
-        except Exception:
+                _add(k)
+            kf = os.environ.get("SPEC_FIRE_EOA_KEYFILE", "").strip()
+            if kf and os.path.exists(kf):
+                mode = os.stat(kf).st_mode & 0o077
+                if mode:
+                    log.warning("VOLLEY keyfile %s доступен группе/миру (mode %o) — "
+                                "ФЛОТ НЕ ЗАГРУЖЕН, поправь права на 0600", kf, mode)
+                else:
+                    n0 = len(accs)
+                    for line in open(kf):
+                        _add(line)
+                    log.info("VOLLEY флот: +%d ключей из keyfile", len(accs) - n0)
+        except Exception as e:
+            log.warning("VOLLEY реестр ключей: %s — тир молчит", type(e).__name__)
             accs = []
         _VOLLEY_ACCTS = accs
         if accs:
-            log.info("VOLLEY тир: %d залповых EOA: %s", len(accs),
-                     ", ".join(a for a, _ in accs))
+            # адреса печатаем только у малого набора: строка на 70 адресов бесполезна в журнале
+            tail = (", ".join(a for a, _ in accs) if len(accs) <= 8
+                    else ", ".join(a for a, _ in accs[:4]) + " ... (+%d)" % (len(accs) - 4))
+            log.info("VOLLEY тир: %d залповых EOA: %s", len(accs), tail)
     return _VOLLEY_ACCTS
 
 
