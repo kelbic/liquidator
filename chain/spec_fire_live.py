@@ -62,11 +62,28 @@ SPEC_FIRE_FAT_DEBT_USD = float(os.environ.get("SPEC_FIRE_FAT_DEBT_USD", "50000")
 SPEC_FIRE_FAT_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_FAT_INTERVAL_SEC", "0.12"))
 SPEC_FIRE_FAT_JITTER_SEC = float(os.environ.get("SPEC_FIRE_FAT_JITTER_SEC", "0.04"))
 SPEC_FIRE_FAT_CAP = int(os.environ.get("SPEC_FIRE_FAT_CAP", "600"))
+# ГЕЙТ ЖИРА ПО ПРИЗУ («го» kelbic 07.08; CASCADE_TIER_DESIGN, экономика 180д): окупаемость
+# плотности определяет ПРИЗ = долг × бонус, а FAT_DEBT меряет долг. $50k долга на cbBTC
+# (LIF 4.39%) = приз $2.2k — кромка окупаемости, а на 12.68%-рынках (cbXRP/AERO/stkWELL)
+# окупаемость начинается уже с долга ~$16k — такие окна мы не уплотняли. PRIZE_USD > 0 =
+# гейт по призу (bonus рынка из covered-снапшота); рынок без бонуса -> фолбэк на долг-гейт
+# (fail-open к прежнему). 0 = прежний долг-гейт бит-в-бит. Откат: убрать из .env.
+SPEC_FIRE_FAT_PRIZE_USD = float(os.environ.get("SPEC_FIRE_FAT_PRIZE_USD", "0"))
 
 
-def _tgts_fat(tgts) -> bool:
+def _tgts_fat(tgts, bonus_of=None) -> bool:
     """Жир в досягаемости тика -> EV-каденс/кап окна."""
-    return SPEC_FIRE_EV_DENSITY and any(t[2] >= SPEC_FIRE_FAT_DEBT_USD for t in tgts)
+    if not SPEC_FIRE_EV_DENSITY:
+        return False
+    if SPEC_FIRE_FAT_PRIZE_USD > 0 and bonus_of is not None:
+        def _fat(t):
+            try:
+                b = float(bonus_of(t[0]) or 0.0)
+            except Exception:
+                b = 0.0
+            return (t[2] * b >= SPEC_FIRE_FAT_PRIZE_USD) if b > 0 else (t[2] >= SPEC_FIRE_FAT_DEBT_USD)
+        return any(_fat(t) for t in tgts)
+    return any(t[2] >= SPEC_FIRE_FAT_DEBT_USD for t in tgts)
 
 
 def _window_cap(fat_mode: bool) -> int:
@@ -462,6 +479,12 @@ class SpecFireLive:
         elig.sort(key=lambda t: -t[2])
         return elig[:k], hold_dist, edge_t
 
+    def _bonus_of(self, mid: str) -> float:
+        """LIF-1 рынка из covered-снапшота (гейт по призу); 0.0 = неизвестен -> долг-гейт."""
+        with self.shared.lock:
+            m = self.shared.by_id.get(mid)
+        return float(getattr(m, "bonus", 0.0) or 0.0)
+
     def _prio_ok(self, feed: str, claim: float) -> bool:
         """Пакет B (B1): True = слот наш — нет более богатой СВЕЖЕЙ заявки другого окна.
         Ничья -> round-robin по временным слотам DENSE-интервала (детерминированно, без
@@ -613,7 +636,7 @@ class SpecFireLive:
                             edge = None
                     if not tgts and edge is not None:
                         tgts = [edge]              # весь top-K мёртв, кромка жива — окно держит её
-                    _fat_now = _tgts_fat(tgts)
+                    _fat_now = _tgts_fat(tgts, bonus_of=self._bonus_of)
                     if _fat_now and not fat_mode:
                         self._log("SPECFIRE ev-density feed=%s: жир $%.0fk в досягаемости — "
                                   "каденс %.2fс, кап %d" % (

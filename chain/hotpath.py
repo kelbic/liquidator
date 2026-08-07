@@ -93,6 +93,14 @@ REACTIVE_PARTIAL = os.environ.get("REACTIVE_PARTIAL", "1").lower() not in ("0", 
 # хеджирован дочиткой с 23.07 — сим получает тот же паттерн: одиночный ретрай через
 # confirmed-rpc (block=latest; после транзита confirmed уже видит флип). Откат HOT_SIM_CONFIRMED_RETRY=0.
 HOT_SIM_CONFIRMED_RETRY = os.environ.get("HOT_SIM_CONFIRMED_RETRY", "1").lower() not in ("0", "false", "no")
+# ИНКРЕМЕНТАЛЬНЫЙ HOT-DISPATCH («го» kelbic 07.08, дефект №3 вскрытия каскада 06.08): 11 preps
+# по ~0.6с СЕРИЕЙ + один батч-dispatch после всех = first-ready ждал хвост 7.8с. Окно победы
+# замерено 0.5-2.2мс — батч-барьер это структурная сдача гонки. ON: готовая цель уходит в
+# dispatch НЕМЕДЛЕННО (kill-switch перед каждым сендом; дедуп _RECENT_SENDS исключает дубль),
+# хвост цикла продолжает готовить следующих. Теряем кросс-целевую сборку юнитов (киты первыми
+# нонсами) — латентность дороже ордеринга (наш промах = +785мс). Откат HOT_DISPATCH_INCREMENTAL=0
+# = прежний батч бит-в-бит.
+HOT_DISPATCH_INCREMENTAL = os.environ.get("HOT_DISPATCH_INCREMENTAL", "1").lower() not in ("0", "false", "no")
 _SIM_TRANSPORT_MARKS = ("429", "Too Many Requests", "timed out", "timeout", "Connection",
                         "Max retries", "502", "503", "504")
 
@@ -1388,6 +1396,27 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     ready, meta_by = [], {}
     _canary_fired = False                        # ранний выстрел на hint-рынке (см. ниже) — один на транзит
     _t_read_total = 0.0; _t_prep_total = 0.0; _t_flips_total = 0.0   # DIAG latency: read=340-call, sim=prepare_hot
+    _incr_results = []                           # инкрементальный dispatch (HOT_DISPATCH_INCREMENTAL)
+    _incr_state = {"blocked": None, "t_send": 0.0}
+
+    def _dispatch_ready_now(item):
+        """Готовая цель уходит немедленно; kill-switch перед КАЖДЫМ сендом (та же GuardState,
+        что у батч-пути). Блок = стоп дальнейших сендов этого транзита (алерт один раз)."""
+        if _incr_state["blocked"]:
+            return
+        from chain.execute import current_inflight, specfire_gas_today
+        today = store.realized_today()
+        blocked = guard.blocked_reason(GuardState(realized_net_today=today["net"],
+                                                  gas_spent_today=today["gas"] + specfire_gas_today(),
+                                                  inflight=current_inflight()))
+        if blocked:
+            _incr_state["blocked"] = blocked
+            log.error("HOT kill switch engaged: %s — инкрементальный dispatch остановлен", blocked)
+            alerter.send_async("\U0001F6D1 hot path halted: %s" % blocked, key="hot-killswitch")
+            return
+        _ds1 = time.perf_counter()
+        _incr_results.extend(dispatch_fn(rpc, cfg, [item], log=log, max_inflight=cfg.max_inflight))
+        _incr_state["t_send"] += (time.perf_counter() - _ds1) * 1000.0
     for mid in feeds.get(agg, []):
         om = meta.get(mid)
         borrowers = groups.get(mid, [])
@@ -1480,6 +1509,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                     ready.append((mid, b, fprep)); meta_by[(mid, b)] = (hr, du)
                     log.info("HOT ready FAST %s/%s hf=%.4f repaid~$%.0f net>=$%.2f block=%d subidx=%s",
                              mid[:10], b[:10], hr.hf, du, fprep["net_usd"], block, subidx)
+                    if HOT_DISPATCH_INCREMENTAL:
+                        _dispatch_ready_now((mid, b, fprep))
                     continue
                 log.info("DIAG fast-lane fallback %s/%s: %s", mid[:10], b[:10], str(fprep.get("reason"))[:60])
             _ps = time.perf_counter()
@@ -1492,6 +1523,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                 ready.append((mid, b, prep)); meta_by[(mid, b)] = (hr, du)
                 log.info("HOT ready %s/%s hf=%.4f repaid~$%.0f net=$%.2f block=%d subidx=%s",
                          mid[:10], b[:10], hr.hf, du, prep["net_usd"], block, subidx)
+                if HOT_DISPATCH_INCREMENTAL:
+                    _dispatch_ready_now((mid, b, prep))
             else:
                 log.info("HOT skip %s/%s: %s", mid[:10], b[:10], str(prep.get("reason"))[:80])
 
@@ -1506,19 +1539,23 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             _maybe_canary(agg, block, subidx, rpc, cfg, log, t0=t)   # ⭐ нет ликвидации -> пробить гонку
         return []
 
-    from chain.execute import current_inflight, specfire_gas_today
-    today = store.realized_today()                           # SHARED kill-switch with the block loop
-    blocked = guard.blocked_reason(GuardState(realized_net_today=today["net"],
-                                              gas_spent_today=today["gas"] + specfire_gas_today(),
-                                              inflight=current_inflight()))   # P0: был хардкод 0 — inflight-гейт мёртв
-    if blocked:
-        log.error("HOT kill switch engaged: %s — %d ready NOT dispatched", blocked, len(ready))
-        alerter.send_async(f"\U0001F6D1 hot path halted: {blocked}", key="hot-killswitch")
-        return []
+    if HOT_DISPATCH_INCREMENTAL:                             # сенды уже ушли по готовности (см. выше)
+        results = _incr_results
+        _t_send = _incr_state["t_send"]
+    else:
+        from chain.execute import current_inflight, specfire_gas_today
+        today = store.realized_today()                       # SHARED kill-switch with the block loop
+        blocked = guard.blocked_reason(GuardState(realized_net_today=today["net"],
+                                                  gas_spent_today=today["gas"] + specfire_gas_today(),
+                                                  inflight=current_inflight()))   # P0: был хардкод 0 — inflight-гейт мёртв
+        if blocked:
+            log.error("HOT kill switch engaged: %s — %d ready NOT dispatched", blocked, len(ready))
+            alerter.send_async(f"\U0001F6D1 hot path halted: {blocked}", key="hot-killswitch")
+            return []
 
-    _ds = time.perf_counter()
-    results = dispatch_fn(rpc, cfg, ready, log=log, max_inflight=cfg.max_inflight)
-    _t_send = (time.perf_counter() - _ds) * 1000.0
+        _ds = time.perf_counter()
+        results = dispatch_fn(rpc, cfg, ready, log=log, max_inflight=cfg.max_inflight)
+        _t_send = (time.perf_counter() - _ds) * 1000.0
     _fl_trip = pop_fast_lane_trip()                # II.6: breaker сработал в receipt-цикле dispatch -> TG-пейдж
     if _fl_trip:
         alerter.send_async(_fl_trip, key="fastlane-breaker")

@@ -482,6 +482,61 @@ def _reconcile_nonce(w3, bot: str):
     except Exception:
         pass
 
+
+# ПОСТ-КОНТРОЛЬ UNCERTAIN («го» kelbic 07.08, дефект №2 вскрытия каскада 06.08): SEND-3
+# uncertain = «raw в секвенсере, МОЖЕТ сесть», но до сих пор посадка считалась свершившейся
+# без положительного доказательства (канон мёртвого сторожа) — потерянный tx оставлял жертву
+# под дедупом _RECENT_SENDS на весь TTL 12с = всё каскадное окно, и никто не перестреливал.
+# Теперь: не сел за ~5 блоков -> это ДРОП, дедуп снимается, цель снова открыта живому конвейеру
+# (он перестроит с fresh sim; ре-бродкаст протухшей калдаты не делаем). Откат: SEND3_UNCERTAIN_WATCH=0.
+SEND3_UNCERTAIN_WATCH = os.environ.get("SEND3_UNCERTAIN_WATCH", "1").lower() not in ("0", "false", "no")
+_UNCERTAIN_DROPPED = {"n": 0}   # телеметрия (DIAG/юниты)
+
+
+def _watch_uncertain(w3, bot: str, tx_nonce: int, tx_hash: str, keys, log=None,
+                     checks=(3.0, 6.0, 9.5), sleep_fn=time.sleep):
+    """Ждёт консьюм nonce/receipt до ~5 блоков; не сел -> снимает дедуп жертв юнита
+    (только если метку не освежила более новая отправка). Возвращает "landed"/"dropped"."""
+    marked = {}
+    with _SEND_LOCK:
+        for k in keys:
+            if k in _RECENT_SENDS:
+                marked[k] = _RECENT_SENDS[k]
+    prev = 0.0
+    for at in checks:
+        sleep_fn(at - prev); prev = at
+        try:
+            if w3.eth.get_transaction_receipt(tx_hash) is not None:
+                return "landed"
+        except Exception:
+            pass                                   # не найден/RPC-икота -> решает nonce ниже
+        try:
+            if int(w3.eth.get_transaction_count(bot)) > int(tx_nonce):
+                return "landed"                    # nonce съеден = tx с этим nonce замайнен
+        except Exception:
+            continue
+    _UNCERTAIN_DROPPED["n"] += 1
+    freed = []
+    with _SEND_LOCK:
+        for k, ts in marked.items():
+            if _RECENT_SENDS.get(k) == ts:         # более новую отправку не трогаем
+                _RECENT_SENDS.pop(k, None)
+                freed.append(k)
+    if log:
+        log.warning("SEND-3 uncertain DROPPED nonce=%d tx=%s: nonce не съеден за ~5 блоков — "
+                    "дедуп снят с %d жертв (%s), цель снова открыта огню", tx_nonce, tx_hash,
+                    len(freed), ",".join("%s/%s" % (m[:8], b[:8]) for m, b in freed) or "-")
+    return "dropped"
+
+
+def _spawn_uncertain_watch(w3, bot: str, tx_nonce: int, tx_hash: str, unit, log=None):
+    """Спавн вотчера по юниту (daemon; keys снимаются под _SEND_LOCK -> гонки с метками нет)."""
+    if not SEND3_UNCERTAIN_WATCH:
+        return
+    threading.Thread(target=_watch_uncertain,   # log позиционно: SyncThread юнитов без kwargs
+                     args=(w3, bot, tx_nonce, tx_hash, [(m, b) for m, b, _p in unit], log),
+                     daemon=True).start()
+
 ORACLE_PRICE_SCALE = 10 ** 36
 WAD = 10 ** 18
 KYBER_HOST = "https://aggregator-api.kyberswap.com"
@@ -1487,7 +1542,8 @@ def _send_units_volley(rpc, w3, cfg, units, base_nonce, tip_wei, bcast_urls, log
     Sign-фейл юнита u: ничего ещё не в сети -> хвост дропаем (nonce-гэп исключён, семантика старого
     цикла), префикс 0..u-1 уходит залпом. Alchemy-фейл юнита НЕ стопит журнал остальных — их raw уже
     в секвенсере (SEND-3 uncertain семантика: учтён sent, nonce инвалидируется вызывающим).
-    Возвращает (sent, err_results, send_failed): sent=[(unit, hash)] как у старого цикла."""
+    Возвращает (sent, err_results, send_failed, unc_watch): sent=[(unit, hash)] как у старого
+    цикла; unc_watch=[(nonce, hash, unit)] — вызывающий спавнит пост-контроль ВНЕ _SEND_LOCK."""
     acct = account_for(w3, cfg.wallet_key)
     _t0 = time.perf_counter()
     _base_fee = _dyn_tip = None
@@ -1564,6 +1620,7 @@ def _send_units_volley(rpc, w3, cfg, units, base_nonce, tip_wei, bcast_urls, log
     _t_volley = time.perf_counter()
     sent = []
     n_unc = 0
+    unc_watch = []
     for u, (unit, _raw, h) in enumerate(signed_units):    # Alchemy-нога: журнал/дедуп, НЕ гонка
         try:
             w3.eth.send_raw_transaction(_raw)
@@ -1573,6 +1630,7 @@ def _send_units_volley(rpc, w3, cfg, units, base_nonce, tip_wei, bcast_urls, log
                 log.warning("volley: Alchemy-нога nonce=%d бросила (%s) — raw уже в секвенсере, "
                             "учтён sent/uncertain, журнал остальных продолжаем",
                             base_nonce + u, type(e).__name__)
+            unc_watch.append((base_nonce + u, h, unit))
         sent.append((unit, h))
         for _mid, _b, _p in unit:                         # дедуп: ВСЕ жертвы юнита помечены отправленными
             _RECENT_SENDS[(_mid, _b)] = time.monotonic()
@@ -1586,7 +1644,7 @@ def _send_units_volley(rpc, w3, cfg, units, base_nonce, tip_wei, bcast_urls, log
         log.info("DIAG send-volley n=%d sign_all=%.0fms volley_spawn=%.0fms alch_leg=%.0fms unc=%d",
                  len(signed_units), (_t_sign - _t0) * 1000.0, (_t_volley - _t_sign) * 1000.0,
                  (time.perf_counter() - _t_volley) * 1000.0, n_unc)
-    return sent, err_results, send_failed
+    return sent, err_results, send_failed, unc_watch
 
 
 def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int = 3,
@@ -1614,7 +1672,8 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
     bot = account_for(w3, cfg.wallet_key).address
     _seq = str(getattr(cfg, "sequencer_rpc", "") or "")
     _bcast = [_seq] if (_seq and _seq.lower() not in ("off", "none", "0")) else None
-    with _SEND_LOCK:                                         # serialize nonce-fetch+send across senders (block loop + hot path)
+    _unc_watch = []                # (nonce, hash, unit) uncertain-отправок: вотчеры спавнятся ВНЕ
+    with _SEND_LOCK:               # _SEND_LOCK (вотчер сам берёт лок — иначе дедлок при sync-спавне)
         # дедуп двойной отправки (см. _RECENT_SENDS): выкидываем (mid,borrower), отправленные за
         # последние TTL сек, ПЕРЕД раздачей nonce — чтобы дубль не съел nonce и газ реверта.
         _now = time.monotonic()
@@ -1658,7 +1717,8 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
         _par = (bool(getattr(cfg, "parallel_broadcast", False)) and send_fn is None
                 and _bcast and len(units) > 1)
         if _par:
-            sent, _verr, _send_failed = _send_units_volley(rpc, w3, cfg, units, base_nonce, tip, _bcast, log)
+            sent, _verr, _send_failed, _unc_v = _send_units_volley(rpc, w3, cfg, units, base_nonce, tip, _bcast, log)
+            _unc_watch.extend(_unc_v)
             results.extend(_verr)
             if _send_failed:
                 _LOCAL_NONCE.pop(bot, None)
@@ -1699,6 +1759,7 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                                     "учтён как sent (дедуп+receipt), стоп + инвалидация nonce", base_nonce + u)
                     _send_failed = True
                     _LOCAL_NONCE.pop(bot, None)
+                    _unc_watch.append((base_nonce + u, res["hash"], unit))
                     break
             except Exception as e:
                 if log:
@@ -1713,6 +1774,8 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                 break
         if not _send_failed:
             _LOCAL_NONCE[bot] = base_nonce + len(sent)
+    for _n2, _h2, _u2 in _unc_watch:                         # пост-контроль uncertain — спавн вне лока
+        _spawn_uncertain_watch(w3, bot, _n2, _h2, _u2, log=log)   # (метки _RECENT_SENDS уже стоят)
     if sent:                                                 # фоновая сверка nonce с RPC (вне лока)
         threading.Thread(target=_reconcile_nonce, args=(w3, bot), daemon=True).start()
     for _unit, _h in sent:                                   # consume-хук (05.08): отправленный direct-сайз
