@@ -659,6 +659,164 @@ def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, lo
         return res["hash"]
 
 
+# --- ПРЕД-ПОДПИСАННАЯ ЛЕСТНИЦА ПРОБ (#32) --------------------------------------------------
+# Замер боевого send-пути: подпись p50=4мс/p99=36мс + вызов держит тред 60мс (p50). При 8
+# тредах это потолок ~133 отправки/с, то есть эквивалент ~20 стволов — лестница «×22» упиралась
+# в НАШ процесс, а не в сеть. Проба доски всегда одна и та же (ровно байт 0x01, план живёт в
+# контракте), поэтому её можно подписать ЗАРАНЕЕ и в момент огня только разослать готовые байты.
+#
+# Почему это безопасно по цене (замер 07.08): basefee Base прижат к полу 0.005 gwei; даже в
+# июньском каскаде выборка дала максимум 0.00562 gwei = 1.1x пола. Предел замера назван: сетка
+# редкая (раз в 800 блоков), короткий всплеск она бы пропустила — поэтому maxFee берётся с
+# запасом MAXFEE_MULT, а платим всё равно по факту.
+#
+# ГЛАВНЫЙ ИНВАРИАНТ: nonce'ы лестницы рассылаются СТРОГО ПОДРЯД. Пропуск = дыра в nonce, и
+# все последующие пробы ноги повиснут до её закрытия. Поэтому неудачная рассылка возвращает
+# запись НА МЕСТО, а не пропускает её.
+_VOLLEY_LADDER: dict = {}       # addr -> {"q": [(nonce, raw_hex, hash)], "gas":, "max_fee":, "ts":}
+_VOLLEY_PRESIGN_DEPTH = int(os.environ.get("SPEC_FIRE_PRESIGN_DEPTH", "40"))
+_VOLLEY_PRESIGN_MAXFEE_MULT = int(os.environ.get("SPEC_FIRE_PRESIGN_MAXFEE_MULT", "100"))
+
+
+def ladder_depth(addr: str) -> int:
+    """Сколько готовых проб осталось у ноги (0 = лестницы нет)."""
+    st = _VOLLEY_LADDER.get(addr)
+    return len(st["q"]) if st else 0
+
+
+def invalidate_ladder(addr: str = None):
+    """Сбросить лестницу (смена nonce вне лестницы, NO-RECEIPT, пересборка)."""
+    if addr is None:
+        _VOLLEY_LADDER.clear()
+    else:
+        _VOLLEY_LADDER.pop(addr, None)
+
+
+def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
+                   base_fee: int = None, tip: int = None, log=None,
+                   start_nonce: int = None) -> int:
+    """Подписать подряд `depth` проб ноги (calldata = V2_PROBE_CALLDATA) начиная с её
+    текущего pending-nonce. Возврат: сколько записей в лестнице ПОСЛЕ вызова.
+
+    Зовётся ФОНОМ (взвод окна), не из горячего пути: подпись — это CPU, и весь смысл в том,
+    чтобы её там не было. Идемпотентна: лестница той же формы не пересобирается.
+    """
+    lk = _VOLLEY_LOCKS.get(addr)
+    if lk is None:
+        return 0
+    depth = int(depth or _VOLLEY_PRESIGN_DEPTH)
+    w3 = rpc._web3()
+    tip_wei = int(tip) if tip else int(cfg.tip_gwei * 1e9)
+    with lk:
+        if base_fee is None:
+            base_fee = int(w3.eth.get_block("latest").get("baseFeePerGas") or 0)
+        max_fee = base_fee * _VOLLEY_PRESIGN_MAXFEE_MULT + tip_wei
+        st = _VOLLEY_LADDER.get(addr)
+        if st and st["gas"] == int(gas) and st["max_fee"] >= max_fee and len(st["q"]) >= depth:
+            return len(st["q"])          # годная лестница уже есть — подпись не жжём
+        # nonce берём с ЦЕПИ: локальный счётчик мог уехать вперёд после NO-RECEIPT
+        nonce = int(start_nonce) if start_nonce is not None else _pending_nonce(w3, addr)
+        acct = account_for(w3, key)
+        q = []
+        for i in range(depth):
+            t = {"from": addr, "to": cfg.liquidator_address, "data": V2_PROBE_CALLDATA,
+                 "nonce": nonce + i, "gas": int(gas), "chainId": rpc.chain_id,
+                 "maxFeePerGas": max_fee, "maxPriorityFeePerGas": tip_wei}
+            signed = acct.sign_transaction(t)
+            raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+            h = getattr(signed, "hash", None)
+            q.append((nonce + i, "0x" + bytes(raw).hex(), h.hex() if h is not None else None))
+        _VOLLEY_LADDER[addr] = {"q": q, "gas": int(gas), "max_fee": max_fee, "ts": time.monotonic()}
+        _VOLLEY_NONCE[addr] = nonce      # локальный счётчик и лестница выходят из одной точки
+        if log:
+            log.info("VOLLEY лестница %s: %d проб с nonce %d, maxFee %.4f gwei",
+                     addr[:10], depth, nonce, max_fee / 1e9)
+        return len(q)
+
+
+def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None):
+    """Огонь из лестницы: НИ подписи, НИ чтения nonce — только рассылка готовых байтов.
+    Гейты те же, что у обычной ноги ($-бакет тира и боевая tx в полёте).
+    Возврат hash|None. При неудаче запись возвращается В НАЧАЛО очереди (инвариант подряд).
+    """
+    global _VOLLEY_PROBES
+    with _INFLIGHT_LOCK:
+        _volley_roll_day_locked()
+        if _VOLLEY_GAS_USD >= CASCADE_TIER_GAS_USD or _INFLIGHT > 0:
+            return None
+    lk = _VOLLEY_LOCKS.get(addr)
+    if lk is None:
+        return None
+    with lk:
+        st = _VOLLEY_LADDER.get(addr)
+        if not st or not st["q"]:
+            return None
+        bal = _VOLLEY_BAL.get(addr)
+        if bal is not None:
+            # тот же принцип, что у обычной ноги: гейт по ХУДШЕМУ случаю, расход по факту
+            if bal[0] - int(st["gas"]) * int(st["max_fee"]) < _VOLLEY_BAL_FLOOR_WEI:
+                if log:
+                    log.info("VOLLEY %s молчит: патрон на поле %.4f ETH", addr[:10], bal[0] / 1e18)
+                return None
+        nonce, raw_hex, h = st["q"].pop(0)
+    # ПУТЬ РАССЫЛКИ ВЫБРАН ЗАМЕРОМ (07.08): тёплая сессия до СЕКВЕНСЕРА держит тред 32.5мс
+    # (p50, 25 проб), синхронная нога Alchemy — 60мс. Секвенсер и есть ордерер Base, а hash
+    # пред-подписанной пробы известен из подписи, поэтому ответ Alchemy не нужен ВООБЩЕ.
+    # Отсюда потолок: 16 тредов x 1/0.0325 = ~493 отправки/с = ~986 проб/блок против прежних
+    # 267 (насыщение окна победы — 1480).
+    try:
+        _seq = None
+        for _u in (broadcast_raw_urls or []):
+            _seq = _u
+            break
+        if _seq is not None:
+            ok, err = _post_raw_sync(_seq, raw_hex)
+            if not ok:
+                raise RuntimeError(err or "sequencer post failed")
+        else:
+            rpc._web3().eth.send_raw_transaction(raw_hex)
+    except Exception as e:
+        _msg = str(e).lower()
+        if "already known" not in _msg and "nonce too low" not in _msg:
+            with lk:                      # НЕ пропускаем nonce: дыра повесит всю ногу
+                st = _VOLLEY_LADDER.get(addr)
+                if st is not None:
+                    st["q"].insert(0, (nonce, raw_hex, h))
+            if log:
+                log.info("VOLLEY лестница %s: рассылка не удалась (%s), запись возвращена",
+                         addr[:10], type(e).__name__)
+            return None
+        # «already known»/«nonce too low» — байты УЖЕ у секвенсера (SEND-3 обогнал):
+        # запись потрачена по назначению, возвращать её нельзя.
+    with lk:
+        _VOLLEY_NONCE[addr] = nonce + 1
+        bal = _VOLLEY_BAL.get(addr)
+        if bal is not None:
+            bal[0] -= _VOLLEY_EXPECTED_GAS * int(st["max_fee"] if st else 0)
+    with _INFLIGHT_LOCK:
+        _VOLLEY_PROBES += 1
+    return h
+
+
+def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5):
+    """Синхронная рассылка raw в секвенсер тёплой сессией. Возврат (ok, err_msg).
+    В отличие от _post_raw_tx (best-effort в треде, глотает всё) ЗДЕСЬ исход нужен вызывающему:
+    от него зависит, вернуть ли запись лестницы на место или считать её потраченной."""
+    try:
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
+                   "params": [raw_hex]}
+        s = _seq_session(url)
+        if s is None:
+            return False, "no session"
+        resp = s.post(url, json=payload, timeout=timeout).json()
+        err = resp.get("error")
+        if err:
+            return False, str(err.get("message", ""))
+        return True, None
+    except Exception as e:
+        return False, type(e).__name__
+
+
 def _post_raw_tx(url: str, raw_hex: str, timeout: int = 5):
     """SEND-3: eth_sendRawTransaction напрямую в секвенсер Base ПАРАЛЛЕЛЬНО с Alchemy-путём.
     Best-effort в daemon-треде: дубль безвреден (второй приём = 'already known'), ошибка здесь
