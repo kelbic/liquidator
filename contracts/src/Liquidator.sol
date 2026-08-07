@@ -56,6 +56,12 @@ contract Liquidator {
     address public immutable MORPHO;
     address public owner;
     uint256 private _locked = 1; // 1 = unlocked, 2 = locked (nonzero-init saves gas)
+    /// @notice v4 (cascade tier): volley EOAs allowed to FIRE liquidations. Profit still sweeps
+    /// to `owner` (liquidate() transfers to owner unconditionally), so an authorized key can
+    /// spend its own gas but never redirect proceeds; a malicious swapTarget from a compromised
+    /// key is stopped by CannotRepay / the checked profit math (balAfter - balBefore reverts on
+    /// deficit). Keys are add/remove-able only by owner.
+    mapping(address => bool) public isAuthorized;
 
     /// @dev Swap context handed to the callback via Morpho's `data`.
     struct SwapData {
@@ -76,6 +82,7 @@ contract Liquidator {
 
     event Liquidated(address indexed borrower, address indexed loanToken, uint256 profit);
     event OwnerChanged(address indexed from, address indexed to);
+    event AuthorizedChanged(address indexed who, bool ok);
     /// @notice A batch item that reverted (reason = first 4 bytes of the revert data).
     event BatchItemFailed(uint256 indexed i, address indexed borrower, bytes4 reason);
 
@@ -85,9 +92,18 @@ contract Liquidator {
     }
 
     /// @dev batchLiquidate calls liquidate() via `this.` (external self-call) so each item gets its
-    /// own revert frame (try/catch isolation). The self-call must pass auth: owner OR the contract.
+    /// own revert frame (try/catch isolation). The self-call must pass auth: owner, the contract,
+    /// or (v4) an authorized volley EOA.
     modifier onlyOwnerOrSelf() {
-        if (msg.sender != owner && msg.sender != address(this)) revert NotOwner();
+        if (msg.sender != owner && msg.sender != address(this) && !isAuthorized[msg.sender]) {
+            revert NotOwner();
+        }
+        _;
+    }
+
+    /// @dev v4: entry gate for batchLiquidate — owner or an authorized volley EOA.
+    modifier onlyAuth() {
+        if (msg.sender != owner && !isAuthorized[msg.sender]) revert NotOwner();
         _;
     }
 
@@ -106,6 +122,12 @@ contract Liquidator {
     function setOwner(address newOwner) external onlyOwner {
         emit OwnerChanged(owner, newOwner);
         owner = newOwner;
+    }
+
+    /// @notice v4: add/remove a volley EOA. Owner-only; profit destination is unaffected.
+    function setAuthorized(address who, bool ok) external onlyOwner {
+        isAuthorized[who] = ok;
+        emit AuthorizedChanged(who, ok);
     }
 
     /// @notice Liquidate `borrower` on market `mp`, repaying `repaidShares` of debt, swapping the
@@ -156,7 +178,7 @@ contract Liquidator {
     /// A failed item emits BatchItemFailed and the loop continues (per-item try/catch); gas must be
     /// budgeted by the caller with headroom — a starved tail fails SILENTLY inside the same
     /// successful tx (prototype C3c), so outcomes must be read from receipt events only.
-    function batchLiquidate(LiquidationItem[] calldata items) external onlyOwner returns (uint256 nOk) {
+    function batchLiquidate(LiquidationItem[] calldata items) external onlyAuth returns (uint256 nOk) {
         for (uint256 i = 0; i < items.length; i++) {
             try this.liquidate(
                 items[i].mp, items[i].borrower, items[i].repaidShares,
