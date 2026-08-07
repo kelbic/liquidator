@@ -193,6 +193,22 @@ SPEC_FIRE_V2_TRIGGER_MARGIN_BPS = int(os.environ.get("SPEC_FIRE_V2_TRIGGER_MARGI
 # Пауза между отправкой setPlan и доверием к доске: пока запись не села в блок, однобайтовая
 # нога попадает в пустой сторадж и тихо возвращается. 6с = 3 блока Base с запасом.
 SPEC_FIRE_V2_BOARD_SETTLE_SEC = float(os.environ.get("SPEC_FIRE_V2_BOARD_SETTLE_SEC", "6"))
+# ВЕРДИКТ ПОБЕДЫ — ИЗ ЛОГОВ ПРОТОКОЛА, А НЕ ИЗ СТАТУСА TX (дефект найден 07.08, #32).
+# У пробы V1 (полная калдата liquidate) статус говорит всё: цель здорова -> Morpho ревертит ->
+# ревертит и tx (status=0). У пробы ДОСКИ (1 байт в fallback) статус не значит НИЧЕГО:
+#   healthy по цене  -> `return`               -> status=1, газ ~18.6k;
+#   попытка неудачна -> `catch {}` (строка 232)-> status=1, газ сотни тысяч, план цел;
+#   ПОБЕДА           -> liquidate прошёл       -> status=1 + событие Liquidated.
+# То есть на доске status==1 у ВСЕХ трёх исходов, и прежний критерий «status==1 = WIN» объявил бы
+# победой первую же холостую пробу: mark_recent_send глушит реактивный дубль, кулдаун гасит ВСЕ
+# окна на WIN_COOLDOWN_SEC, окно закрывается. Блэкаут ровно в тот каскад, ради которого строился
+# флот. Признак победы один и общий для обоих путей: событие Liquidated от НАШЕГО контракта
+# (fallback зовёт ту же liquidate, поэтому оно есть и там). Газ негоден как признак: неудачная
+# попытка жжёт его столько же, сколько выигрыш.
+# Асимметрия цены ошибки задаёт направление отказа: ложная победа = блэкаут огня, пропущенная =
+# приз УЖЕ у владельца (контракт сметает прибыль сам), план одноразовый (delete _plan), а лишние
+# пробы по нему — дешёвые no-op'ы. Значит на доске fail-closed: нет события — нет победы.
+LIQUIDATED_TOPIC0 = "0xde0aa27286f5cb3a4ed853dc4823ead62d63e92cdf13de09d6aece56970721a4"
 # Флот (07.08): ног может быть десятки. Тред-на-ногу при 70 ногах на ДВУХЪЯДЕРНОЙ машине —
 # это ровно тот эффект наблюдателя, на который у нас есть задокументированные инциденты.
 # Поэтому ноги режутся на пачки: не больше N тредов на залп, каждый ведёт свою долю ног.
@@ -323,6 +339,35 @@ SPEC_FIRE_RECEIPT_TIMEOUT = float(os.environ.get("SPEC_FIRE_RECEIPT_TIMEOUT", "4
 def _probe_tip_wei(tip_gwei: float) -> int:
     """Tip пробы: min(боевой, кап) — пробы НИКОГДА не наследуют каскадные ступени/эскалацию."""
     return int(min(float(tip_gwei), SPEC_FIRE_TIP_CAP_GWEI) * 1e9)
+
+
+def _receipt_has_win(r, liquidator_addr: str):
+    """Есть ли в квитанции событие Liquidated ОТ НАШЕГО контракта (см. LIQUIDATED_TOPIC0).
+
+    -> True/False, либо None если о логах судить нельзя (поле отсутствует). None НЕ равно False:
+    на доске оно означает «не знаю», и вызывающий обязан не объявлять победу, а на пути V1 —
+    что вердикт остаётся за статусом. Чужие Liquidated (конкурент в том же блоке) отсекаются
+    сверкой адреса эмитента: событие есть у многих, наш контракт — один.
+    """
+    logs = r.get("logs") if hasattr(r, "get") else None
+    if logs is None:
+        return None
+    want = (liquidator_addr or "").lower()
+    for lg in logs:
+        try:
+            src = lg.get("address") if hasattr(lg, "get") else getattr(lg, "address", None)
+            tops = lg.get("topics") if hasattr(lg, "get") else getattr(lg, "topics", None)
+            if not tops or str(src or "").lower() != want:
+                continue
+            t0 = tops[0]
+            t0 = t0.hex() if hasattr(t0, "hex") else str(t0)
+            if not t0.startswith("0x"):
+                t0 = "0x" + t0
+            if t0.lower() == LIQUIDATED_TOPIC0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 class SpecFireLive:
@@ -532,7 +577,8 @@ class SpecFireLive:
                 # blk/idx — метрика гонки плотностей: позиция пробы в очереди против
                 # транзита/победителя снимается прямо из журнала (ревью 31.07)
                 return (int(r.get("status") or 0), gas_usd,
-                        r.get("blockNumber"), r.get("transactionIndex"))
+                        r.get("blockNumber"), r.get("transactionIndex"),
+                        _receipt_has_win(r, self.cfg.liquidator_address))
             self._sleep(SPEC_FIRE_RECEIPT_POLL_SEC)
         return None
 
@@ -816,7 +862,8 @@ class SpecFireLive:
                 self._log("SPECFIRE volley leg=%d/%d%s%s eoa=%s feed=%s %s/%s tx=%s" % (
                     i + 1, len(accts), " [sync]" if sync else "", " [доска]" if board else "",
                     addr[:10], feed, mid[:10], b[:10], h))
-                threading.Thread(target=self._collect_volley, args=(h, mid, b, d, feed, addr),
+                threading.Thread(target=self._collect_volley,
+                                 args=(h, mid, b, d, feed, addr, board),
                                  daemon=True).start()
             except Exception as e:
                 self._log("SPECFIRE volley leg fail feed=%s eoa=%s: %s" % (
@@ -858,9 +905,12 @@ class SpecFireLive:
 
         threading.Thread(target=_run, daemon=True, name="volley-%s" % feed).start()
 
-    def _collect_volley(self, h, mid, borrower, debt_usd, feed, addr):
+    def _collect_volley(self, h, mid, borrower, debt_usd, feed, addr, board=False):
         """Receipt ноги залпа: газ — в бакет тира; WIN — та же семантика, что у главной пробы
-        (дедуп-маркер, кулдаун, окно закрыть); NO-RECEIPT инвалидирует nonce СВОЕГО EOA."""
+        (дедуп-маркер, кулдаун, окно закрыть); NO-RECEIPT инвалидирует nonce СВОЕГО EOA.
+
+        board=True — проба ДОСКИ: статус tx о победе не говорит ничего (три исхода дают
+        status=1, см. LIQUIDATED_TOPIC0), поэтому вердикт выносит только событие Liquidated."""
         from chain.execute import volley_gas_add, volley_invalidate_nonce, mark_recent_send
         res = (self._receipt_fn or self._receipt)(h)
         if res is None:
@@ -869,7 +919,13 @@ class SpecFireLive:
             return
         status, gas_usd = res[0], res[1]
         pos = (" blk=%s idx=%s" % (res[2], res[3])) if len(res) >= 4 and res[2] is not None else ""
+        won = res[4] if len(res) >= 5 else None
         volley_gas_add(gas_usd)
+        if board and status == 1 and won is not True:
+            # холостая проба доски (или неудачная попытка, съеденная catch): приза нет.
+            # Молча — таких строк в каскаде будут тысячи.
+            self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
+            return
         if status == 1:
             self.stats["wins"] += 1
             mark_recent_send(mid, borrower)               # жертва взята — глушим реактивный дубль
