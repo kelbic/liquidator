@@ -196,7 +196,7 @@ def run(cfg, days: int = 7, min_repaid_usd: float = 1000.0) -> None:
         print("  %-24s %3d  (%s)" % (k, n, "%.0f%%" % (100.0 * n / inside) if inside else "—"))
     if cats["вне ленты"]:
         print("  %-24s %3d  (лента окон не достаёт — НЕ засчитано ни в одну сторону)"
-              % "вне ленты", len(cats["вне ленты"]))
+              % ("вне ленты", len(cats["вне ленты"])))
 
     if cats["оспорено"]:
         print("\n  win-rate по ОСПОРЕННЫМ: 0/%d  <- вот настоящий знаменатель" % len(cats["оспорено"]))
