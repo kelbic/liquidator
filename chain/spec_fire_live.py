@@ -130,6 +130,21 @@ SPEC_FIRE_RECEIPT_POLL_SEC = float(os.environ.get("SPEC_FIRE_RECEIPT_POLL_SEC", 
 # их ограничивает $-бакет CASCADE_TIER_GAS_USD (execute). WIN любой ноги закрывает окно, глушит
 # реактивный дубль и рвёт паттерн кулдауном — как главная. Откат: SPEC_FIRE_VOLLEY=0 (execute).
 SPEC_FIRE_VOLLEY_PHASE_SEC = float(os.environ.get("SPEC_FIRE_VOLLEY_PHASE_MS", "50")) / 1000.0
+# ПАРАЛЛЕЛЬНЫЕ НОГИ (07.08, замер боевого send-пути: 1717 отправок за 7д, journalctl DIAG
+# send-stages). Разложение: sign p50=4мс/p99=36, relay_spawn p50=0 (SEND-3 отдаёт raw в
+# секвенсер daemon-тредами ДО синхронной ноги), alch p50=55мс/p90=69/max=222. Итог: до
+# СЕКВЕНСЕРА (= гонка) нога доезжает за ~5мс, но вызов send_tx ДЕРЖИТ тред 60мс (p50), и
+# последовательный цикл прибавлял их к сдвигу: шаг ног был 50+60=110мс вместо 50 — расписание
+# задавала сеть, а не мы, и 4-я нога уходила на ~440мс. Тред на ногу: сдвиг снова наш
+# (i+1)*PHASE, RTT перекрываются. Откат: SPEC_FIRE_VOLLEY_PARALLEL=0 -> прежний цикл бит-в-бит.
+SPEC_FIRE_VOLLEY_PARALLEL = os.environ.get(
+    "SPEC_FIRE_VOLLEY_PARALLEL", "1").lower() not in ("0", "false", "no")
+# ОДНОВРЕМЕННЫЙ ЗАЛП ПО ДЕТЕКТУ: в ветке pending-handoff транзит УЖЕ виден — момент известен,
+# и лесенка сдвига там перевёрнута против цели (окно победы W=0.5-2.2мс, а нога 4 уходила
+# через сотни мс). Разнос фазы ценен ровно там, где момент НЕизвестен (обычная ветка: N ног =
+# N участков покрытия); по детекту бьём разом. Откат: SPEC_FIRE_VOLLEY_DETECT_SYNC=0.
+SPEC_FIRE_VOLLEY_DETECT_SYNC = os.environ.get(
+    "SPEC_FIRE_VOLLEY_DETECT_SYNC", "1").lower() not in ("0", "false", "no")
 # ФОЛБЭК ЦЕЛИ (01.08, ревью гонки cbDOGE): топ-цель «нет свопа» монополизировала тик —
 # $4.1k-жертва в досягаемости И в капе пула не получила НИ ОДНОЙ пробы за три окна
 # (18:45-18:50), конкурент выиграл присутствием (tip 0.0055 < наших 0.05). Небилдящаяся
@@ -550,37 +565,63 @@ class SpecFireLive:
         return (len([t for t in self._arm_ts if n - t < 3600.0]) >= SPEC_FIRE_CASCADE_WINDOWS
                 and _facts_fresh())
 
-    def _volley(self, probe, mid, b, d, feed):
+    def _volley(self, probe, mid, b, d, feed, simultaneous=False):
         """Залп вслед за успешной пробой главного кошелька: тот же calldata на v4 от каждого
-        залпового EOA, ноги со сдвигом фазы ~50мс (свои не толкаются — разные слоты блока).
-        Огонь и ожидания — в daemon-треде: петля окна не тормозится ни на мс."""
+        залпового EOA. Огонь и ожидания — в daemon-тредах: петля окна не тормозится ни на мс.
+
+        Расстановка ног зависит от того, ЗНАЕМ ли мы момент:
+          simultaneous=False (вслепую) — сдвиг фазы (i+1)*PHASE. N ног = N участков покрытия,
+            модель P(win)=W/τ; синхронный залп здесь дал бы N-кратную избыточность на одном
+            участке, т.е. выиграл бы ровно те гонки, что и один EOA — покрытие не растёт;
+          simultaneous=True (транзит виден в pending) — момент известен, бьём разом.
+        SPEC_FIRE_VOLLEY_PARALLEL=1: нога = свой тред, сдвиг держим мы, а не сеть (замер
+        боевого send-пути — у константы). =0 — прежний последовательный цикл бит-в-бит."""
         from chain import execute as _ex
         if not _ex.SPEC_FIRE_VOLLEY or not self._cascade_active():
             return
         accts = (self._volley_accounts_fn or _ex.volley_accounts)()
         if not accts:
             return
+        sync = bool(simultaneous) and SPEC_FIRE_VOLLEY_DETECT_SYNC
+
+        def _leg(i, addr, key, mf, tip, bcast, wait_sec):
+            try:
+                if wait_sec > 0:
+                    self._sleep(wait_sec)
+                h = (self._volley_send_fn or _ex.send_volley_probe)(
+                    self.rpc, self.cfg, addr, key, probe["calldata"], probe["gas"],
+                    log=log, max_fee=mf, tip=tip, broadcast_raw_urls=bcast)
+                if h is None:
+                    return
+                self.stats["volley_probes"] += 1
+                self._log("SPECFIRE volley leg=%d/%d%s eoa=%s feed=%s %s/%s tx=%s" % (
+                    i + 1, len(accts), " [sync]" if sync else "", addr[:10], feed,
+                    mid[:10], b[:10], h))
+                threading.Thread(target=self._collect_volley, args=(h, mid, b, d, feed, addr),
+                                 daemon=True).start()
+            except Exception as e:
+                self._log("SPECFIRE volley leg fail feed=%s eoa=%s: %s" % (
+                    feed, addr[:10], type(e).__name__))
 
         def _run():
             try:
                 from chain.hotpath import _fresh_basefee
-                fb = _fresh_basefee()
+                fb = _fresh_basefee()                     # один фетч на залп, не на ногу
                 tip = _probe_tip_wei(self.cfg.tip_gwei)   # тот же tip-кап: FCFS, место не покупается
                 mf = (fb * 2 + tip) if fb is not None else None
                 seq = str(getattr(self.cfg, "sequencer_rpc", "") or "")
                 bcast = [seq] if (seq and seq.lower() not in ("off", "none", "0")) else None
                 for i, (addr, key) in enumerate(accts):
-                    self._sleep(SPEC_FIRE_VOLLEY_PHASE_SEC)
-                    h = (self._volley_send_fn or _ex.send_volley_probe)(
-                        self.rpc, self.cfg, addr, key, probe["calldata"], probe["gas"],
-                        log=log, max_fee=mf, tip=tip, broadcast_raw_urls=bcast)
-                    if h is None:
-                        continue
-                    self.stats["volley_probes"] += 1
-                    self._log("SPECFIRE volley leg=%d/%d eoa=%s feed=%s %s/%s tx=%s" % (
-                        i + 1, len(accts), addr[:10], feed, mid[:10], b[:10], h))
-                    threading.Thread(target=self._collect_volley, args=(h, mid, b, d, feed, addr),
-                                     daemon=True).start()
+                    if SPEC_FIRE_VOLLEY_PARALLEL:
+                        # сдвиг НАКОПЛЕННЫЙ: тред ноги отсыпает свой слот сам, соседей не держит
+                        threading.Thread(
+                            target=_leg,
+                            args=(i, addr, key, mf, tip, bcast,
+                                  0.0 if sync else SPEC_FIRE_VOLLEY_PHASE_SEC * (i + 1)),
+                            daemon=True, name="volley-leg%d" % (i + 1)).start()
+                    else:                                 # прежний путь: сдвиг ПЕРЕД каждой ногой
+                        _leg(i, addr, key, mf, tip, bcast,
+                             0.0 if sync else SPEC_FIRE_VOLLEY_PHASE_SEC)
             except Exception as e:
                 self._log("SPECFIRE volley fail feed=%s: %s" % (feed, type(e).__name__))
 
@@ -665,7 +706,8 @@ class SpecFireLive:
                                 threading.Thread(target=self._collect, args=(h, _pm, _pb, _pd, feed),
                                                  daemon=True).start()
                                 if fat_mode:      # тир: залп по подтверждённому флипу (07.08)
-                                    self._volley(probe, _pm, _pb, _pd, feed)
+                                    # транзит подтверждён в pending -> момент известен: разом
+                                    self._volley(probe, _pm, _pb, _pd, feed, simultaneous=True)
                     except Exception as e:
                         self._log("SPECFIRE pending-handoff fail feed=%s: %s" % (feed, type(e).__name__))
                     stop.wait(SPEC_FIRE_POLL_SEC)

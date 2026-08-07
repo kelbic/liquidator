@@ -117,7 +117,10 @@ try:
     assert [a for a, _, _, _ in VLEGS] == ["0xEOA2", "0xEOA3"], VLEGS
     assert all(c == "0xdeadbeef" and g == 625_000 for _, c, g, _ in VLEGS)
     assert all(t == int(0.05e9) for *_, t in VLEGS)          # tip = min(боевой, кап)
-    assert SLEEPS == [sfl_mod.SPEC_FIRE_VOLLEY_PHASE_SEC] * 2, SLEEPS
+    # сдвиг НАКОПЛЕННЫЙ: нога i ждёт (i+1)*PHASE от начала залпа. Прежний цикл спал PHASE
+    # перед каждой, но добавлял к шагу блокировку send_tx (замер: 60мс p50) — расписание
+    # задавала сеть. Тред на ногу => фаза снова наша.
+    assert SLEEPS == [sfl_mod.SPEC_FIRE_VOLLEY_PHASE_SEC * (i + 1) for i in range(2)], SLEEPS
     assert abs(ex.volley_gas_today() - g0 - 0.022) < 1e-9    # 2 ноги × $0.011
     assert abs(ex.specfire_gas_today() - s0 - 0.022) < 1e-9  # kill-switch видит залп
     assert sf.stats["volley_probes"] == 2
@@ -144,9 +147,38 @@ try:
     assert sf.stats["wins"] >= 1
     RECEIPT["v"] = (0, 0.011)
     print("UNIT_OK: WIN ноги закрывает окно (дедуп + кулдаун)")
+
+    # 6. откат SPEC_FIRE_VOLLEY_PARALLEL=0 -> прежний цикл: сдвиг ПЕРЕД каждой ногой
+    sfl_mod.SPEC_FIRE_VOLLEY_PARALLEL = False
+    VLEGS.clear()
+    SLEEPS.clear()
+    sf._volley(PROBE, "0xbtc", "0xFAT", 1.5e6, "BTC")
+    assert SLEEPS == [sfl_mod.SPEC_FIRE_VOLLEY_PHASE_SEC] * 2, SLEEPS
+    assert len(VLEGS) == 2, VLEGS
+    sfl_mod.SPEC_FIRE_VOLLEY_PARALLEL = True
+    print("UNIT_OK: откат SPEC_FIRE_VOLLEY_PARALLEL=0 — прежняя лесенка")
+
+    # 7. по детекту момент ИЗВЕСТЕН -> ноги разом, ни одного сдвига
+    VLEGS.clear()
+    SLEEPS.clear()
+    sf._volley(PROBE, "0xbtc", "0xFAT", 1.5e6, "BTC", simultaneous=True)
+    assert SLEEPS == [], SLEEPS
+    assert len(VLEGS) == 2, VLEGS
+    print("UNIT_OK: залп по детекту (simultaneous) — без фазового сдвига")
+
+    # 8. откат SPEC_FIRE_VOLLEY_DETECT_SYNC=0 -> лесенка возвращается даже по детекту
+    sfl_mod.SPEC_FIRE_VOLLEY_DETECT_SYNC = False
+    VLEGS.clear()
+    SLEEPS.clear()
+    sf._volley(PROBE, "0xbtc", "0xFAT", 1.5e6, "BTC", simultaneous=True)
+    assert SLEEPS == [sfl_mod.SPEC_FIRE_VOLLEY_PHASE_SEC * (i + 1) for i in range(2)], SLEEPS
+    sfl_mod.SPEC_FIRE_VOLLEY_DETECT_SYNC = True
+    print("UNIT_OK: откат SPEC_FIRE_VOLLEY_DETECT_SYNC=0 — лесенка по детекту")
 finally:
     sfl_mod.threading = _real_threading
     sfl_mod._facts_fresh = _orig_facts
+    sfl_mod.SPEC_FIRE_VOLLEY_PARALLEL = True
+    sfl_mod.SPEC_FIRE_VOLLEY_DETECT_SYNC = True
 
 # ---- Часть B: execute-гейты (до любого RPC — rpc=None это доказывает) ----
 ex._VOLLEY_DAY = int(time.time() // 86400)
