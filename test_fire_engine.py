@@ -249,4 +249,44 @@ finally:
     fe.ENGINE_ON, ex_mod.SPEC_FIRE_VOLLEY = _saved_on, _saved_volley
 print("UNIT_OK: флаг переключает путь — ВКЛ кормит движок, ВЫКЛ стреляет по-старому")
 
+# ---- 9. Склад набивается на АРМЕ доски, но право стрелять этим не выдаётся ----
+# Иначе пул выйдет на пустые лестницы ровно в старте окна победы: подписать 5 ног x 40 проб
+# это ~0.8с молчания. Арм — спокойное время, ради запаса которого доска и существует.
+_saved_on = fe.ENGINE_ON
+try:
+    fe.ENGINE_ON = True
+    sf = SpecFireLive(rpc=None, cfg=_cfg, shared=_shared, ret_fn=lambda l: 0.0,
+                      dev_by={"BTC": 0.001}, build_fn=lambda m, b, d: PROBE,
+                      send_fn=lambda c, g: "0xh", receipt_fn=lambda h: (0, 0.0),
+                      log_fn=lambda s: None)
+    sf._now = lambda: 5000.0
+    raised = {"n": 0}
+    sf._top_fat = lambda f, d, max_dist=None, k=1: ([("0xmid", "0xb", 50_000.0)], None, None)
+    sf._board_ready = lambda m, b: False
+    sf._arm_board = lambda p, m, b, f: None
+
+    class _E:
+        def __init__(self):
+            self.alive = []
+
+        def keepalive(self, target=None, ttl=None):
+            self.alive.append(target)
+
+        def armed(self):
+            return False
+
+    def _mkeng():
+        raised["n"] += 1
+        sf._fire_engine = _E()
+        return sf._fire_engine
+
+    sf._engine = _mkeng
+    sf._prearm_board("BTC", "down", 0.001)
+    assert raised["n"] == 1, "движок обязан подниматься на арме доски (склад набивается заранее)"
+    assert sf._fire_engine.alive == [], "подъём — не право стрелять: keepalive выдаёт только горячий тик"
+    assert sf._fire_engine.armed() is False, "поднятый, но не вооружённый — это и есть нужное состояние"
+finally:
+    fe.ENGINE_ON = _saved_on
+print("UNIT_OK: арм доски набивает склад заранее, но огня не разрешает")
+
 print("ПРОШЛИ: движок огня и батч-коллектор")
