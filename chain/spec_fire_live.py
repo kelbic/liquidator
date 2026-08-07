@@ -121,6 +121,15 @@ SPEC_FIRE_TOPK = max(1, int(os.environ.get("SPEC_FIRE_TOPK", "1")))
 # на двоих). Откат SPEC_FIRE_EDGE_SLOT=0 = прежний чистый ранг по долгу.
 SPEC_FIRE_EDGE_SLOT = os.environ.get("SPEC_FIRE_EDGE_SLOT", "1").lower() not in ("0", "false", "no")
 SPEC_FIRE_RECEIPT_POLL_SEC = float(os.environ.get("SPEC_FIRE_RECEIPT_POLL_SEC", "1.0"))
+# КАСКАДНЫЙ ТИР («го» kelbic 07.08; v4 authorized-set + 4 залповых EOA задеплоены): залп =
+# та же проба РАЗНЫМИ nonce-потоками вслед за пробой главного кошелька, сдвиг фазы ~50мс
+# на ногу — модель P(win)=W/τ: τ делится на (1+N ног), 5 потоков = 2-9% на контестед-событие
+# (см. CASCADE_TIER_DESIGN). Активация СТРОГО fat_mode И каскад-детект (армы>=CASCADE_WINDOWS/час
+# И свежий факт-флаг — тот же гибрид, что бустер бакета); вне каскада тир молчит — один EOA,
+# штиль не жжём ($0 в худший месяц). Ноги НЕ входят в кап окна (кап меряет главный nonce-поток) —
+# их ограничивает $-бакет CASCADE_TIER_GAS_USD (execute). WIN любой ноги закрывает окно, глушит
+# реактивный дубль и рвёт паттерн кулдауном — как главная. Откат: SPEC_FIRE_VOLLEY=0 (execute).
+SPEC_FIRE_VOLLEY_PHASE_SEC = float(os.environ.get("SPEC_FIRE_VOLLEY_PHASE_MS", "50")) / 1000.0
 # ФОЛБЭК ЦЕЛИ (01.08, ревью гонки cbDOGE): топ-цель «нет свопа» монополизировала тик —
 # $4.1k-жертва в досягаемости И в капе пула не получила НИ ОДНОЙ пробы за три окна
 # (18:45-18:50), конкурент выиграл присутствием (tip 0.0055 < наших 0.05). Небилдящаяся
@@ -254,13 +263,16 @@ class SpecFireLive:
 
     def __init__(self, rpc, cfg, shared, ret_fn, dev_by: dict,
                  build_fn=None, send_fn=None, receipt_fn=None, log_fn=None,
-                 now=time.monotonic, sleep=None):
+                 now=time.monotonic, sleep=None,
+                 volley_accounts_fn=None, volley_send_fn=None):
         self.rpc, self.cfg, self.shared = rpc, cfg, shared
         self.ret_fn = ret_fn                      # label -> текущий return к якорю (None = нет данных)
         self.dev_by = {k.upper(): float(v) for k, v in dev_by.items()}
         self._build_fn = build_fn                 # шов: (mid, borrower, debt_usd) -> {calldata, gas}|None
         self._send_fn = send_fn                   # шов: (calldata, gas) -> hash|None
         self._receipt_fn = receipt_fn             # шов: (hash) -> (status, gas_usd)|None
+        self._volley_accounts_fn = volley_accounts_fn   # шов тира: () -> [(addr, key)]
+        self._volley_send_fn = volley_send_fn     # шов тира: (rpc,cfg,addr,key,calldata,gas,...) -> hash|None
         self._log = log_fn or (lambda m: log.info("%s", m))
         self._now = now
         self._sleep = sleep or time.sleep
@@ -271,7 +283,8 @@ class SpecFireLive:
         self._arm_ts: list = []                   # ts армленных окон за час (каскад-детект)
         self.stats = {"windows_armed": 0, "probes": 0, "wins": 0,
                       "owed_probes": 0, "sticky_windows": 0,   # peak-owed: would-have-fired учёт
-                      "pending_fires": 0}                      # A2: выстрелы по pending-handoff
+                      "pending_fires": 0,                      # A2: выстрелы по pending-handoff
+                      "volley_probes": 0}                      # каскадный тир: ноги залпа (07.08)
         self._owed: dict = {}                     # feed -> owed_until (peak-owed, пишет петля окна)
         self._prio: dict = {}                     # feed -> (claim_debt, ts): заявки на слот (пакет B)
         self.probe_board: dict = {}               # feed -> (mid, b, debt, calldata, gas, ts): свежая
@@ -529,6 +542,79 @@ class SpecFireLive:
         else:
             self._log("SPECFIRE probe revert (healthy, ожидаемо) tx=%s gas=$%.3f%s" % (h, gas_usd, pos))
 
+    # ---- каскадный тир (07.08): залп той же пробой с залповых EOA ----
+    def _cascade_active(self) -> bool:
+        """Каскад-флаг тира: армы за час >= порога И свежий факт-флаг — ровно тот же гибрид,
+        что у бустера бакета (армы = надежда, факты = подтверждение; калибровка 31.07)."""
+        n = self._now()
+        return (len([t for t in self._arm_ts if n - t < 3600.0]) >= SPEC_FIRE_CASCADE_WINDOWS
+                and _facts_fresh())
+
+    def _volley(self, probe, mid, b, d, feed):
+        """Залп вслед за успешной пробой главного кошелька: тот же calldata на v4 от каждого
+        залпового EOA, ноги со сдвигом фазы ~50мс (свои не толкаются — разные слоты блока).
+        Огонь и ожидания — в daemon-треде: петля окна не тормозится ни на мс."""
+        from chain import execute as _ex
+        if not _ex.SPEC_FIRE_VOLLEY or not self._cascade_active():
+            return
+        accts = (self._volley_accounts_fn or _ex.volley_accounts)()
+        if not accts:
+            return
+
+        def _run():
+            try:
+                from chain.hotpath import _fresh_basefee
+                fb = _fresh_basefee()
+                tip = _probe_tip_wei(self.cfg.tip_gwei)   # тот же tip-кап: FCFS, место не покупается
+                mf = (fb * 2 + tip) if fb is not None else None
+                seq = str(getattr(self.cfg, "sequencer_rpc", "") or "")
+                bcast = [seq] if (seq and seq.lower() not in ("off", "none", "0")) else None
+                for i, (addr, key) in enumerate(accts):
+                    self._sleep(SPEC_FIRE_VOLLEY_PHASE_SEC)
+                    h = (self._volley_send_fn or _ex.send_volley_probe)(
+                        self.rpc, self.cfg, addr, key, probe["calldata"], probe["gas"],
+                        log=log, max_fee=mf, tip=tip, broadcast_raw_urls=bcast)
+                    if h is None:
+                        continue
+                    self.stats["volley_probes"] += 1
+                    self._log("SPECFIRE volley leg=%d/%d eoa=%s feed=%s %s/%s tx=%s" % (
+                        i + 1, len(accts), addr[:10], feed, mid[:10], b[:10], h))
+                    threading.Thread(target=self._collect_volley, args=(h, mid, b, d, feed, addr),
+                                     daemon=True).start()
+            except Exception as e:
+                self._log("SPECFIRE volley fail feed=%s: %s" % (feed, type(e).__name__))
+
+        threading.Thread(target=_run, daemon=True, name="volley-%s" % feed).start()
+
+    def _collect_volley(self, h, mid, borrower, debt_usd, feed, addr):
+        """Receipt ноги залпа: газ — в бакет тира; WIN — та же семантика, что у главной пробы
+        (дедуп-маркер, кулдаун, окно закрыть); NO-RECEIPT инвалидирует nonce СВОЕГО EOA."""
+        from chain.execute import volley_gas_add, volley_invalidate_nonce, mark_recent_send
+        res = (self._receipt_fn or self._receipt)(h)
+        if res is None:
+            volley_invalidate_nonce(addr)
+            self._log("SPECFIRE volley NO-RECEIPT eoa=%s tx=%s (nonce EOA инвалидирован)" % (addr[:10], h))
+            return
+        status, gas_usd = res[0], res[1]
+        pos = (" blk=%s idx=%s" % (res[2], res[3])) if len(res) >= 4 and res[2] is not None else ""
+        volley_gas_add(gas_usd)
+        if status == 1:
+            self.stats["wins"] += 1
+            mark_recent_send(mid, borrower)               # жертва взята — глушим реактивный дубль
+            self._cooldown_until = self._now() + SPEC_FIRE_WIN_COOLDOWN_SEC
+            if feed:
+                with self._lock:
+                    stop = self._windows.pop(feed, None)
+                if stop is not None:
+                    stop.set()
+            log.warning("SPECFIRE WIN!!! [volley %s] %s/%s debt=$%.0fk tx=%s gas=$%.2f%s — залп "
+                        "взял предочередь (окна на паузе %.0fс)",
+                        addr[:10], mid[:10], borrower[:10], debt_usd / 1e3, h, gas_usd, pos,
+                        SPEC_FIRE_WIN_COOLDOWN_SEC)
+        else:
+            self._log("SPECFIRE volley revert (healthy) eoa=%s tx=%s gas=$%.3f%s" % (
+                addr[:10], h, gas_usd, pos))
+
     def _window_loop(self, feed: str, direction: str, stop: threading.Event):
         dev = self.dev_by.get(feed, 0.005)
         thr = dev * SPEC_FIRE_THRESHOLD
@@ -578,6 +664,8 @@ class SpecFireLive:
                                               probes, feed, _pm[:10], _pb[:10], _pd / 1e3, h))
                                 threading.Thread(target=self._collect, args=(h, _pm, _pb, _pd, feed),
                                                  daemon=True).start()
+                                if fat_mode:      # тир: залп по подтверждённому флипу (07.08)
+                                    self._volley(probe, _pm, _pb, _pd, feed)
                     except Exception as e:
                         self._log("SPECFIRE pending-handoff fail feed=%s: %s" % (feed, type(e).__name__))
                     stop.wait(SPEC_FIRE_POLL_SEC)
@@ -718,6 +806,8 @@ class SpecFireLive:
                                         probes, feed, mid[:10], b[:10], d / 1e3, (r or 0) * 100.0, _om, h))
                                     threading.Thread(target=self._collect, args=(h, mid, b, d, feed),
                                                      daemon=True).start()
+                                    if fat_mode:  # тир: жир И каскад -> залп той же пробой (07.08)
+                                        self._volley(probe, mid, b, d, feed)
                                 sent = True                    # слот тика израсходован отправкой
                                 break
                             nobuild[(mid, b)] = self._now() + SPEC_FIRE_NOBUILD_RETRY_SEC

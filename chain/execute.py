@@ -362,10 +362,12 @@ def specfire_stats():
 
 def specfire_gas_today() -> float:
     """Спек-газ за текущие UTC-сутки — слагаемое в общий kill-switch (гард видит СУММАРНЫЙ
-    дневной расход: боевой + пробный; спек-кап $10 = максимум 10% от дневного лимита)."""
+    дневной расход: боевой + пробный; спек-кап $10 = максимум 10% от дневного лимита).
+    Каскадный тир (07.08): + залповый газ всех EOA — kill-switch видит расход всех отправителей."""
     with _INFLIGHT_LOCK:
         _specfire_roll_day_locked()
-        return _SPECFIRE_GAS_USD
+        _volley_roll_day_locked()
+        return _SPECFIRE_GAS_USD + _VOLLEY_GAS_USD
 
 
 def specfire_gas_add(gas_usd: float):
@@ -442,6 +444,139 @@ def canary_invalidate_nonce(rpc, cfg):
             _LOCAL_NONCE.pop(bot, None)
     except Exception:
         pass
+
+
+# ---- КАСКАДНЫЙ ТИР («го» kelbic 07.08; контракт v4 authorized-set задеплоен, 4 EOA): залп ----
+# Замер окна победы (CASCADE_TIER_DESIGN): P(win) ~ W/τ, W=0.5-2.2мс; один EOA упирается в
+# nonce-очередь (~13 проб/блок, τ~120мс = 0.4-1.8% на контестед-событие). Залп кладёт ту же
+# пробу от N залповых EOA — РАЗНЫЕ nonce-потоки заполняют разные слоты блока, τ -> τ/(1+N).
+# Здесь только механика отправки; активацию (fat_mode И каскад-детект) решает spec_fire_live.
+# Ключи SPEC_FIRE_EOA_KEY_2.. живут ТОЛЬКО в .env Шарлотты; профит v4 шлёт owner'у
+# безусловно — компрометация залпового ключа = чужой газ, не касса (testCompromisedVolleyCannotSteal).
+# Свой $-бакет CASCADE_TIER_GAS_USD; kill-switch видит сумму через specfire_gas_today().
+# Свой nonce-поток на EOA (_VOLLEY_NONCE + пер-EOA лок) — _SEND_LOCK главного кошелька залп
+# НЕ трогает: боевой путь не тормозится и не толкается. Откат: SPEC_FIRE_VOLLEY=0.
+SPEC_FIRE_VOLLEY = os.environ.get("SPEC_FIRE_VOLLEY", "1").lower() not in ("0", "false", "no")
+CASCADE_TIER_GAS_USD = float(os.environ.get("CASCADE_TIER_GAS_USD", "150"))
+_VOLLEY_GAS_USD = 0.0
+_VOLLEY_PROBES = 0
+_VOLLEY_DAY = int(time.time() // 86400)
+_VOLLEY_ACCTS = None            # lazy: [(addr, key)] из env; [] = ключей нет -> тир молчит
+_VOLLEY_NONCE: dict = {}        # addr -> следующий nonce (пер-EOA, инварианты как _LOCAL_NONCE)
+_VOLLEY_LOCKS: dict = {}        # addr -> Lock
+_VOLLEY_BAL: dict = {}          # addr -> [balance_wei, monotonic_ts] (кэш патрона, TTL 60с)
+_VOLLEY_BAL_TTL = 60.0
+_VOLLEY_BAL_FLOOR_WEI = int(0.003e18)   # патрон на исходе -> нога молчит (долив решает владелец)
+
+
+def volley_accounts():
+    """Залповые EOA из env: SPEC_FIRE_EOA_KEY_2.. подряд до первого пропуска.
+    Ключи НЕ логируются нигде; адреса — можно."""
+    global _VOLLEY_ACCTS
+    if _VOLLEY_ACCTS is None:
+        accs = []
+        try:
+            from eth_account import Account
+            for i in range(2, 10):
+                k = os.environ.get("SPEC_FIRE_EOA_KEY_%d" % i)
+                if not k:
+                    break
+                a = Account.from_key(k)
+                accs.append((a.address, k))
+                _VOLLEY_LOCKS.setdefault(a.address, threading.Lock())
+        except Exception:
+            accs = []
+        _VOLLEY_ACCTS = accs
+        if accs:
+            log.info("VOLLEY тир: %d залповых EOA: %s", len(accs),
+                     ", ".join(a for a, _ in accs))
+    return _VOLLEY_ACCTS
+
+
+def _volley_roll_day_locked():
+    """Только под _INFLIGHT_LOCK: суточный сброс залпового бакета (как _specfire_roll_day)."""
+    global _VOLLEY_DAY, _VOLLEY_GAS_USD
+    d = int(time.time() // 86400)
+    if d != _VOLLEY_DAY:
+        _VOLLEY_DAY = d
+        _VOLLEY_GAS_USD = 0.0
+
+
+def volley_gas_add(gas_usd: float):
+    global _VOLLEY_GAS_USD
+    with _INFLIGHT_LOCK:
+        _volley_roll_day_locked()
+        _VOLLEY_GAS_USD += max(0.0, gas_usd)
+
+
+def volley_gas_today() -> float:
+    with _INFLIGHT_LOCK:
+        _volley_roll_day_locked()
+        return _VOLLEY_GAS_USD
+
+
+def volley_invalidate_nonce(addr: str):
+    """NO-RECEIPT ноги залпа: nonce EOA возможно впереди чейна — пере-читать на следующей."""
+    lk = _VOLLEY_LOCKS.get(addr)
+    if lk is None:
+        return
+    with lk:
+        _VOLLEY_NONCE.pop(addr, None)
+
+
+def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, log=None,
+                      max_fee=None, tip=None, broadcast_raw_urls=None):
+    """Одна нога залпа: ТА ЖЕ проба (calldata на v4), но от залпового EOA — свой nonce-поток.
+    Гейты до любого RPC: $-бакет тира и _INFLIGHT>0 (боевая tx главнее — как у проб).
+    Под пер-EOA локом: патронный пол по кэшу баланса (TTL 60с, пессимистичный декремент),
+    затем send_tx тем же SEND-3 путём. Возврат hash|None."""
+    global _VOLLEY_PROBES
+    with _INFLIGHT_LOCK:
+        _volley_roll_day_locked()
+        if _VOLLEY_GAS_USD >= CASCADE_TIER_GAS_USD or _INFLIGHT > 0:
+            return None
+    lk = _VOLLEY_LOCKS.get(addr)
+    if lk is None:
+        return None
+    w3 = rpc._web3()
+    with lk:
+        _n = time.monotonic()
+        bal = _VOLLEY_BAL.get(addr)
+        if bal is None or _n - bal[1] > _VOLLEY_BAL_TTL:
+            try:
+                bal = [int(w3.eth.get_balance(addr)), _n]
+                _VOLLEY_BAL[addr] = bal
+            except Exception:
+                pass                      # чтение упало: живём старым кэшем; без кэша молчим
+        if bal is None:
+            return None
+        _cost = int(gas) * int(max_fee if max_fee else int(cfg.tip_gwei * 1e9) * 3)
+        if bal[0] - _cost < _VOLLEY_BAL_FLOOR_WEI:
+            if log:
+                log.info("VOLLEY %s молчит: патрон на поле %.4f ETH (долив — решение владельца)",
+                         addr[:10], bal[0] / 1e18)
+            return None
+        nonce = _VOLLEY_NONCE.get(addr)
+        if nonce is None:
+            nonce = _pending_nonce(w3, addr)
+        tip_wei = int(tip) if tip else int(cfg.tip_gwei * 1e9)
+        _tx = {"to": cfg.liquidator_address, "data": calldata, "nonce": nonce, "gas": int(gas)}
+        if max_fee is not None:
+            _tx["maxFeePerGas"] = int(max_fee)
+            _tx["maxPriorityFeePerGas"] = tip_wei
+        try:
+            res = send_tx(rpc, key, _tx, wait=False, min_tip_wei=tip_wei,
+                          broadcast_raw_urls=broadcast_raw_urls)
+        except Exception as e:
+            _VOLLEY_NONCE.pop(addr, None)
+            if log:
+                log.info("VOLLEY send fail %s: %s", addr[:10], type(e).__name__)
+            return None
+        _VOLLEY_NONCE[addr] = nonce + 1
+        bal[0] -= _cost                  # пессимистично до receipt; $-учёт — volley_gas_add
+        with _INFLIGHT_LOCK:
+            _VOLLEY_PROBES += 1
+        return res["hash"]
 
 
 def _post_raw_tx(url: str, raw_hex: str, timeout: int = 5):
