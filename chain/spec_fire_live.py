@@ -785,7 +785,12 @@ class SpecFireLive:
         # (цель не палится, газ калдаты ~в 200 раз меньше). Иначе — прежний полный calldata.
         board = self._board_live(mid, b)
         _cd = _ex.V2_PROBE_CALLDATA if board else probe["calldata"]
-        _gas = SPEC_FIRE_V2_PROBE_GAS if board else probe["gas"]
+        # Газ 1-байт пробы: НЕ константа 260k. Отфильтрованный no-op стоит 18.6k, но при
+        # сработавшем триггере ЭТА ЖЕ проба исполняет полную ликвидацию плана — реальные роуты
+        # 500-700k. OOG на выигрыше глотается try/catch контракта МОЛЧА (tx успешна, план цел,
+        # приз ушёл) и виден только в единственный момент, который имеет значение. План знает
+        # газ своего роута (probe["gas"]) — берём максимум; неиспользованный лимит бесплатен.
+        _gas = max(SPEC_FIRE_V2_PROBE_GAS, int(probe.get("gas") or 0)) if board else probe["gas"]
 
         def _leg(i, addr, key, mf, tip, bcast, wait_sec):
             try:

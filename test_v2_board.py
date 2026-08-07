@@ -116,11 +116,18 @@ assert sf._board_live("0xbtc", FAT) is True
 volley(sf)
 assert len(SENT) == 2, SENT
 assert all(cd == ex_mod.V2_PROBE_CALLDATA for _, cd, _g in SENT), SENT
-assert all(g == sfl_mod.SPEC_FIRE_V2_PROBE_GAS for _, _c, g in SENT), SENT
+# ГАЗ — не константа пробы, а МАКСИМУМ из неё и газа плана. Однобайтовая проба обычно
+# отфильтрованный no-op (18.6к), но при сработавшем триггере ЭТА ЖЕ проба исполняет полную
+# ликвидацию, а роуты стоят 500-700к. Лимит 260к дал бы OOG внутри try/catch контракта:
+# tx успешна, план цел, приза нет — молча, ровно в единственный момент, который важен.
+# Неиспользованный лимит бесплатен, поэтому берём с запасом плана.
+assert all(g == max(sfl_mod.SPEC_FIRE_V2_PROBE_GAS, PROBE["gas"]) for _, _c, g in SENT), SENT
+assert PROBE["gas"] > sfl_mod.SPEC_FIRE_V2_PROBE_GAS, \
+    "позитивный контроль: план в этом тесте обязан быть ДОРОЖЕ константы, иначе max() не проверен"
 assert sf.stats["board_probes"] == 2, sf.stats
 assert len(ex_mod.V2_PROBE_CALLDATA) == 4 and ex_mod.V2_PROBE_CALLDATA != "0x00", \
     "проба = один НЕнулевой байт (нулевая калдата читается как простой перевод)"
-print("UNIT_OK: после оседания ноги несут 1 байт и дешёвый газ")
+print("UNIT_OK: после оседания ноги несут 1 байт, газ = max(константа, план) — без OOG на выигрыше")
 
 # ---- 4. Доска действует ТОЛЬКО на свою цель ----
 volley(sf, mid="0xETH", b="0xOTHER")
