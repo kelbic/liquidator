@@ -37,6 +37,7 @@ def reset_registry():
         if k.startswith("SPEC_FIRE_EOA_KEY_"):
             del os.environ[k]
     os.environ.pop("SPEC_FIRE_EOA_KEYFILE", None)
+    os.environ.pop("SPEC_FIRE_EOA_MAX", None)
 
 
 def write_keyfile(keys, mode=0o600):
@@ -87,6 +88,30 @@ os.environ["SPEC_FIRE_EOA_KEY_2"] = KEYS[0]
 os.environ["SPEC_FIRE_EOA_KEYFILE"] = os.path.join(TMP, "нет-такого-файла")
 assert len(ex.volley_accounts()) == 1
 print("UNIT_OK: пропавший keyfile не гасит именованные ключи")
+
+# ---- 5b. СТУПЕНЬ включения: SPEC_FIRE_EOA_MAX режет флот, keyfile не трогаем ----
+# Авторизация ноги на цепи — разовая (owner-only, бот стоит), поэтому на цепи открываем ВЕСЬ
+# флот, а сколько ног стреляет — правка .env. Срез обязан быть с НАЧАЛА и одинаковый между
+# рестартами: иначе на каждом подъёме стреляют другие ноги и nonce-потоки скачут по флоту.
+def _load(keys, cap=None):
+    reset_registry()
+    write_keyfile(keys)
+    os.environ["SPEC_FIRE_EOA_KEYFILE"] = KF
+    if cap is not None:
+        os.environ["SPEC_FIRE_EOA_MAX"] = cap
+    return [a for a, _ in ex.volley_accounts()]
+
+
+full = _load(KEYS[:10])
+assert len(full) == 10, full
+step = _load(KEYS[:10], "4")
+assert step == full[:4], "срез обязан идти с начала списка и совпадать между подъёмами"
+assert _load(KEYS[:10], "999") == full, "ступень выше числа ног не режет ничего"
+assert _load(KEYS[:10], "0") == full, "0 = без ограничения"
+# опечатка в переменной НЕ должна глушить залп: молчащий флот выглядит как исправный
+assert _load(KEYS[:10], "двадцать") == full, "мусор в ступени = без ограничения, не пустой флот"
+reset_registry()
+print("UNIT_OK: ступень SPEC_FIRE_EOA_MAX режет флот с начала; перебор и мусор не глушат ноги")
 
 # ---- 6. пол патрона настраиваемый ----
 import importlib
