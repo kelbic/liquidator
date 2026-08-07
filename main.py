@@ -917,8 +917,10 @@ def main():
         log.warning("EXECUTE mode — real txs. kill switch: loss<=$%.0f gas<=$%.0f",
                     cfg.max_daily_loss_usd, cfg.max_daily_gas_usd)
         if rpc:
-            from chain.execute import prewarm_local_nonce
+            from chain.execute import prewarm_local_nonce, volley_accounts
             prewarm_local_nonce(rpc, cfg.wallet_key)   # 07-23: снять единственный RPC-hop с ПЕРВОГО залпа
+            volley_accounts()   # тир 07.08: ростер залповых EOA в старт-лог (позитивное
+                                # доказательство загрузки ключей; пусто = тир молчит)
 
     if cfg.loop_mode == "block" and rpc:
         asyncio.run(block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_cache))
