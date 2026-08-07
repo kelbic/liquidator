@@ -58,26 +58,43 @@ def _journal(days: int):
     return opens, closes, holds
 
 
-def _windows(opens, closes):
-    """Сшить открытия с закрытиями по фиду (FIFO). Открытие без закрытия — окно ещё живо или
-    процесс перезапустили; такие НЕ выбрасываем, а закрываем «сейчас» и метим, иначе рестарт
-    молча превратил бы открытое окно в отсутствие окна."""
-    pend, wins = {}, []
+# Потолок длительности окна. Строка `SPECFIRE window close` появилась в логе только 04.08, а
+# рестартов бота — десятки: закрытий втрое меньше открытий, и НАИВНАЯ сшивка (FIFO без потолка)
+# склеивает закрытие 04.08 с открытием 31.07. Такое «окно» длиной в сутки накрывает любую
+# ликвидацию и превращает разбор в машину, способную выдать только «оспорено» — то есть в
+# ответ, не зависящий от данных. Замер по журналу: реальное окно живёт 20с-3мин.
+MAX_WIN_SEC = 1800
+
+
+def _windows(opens, closes, max_win: int = MAX_WIN_SEC):
+    """Сшить открытия с закрытиями по фиду.
+
+    Закрытие берёт САМОЕ СВЕЖЕЕ незакрытое открытие того же фида (не самое старое): потерянные
+    закрытия — норма при рестарте, и FIFO в этих условиях сшивает заведомо чужие пары. Всё, что
+    старше потолка, отбрасывается как потерянное, а не растягивается.
+    """
+    pend, wins, dropped = {}, [], 0
     ev = [(t, "o", f, 0) for t, f in opens] + [(t, "c", f, p) for t, f, p in closes]
     ev.sort(key=lambda x: (x[0], x[1] == "c"))
     for t, kind, feed, probes in ev:
+        q = pend.setdefault(feed, [])
+        n0 = len(q)
+        q[:] = [t0 for t0 in q if t - t0 <= max_win]      # протухшие открытия — выбросить
+        dropped += n0 - len(q)
         if kind == "o":
-            pend.setdefault(feed, []).append(t)
+            q.append(t)
         else:
-            q = pend.get(feed) or []
-            t0 = q.pop(0) if q else t
+            t0 = q.pop() if q else t                       # самое свежее, не самое старое
             wins.append({"feed": feed, "t0": t0, "t1": t, "probes": probes, "open_ended": False})
     now = int(time.time())
     for feed, q in pend.items():
         for t0 in q:
-            wins.append({"feed": feed, "t0": t0, "t1": now, "probes": None, "open_ended": True})
+            # незакрытое окно тоже ограничено потолком: «до сих пор открыто» для окна недельной
+            # давности — не факт, а артефакт пропавшей строки закрытия
+            wins.append({"feed": feed, "t0": t0, "t1": min(now, t0 + max_win),
+                         "probes": None, "open_ended": True})
     wins.sort(key=lambda w: w["t0"])
-    return wins
+    return wins, dropped
 
 
 def _feed_matches(feed: str, pair: str) -> bool:
@@ -129,12 +146,18 @@ def run(cfg, days: int = 7, min_repaid_usd: float = 1000.0) -> None:
 
     big = [r for r in rows if r["repaid_usd"] >= min_repaid_usd]
     opens, closes, holds = _journal(days)
-    wins = _windows(opens, closes)
+    wins, dropped = _windows(opens, closes)
+    med = sorted(w["t1"] - w["t0"] for w in wins if not w["open_ended"])
 
     print("=== ЯВКА за %dд: наши %d рынков, порог $%s ===" % (days, len(markets), f"{min_repaid_usd:,.0f}"))
     print("ликвидаций всего: %d | крупных: %d" % (len(rows), len(big)))
-    print("окон в журнале: открытий %d, закрытий %d, сшито %d (из них незакрытых %d)"
-          % (len(opens), len(closes), len(wins), sum(1 for w in wins if w["open_ended"])))
+    print("окон в журнале: открытий %d, закрытий %d, сшито %d (незакрытых %d, протухших %d)"
+          % (len(opens), len(closes), len(wins), sum(1 for w in wins if w["open_ended"]), dropped))
+    # Медиана длительности — проверка самой сшивки: окно в часы означает склейку чужих пар,
+    # а не долгое окно, и тогда любому «оспорено» ниже верить нельзя.
+    if med:
+        print("длительность сшитого окна: медиана %ds, max %ds (потолок %ds)"
+              % (med[len(med) // 2], med[-1], MAX_WIN_SEC))
 
     # Глубина журнала — НАЗВАТЬ, а не подразумевать: строка close появилась 04.08, и за более
     # ранние сутки «окна не было» означало бы «лога не было», то есть враньё в пользу детекта.
