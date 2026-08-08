@@ -189,6 +189,11 @@ SPEC_FIRE_LATTICE_MIN_FRAC = float(os.environ.get("SPEC_FIRE_LATTICE_MIN_FRAC", 
 SPEC_FIRE_V2_BOARD = os.environ.get("SPEC_FIRE_V2_BOARD", "0").lower() not in ("0", "false", "no")
 SPEC_FIRE_V2_PLAN_TTL_SEC = int(os.environ.get("SPEC_FIRE_V2_PLAN_TTL_SEC", "900"))
 SPEC_FIRE_V2_REARM_SEC = float(os.environ.get("SPEC_FIRE_V2_REARM_SEC", "240"))
+# #57 (ревью 08.08): арм доски — ЕДИНСТВЕННАЯ точка входа флота в бой (право огня движку даёт
+# только живой севший план; V1-деградация сидит за тир-гейтом, ложным в решающий блок). Осечка
+# ОДНОГО setPlan при каденсе переарма 240с оставляла окно короче ретрая вовсе без доски: движок
+# выглядит здоровым, проб ноль. Поэтому неудача переспрашивается БЫСТРО, а не через каденс.
+SPEC_FIRE_V2_ARM_RETRY_SEC = float(os.environ.get("SPEC_FIRE_V2_ARM_RETRY_SEC", "5"))
 SPEC_FIRE_V2_PROBE_GAS = int(os.environ.get("SPEC_FIRE_V2_PROBE_GAS", "260000"))
 # ЛИМИТ ГАЗА ПРОБЫ ДОСКИ — считается от ВЫИГРЫША, а не от no-op'а (замер 07.08, #32).
 # Однобайтовая проба почти всегда тихий no-op (18.6k), но в тот единственный раз, когда
@@ -357,6 +362,19 @@ SPEC_FIRE_TAIL_JITTER_SEC = float(os.environ.get("SPEC_FIRE_TAIL_JITTER_SEC", "0
 # как учебник нашего слоя. После взятого приза окна не армятся COOLDOWN сек — паттерн рвётся,
 # а сам приз уже в кармане (реактивный путь паузой НЕ трогаем, он главный). 0 = выключено.
 SPEC_FIRE_WIN_COOLDOWN_SEC = float(os.environ.get("SPEC_FIRE_WIN_COOLDOWN_SEC", "900"))
+# #46 (решение владельца 08.08, ревью). Кулдаун победы страховал РЕАКТИВНЫЙ тракт от двойного
+# расхода инвентаря и от «палева паттерна проб». Обе премиссы устарели: реакция 0/9794, а пробы
+# движка инвентарь не тратят вовсе — страхуемый актив отсутствует, значит страховка чистый
+# убыток. Прежнее поведение (любая победа гасит арм ВСЕХ фидов на 900с) в каскаде отдавало
+# стене ноги 2+: каждый пуш ре-якорит и дизармит, новой ноге нужен новый arm, а он заблокирован.
+#   TRIGGER=combat (дефолт) — взводит только БОЕВАЯ победа с положительным доказательством
+#                             захвата; победа пробы (в т.ч. 1-байтовой) кулдаун не ставит.
+#   TRIGGER=any             — прежнее «любая победа» (откат).
+#   SCOPE=feed (дефолт)     — гасится только фид, чья цель взята; остальные стреляют.
+#   SCOPE=global            — прежнее «все фиды» (откат).
+# TTL 900с намеренно не трогаем этим пакетом — отдельной задачей после телеметрии.
+SPEC_FIRE_COOLDOWN_TRIGGER = os.environ.get("SPEC_FIRE_COOLDOWN_TRIGGER", "combat").strip().lower()
+SPEC_FIRE_COOLDOWN_SCOPE = os.environ.get("SPEC_FIRE_COOLDOWN_SCOPE", "feed").strip().lower()
 SPEC_FIRE_MIN_PROFIT_BPS = int(os.environ.get("SPEC_FIRE_MIN_PROFIT_BPS", "30"))
 SPEC_FIRE_POLL_SEC = float(os.environ.get("SPEC_FIRE_POLL_SEC", "0.15"))
 SPEC_FIRE_RECEIPT_TIMEOUT = float(os.environ.get("SPEC_FIRE_RECEIPT_TIMEOUT", "45"))
@@ -417,7 +435,9 @@ class SpecFireLive:
         self._lock = threading.Lock()
         self._windows: dict = {}                  # feed -> stop Event
         self._armskip_ts: dict = {}               # feed -> ts последнего arm-skip-лога (троттлинг 300с)
-        self._cooldown_until = 0.0                # WIN-пауза: до этого момента окна не армим
+        self._cooldown_until = 0.0                # WIN-пауза (SCOPE=global): окна не армим
+        self._cooldown_feed: dict = {}            # feed -> ts (SCOPE=feed, дефолт): гаснет только
+                                                  # фид, чья цель взята — ноги 2+ каскада живы
         self._arm_ts: list = []                   # ts армленных окон за час (каскад-детект)
         self.stats = {"windows_armed": 0, "probes": 0, "wins": 0,
                       "owed_probes": 0, "sticky_windows": 0,   # peak-owed: would-have-fired учёт
@@ -438,6 +458,10 @@ class SpecFireLive:
         self.pending_fire: dict = {}              # feed -> (mid, b, debt, ts): атомарный handoff (A2)
         self.pending_healthy_fn = None            # () -> bool: pending-цикл жив (A3-кипэлайв)
         self._ws_handoff_ts: dict = {}            # feed -> ts последнего WS-handoff (кулдаун дублей)
+        self._board_next_try: dict = {}           # feed -> ts следующей попытки арма (#57): осечка
+                                                  # арма обязана перепробовать БЫСТРО, а не через
+                                                  # каденс переарма — окно короче ретрая иначе
+                                                  # остаётся без доски, и весь флот нем
 
     def note_ws_transmit(self, mids, src="ws"):
         """WS-handoff (06.08): recv-петля увидела transmit в ФОРМИРУЕМОМ блоке — если он бьёт
@@ -692,7 +716,7 @@ class SpecFireLive:
         if status == 1:
             self.stats["wins"] += 1
             mark_recent_send(mid, borrower)               # жертва взята — глушим реактивный дубль
-            self._cooldown_until = self._now() + SPEC_FIRE_WIN_COOLDOWN_SEC   # рвём паттерн «пробы->приз»
+            self._set_cooldown(feed, "probe", proven=True)   # #46: скоуп/триггер — ручками env
             if feed:                                      # приз взят — окно не жжёт кап ревертами
                 with self._lock:
                     stop = self._windows.pop(feed, None)
@@ -874,8 +898,11 @@ class SpecFireLive:
             if self._board_ready(mid, b):
                 return
             probe = (self._build_fn or self._build)(mid, b, d)
+            if not isinstance(probe, dict):
+                self._arm_retry(feed, "проба не собралась")
             if isinstance(probe, dict):
-                self._arm_board(probe, mid, b, feed, debt=d)
+                if not self._arm_board(probe, mid, b, feed, debt=d):
+                    self._arm_retry(feed, "setPlan не подтвердился")
                 # #47: ПУБЛИКУЕМ probe_board уже на прогреве. Раньше он заполнялся ТОЛЬКО при
                 # пересборке в горячей фазе (|ret|>=1.0*dev), а pending-detect tier-2 и
                 # ws-handoff при пустой доске делают return, ВЫБРАСЫВАЯ уже обнаруженный
@@ -893,7 +920,52 @@ class SpecFireLive:
                 # на огонь даёт только keepalive из горячего тика.
                 self._engine()
         except Exception as e:
+            self._arm_retry(feed, _diag(e))
             self._log("SPECFIRE доска prearm fail feed=%s: %s" % (feed, _diag(e)))
+
+    def _set_cooldown(self, feed, src, proven=False):
+        """WIN-пауза по решению владельца (#46): триггер и скоуп — ручками env.
+
+        src: "combat" (наша боевая tx) | "probe" (спек/движок/залп). proven=True означает
+        положительное доказательство захвата (Liquidated/repaidAssets>0), а НЕ «status==1» и
+        не «uncertain»: фантомная победа, гасящая нас посреди живой возможности, — тот же класс,
+        что мёртвый сторож. Возврат: пауза взведена?"""
+        if SPEC_FIRE_COOLDOWN_TRIGGER == "combat" and not (src == "combat" and proven):
+            return False                          # победа пробы инвентарь не тратит — не гасим
+        if SPEC_FIRE_COOLDOWN_TRIGGER != "any" and not proven:
+            return False                          # без доказательства захвата паузу не ставим
+        until = self._now() + SPEC_FIRE_WIN_COOLDOWN_SEC
+        if SPEC_FIRE_COOLDOWN_SCOPE == "global":
+            self._cooldown_until = until
+        elif feed:
+            self._cooldown_feed[feed] = until
+        else:
+            return False                          # пер-фид без фида гасить нечего
+        self._log("SPECFIRE WIN-пауза %s: скоуп=%s src=%s на %.0fс" % (
+            feed or "—", SPEC_FIRE_COOLDOWN_SCOPE, src, SPEC_FIRE_WIN_COOLDOWN_SEC))
+        return True
+
+    def _cooldown_active(self, feed) -> bool:
+        n = self._now()
+        if n < self._cooldown_until:              # глобальная пауза (SCOPE=global / откат)
+            return True
+        return n < self._cooldown_feed.get(feed, 0.0)
+
+    def note_combat_win(self, feed=None, proven=False):
+        """Точка входа боевой победы (#46): зовётся из разбора квитанции БОЕВОЙ tx, когда захват
+        подтверждён (repaidAssets>0). proven=False (например, SEND-3 uncertain) паузу НЕ ставит —
+        иначе фантом глушил бы нас посреди живой возможности."""
+        return self._set_cooldown(feed, "combat", proven=proven)
+
+    def _arm_retry(self, feed, why):
+        """#57: осечка арма = быстрый переспрос, а не ожидание каденса 240с. Доска — единственная
+        точка входа флота: без севшего плана движок не получает права огня вовсе, а V1-деградация
+        сидит за тир-гейтом, ложным в решающий блок. Молчаливая осечка = немой флот при здоровом
+        на вид движке, поэтому она ещё и громкая (счётчик виден в close-строке окна)."""
+        self._board_next_try[feed] = self._now() + SPEC_FIRE_V2_ARM_RETRY_SEC
+        self.stats["board_arm_fails"] = self.stats.get("board_arm_fails", 0) + 1
+        self._log("SPECFIRE доска: арм НЕ ВЗВЁЛСЯ feed=%s (%s) — переспрос через %.0fс "
+                  "(без доски флот нем)" % (feed, why, SPEC_FIRE_V2_ARM_RETRY_SEC))
 
     # ---- движок огня (#32, 07.08): постоянный пул вместо порождения залпа на тик ----
     def _engine(self):
@@ -956,7 +1028,7 @@ class SpecFireLive:
         from chain.execute import mark_recent_send
         self.stats["wins"] += 1
         mark_recent_send(mid, b)
-        self._cooldown_until = self._now() + SPEC_FIRE_WIN_COOLDOWN_SEC
+        self._set_cooldown(feed, "probe", proven=True)       # #46: победа пробы не гасит флот
         eng = getattr(self, "_fire_engine", None)
         if eng is not None:
             eng.disarm()                 # приз взят — огонь гасим немедленно, не ждём TTL
@@ -1095,7 +1167,7 @@ class SpecFireLive:
         if status == 1:
             self.stats["wins"] += 1
             mark_recent_send(mid, borrower)               # жертва взята — глушим реактивный дубль
-            self._cooldown_until = self._now() + SPEC_FIRE_WIN_COOLDOWN_SEC
+            self._set_cooldown(feed, "probe", proven=True)   # #46
             if feed:
                 with self._lock:
                     stop = self._windows.pop(feed, None)
@@ -1192,10 +1264,12 @@ class SpecFireLive:
                 was_raw_hot = raw_hot
                 self._owed[feed] = owed_until if SPEC_FIRE_PEAK_OWED else 0.0
                 hot = raw_hot or owed_fire
-                if SPEC_FIRE_V2_BOARD and _n >= next_board_try:
+                if SPEC_FIRE_V2_BOARD and _n >= self._board_next_try.get(feed, next_board_try):
                     # доску армим ЗАРАНЕЕ и переармливаем по каденсу (роут протухает так же,
                     # как у обычной пробы). Свой тред: сборка плана не крадёт мс у огня.
-                    next_board_try = _n + SPEC_FIRE_V2_REARM_SEC
+                    # #57: расписание живёт в _board_next_try — осечка арма подтянет его к
+                    # быстрому ретраю, а не оставит окно без доски на весь каденс 240с.
+                    self._board_next_try[feed] = _n + SPEC_FIRE_V2_REARM_SEC
                     threading.Thread(target=self._prearm_board, args=(feed, direction, dev),
                                      daemon=True, name="board-%s" % feed).start()
                 if hot and gap_t0 is None:
@@ -1363,7 +1437,7 @@ class SpecFireLive:
             feed = (ev.get("feed") or "").upper()
             if kind == "arm":
                 direction = ev.get("dir") or "down"
-                if self._now() < self._cooldown_until:     # WIN-пауза: приз взят, паттерн не палим
+                if self._cooldown_active(feed):            # WIN-пауза (#46: по умолчанию пер-фид)
                     return None
                 best, hold_dist, _ = self._top_fat(feed, direction, max_dist=SPEC_FIRE_ARM_MAX_DIST)
                 if not best:

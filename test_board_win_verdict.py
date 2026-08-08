@@ -73,7 +73,21 @@ print("UNIT_OK: доска — status=1 без события Liquidated это 
 sf = make(rcpt(1, True))
 won, cooled = fire(sf, True, rcpt(1, True))
 assert won, "настоящая победа доски НЕ распознана — тест умел бы только не-победу"
-assert cooled, "победа обязана взвести кулдаун (паттерн проб->приз рвём)"
+# #46 (решение kelbic 08.08): победа ПРОБЫ больше не гасит арм — инвентарь она не тратит,
+# а глобальная пауза отдавала стене ноги 2+ каскада. Пауза осталась за боевой победой.
+assert not cooled, "победа пробы снова гасит флот (#46)"
+import chain.spec_fire_live as _sfl_rb                      # КОНТРОЛЬ ОТКАТА
+_rb = _sfl_rb.SPEC_FIRE_COOLDOWN_TRIGGER
+_rbs = _sfl_rb.SPEC_FIRE_COOLDOWN_SCOPE
+_sfl_rb.SPEC_FIRE_COOLDOWN_TRIGGER = "any"
+_sfl_rb.SPEC_FIRE_COOLDOWN_SCOPE = "global"      # прежняя пауза = любая победа + все фиды
+try:
+    sf_rb = make(rcpt(1, True))
+    _w, _c = fire(sf_rb, True, rcpt(1, True))
+    assert _w and _c, "откат SPEC_FIRE_COOLDOWN_TRIGGER=any не возвращает прежнюю паузу"
+finally:
+    _sfl_rb.SPEC_FIRE_COOLDOWN_TRIGGER = _rb
+    _sfl_rb.SPEC_FIRE_COOLDOWN_SCOPE = _rbs
 print("UNIT_OK: позитивный контроль — событие Liquidated даёт WIN и кулдаун")
 
 # ---- 3. Неизвестный вердикт (логов в квитанции нет) — доска молчит, fail-closed ----
@@ -88,7 +102,11 @@ won, _ = fire(sf, False, rcpt(0, False))
 assert not won, "V1: revert (цель здорова) — не победа"
 sf = make(rcpt(1, None))
 won, cooled = fire(sf, False, rcpt(1, None))
-assert won and cooled, "V1: прямая liquidate прошла => победа даже без сведений о логах"
+# #46: победа V1-ноги — тоже победа ПРОБЫ, паузу по дефолту не ставит (гасить весь
+# флот на 15 минут ради взятого приза = отдавать стене ноги 2+ каскада). Вердикт
+# «победа» при этом обязан сохраниться бит-в-бит — его и проверяем.
+assert won, "V1: прямая liquidate прошла => победа даже без сведений о логах"
+assert not cooled, "V1-победа снова гасит все окна (#46)"
 print("UNIT_OK: путь V1 не тронут — там статус по-прежнему решает")
 
 # ---- 5. Разбор логов: чужое событие и чужой эмитент не считаются нашей победой ----

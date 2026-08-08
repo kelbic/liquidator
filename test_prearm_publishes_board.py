@@ -31,6 +31,7 @@ def mk(now=5000.0):
     sf.probe_board = {}
     sf.pending_fire = {}
     sf._ws_handoff_ts = {}
+    sf._board_next_try = {}
     sf._windows = {FEED: True}                 # окно армлено (порог арма 0.65*dev — ниже огня)
     sf._board = {}
     sf.stats = {}

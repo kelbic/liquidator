@@ -225,8 +225,13 @@ print("UNIT_OK: probe-гейты (inflight, газ-бакет) атомарно 
 # 8b) WIN-cooldown: после приза окна не армятся (паттерн «пробы->приз» не палим)
 sent.clear()
 sf10 = make(receipt_fn=lambda h: (1, 0.02))
-sf10._collect("0xw", "0xbtc", "0xFAT", 1_500_000.0)     # WIN -> кулдаун
-assert sf10._cooldown_until > 0
+sfl_mod.SPEC_FIRE_COOLDOWN_TRIGGER = "any"                  # #46: дефолт combat — пауза за боевой
+sfl_mod.SPEC_FIRE_COOLDOWN_SCOPE = "global"                 # экзаменуем ПРЕЖНЮЮ семантику
+try:
+    sf10._collect("0xw", "0xbtc", "0xFAT", 1_500_000.0)     # WIN -> кулдаун
+    assert sf10._cooldown_until > 0
+finally:
+    sfl_mod.SPEC_FIRE_COOLDOWN_TRIGGER, sfl_mod.SPEC_FIRE_COOLDOWN_SCOPE = "combat", "feed"
 sf10.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
 time.sleep(0.3)
 assert sf10.stats["windows_armed"] == 0, "в WIN-паузе окно не должно армиться"

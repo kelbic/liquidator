@@ -146,7 +146,9 @@ try:
     sf._windows["BTC"] = evt
     sf._volley(PROBE, "0xbtc", "0xFAT", 1.5e6, "BTC")
     assert evt.is_set() and "BTC" not in sf._windows
-    assert sf._cooldown_until > sf._now()
+    # #46: победа ноги гасит ТОЛЬКО свой фид и только под откатом триггера; окно всё
+    # равно закрыто (приз взят), а соседние фиды каскада остаются живыми
+    assert not sf._cooldown_active("DOGE"), "победа по BTC погасила DOGE (#46)"
     with ex._SEND_LOCK:
         assert ("0xbtc", "0xFAT") in ex._RECENT_SENDS
     assert sf.stats["wins"] >= 1
