@@ -257,6 +257,17 @@ SPEC_FIRE_CASCADE_WINDOWS = int(os.environ.get("SPEC_FIRE_CASCADE_WINDOWS", "4")
 SPEC_FIRE_HYBRID = os.environ.get("SPEC_FIRE_HYBRID", "1").lower() not in ("0", "false", "no")
 SPEC_FIRE_FACTS_FLAG = os.environ.get("SPEC_FIRE_FACTS_FLAG", "state/cascade_facts.flag")
 SPEC_FIRE_FACTS_TTL_SEC = float(os.environ.get("SPEC_FIRE_FACTS_TTL_SEC", "900"))
+# Право огня движку в fat-окне выдаёт САМО окно, не тир выше (вскрытие 07.08 17:00, блок
+# 49666338). Гонка живёт в одном блоке, а тир (армы>=N/час И свежий факт-флаг) в решающий
+# блок ложен ПО ПОСТРОЕНИЮ: армы копятся медленнее часа, факт появляется только ПОСЛЕ чьей-то
+# состоявшейся ликвидации. Месяц журнала: тир открылся 10 раз при 198 fail-closed, ноги и
+# доска — 0 боевых проб, а позиционную лотерею стены выиграли на плотности (наши пробы легли
+# на idx 2439+ при победителях 2176-2187 сразу за транзитом). Бюджет держат гейты
+# send_presigned_probe ($-бакет тира, патрон ноги, боевая tx в полёте), токен-бакет движка и
+# TTL keepalive (перестали продлевать — потух); fat-окон — 2 за месяц ретенции.
+# Откат: SPEC_FIRE_ENGINE_FAT_KEEPALIVE=0 — право огня снова только у тир-гейта.
+SPEC_FIRE_ENGINE_FAT_KEEPALIVE = os.environ.get(
+    "SPEC_FIRE_ENGINE_FAT_KEEPALIVE", "1").lower() not in ("0", "false", "no")
 # ПАКЕТ B — SCHED (план ревьювера 04.08): дыра 18:50:15→39 = 7 проб ушли в XRP-окно ($16k),
 # пока рвался DOGE-кит ($71k); fallback 3870d89 починил лок ЦЕЛИ внутри окна, но не расписание
 # МЕЖДУ окнами. Пробный слот (общий $-бакет + send-интервал) достаётся окну с самой богатой
@@ -764,7 +775,7 @@ class SpecFireLive:
         return bool(st and st.get("key") == (mid, b)
                     and self._now() < st.get("until", 0.0))
 
-    def _arm_board(self, probe, mid, b, feed) -> bool:
+    def _arm_board(self, probe, mid, b, feed, debt=0.0) -> bool:
         """Записать armed-план в контракт (owner-tx с главного кошелька). Возврат: доска готова?
 
         Вызывается ЗАРАНЕЕ (пока окно взведено, но горячая фаза не началась) — плану надо сесть
@@ -796,7 +807,7 @@ class SpecFireLive:
             if h is None:
                 self.stats["board_fails"] += 1
                 return False
-            self._board = {"key": (mid, b), "armed_ts": self._now(),
+            self._board = {"key": (mid, b), "armed_ts": self._now(), "debt": float(debt),
                            # доска считается годной только ПОСЛЕ того, как tx могла сесть;
                            # до этого 1-байт пробы ушли бы в пустоту (плана в сторадже нет)
                            "until": self._now() + SPEC_FIRE_V2_PLAN_TTL_SEC - 30.0,
@@ -819,6 +830,36 @@ class SpecFireLive:
         st = self._board
         return bool(self._board_ready(mid, b) and self._now() >= st.get("ready_at", 0.0))
 
+    def _board_plan_live(self):
+        """(mid, b) ЖИВОГО армленного плана (запись успела сесть) или None.
+
+        Ключ права огня движку: keepalive ведётся по цели ПЛАНА, а не по цели текущего тика —
+        handoff 07.08 пришёл по $1k-жертве, пока доска держала план по $31k, и проверка по
+        цели тика оставила бы движок немым ровно в блоке транзита."""
+        k = (self._board or {}).get("key")
+        return k if (k is not None and self._board_live(k[0], k[1])) else None
+
+    def _engine_fat_keepalive(self, feed) -> bool:
+        """Право огня движку от САМОГО fat-окна (см. SPEC_FIRE_ENGINE_FAT_KEEPALIVE).
+        Возврат True = продлили. Зовётся из тика окна и из pending-handoff: огонь ведёт ОКНО,
+        а не удача кадансовой пробы — гейт _INFLIGHT глушит пробу главного кошелька на время
+        боевой tx, и keepalive из залпа погас бы ровно в горячие секунды каскада."""
+        if not SPEC_FIRE_ENGINE_FAT_KEEPALIVE:
+            return False
+        plan = self._board_plan_live()
+        if plan is None:
+            return False
+        eng = self._engine()
+        if eng is None:
+            return False
+        eng.keepalive(target=(feed, plan[0], plan[1], (self._board or {}).get("debt", 0.0)))
+        n = self._now()
+        if n - getattr(self, "_fat_ka_logged", 0.0) > 60.0:   # DIAG раз в минуту, не на тик
+            self._fat_ka_logged = n
+            self._log("SPECFIRE движок: право огня от fat-окна feed=%s план=%s/%s" % (
+                feed, str(plan[0])[:10], str(plan[1])[:10]))
+        return True
+
     def _prearm_board(self, feed, direction, dev):
         """Положить план по самой жирной достижимой цели ЗАРАНЕЕ — пока окно взведено, но
         горячая фаза не началась. Именно ради этого запаса времени доска и существует: запись
@@ -834,7 +875,7 @@ class SpecFireLive:
                 return
             probe = (self._build_fn or self._build)(mid, b, d)
             if isinstance(probe, dict):
-                self._arm_board(probe, mid, b, feed)
+                self._arm_board(probe, mid, b, feed, debt=d)
                 # СКЛАД НАБИВАЕТСЯ ЗДЕСЬ, а не в первом огне. Движок поднимается лениво, и если
                 # ждать первого тика горячей фазы, пул выйдет на пустые лестницы: подписать
                 # 5 ног x 40 проб — это ~0.8с молчания ровно на старте окна победы. Арм доски —
@@ -1086,6 +1127,8 @@ class SpecFireLive:
                     # Стреляем вне очереди: без ret-гейта, без интервала, без арбитра (B).
                     # Тот же send-шов (send_spec_fire_probe, единый nonce) — fire-путь не менялся.
                     _pm, _pb, _pd = pf[0], pf[1], pf[2]
+                    if fat_mode:
+                        self._engine_fat_keepalive(feed)   # право огня ДО сборки/отправки пробы
                     try:
                         probe, _bts = cache.get((_pm, _pb), (None, 0.0))
                         if not isinstance(probe, dict):
@@ -1190,6 +1233,8 @@ class SpecFireLive:
                                       feed, max(t[2] for t in tgts) / 1e3,
                                       SPEC_FIRE_FAT_INTERVAL_SEC, SPEC_FIRE_FAT_CAP))
                     fat_mode = _fat_now
+                    if fat_mode:
+                        self._engine_fat_keepalive(feed)
                     if not tgts:
                         if hold_dist is None:
                             break                              # жир ушёл из набора — окно нам не нужно

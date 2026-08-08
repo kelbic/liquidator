@@ -263,7 +263,7 @@ try:
     raised = {"n": 0}
     sf._top_fat = lambda f, d, max_dist=None, k=1: ([("0xmid", "0xb", 50_000.0)], None, None)
     sf._board_ready = lambda m, b: False
-    sf._arm_board = lambda p, m, b, f: None
+    sf._arm_board = lambda p, m, b, f, debt=0.0: None
 
     class _E:
         def __init__(self):
