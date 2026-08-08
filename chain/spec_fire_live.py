@@ -194,6 +194,9 @@ SPEC_FIRE_V2_REARM_SEC = float(os.environ.get("SPEC_FIRE_V2_REARM_SEC", "240"))
 # ОДНОГО setPlan при каденсе переарма 240с оставляла окно короче ретрая вовсе без доски: движок
 # выглядит здоровым, проб ноль. Поэтому неудача переспрашивается БЫСТРО, а не через каденс.
 SPEC_FIRE_V2_ARM_RETRY_SEC = float(os.environ.get("SPEC_FIRE_V2_ARM_RETRY_SEC", "5"))
+# #49: предел доверия к `updatedAt` оракула. Больше — часы разъехались (или апдейт из
+# прошлого), метка встаёт на время детекта, и это видно счётчиком lattice_skew_bad.
+SPEC_FIRE_LATTICE_MAX_SKEW_SEC = float(os.environ.get("SPEC_FIRE_LATTICE_MAX_SKEW_SEC", "120"))
 SPEC_FIRE_V2_PROBE_GAS = int(os.environ.get("SPEC_FIRE_V2_PROBE_GAS", "260000"))
 # ЛИМИТ ГАЗА ПРОБЫ ДОСКИ — считается от ВЫИГРЫША, а не от no-op'а (замер 07.08, #32).
 # Однобайтовая проба почти всегда тихий no-op (18.6k), но в тот единственный раз, когда
@@ -737,10 +740,31 @@ class SpecFireLive:
         return (len([t for t in self._arm_ts if n - t < 3600.0]) >= SPEC_FIRE_CASCADE_WINDOWS
                 and _facts_fresh())
 
-    def note_push(self, feed, t=None):
+    def note_push(self, feed, t=None, updated_at=None):
         """Отметить севший оракульный апдейт: буфер меток кормит фазовый гейт И его же
-        онлайн-валидатор. Дедуп 5с — confirmed и push об одном апдейте приходят парой."""
+        онлайн-валидатор. Дедуп 5с — confirmed и push об одном апдейте приходят парой.
+
+        #49 (ревью 08.08): метка обязана стоять на времени ОРАКУЛА (`updatedAt`), а не на
+        моменте, когда её увидел наш полл. Полл ходит раз в 4с при толерансе фазы ±2с — метки
+        были квантованы грубее самого гейта: доля гэпов на решётке падала до ~0.72 против
+        порога 0.80 (фича молча мертва), а при флуктуационном подтверждении фаза уезжала до
+        4с и `lattice_skips` глушили огонь в истинную секунду транзита. Хуже всего, что
+        валидатор hits/misses мерил теми же смещёнными часами и выглядел здоровым.
+        Переводим unix-время оракула в монотонный кадр буфера — сравниваются только разности,
+        поэтому кадр обязан быть ОДИН."""
         t = self._now() if t is None else float(t)
+        if updated_at:
+            try:
+                _skew = time.time() - float(updated_at)     # возраст апдейта на момент детекта
+            except Exception:
+                _skew = None
+            if _skew is not None and 0.0 <= _skew <= SPEC_FIRE_LATTICE_MAX_SKEW_SEC:
+                t = t - _skew                               # момент САМОГО апдейта
+                self.stats["lattice_oracle_ts"] = self.stats.get("lattice_oracle_ts", 0) + 1
+            else:
+                # часы узла/оракула разъехались — честно живём на времени детекта и говорим
+                # об этом: молчаливый фолбэк вернул бы ровно тот дефект, что чиним
+                self.stats["lattice_skew_bad"] = self.stats.get("lattice_skew_bad", 0) + 1
         ts = self._push_ts.setdefault(feed, [])
         if ts and t - ts[-1] < 5.0:
             return
@@ -1474,7 +1498,8 @@ class SpecFireLive:
                                  daemon=True, name="specfire-%s" % feed).start()
             elif kind in ("confirmed", "push", "disarm", "falsepos", "stale"):
                 if kind in ("confirmed", "push"):
-                    self.note_push(feed)          # решётка OCR: метка севшего апдейта
+                    self.note_push(feed, updated_at=ev.get("updated_at"))
+                    # решётка OCR: метка севшего апдейта — по времени ОРАКУЛА (#49)
                 if (SPEC_FIRE_PEAK_OWED and kind in ("disarm", "falsepos")
                         and self._owed.get(feed, 0.0) > self._now()
                         and feed in self._windows):

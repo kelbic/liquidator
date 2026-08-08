@@ -215,7 +215,8 @@ class PredictEngine:
             events.append(self._end(f, "disarm", r))
         return events
 
-    def on_push(self, symbol: str, wall: float | None = None, price: float | None = None) -> list:
+    def on_push(self, symbol: str, wall: float | None = None, price: float | None = None,
+                updated_at: float | None = None) -> list:
         """Подтверждённый on-chain пуш (updatedAt сдвинулся): confirmed (если armed) либо push
         (recall-мисс), затем ре-якорь на текущий Binance-mid (return ≈ 0)."""
         f = self.feeds.get(symbol.upper())
@@ -229,11 +230,13 @@ class PredictEngine:
                            "lead_s": (None if lead is None else round(lead, 3)),
                            "ret_pct": (None if r is None else r * 100.0),
                            "arm_ret_pct": (None if f.arm_return is None else f.arm_return * 100.0),
-                           "anchor": f.anchor, "push_mid": f.mid})
+                           "anchor": f.anchor, "push_mid": f.mid,
+                           "updated_at": updated_at})   # #49: время ОРАКУЛА, не поллера
         else:
             events.append({"event": "push", "feed": f.label, "was_armed": False, "lead_s": None,
                            "ret_pct": (None if r is None else r * 100.0),
-                           "anchor": f.anchor, "push_mid": f.mid})
+                           "anchor": f.anchor, "push_mid": f.mid,
+                           "updated_at": updated_at})   # #49
         new_anchor = f.mid if f.mid is not None else price
         if new_anchor is not None and new_anchor > 0:
             f.anchor = float(new_anchor)
@@ -418,7 +421,7 @@ class PredictDriver:
             elif sym not in self._last_updated:
                 self._last_updated[sym] = updated_at    # первый poll-baseline, НЕ пуш
             elif updated_at != self._last_updated[sym]:
-                events += self.engine.on_push(sym, wall, price)
+                events += self.engine.on_push(sym, wall, price, updated_at=updated_at)
                 self._last_updated[sym] = updated_at
         return events
 
