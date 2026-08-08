@@ -36,6 +36,12 @@ class _FakeEth:
     def get_block(self, _b):
         return {"baseFeePerGas": BASEFEE}
 
+    def get_balance(self, _a):
+        # #45: патрон обязан быть ИЗВЕСТЕН, иначе гейт закрыт (незнание закрывает гард).
+        # presign_ladder греет кэш вне пути огня — здесь это и проверяется по факту.
+        self._outer.bal_reads += 1
+        return self._outer.balance_wei
+
     def get_transaction_count(self, _a, _blk="pending"):
         # ПОДТЕКАЮЩИЙ pending: узел ещё не увидел разосланные пробы. Ровно эта отсталость
         # и делает пересборку лестницы от pending дырой в nonce (см. тест доточки).
@@ -62,6 +68,8 @@ class _FakeRpc:
         self.fail_next = False
         self.fail_msg = "connection reset"
         self.pending_nonce = 0
+        self.balance_wei = int(0.008 * 10**18)     # заправка ноги флота
+        self.bal_reads = 0
 
     def _web3(self):
         return _FakeW3(self)
@@ -184,8 +192,13 @@ for _ in range(60):
         break
     _fired += 1
 assert _fired == 60, "нога замолчала после %d проб — списание считается по лимиту, не по факту" % _fired
-assert ex._VOLLEY_BAL[ADDR][0] < int(0.008e18), "позитивный контроль: баланс всё же убывает"
-print("UNIT_OK: расход по факту — нога отдала все %d проб лестницы" % _fired)
+# #45: путь огня БОЛЬШЕ не списывает по эстимейту (он завышал расход no-op в ~250 раз и глушил
+# ногу за ~135 проб). Кэш двигает только квитанция — вот позитивный контроль, что учёт жив:
+assert ex._VOLLEY_BAL[ADDR][0] == int(0.008e18), "путь огня снова списывает по эстимейту"
+ex.volley_bal_charge(ADDR, 18600 * _mf)                  # квитанция no-op пробы доски
+assert ex._VOLLEY_BAL[ADDR][0] == int(0.008e18) - 18600 * _mf, \
+    "позитивный контроль: списание по квитанции не двигает патрон"
+print("UNIT_OK: расход по факту — нога отдала все %d проб, патрон списан квитанцией" % _fired)
 
 # ---- 8. Гейты тира действуют и на лестницу ----
 rpc = fresh()

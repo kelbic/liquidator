@@ -538,6 +538,17 @@ _VOLLEY_BAL_FLOOR_WEI = int(float(os.environ.get("SPEC_FIRE_VOLLEY_FLOOR_ETH", "
 #   гейт     — по ХУДШЕМУ случаю: нога обязана быть способна оплатить полный выигрыш;
 #   декремент— по ОЖИДАЕМОМУ: no-op, а не лимит (истину всё равно вернёт refresh кэша).
 _VOLLEY_EXPECTED_GAS = int(os.environ.get("SPEC_FIRE_VOLLEY_EXPECTED_GAS", "45000"))
+# ПУТЬ ДВИЖКА (#45, ревью 08.08): гейт патрона там был сломан в ОБЕ стороны — при пустом кэше
+# молча пропускался (незнание как разрешение — канон, экземпляр katana 08.08), а сам кэш на
+# этом пути никогда не обновлялся, и пессимистичный декремент по ЭСТИМЕЙТУ гнал его к полу:
+# нога самоглушилась за ~135-155 проб при реальном расходе no-op 0.00000009 ETH (завышение
+# ~250x). Решение владельца: декремент — по ФАКТИЧЕСКОЙ квитанции, пустой кэш — пропуск с
+# АСИНХРОННЫМ дозором (синхронный get_balance на пути огня стоил бы RTT в горячем окне),
+# отказы — счётчиком в экспорт (невидимый отказ = отказ, который никто не чинит).
+_VOLLEY_BAL_MAX_AGE = float(os.environ.get("SPEC_FIRE_VOLLEY_BAL_MAX_AGE_SEC", "600"))
+_VOLLEY_BAL_REFRESHING: set = set()      # addr с дозором в полёте (без него 8 тредов = шторм)
+_VOLLEY_FLOOR_SKIPS = 0                  # отказов «патрон на поле»
+_VOLLEY_UNKNOWN_SKIPS = 0                # отказов «баланс неизвестен/протух» (fail-closed)
 # Пробы движка мимо гейта _INFLIGHT (решение kelbic 08.08 по замеру немоты: p50=1.8с/tx,
 # в каскаде 17:00 три слепых пятна съели 75% горячего окна, а окно фида закрылось ВНУТРИ
 # первой немоты). Касается ТОЛЬКО send_presigned_probe (1-байт со склада, свои nonce-потоки);
@@ -545,6 +556,54 @@ _VOLLEY_EXPECTED_GAS = int(os.environ.get("SPEC_FIRE_VOLLEY_EXPECTED_GAS", "4500
 # nonce/фиатный вес. Откат: SPEC_FIRE_ENGINE_IGNORE_INFLIGHT=0.
 _ENGINE_PROBE_IGNORE_INFLIGHT = os.environ.get(
     "SPEC_FIRE_ENGINE_IGNORE_INFLIGHT", "1").lower() not in ("0", "false", "no")
+
+
+def volley_probe_skips():
+    """(floor_skips, unknown_skips) — отказы пути движка. В экспорт: отказ пола БЕЗ счётчика
+    неотличим от «окно было пустым», и нога, замолчавшая на 135-й пробе, выглядела бы штилем."""
+    with _INFLIGHT_LOCK:
+        return (_VOLLEY_FLOOR_SKIPS, _VOLLEY_UNKNOWN_SKIPS)
+
+
+def volley_bal_warm(rpc, addr: str) -> bool:
+    """Синхронно засеять кэш патрона ВНЕ пути огня (пресайн лестницы, прогрев доски).
+    Возврат True, если кэш теперь живой. Здесь RTT допустим — путь холодный."""
+    try:
+        w3 = rpc._web3()
+        b = int(w3.eth.get_balance(addr))
+    except Exception:
+        return False
+    _VOLLEY_BAL[addr] = [b, time.monotonic()]
+    return True
+
+
+def volley_bal_refresh_async(rpc, addr: str):
+    """Дозор патрона мимо пути огня: один в полёте на ногу (иначе 8 тредов движка дают шторм
+    get_balance ровно в горячем окне). Тихий: исход виден по кэшу и счётчикам отказов."""
+    with _INFLIGHT_LOCK:
+        if addr in _VOLLEY_BAL_REFRESHING:
+            return
+        _VOLLEY_BAL_REFRESHING.add(addr)
+
+    def _run():
+        try:
+            volley_bal_warm(rpc, addr)
+        finally:
+            with _INFLIGHT_LOCK:
+                _VOLLEY_BAL_REFRESHING.discard(addr)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def volley_bal_charge(addr: str, wei: int):
+    """Списать с кэша патрона ФАКТИЧЕСКИЙ расход по квитанции (#45). Эстимейт на пути огня
+    завышал расход в ~250 раз и глушил ногу за ~135 проб; истина приходит от коллектора."""
+    if not addr or wei <= 0:
+        return
+    bal = _VOLLEY_BAL.get(addr)
+    if bal is None:
+        return
+    bal[0] = max(0, int(bal[0]) - int(wei))
 
 
 def volley_accounts():
@@ -746,7 +805,13 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
 
     Зовётся ФОНОМ (взвод окна), не из горячего пути: подпись — это CPU, и весь смысл в том,
     чтобы её там не было. Идемпотентна: лестница той же формы не пересобирается.
+
+    Здесь же греется кэш патрона (#45): путь холодный, RTT допустим, и нога выходит в окно
+    с ИЗВЕСТНЫМ балансом — иначе первый же выстрел уткнулся бы в fail-closed гейт.
     """
+    _bw = _VOLLEY_BAL.get(addr)
+    if _bw is None or time.monotonic() - _bw[1] > _VOLLEY_BAL_TTL:
+        volley_bal_warm(rpc, addr)
     lk = _VOLLEY_LOCKS.get(addr)
     if lk is None:
         return 0
@@ -811,7 +876,7 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
     Откат: SPEC_FIRE_ENGINE_IGNORE_INFLIGHT=0 — движок снова молчит при боевой tx в полёте.
     Возврат hash|None. При неудаче запись возвращается В НАЧАЛО очереди (инвариант подряд).
     """
-    global _VOLLEY_PROBES
+    global _VOLLEY_PROBES, _VOLLEY_FLOOR_SKIPS, _VOLLEY_UNKNOWN_SKIPS
     with _INFLIGHT_LOCK:
         _volley_roll_day_locked()
         if (_VOLLEY_GAS_USD >= CASCADE_TIER_GAS_USD
@@ -824,13 +889,33 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
         st = _VOLLEY_LADDER.get(addr)
         if not st or not st["q"]:
             return None
+        # ГЕЙТ ПАТРОНА (#45): незнание ЗАКРЫВАЕТ гард. Кэша нет или он старше предельного
+        # возраста -> пробу НЕ шлём и будим дозор вне пути огня (синхронный get_balance здесь
+        # стоил бы RTT в горячем окне). Кэш свежий-но-протухший по TTL: стреляем по известному
+        # числу и обновляем фоном — молчать весь RTT в горячем окне дороже, чем ошибиться на
+        # расход одной пробы (~$0.0004 при гейте по ХУДШЕМУ случаю).
         bal = _VOLLEY_BAL.get(addr)
-        if bal is not None:
-            # тот же принцип, что у обычной ноги: гейт по ХУДШЕМУ случаю, расход по факту
-            if bal[0] - int(st["gas"]) * int(st["max_fee"]) < _VOLLEY_BAL_FLOOR_WEI:
-                if log:
-                    log.info("VOLLEY %s молчит: патрон на поле %.4f ETH", addr[:10], bal[0] / 1e18)
-                return None
+        _age = (time.monotonic() - bal[1]) if bal is not None else None
+        if bal is None or _age > _VOLLEY_BAL_MAX_AGE:
+            with _INFLIGHT_LOCK:
+                _VOLLEY_UNKNOWN_SKIPS += 1
+            if rpc is not None:
+                volley_bal_refresh_async(rpc, addr)
+            if log:
+                log.info("VOLLEY %s молчит: патрон НЕИЗВЕСТЕН (кэш %s) — дозор разбужен",
+                         addr[:10], "пуст" if bal is None else "возраст %.0fс" % _age)
+            return None
+        if _age > _VOLLEY_BAL_TTL and rpc is not None:
+            volley_bal_refresh_async(rpc, addr)       # фоном, огонь не ждёт
+        # гейт по ХУДШЕМУ случаю: нога обязана быть способна оплатить полный выигрыш
+        if bal[0] - int(st["gas"]) * int(st["max_fee"]) < _VOLLEY_BAL_FLOOR_WEI:
+            with _INFLIGHT_LOCK:
+                _VOLLEY_FLOOR_SKIPS += 1
+            if rpc is not None:
+                volley_bal_refresh_async(rpc, addr)   # вдруг ногу долили — узнаем без рестарта
+            if log:
+                log.info("VOLLEY %s молчит: патрон на поле %.4f ETH", addr[:10], bal[0] / 1e18)
+            return None
         nonce, raw_hex, h = st["q"].pop(0)
     # ПУТЬ РАССЫЛКИ ВЫБРАН ЗАМЕРОМ (07.08): тёплая сессия до СЕКВЕНСЕРА держит тред 32.5мс
     # (p50, 25 проб), синхронная нога Alchemy — 60мс. Секвенсер и есть ордерер Base, а hash
@@ -863,9 +948,9 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
         # запись потрачена по назначению, возвращать её нельзя.
     with lk:
         _VOLLEY_NONCE[addr] = nonce + 1
-        bal = _VOLLEY_BAL.get(addr)
-        if bal is not None:
-            bal[0] -= _VOLLEY_EXPECTED_GAS * int(st["max_fee"] if st else 0)
+        # ДЕКРЕМЕНТ ПО ФАКТУ (#45): эстимейт здесь завышал расход no-op пробы в ~250 раз и
+        # глушил ногу за ~135 проб. Истину приносит коллектор квитанций (volley_bal_charge),
+        # а верхнюю границу дрейфа держит дозор по возрасту кэша.
     with _INFLIGHT_LOCK:
         _VOLLEY_PROBES += 1
     return h

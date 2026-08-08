@@ -876,6 +876,14 @@ class SpecFireLive:
             probe = (self._build_fn or self._build)(mid, b, d)
             if isinstance(probe, dict):
                 self._arm_board(probe, mid, b, feed, debt=d)
+                # #47: ПУБЛИКУЕМ probe_board уже на прогреве. Раньше он заполнялся ТОЛЬКО при
+                # пересборке в горячей фазе (|ret|>=1.0*dev), а pending-detect tier-2 и
+                # ws-handoff при пустой доске делают return, ВЫБРАСЫВАЯ уже обнаруженный
+                # транзит: в классе каскадов, где оракульный базис держит наш ret ниже порога
+                # (cbXRP: оракул -0.50% при ret -0.43%), окно молчало сквозь реальный транзит.
+                # Прогрев строит ровно тот же probe-dict — публикация здесь открывает оба
+                # детект-пути, не трогая порог огня.
+                self.probe_board[feed] = (mid, b, d, probe["calldata"], probe["gas"], self._now())
                 # СКЛАД НАБИВАЕТСЯ ЗДЕСЬ, а не в первом огне. Движок поднимается лениво, и если
                 # ждать первого тика горячей фазы, пул выйдет на пустые лестницы: подписать
                 # 5 ног x 40 проб — это ~0.8с молчания ровно на старте окна победы. Арм доски —
@@ -932,14 +940,15 @@ class SpecFireLive:
     def _engine_result(self, meta, h, r):
         """Исход пробы движка. Вердикт победы — ТОЛЬКО по событию Liquidated (см. LIQUIDATED_TOPIC0):
         у пробы доски status=1 бывает и у холостой, и у неудачной попытки."""
-        from chain.execute import volley_gas_add
+        from chain.execute import volley_gas_add, volley_bal_charge
         addr, tgt = (meta or (None, None))
         try:
-            gas_usd = (int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
-                       * float(self.cfg.eth_price_usd) / 1e18)
+            _wei = int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
+            gas_usd = _wei * float(self.cfg.eth_price_usd) / 1e18
         except Exception:
-            gas_usd = 0.0
+            _wei, gas_usd = 0, 0.0
         volley_gas_add(gas_usd)
+        volley_bal_charge(addr, _wei)     # #45: патрон списывается по ФАКТУ, не по эстимейту
         if _receipt_has_win(r, self.cfg.liquidator_address) is not True:
             self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
             return
@@ -1334,9 +1343,19 @@ class SpecFireLive:
             _g = sorted(gaps)
             # close-строка: B3-метрика (gap p95 горячей фазы) + кумулятивные счётчики (C5:
             # owed_probes/sticky_windows/pending_fires видны grep'ом без маркеров)
-            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s stats=%s" % (
-                feed, probes,
-                ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—", self.stats))
+            # #45: отказы пути движка — в ту же close-строку. Невидимый отказ = отказ, который
+            # никто не чинит: нога, замолчавшая на полу или без кэша патрона, до этого была
+            # неотличима от «окно было пустым».
+            try:
+                from chain.execute import volley_probe_skips
+                _fs, _us = volley_probe_skips()
+            except Exception:
+                _fs = _us = -1
+            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
+                      "patron_floor_skips=%d patron_unknown_skips=%d stats=%s" % (
+                          feed, probes,
+                          ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
+                          _fs, _us, self.stats))
 
     def handle_event(self, ev: dict):
         try:
