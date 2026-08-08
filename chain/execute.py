@@ -547,6 +547,10 @@ _VOLLEY_EXPECTED_GAS = int(os.environ.get("SPEC_FIRE_VOLLEY_EXPECTED_GAS", "4500
 # отказы — счётчиком в экспорт (невидимый отказ = отказ, который никто не чинит).
 _VOLLEY_BAL_MAX_AGE = float(os.environ.get("SPEC_FIRE_VOLLEY_BAL_MAX_AGE_SEC", "600"))
 _VOLLEY_BAL_REFRESHING: set = set()      # addr с дозором в полёте (без него 8 тредов = шторм)
+_VOLLEY_REFRESH_MAX = int(os.environ.get("SPEC_FIRE_VOLLEY_REFRESH_MAX", "4"))   # потолок на флот
+# Во сколько раз записанный max_fee должен превышать нынешний, чтобы лестницу пересобрать
+# ВНИЗ (разрыв защёлки). 3x: обычную рябь basefee не трогаем, вздутие всплеска — снимаем.
+_VOLLEY_MAXFEE_RESIGN_MULT = float(os.environ.get("SPEC_FIRE_PRESIGN_RESIGN_MULT", "3"))
 _VOLLEY_FLOOR_SKIPS = 0                  # отказов «патрон на поле»
 _VOLLEY_UNKNOWN_SKIPS = 0                # отказов «баланс неизвестен/протух» (fail-closed)
 # Пробы движка мимо гейта _INFLIGHT (решение kelbic 08.08 по замеру немоты: p50=1.8с/tx,
@@ -565,23 +569,38 @@ def volley_probe_skips():
         return (_VOLLEY_FLOOR_SKIPS, _VOLLEY_UNKNOWN_SKIPS)
 
 
-def volley_bal_warm(rpc, addr: str) -> bool:
+def volley_bal_stale(addr: str) -> bool:
+    """Патрон ноги протух и подлежит освежению ФОНОМ. Гейт огня fail-closed по возрасту, поэтому
+    единственный прогрев в момент СОЗДАНИЯ лестницы флот не спасает: между fat-окнами проходят
+    недели, склад всё это время полон, пополнение не зовётся — и на старте окна немыми оказались
+    бы все ноги разом. Порог освежения — половина TTL, чтобы фон успевал до огня."""
+    bal = _VOLLEY_BAL.get(addr)
+    return bal is None or (time.monotonic() - bal[1]) > (_VOLLEY_BAL_TTL * 0.5)
+
+
+def volley_bal_warm(rpc, addr: str, log=None) -> bool:
     """Синхронно засеять кэш патрона ВНЕ пути огня (пресайн лестницы, прогрев доски).
     Возврат True, если кэш теперь живой. Здесь RTT допустим — путь холодный."""
     try:
         w3 = rpc._web3()
         b = int(w3.eth.get_balance(addr))
-    except Exception:
+    except Exception as e:
+        # Молчаливая осечка = лестница на 40 проб при пустом кэше, то есть нога, немая до
+        # следующего освежения. Говорим вслух.
+        if log:
+            log.info("VOLLEY %s: прогрев патрона не удался (%s) — нога под fail-closed гейтом",
+                     addr[:10], type(e).__name__)
         return False
     _VOLLEY_BAL[addr] = [b, time.monotonic()]
     return True
 
 
 def volley_bal_refresh_async(rpc, addr: str):
-    """Дозор патрона мимо пути огня: один в полёте на ногу (иначе 8 тредов движка дают шторм
-    get_balance ровно в горячем окне). Тихий: исход виден по кэшу и счётчикам отказов."""
+    """Дозор патрона мимо пути огня: один в полёте на ногу И не более _VOLLEY_REFRESH_MAX на
+    весь флот. Без общего потолка 110 стухших ног за один круг round-robin дали бы 110 тредов
+    и ~3000 CU/с в боевой ключ — самоподдерживающийся 429-шторм ровно в горячем окне."""
     with _INFLIGHT_LOCK:
-        if addr in _VOLLEY_BAL_REFRESHING:
+        if addr in _VOLLEY_BAL_REFRESHING or len(_VOLLEY_BAL_REFRESHING) >= _VOLLEY_REFRESH_MAX:
             return
         _VOLLEY_BAL_REFRESHING.add(addr)
 
@@ -809,9 +828,8 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
     Здесь же греется кэш патрона (#45): путь холодный, RTT допустим, и нога выходит в окно
     с ИЗВЕСТНЫМ балансом — иначе первый же выстрел уткнулся бы в fail-closed гейт.
     """
-    _bw = _VOLLEY_BAL.get(addr)
-    if _bw is None or time.monotonic() - _bw[1] > _VOLLEY_BAL_TTL:
-        volley_bal_warm(rpc, addr)
+    if volley_bal_stale(addr):
+        volley_bal_warm(rpc, addr, log=log)
     lk = _VOLLEY_LOCKS.get(addr)
     if lk is None:
         return 0
@@ -823,7 +841,19 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
             base_fee = int(w3.eth.get_block("latest").get("baseFeePerGas") or 0)
         max_fee = base_fee * _VOLLEY_PRESIGN_MAXFEE_MULT + tip_wei
         st = _VOLLEY_LADDER.get(addr)
-        compat = bool(st and st["gas"] == int(gas) and st["max_fee"] >= max_fee)
+        # ЗАЩЁЛКА max_fee (ревью 08.08, CONFIRMED). Лестница, переподписанная на всплеске
+        # basefee, несёт вздутый max_fee НАВСЕГДА: гейт по худшему случаю (gas x max_fee) при
+        # нём закрыт -> отправок нет -> склад остаётся полным -> пополнение ногу не трогает ->
+        # max_fee никогда не пересчитывается ВНИЗ. Нога немела до рестарта даже после того, как
+        # сеть успокоилась. Поэтому «годной» считаем лестницу, чей max_fee не только НЕ НИЖЕ
+        # текущего, но и не абсурдно выше: сильно подорожавшую пересобираем по нынешней цене.
+        _latched = bool(st and max_fee > 0
+                        and int(st["max_fee"]) > int(max_fee) * _VOLLEY_MAXFEE_RESIGN_MULT)
+        compat = bool(st and st["gas"] == int(gas) and st["max_fee"] >= max_fee and not _latched)
+        if _latched and log:
+            log.info("VOLLEY лестница %s: max_fee %.4f gwei против нынешних %.4f — пересборка "
+                     "(иначе гейт патрона держал бы ногу немой до рестарта)",
+                     addr[:10], int(st["max_fee"]) / 1e9, max_fee / 1e9)
         if compat and len(st["q"]) >= depth:
             return len(st["q"])          # годная лестница уже есть — подпись не жжём
         acct = account_for(w3, key)

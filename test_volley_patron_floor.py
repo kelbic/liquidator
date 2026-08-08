@@ -157,3 +157,64 @@ assert "volley_bal_charge" in pathlib.Path("chain/spec_fire_live.py").read_text(
     "коллектор квитанций движка не списывает патрон по факту"
 
 print("OK: незнание закрывает гард патрона, расход списывается по квитанции, отказы видны")
+
+
+# --- 8. РЕГРЕССИЯ ФИКСА #45 (ревью: моё же допущение ОПРОВЕРГНУТО) ----------------------
+# Прогрев стоял ТОЛЬКО при создании лестницы, а гейт проверяет возраст повторно. Между
+# fat-окнами (недели) склад полон -> пополнение не зовётся -> кэш стареет -> на старте окна
+# fail-closed глушил бы ВЕСЬ флот разом, да ещё и порождал 110 дозорных тредов в боевой ключ.
+import chain.fire_engine as fe                            # noqa: E402
+
+_sv2 = (ex._VOLLEY_BAL.get(ADDR), ex._VOLLEY_REFRESH_MAX)
+try:
+    # 8а. протухший патрон при ПОЛНОМ складе обязан звать пополнение (фон, не путь огня)
+    ex._VOLLEY_BAL[ADDR] = [FUNDED, time.monotonic() - ex._VOLLEY_BAL_TTL]
+    assert ex.volley_bal_stale(ADDR) is True, "протухший патрон не опознан как требующий дозора"
+    ex._VOLLEY_BAL[ADDR] = [FUNDED, time.monotonic()]
+    assert ex.volley_bal_stale(ADDR) is False, "свежий патрон гоняют на пополнение впустую"
+
+    refilled = []
+    eng = fe.FireEngine(legs_fn=lambda: ["0xLegStale"], send_fn=lambda a: None,
+                        collector=None, threads=1, rate=50.0, ttl=0.2,
+                        refill_fn=refilled.append,
+                        depth_fn=lambda a: 40,             # СКЛАД ПОЛОН — прежний триггер молчит
+                        stale_fn=lambda a: True)
+    eng.start()
+    _dl = time.time() + 3.0
+    while time.time() < _dl and not refilled:
+        time.sleep(0.02)
+    eng.stop()
+    assert refilled, "полный склад + протухший патрон = пополнение не позвано (флот немеет)"
+
+    # 8б. КОНТРОЛЬ: свежий патрон и полный склад пополнение НЕ дёргают (иначе жжём CPU/RTT)
+    refilled2 = []
+    eng2 = fe.FireEngine(legs_fn=lambda: ["0xLegFresh"], send_fn=lambda a: None,
+                         collector=None, threads=1, rate=50.0, ttl=0.2,
+                         refill_fn=refilled2.append,
+                         depth_fn=lambda a: 40, stale_fn=lambda a: False)
+    eng2.start()
+    time.sleep(1.2)
+    eng2.stop()
+    assert not refilled2, "пополнение зовут при полном складе и свежем патроне: %d" % len(refilled2)
+
+    # 8в. ПОТОЛОК ДОЗОРА на весь флот: 110 стухших ног не должны дать 110 тредов в боевой ключ
+    ex._VOLLEY_REFRESH_MAX = 4
+    with ex._INFLIGHT_LOCK:
+        ex._VOLLEY_BAL_REFRESHING.clear()
+    _slow = _Rpc()
+    for i in range(110):
+        ex.volley_bal_refresh_async(_slow, "0x%040x" % i)
+    with ex._INFLIGHT_LOCK:
+        _inflight = len(ex._VOLLEY_BAL_REFRESHING)
+    assert _inflight <= 4, "дозор без потолка: %d тредов в боевой ключ = 429-шторм" % _inflight
+    time.sleep(0.4)
+    with ex._INFLIGHT_LOCK:
+        ex._VOLLEY_BAL_REFRESHING.clear()
+finally:
+    ex._VOLLEY_REFRESH_MAX = _sv2[1]
+    if _sv2[0] is None:
+        ex._VOLLEY_BAL.pop(ADDR, None)
+    else:
+        ex._VOLLEY_BAL[ADDR] = _sv2[0]
+
+print("OK: протухший патрон освежается фоном, дозор не штормит боевой ключ")

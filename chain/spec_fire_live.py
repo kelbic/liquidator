@@ -1028,7 +1028,8 @@ class SpecFireLive:
                 on_result=self._engine_result, on_timeout=self._engine_timeout,
                 log=self._log)
             eng = _fe.FireEngine(legs_fn=_legs, send_fn=_send, collector=col,
-                                 refill_fn=_refill, depth_fn=_ex.ladder_depth, log=self._log)
+                                 refill_fn=_refill, depth_fn=_ex.ladder_depth,
+                                 stale_fn=_ex.volley_bal_stale, log=self._log)
             self._fire_engine = eng
             eng.start()
             return eng

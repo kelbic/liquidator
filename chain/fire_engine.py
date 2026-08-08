@@ -160,13 +160,16 @@ class FireEngine:
     """Постоянный пул тредов огня. Тик окна лишь ПРОДЛЕВАЕТ право стрелять (keepalive)."""
 
     def __init__(self, legs_fn, send_fn, collector=None, refill_fn=None, depth_fn=None,
-                 log=None, threads=None, rate=None, ttl=None, now=None, sleep=None):
+                 log=None, threads=None, rate=None, ttl=None, now=None, sleep=None,
+                 stale_fn=None):
         """legs_fn() -> [addr,...] (ноги со склада); send_fn(addr) -> hash|None (рассылка пробы);
-        refill_fn(addr) -> None (фоновое пополнение склада); depth_fn(addr) -> int (остаток)."""
+        refill_fn(addr) -> None (фоновое пополнение склада); depth_fn(addr) -> int (остаток);
+        stale_fn(addr) -> bool (данные ноги протухли и их надо освежить ФОНОМ, а не в огне)."""
         self._legs_fn = legs_fn
         self._send_fn = send_fn
         self._refill_fn = refill_fn
         self._depth_fn = depth_fn
+        self._stale_fn = stale_fn
         self._collector = collector
         self._log = log
         self._nthreads = ENGINE_THREADS if threads is None else int(threads)
@@ -288,7 +291,13 @@ class FireEngine:
                     if self._stop.is_set():
                         break
                     d = self._depth_fn(addr) if self._depth_fn else 0
-                    if d < ENGINE_REFILL_AT:
+                    # Полный склад НЕ означает готовую ногу: у пробы есть ещё и данные
+                    # (патрон), которые протухают сами по себе. Раньше пополнение звалось
+                    # ТОЛЬКО по остатку — между fat-окнами (недели) склад полон, refill не
+                    # зовётся, кэш патрона стареет, и на старте окна fail-closed гейт глушил
+                    # бы ВЕСЬ флот разом. Освежение — фоном, до огня, а не в горячей фазе.
+                    _stale = bool(self._stale_fn(addr)) if self._stale_fn else False
+                    if d < ENGINE_REFILL_AT or _stale:
                         self._refill_fn(addr)
             except Exception as e:
                 if self._log:

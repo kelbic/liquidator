@@ -292,3 +292,22 @@ print("UNIT_OK: пустой склад продолжает с локально
 ex.invalidate_ladder(ADDR)
 assert ex.ladder_depth(ADDR) == 0
 print("ПРОШЛИ: пред-подписанная лестница проб")
+
+# ---- 12. РАЗРЫВ ЗАЩЁЛКИ max_fee (ревью 08.08, CONFIRMED) ----
+# Лестница, переподписанная на всплеске basefee, несла вздутый max_fee НАВСЕГДА: гейт патрона
+# по худшему случаю при нём закрыт -> отправок нет -> склад полон -> пополнение ногу не трогает
+# -> max_fee никогда не пересчитывался вниз. Нога немела до рестарта даже после того, как сеть
+# успокоилась. Теперь абсурдно дорогая лестница пересобирается по нынешней цене.
+rpc = fresh()
+ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=6, start_nonce=0)
+_normal = ex._VOLLEY_LADDER[ADDR]["max_fee"]
+ex._VOLLEY_LADDER[ADDR]["max_fee"] = _normal * 50          # «пережили всплеск»
+ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=6, start_nonce=0)
+assert ex._VOLLEY_LADDER[ADDR]["max_fee"] == _normal, \
+    "защёлка жива: max_fee %.4f не пересобрался вниз" % (ex._VOLLEY_LADDER[ADDR]["max_fee"] / 1e9)
+# КОНТРОЛЬ: обычная рябь (в пределах множителя) лестницу НЕ пересобирает — подпись не жжём
+_q_id = id(ex._VOLLEY_LADDER[ADDR]["q"])
+ex._VOLLEY_LADDER[ADDR]["max_fee"] = int(_normal * 1.5)
+ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=6, start_nonce=0)
+assert id(ex._VOLLEY_LADDER[ADDR]["q"]) == _q_id, "рябь basefee жжёт подпись впустую"
+print("UNIT_OK: вздутая лестница пересобирается вниз, рябь — нет")
