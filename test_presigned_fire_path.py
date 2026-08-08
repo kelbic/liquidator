@@ -46,12 +46,32 @@ try:
     assert len(ex._VOLLEY_LADDER[ADDR]["q"]) == 1, "гейт закрыт, а запись потрачена"
     ex._VOLLEY_GAS_USD = 0.0
 
-    # 3. КОНТРОЛЬ: боевая tx в полёте главнее пробы
+    # 3. боевая tx в полёте НЕ глушит пробу движка (решение kelbic 08.08: немота съедала
+    #    75% горячего окна каскада; у 1-байт проб свои nonce и цена $0.0004)
     seed()
     ex._INFLIGHT = 1
-    assert ex.send_presigned_probe(None, None, ADDR, broadcast_raw_urls=SEQ) is None
-    assert len(ex._VOLLEY_LADDER[ADDR]["q"]) == 1
+    assert ex.send_presigned_probe(None, None, ADDR, broadcast_raw_urls=SEQ) == "0xhash5", \
+        "проба движка обязана лететь при боевой tx в полёте (дефолт)"
     ex._INFLIGHT = 0
+
+    # 3б. КОНТРОЛЬ ОТКАТА: SPEC_FIRE_ENGINE_IGNORE_INFLIGHT=0 -> прежнее «боевая главнее»
+    seed()
+    ex._INFLIGHT = 1
+    _sv = ex._ENGINE_PROBE_IGNORE_INFLIGHT
+    ex._ENGINE_PROBE_IGNORE_INFLIGHT = False
+    try:
+        assert ex.send_presigned_probe(None, None, ADDR, broadcast_raw_urls=SEQ) is None
+        assert len(ex._VOLLEY_LADDER[ADDR]["q"]) == 1, "гейт отката закрыт, а запись потрачена"
+    finally:
+        ex._ENGINE_PROBE_IGNORE_INFLIGHT = _sv
+    ex._INFLIGHT = 0
+
+    # 3в. КОНТРОЛЬ границы: V1-нога залпа (send_volley_probe) ОСТАЁТСЯ под гейтом —
+    #    освобождён только путь движка
+    _src = pathlib.Path("chain/execute.py").read_text()
+    _volley_fn = _src[_src.index("def send_volley_probe"):_src.index("def send_presigned_probe")]
+    assert "_INFLIGHT > 0" in _volley_fn and "_ENGINE_PROBE_IGNORE_INFLIGHT" not in _volley_fn, \
+        "гейт V1-ноги изменён — освобождать договаривались только движок"
 
     # 4. рассылка не удалась -> запись ВЕРНУЛАСЬ В НАЧАЛО (дыра в nonce повесила бы ногу)
     seed([(5, "0xaa", "0xh5"), (6, "0xbb", "0xh6")])
@@ -66,6 +86,14 @@ try:
     ex._VOLLEY_BAL[ADDR] = [ex._VOLLEY_BAL_FLOOR_WEI, time.monotonic()]
     assert ex.send_presigned_probe(None, None, ADDR, broadcast_raw_urls=SEQ) is None
     assert len(ex._VOLLEY_LADDER[ADDR]["q"]) == 1
+
+    # 6. пул секвенсер-сессии держит пик каскада: 8 тредов движка + 3 боевых + канарейка > 10
+    #    дефолтных коннектов urllib3 — переполнёж клал бы боевой броадкаст на холодный TCP+TLS
+    if ex._requests is not None:
+        _u = "http://pool-size.test"
+        _pm = ex._seq_session(_u).get_adapter(_u)._pool_maxsize
+        ex._SEQ_SESSIONS.pop(_u, None)
+        assert _pm >= 16, "pool_maxsize=%s — пик каскада переполняет пул" % _pm
 finally:
     (ex._post_raw_sync, ex._VOLLEY_GAS_USD, ex._INFLIGHT, ex._VOLLEY_DAY) = _saved
     for d in (ex._VOLLEY_LOCKS, ex._VOLLEY_LADDER, ex._VOLLEY_BAL, ex._VOLLEY_NONCE):

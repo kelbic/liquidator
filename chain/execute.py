@@ -104,6 +104,13 @@ def _seq_session(url: str):
         s = _SEQ_SESSIONS.get(url)
         if s is None:
             s = _requests.Session()
+            # Дефолтный пул urllib3 = 10 коннектов, block=False: сверх десятого одновременного
+            # поста соединение создаётся ХОЛОДНЫМ и выбрасывается. Пик каскада: 8 тредов движка
+            # + до 3 боевых _post_raw_tx + канарейка/keepalive > 10 — и холод падал бы ровно на
+            # боевой броадкаст. 32 держит пик с запасом.
+            _ad = _requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=32)
+            s.mount("https://", _ad)
+            s.mount("http://", _ad)
             _SEQ_SESSIONS[url] = s
             threading.Thread(target=_seq_keepalive, args=(url, s), daemon=True).start()
         return s
@@ -531,6 +538,13 @@ _VOLLEY_BAL_FLOOR_WEI = int(float(os.environ.get("SPEC_FIRE_VOLLEY_FLOOR_ETH", "
 #   гейт     — по ХУДШЕМУ случаю: нога обязана быть способна оплатить полный выигрыш;
 #   декремент— по ОЖИДАЕМОМУ: no-op, а не лимит (истину всё равно вернёт refresh кэша).
 _VOLLEY_EXPECTED_GAS = int(os.environ.get("SPEC_FIRE_VOLLEY_EXPECTED_GAS", "45000"))
+# Пробы движка мимо гейта _INFLIGHT (решение kelbic 08.08 по замеру немоты: p50=1.8с/tx,
+# в каскаде 17:00 три слепых пятна съели 75% горячего окна, а окно фида закрылось ВНУТРИ
+# первой немоты). Касается ТОЛЬКО send_presigned_probe (1-байт со склада, свои nonce-потоки);
+# кадансовые пробы главного кошелька и V1-залп ног остаются под гейтом — у них общий
+# nonce/фиатный вес. Откат: SPEC_FIRE_ENGINE_IGNORE_INFLIGHT=0.
+_ENGINE_PROBE_IGNORE_INFLIGHT = os.environ.get(
+    "SPEC_FIRE_ENGINE_IGNORE_INFLIGHT", "1").lower() not in ("0", "false", "no")
 
 
 def volley_accounts():
@@ -790,13 +804,18 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
 
 def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None):
     """Огонь из лестницы: НИ подписи, НИ чтения nonce — только рассылка готовых байтов.
-    Гейты те же, что у обычной ноги ($-бакет тира и боевая tx в полёте).
+    Гейты: $-бакет тира и пол патрона — как у обычной ноги. Гейт «боевая tx в полёте» с 08.08
+    по умолчанию НЕ действует (решение kelbic по замеру: немота p50=1.8с/tx съедала 75%
+    горячего окна каскада 17:00; у 1-байт проб свои nonce-потоки и цена ~$0.0004, худший
+    случай — копеечный реверт-дубль по жертве, которую уже берёт боевая tx).
+    Откат: SPEC_FIRE_ENGINE_IGNORE_INFLIGHT=0 — движок снова молчит при боевой tx в полёте.
     Возврат hash|None. При неудаче запись возвращается В НАЧАЛО очереди (инвариант подряд).
     """
     global _VOLLEY_PROBES
     with _INFLIGHT_LOCK:
         _volley_roll_day_locked()
-        if _VOLLEY_GAS_USD >= CASCADE_TIER_GAS_USD or _INFLIGHT > 0:
+        if (_VOLLEY_GAS_USD >= CASCADE_TIER_GAS_USD
+                or (_INFLIGHT > 0 and not _ENGINE_PROBE_IGNORE_INFLIGHT)):
             return None
     lk = _VOLLEY_LOCKS.get(addr)
     if lk is None:
@@ -2305,9 +2324,36 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                                 "status": None, "gas_used": None, "net_usd": prep["net_usd"]})
         return results
 
+    # ЗАМЕР 08.08 (месяц журнала): немота _INFLIGHT p50=1.8с/tx, в каскаде 17:00 объединение
+    # 7.5с из 9.9с горячего окна (75%) — и ~половина брекета была НЕ полётом, а пост-диагностикой
+    # (_revert_reason: ретрай sleep 1.5с; _submit_xray: sleep 2.0с + get_logs/get_transaction/
+    # get_block). «tx в полёте» кончается квитанцией либо таймаутом: ПРОХОД 1 собирает квитанции
+    # и отпускает _INFLIGHT (гейты проб открываются сразу), ПРОХОД 2 — диагностика и книжки.
+    # Инвалидация nonce на таймауте остаётся в моменте обнаружения (проход 1).
+    _got = []                                                 # (unit, hash, rcpt|None, err|None)
     for unit, h in sent:
+        _rcpt = None
+        _rerr = None
         try:
-            rcpt = w3.eth.wait_for_transaction_receipt(h, timeout=timeout)
+            _rcpt = w3.eth.wait_for_transaction_receipt(h, timeout=timeout)
+        except Exception as e:
+            # HIGH-фикс: tx могла быть ДРОПНУТА из мемпула (не замайнена за timeout) -> инвалидация
+            # nonce (следующий dispatch пере-читает RPC и закрывает возможную дыру)
+            _rerr = e
+            with _SEND_LOCK:
+                _LOCAL_NONCE.pop(bot, None)
+        finally:
+            _inflight_add(-1)    # -1 на tx (юнит): receipt получен либо timeout; диагностика ниже — не полёт
+        _got.append((unit, h, _rcpt, _rerr))
+        if log:
+            # Положительное доказательство конца брекета для замера немоты: терминальные маркеры
+            # диагностики уехали в проход 2 и момент декремента больше не видны в журнале.
+            log.info("dispatch: inflight released tx=%s outcome=%s left=%d",
+                     h, "receipt" if _rerr is None else "timeout", current_inflight())
+    for unit, h, rcpt, _rerr in _got:
+        try:
+            if _rerr is not None:
+                raise _rerr                                   # хвостовые строки книжит общий except ниже
             status = rcpt.get("status")
             _blk = rcpt.get("blockNumber"); _txi = rcpt.get("transactionIndex")
             if len(unit) == 1:                                # --- одиночный путь: бит-в-бит старый ---
@@ -2372,12 +2418,13 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                     if log:
                         log.info("batch receipt tx=%s n=%d win=%d block=%s idx=%s", h, len(unit), n_win, _blk, _txi)
         except Exception as e:
-            # outcome unknown -> conservatively book estimated cost as a LOSS, never a phantom profit
-            # HIGH-фикс: tx могла быть ДРОПНУТА из мемпула (не замайнена за timeout) -> инвалидация nonce
-            # (следующий dispatch пере-читает RPC и закрывает возможную дыру). Timeout-ветка: суммарный
-            # est-cost ОДИН раз (на первую строку юнита), остальные строки нулевые -> сумма/день точна.
-            with _SEND_LOCK:
-                _LOCAL_NONCE.pop(bot, None)
+            # outcome unknown -> conservatively book estimated cost as a LOSS, never a phantom profit.
+            # Сюда падают И перекинутый таймаут квитанции, И осечка самой диагностики. Nonce здесь
+            # НЕ трогаем: на таймауте pop уже сделан в проходе 1 в момент детекта, а повторный pop
+            # между проходами снёс бы СВЕЖИЙ кэш параллельного dispatch/арма (гейты открыты с
+            # прохода 1); при осечке диагностики квитанция на руках — nonce потреблён on-chain,
+            # кэш валиден. Timeout-ветка: суммарный est-cost ОДИН раз (на первую строку юнита),
+            # остальные строки нулевые -> сумма/день точна. _INFLIGHT уже отпущен в проходе 1.
             for j, (mid, borrower, prep) in enumerate(unit):
                 _first = (j == 0)
                 results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
@@ -2385,6 +2432,4 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                                 "net_usd": (-prep["cost_usd"] if _first else 0.0),
                                 "gas_usd": (prep["cost_usd"] if _first else 0.0),
                                 "reason": f"receipt timeout: {type(e).__name__}"})
-        finally:
-            _inflight_add(-1)        # -1 на tx (юнит): receipt получен либо timeout
     return results

@@ -193,13 +193,20 @@ ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=3, start_nonce=0)
 ex._VOLLEY_GAS_USD = ex.CASCADE_TIER_GAS_USD + 1
 assert ex.send_presigned_probe(rpc, cfg, ADDR) is None
 ex._VOLLEY_GAS_USD = 0.0
+# 08.08 (решение kelbic): боевая tx в полёте больше НЕ глушит лестницу по умолчанию —
+# немота съедала 75% горячего окна каскада. Прежнее поведение живо под флагом отката.
 ex._INFLIGHT = 1
+_sv = ex._ENGINE_PROBE_IGNORE_INFLIGHT
 try:
+    assert ex.send_presigned_probe(rpc, cfg, ADDR) is not None, \
+        "проба лестницы обязана лететь при боевой tx в полёте (дефолт 08.08)"
+    ex._ENGINE_PROBE_IGNORE_INFLIGHT = False           # контроль отката
     assert ex.send_presigned_probe(rpc, cfg, ADDR) is None
 finally:
+    ex._ENGINE_PROBE_IGNORE_INFLIGHT = _sv
     ex._INFLIGHT = 0
-assert ex.ladder_depth(ADDR) == 3, "гейт обязан сработать ДО расхода записи"
-print("UNIT_OK: $-бакет тира и боевая tx в полёте глушат лестницу, записи целы")
+assert ex.ladder_depth(ADDR) == 2, "дефолт тратит одну запись, откат — ни одной"
+print("UNIT_OK: $-бакет глушит лестницу; inflight глушит только под флагом отката")
 
 # ---- 9. БОЕВОЙ ПУТЬ = СЕКВЕНСЕР, а не синхронная нога Alchemy ----
 # Замер 07.08: тёплая сессия до секвенсера держит тред 32.5мс (p50), Alchemy — 60мс.
