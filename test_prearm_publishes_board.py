@@ -32,6 +32,7 @@ def mk(now=5000.0):
     sf.pending_fire = {}
     sf._ws_handoff_ts = {}
     sf._board_next_try = {}
+    sf._board_probe_cache = {}
     sf._windows = {FEED: True}                 # окно армлено (порог арма 0.65*dev — ниже огня)
     sf._board = {}
     sf.stats = {}
@@ -92,6 +93,42 @@ try:
     assert FEED not in sf6.probe_board, "не-dict проба попала на доску"
 finally:
     sfl.PENDING_WS_HANDOFF = _saved
+
+# --- 8. HIGH N1 (ревью 09.08): доска ЖИВОГО плана публикуется и в окнах 2..N -------------
+# Ранний выход по _board_ready стоял ДО публикации, и после фикса #57 стал ЖИВЫМ путём: окна
+# 2..N каскада доходят сюда гарантированно (план жив по TTL ~870с), а запись первого окна снял
+# его же finally. Освежение отметки раз в 4с не спасает — обновлять нечего.
+_saved2 = sfl.PENDING_WS_HANDOFF
+try:
+    sfl.PENDING_WS_HANDOFF = True
+
+    # окно 1: обычная публикация + кэш пробы
+    sf7 = mk()
+    sf7._prearm_board(FEED, "down", 0.005)
+    assert FEED in sf7.probe_board and sf7._board_probe_cache, "окно 1 не наполнило кэш пробы"
+
+    # окно 2 того же фида: план ЖИВ, доска снята finally окна 1, сборка НЕ зовётся
+    sf7.probe_board.pop(FEED, None)
+    sf7._board_ready = lambda m, b: True                 # план жив по TTL
+    _built = []
+    sf7._build_fn = lambda m, b, d: _built.append(1) or {"calldata": "0xNEW", "gas": 1}
+    sf7._arm_calls.clear()
+    sf7._prearm_board(FEED, "down", 0.005)
+    assert FEED in sf7.probe_board, \
+        "окно 2 ушло в ранний выход БЕЗ публикации — транзит снова выбрасывается (HIGH N1)"
+    assert sf7.probe_board[FEED][3] == PROBE["calldata"], "опубликована не та проба"
+    assert _built == [], "под живым планом пересобрали пробу — платим за то, что уже есть"
+    assert sf7._arm_calls == [], "под живым планом ушёл лишний setPlan"
+    # и транзит доходит до огня
+    assert sf7.note_ws_transmit([MID], src="ws") is True and sf7.pending_fire.get(FEED)
+
+    # кэша нет (рестарт под живым планом) -> НЕ выходим молча, а собираем ради публикации
+    sf8 = mk()
+    sf8._board_ready = lambda m, b: True
+    sf8._prearm_board(FEED, "down", 0.005)
+    assert FEED in sf8.probe_board, "без кэша окно осталось без доски — фикс неполон"
+finally:
+    sfl.PENDING_WS_HANDOFF = _saved2
 
 # --- 7. второй потребитель доски (pending-detect tier-2) читает тот же ключ -------------
 _pd = pathlib.Path("chain/pending_detect.py").read_text()

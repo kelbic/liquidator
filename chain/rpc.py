@@ -22,10 +22,49 @@ def _redact_one_url(u: str) -> str:
     return m.group(1) + _SECRET_SEG_RE.sub(lambda x: x.group(1) + "<ключ скрыт>", m.group(2))
 
 
-def redact(s) -> str:
-    """Убрать ключи провайдеров из произвольной строки перед печатью."""
+# РЕЕСТР ЛИТЕРАЛЬНЫХ СЕКРЕТОВ (09.08, находка ревьюера). Регексп выше режет ключ только ВНУТРИ
+# URL, а исключения транспорта его теряют: urllib3/DNS/SSL печатают хост и «голый» путь без
+# схемы, socket.gaierror несёт только имя хоста, а requests в ряде ошибок отдаёт строку, где
+# «://» нет вовсе — и тогда фильтр журнала пропускал строку целиком (гейт стоял на «://»).
+# Поэтому ключи, увиденные при разборе НАШИХ URL, запоминаются как литералы и режутся где угодно.
+_SECRETS: set = set()
+_SECRETS_LOCK = threading.Lock()
+
+
+def note_secret(value: str):
+    """Запомнить литерал секрета (сегмент пути / значение query нашего RPC-URL)."""
+    v = (value or "").strip()
+    if len(v) >= 16:                       # короче — не ключ, а риск порезать полезное
+        with _SECRETS_LOCK:
+            _SECRETS.add(v)
+
+
+def note_secrets_from_url(url: str):
+    """Разобрать наш URL и запомнить всё, что похоже на ключ: сегменты пути и значения query."""
     try:
-        return _URL_RE.sub(lambda m: _redact_one_url(m.group(0)), str(s))
+        m = _AUTHORITY_RE.match(str(url) or "")
+        if not m:
+            return
+        for part in re.split(r"[/?&#]", m.group(2) or ""):
+            note_secret(part.split("=", 1)[1] if "=" in part else part)
+    except Exception:
+        pass
+
+
+def redact(s) -> str:
+    """Убрать ключи провайдеров из произвольной строки перед печатью.
+
+    Два рубежа: (1) известные литералы — ловят ключ ДАЖЕ там, где URL распался (DNS/SSL/таймаут
+    транспорта); (2) регексп по URL — ловит то, чего мы ещё не видели."""
+    try:
+        out = str(s)
+        if _SECRETS:
+            with _SECRETS_LOCK:
+                _known = tuple(_SECRETS)
+            for k in _known:
+                if k in out:
+                    out = out.replace(k, "<ключ скрыт>")
+        return _URL_RE.sub(lambda m: _redact_one_url(m.group(0)), out)
     except Exception:
         return "<строка не поддалась редакции>"
 
@@ -40,16 +79,17 @@ class RedactingFilter:
 
     def filter(self, record) -> bool:
         try:
-            if isinstance(record.msg, str) and "://" in record.msg:
+            # Гейт «строка содержит ://» был ДЫРОЙ: ошибки транспорта (DNS, SSL, таймаут)
+            # несут ключ без схемы. Редактируем безусловно — цена одна str.replace на литерал.
+            if isinstance(record.msg, str):
                 record.msg = redact(record.msg)
             if record.args:
                 if isinstance(record.args, dict):
-                    record.args = {k: (redact(v) if isinstance(v, str) and "://" in v else v)
+                    record.args = {k: (redact(v) if isinstance(v, str) else v)
                                    for k, v in record.args.items()}
                 else:
                     record.args = tuple(
-                        redact(a) if isinstance(a, str) and "://" in a else a
-                        for a in record.args)
+                        redact(a) if isinstance(a, str) else a for a in record.args)
             if record.exc_info:
                 # traceback хендлер рендерит отдельно от msg и кэширует в exc_text; рендерим
                 # сами и отдаём уже отредактированным, иначе log.exception() пронесёт URL мимо.
@@ -208,6 +248,10 @@ class BaseRpc:
         зависший эндпоинт хуже потерянного вызова (fallback-резолвер фидов: mainnet.base.org
         чёрнодырил 23.07, bg-резолв висел 7+ мин на одном вызове)."""
         self.rpc_url = rpc_url
+        # ЕДИНСТВЕННАЯ дверь, через которую URL входит в бота (все контуры строят BaseRpc):
+        # здесь же запоминаем ключ как ЛИТЕРАЛ, чтобы фильтр журнала резал его и там, где URL
+        # распался — DNS/SSL/таймаут транспорта печатают строку без схемы (находка ревьюера).
+        note_secrets_from_url(rpc_url)
         self.chain_id = chain_id
         self.request_timeout = request_timeout
         self._w3 = None
