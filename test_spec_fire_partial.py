@@ -21,20 +21,21 @@ assert partial_shares_for_cap(1_000_000, 800_000, 100_000, headroom_pct=100) == 
 assert sp * 800_000 // 1_000_000 <= 100_000
 print("UNIT_OK: partial_shares_for_cap — гарды, скейл, инвариант капа")
 
-# 2) route_max_in на боевой таблице: cbDOGE капнут 100k токенов, LBTC/cbBTC без капа
+# 2) route_max_in на боевой таблице: cbDOGE капнут по замеру, LBTC/cbBTC — тоже (#75: раньше
+#    он жил БЕЗ капа и потому был невидим живому слою, который меряет только капнутые роуты)
 CBDOGE = "0xcbd06e5a2b0c65597161de254aa074e489deb510"
 USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-assert ex.route_max_in(CBDOGE, USDC) == 50_000 * 10**8   # #71: кап по замеру канарейки
+assert ex.route_max_in(CBDOGE, USDC) == 32_000 * 10**8   # #71: кап по замеру обрыва (64.9k/2)
 assert ex.route_max_in("0xecac9c5f704e954931349da37f60e39f515c11c1",
-                       "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf") is None   # LBTC/cbBTC
+                       "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf") == 27 * 10**8   # LBTC/cbBTC
 assert ex.route_max_in("0x" + "11" * 20, USDC) is None, "нет роута -> None"
-print("UNIT_OK: route_max_in — кап cbDOGE, None для бескапных/чужих пар")
+print("UNIT_OK: route_max_in — капы cbDOGE/LBTC по замеру, None для чужих пар")
 
 # 3) direct_swap: сверх капа None, в капе — calldata (боевая таблица, без сети)
 LIQ = "0x" + "12" * 20
 big = ex.direct_swap(CBDOGE, USDC, 1_200_000 * 10**8, LIQ, LIQ, repaid_assets=10**6)
 assert big is None, "сейз кита сверх капа обязан отдать None (как в гонке 01.08)"
-ok = ex.direct_swap(CBDOGE, USDC, 40_000 * 10**8, LIQ, LIQ, repaid_assets=10**6)  # #71: под капом 50k
+ok = ex.direct_swap(CBDOGE, USDC, 30_000 * 10**8, LIQ, LIQ, repaid_assets=10**6)  # #71: под капом 32k
 assert ok is not None and ok.get("calldata", "").startswith("0x")
 print("UNIT_OK: direct_swap — None сверх капа, роут в капе")
 
@@ -165,7 +166,7 @@ print("UNIT_OK: prepare_fast — частичка вместо отказа, о�
 # 6) PREARM cap-aware: routed_at_size по боевой таблице cbDOGE; откат PREARM_CAP_AWARE=0
 import chain.prearm as pa2
 
-assert pa2.routed_at_size(CBDOGE, USDC, 50_000 * 10**8) is True, "сейз в капе — прямой прикрыт"
+assert pa2.routed_at_size(CBDOGE, USDC, 30_000 * 10**8) is True, "сейз в капе — прямой прикрыт"
 assert pa2.routed_at_size(CBDOGE, USDC, 1_200_000 * 10**8) is False, "кит сверх капа — греть Kyber"
 assert pa2.routed_at_size("0x" + "11" * 20, USDC, 1) is False, "нет роута — не прикрыт"
 pa2.PREARM_CAP_AWARE = False

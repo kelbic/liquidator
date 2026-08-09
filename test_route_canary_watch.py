@@ -144,6 +144,24 @@ th_def, src_def = w.threshold_for("WETH", "USDC", MARKETS)
 check(th_def == 10.0 and "дефолт" in src_def, "пары нет в файле -> дефолт 10%%: %s" % src_def)
 print("UNIT_OK: порог = LIF рынка (мин. бонус пары), иначе дефолт 10%")
 
+print("\n=== 1б. #76: пара, которой нет в covered_markets, судится по lltv С ЦЕПИ ===")
+# WETH/USDC (0x8793cf30) живёт в INCLUDE_MARKETS, а в covered_markets.json его нет — на
+# БОЕВОЙ карте роутов канарейка выдавала ему дефолт 10% при настоящем бонусе 4.38%, то есть
+# молчала бы при выходе, съедающем бонус ВДВОЕ. Порог, врущий про запас, опаснее его
+# отсутствия. Проверяем на боевых адресах, а не на синтетике.
+_real_rows = [{"coll": c, "loan": l} for (c, l), _r in rc.routes()[0]]
+_real_th = w.thresholds_for_rows(_real_rows, markets=w.load_markets())
+_wu = _real_th[(_WETH, _USDC)]
+check(abs(_wu[0] - 4.3841) < 1e-3, "WETH/USDC порог = 4.38%% с цепи, получено %.4f%%" % _wu[0])
+check("дефолт" not in _wu[1], "источник больше не дефолт: %s" % _wu[1])
+# и обратная сторона: НИ ОДИН боевой роут не остаётся на щедром дефолте
+_defaults = [k for k, (_p, s) in _real_th.items() if "дефолт" in s]
+check(not _defaults, "роутов на дефолтном пороге быть не должно: %s" % _defaults)
+# cbXRP: на паре два рынка, порог обязан быть по ТЕСНОМУ (7.41%), а не по жирному (12.68%)
+_xr = _real_th[(_MOD._CBXRP, _USDC)]
+check(abs(_xr[0] - 7.4114) < 1e-3, "cbXRP/USDC порог = 7.41%%, получено %.4f%%" % _xr[0])
+print("UNIT_OK: пары вне covered_markets судятся по lltv с цепи (WETH/USDC 4.38%, не 10%)")
+
 print("\n=== 2. Карта адрес->символ строится из констант chain.execute ===")
 syms = w.token_symbols(module=_MOD, markets=MARKETS)
 check(syms.get(_CBDOGE) == "cbDOGE", "cbDOGE опознан: %s" % syms.get(_CBDOGE))

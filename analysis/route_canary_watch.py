@@ -109,23 +109,52 @@ def token_symbols(module=None, markets=None):
     return out
 
 
-def threshold_for(coll_sym, loan_sym, markets, default_pct=DEFAULT_PCT, margin=1.0):
+def onchain_bonus_pct(coll_addr, loan_addr):
+    """Бонус пары из таблицы lltv, снятой С ЦЕПИ (chain.route_depth). None — пары там нет.
+
+    Зачем второй источник (#76, 09.08): covered_markets.json на агентской машине НЕ ЗНАЕТ
+    рынков, включённых решением владельца через INCLUDE_MARKETS — WETH/USDC (0x8793cf30,
+    lltv 0.86, бонус 4.38%) и мега-cbXRP (0xd4a903dc). Для WETH/USDC это означало порог
+    ДЕФОЛТА 10% на рынке, весь бонус которого 4.38%: канарейка молчала бы при импакте 9.9%,
+    то есть при выходе, съедающем бонус вдвое. Порог, врущий про запас, опаснее его
+    отсутствия — по нему принимают решения."""
+    try:
+        from chain.route_depth import route_bonus_pct  # noqa: PLC0415 — боевой модуль по требованию
+        return route_bonus_pct(coll_addr, loan_addr)
+    except Exception:  # noqa: BLE001 — канарейка обязана мерить и без этого источника
+        return None
+
+
+def threshold_for(coll_sym, loan_sym, markets, default_pct=DEFAULT_PCT, margin=1.0,
+                  pair=None):
     """Порог impact в процентах + откуда он взят.
 
     Порог = бонус ликвидации (LIF-1) самого тесного рынка этой пары × margin. Выход,
     съедающий бонус целиком, делает ликвидацию убыточной ПО ПОСТРОЕНИЮ — газ и
     заложенный slippage сверху.
+
+    Источников ДВА, и берётся МЕНЬШИЙ: covered_markets.json (обновляется рескaном, знает
+    новые рынки) и таблица lltv с цепи в chain.route_depth (знает решения владельца, которых
+    в файле нет). Дефолт 10% остаётся только когда молчат оба.
     """
+    cands = []
     if coll_sym and loan_sym:
         hits = [m for m in markets
                 if str(m.get("collateral_token", "")).lower() == str(coll_sym).lower()
                 and str(m.get("loan_token", "")).lower() == str(loan_sym).lower()]
         bonuses = [float(m["bonus"]) for m in hits if isinstance(m.get("bonus"), (int, float))]
         if bonuses:
-            pct = min(bonuses) * 100.0 * margin
-            src = "LIF %s/%s (рынков %d, бонус %.2f%%)" % (
-                coll_sym, loan_sym, len(hits), min(bonuses) * 100.0)
-            return pct, src
+            cands.append((min(bonuses) * 100.0,
+                          "LIF %s/%s (рынков %d, бонус %.2f%%)" % (
+                              coll_sym, loan_sym, len(hits), min(bonuses) * 100.0)))
+    if pair:
+        b = onchain_bonus_pct(pair[0], pair[1])
+        if b is not None:
+            cands.append((b, "LIF %s/%s с цепи (lltv рынков пары, бонус %.2f%%)" % (
+                coll_sym or pair[0][:8], loan_sym or pair[1][:8], b)))
+    if cands:
+        pct, src = min(cands)
+        return pct * margin, src
     return default_pct * margin, "дефолт %.0f%% (пары нет в covered_markets)" % default_pct
 
 
@@ -137,7 +166,8 @@ def thresholds_for_rows(rows, markets=None, symbols=None, default_pct=DEFAULT_PC
     for r in rows:
         cs = symbols.get(r["coll"].lower())
         ls = symbols.get(r["loan"].lower())
-        out[(r["coll"], r["loan"])] = threshold_for(cs, ls, markets, default_pct, margin)
+        out[(r["coll"], r["loan"])] = threshold_for(cs, ls, markets, default_pct, margin,
+                                                    pair=(r["coll"], r["loan"]))
     return out
 
 

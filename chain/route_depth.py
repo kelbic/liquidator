@@ -2,10 +2,28 @@
 
 Ликвидность тонких CL-пулов подвижна (см. коммент у _LIVE_CAPS в chain/execute.py). Один
 замер = ОДНА aggregate3-пачка квот у квотера DEX'а роута: базовая квота (1% статик-капа) +
-лестница долей статик-капа. Live cap = верхняя ступень с импактом <= LIVE_CAP_MAX_IMPACT_PCT
--> chain.execute.set_live_cap (TTL, рост капнут там же). Семантика ошибок РАЗНАЯ:
-реверт ступени = ДАННЫЕ (пул не тянет — режем кап, вплоть до 0 = полный Kyber-фолбэк),
-транспортная ошибка RPC = fail-open (live-кап не трогаем, протухнет в статик сам).
+лестница долей статик-капа. Live cap -> chain.execute.set_live_cap (TTL, рост капнут там же).
+Семантика ошибок РАЗНАЯ: реверт ступени = ДАННЫЕ (пул не тянет — режем кап, вплоть до 0 =
+полный Kyber-фолбэк), транспортная ошибка RPC = fail-open (live-кап не трогаем, протухнет
+в статик сам).
+
+ПОРОГ ИМПАКТА — ОТ БОНУСА РЫНКА, НЕ ПЛОСКИЙ (#75, замер 09.08 блоки 49753974/49754165/
+49754310). До этого стоял LIVE_CAP_MAX_IMPACT_PCT=0.5% на все 11 роутов, а бонус у них
+разный (1.06%…12.68%): те же 0.5% означали «отдать 4% бонуса» на cbDOGE и «отдать 47%»
+на wstETH/WETH. Одна константа = одиннадцать разных политик, ни одна не выбрана.
+
+Правило из ДВУХ членов с разной силой:
+  * МЯГКИЙ (политика маржи): impact <= LIVE_CAP_BONUS_SHARE * бонус. Половина бонуса —
+    нам, половина — пулу; остаток бонуса покрывает газ, зазор «оракул != цена выхода» и
+    дрейф между котировкой и включением.
+  * ЖЁСТКИЙ (не разориться): cap <= S_обрыв / LIVE_CAP_CLIFF_SAFETY, где S_обрыв — размер,
+    на котором импакт достигает ПОЛНОГО бонуса (с него ликвидация убыточна по построению).
+    Делитель 2 не выдуман, а ЗАМЕРЕН как дрейф самого обрыва: weETH 210 -> ~100 за день
+    (24.07), cbDOGE 135k -> ~65k за две недели (25.07->09.08), cbADA 116k ток. дал 5.84%
+    и 8.14% на блоках в пяти минутах друг от друга (09.08).
+На пологом пуле связывает мягкий член (S_budget < S_обрыв/2 при share<0.5), на CL-пуле
+«плоско->обрыв» — жёсткий: там любой порог импакта даёт ОДИН и тот же размер (последний
+перед исчерпанием диапазона), то есть порог вообще не является связывающим пределом.
 
 Триггеры: (а) RouteDepthWatcher — фоновая петля, меряет капнутый роут пока на его паре живёт
 кандидат с долгом >= LIVE_CAP_MIN_DEBT_USD (адреса пары — из idToMarketParams, кэш навсегда:
@@ -29,8 +47,18 @@ UNIV3_QUOTER = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"   # UniV3 QuoterV2 (
 _QUOTE_SEL = bytes.fromhex("cdca1753")                        # quoteExactInput(bytes,uint256)
 _MORPHO = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
 
-LIVE_CAP_LADDER = (0.25, 0.5, 1.0, 1.5, 2.0)                  # доли статик max_in
-LIVE_CAP_MAX_IMPACT_PCT = float(os.environ.get("LIVE_CAP_MAX_IMPACT_PCT", "0.5"))
+LIVE_CAP_LADDER = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0)   # доли статик max_in
+# Лестница уплотнена в середине и ДОТЯНУТА ДО 4x (#75). Два разных требования:
+#  * плотность у рабочего размера — чтобы кап не прыгал ступенями по 2x;
+#  * ДЛИНА за пределы того, что мы готовы исполнить (потолок роста всё равно 2x статика) —
+#    иначе «обрыв не найден» неотличимо от «обрыва нет». Первая редакция этого фикса мерила
+#    до 2x, обрыва не видела и на живом узле поднимала кап РОВНО на обрыв: wstETH статик 150
+#    -> live 300 при разорительном размере 318. Тест, который может вернуть только ноль.
+LIVE_CAP_BONUS_SHARE = float(os.environ.get("LIVE_CAP_BONUS_SHARE", "0.5"))
+LIVE_CAP_CLIFF_SAFETY = float(os.environ.get("LIVE_CAP_CLIFF_SAFETY", "2.0"))
+# Плоский порог остаётся ТОЛЬКО как аварийный ручной оверрайд (откат к поведению до #75):
+# пусто/0 = порог считается от бонуса рынка. Число -> оно и есть порог на все роуты.
+LIVE_CAP_MAX_IMPACT_PCT = float(os.environ.get("LIVE_CAP_MAX_IMPACT_PCT", "0") or 0)
 LIVE_CAP_REFRESH_SEC = float(os.environ.get("LIVE_CAP_REFRESH_SEC", "120"))
 LIVE_CAP_MIN_DEBT_USD = float(os.environ.get("LIVE_CAP_MIN_DEBT_USD", "25000"))
 LIVE_CAP_WATCH = os.environ.get("LIVE_CAP_WATCH", "1").lower() not in ("0", "false", "no")
@@ -38,6 +66,74 @@ LIVE_CAP_WATCH_POLL_SEC = float(os.environ.get("LIVE_CAP_WATCH_POLL_SEC", "30"))
 
 _TS_LOCK = threading.Lock()
 _LAST_TS: dict = {}      # (tin, tout) -> monotonic последней попытки замера
+
+# --- БОНУС РЫНКА = потолок, который выход не имеет права съесть (#75/#76) ------------------
+# LIF Morpho: min(MAX_LIF, 1/(CURSOR*lltv + 1-CURSOR)); бонус = LIF-1. lltv рынка ИММУТАБЕЛЕН,
+# поэтому таблица — константа, как и сама карта роутов; измениться может только состав рынков
+# на паре (новый рынок с другим lltv). Значения сняты С ЦЕПИ (Morpho.idToMarketParams, блок
+# 49753919, публичный узел), НЕ из covered_markets.json: тот файл на агентской машине отстаёт
+# от решений владельца (WETH/USDC и мега-cbXRP живут в INCLUDE_MARKETS, а в JSON их нет).
+# Расхождение файла с этой таблицей ловит канарейка выходов (route_canary_watch).
+MORPHO_LIQUIDATION_CURSOR = 0.3
+MORPHO_MAX_LIF = 1.15
+
+
+def lif_bonus_pct(lltv: float) -> float:
+    """Бонус ликвидации рынка в ПРОЦЕНТАХ по его lltv. Чистая (юнит)."""
+    lif = min(MORPHO_MAX_LIF,
+              1.0 / (MORPHO_LIQUIDATION_CURSOR * float(lltv) + 1.0 - MORPHO_LIQUIDATION_CURSOR))
+    return (lif - 1.0) * 100.0
+
+
+def _lltv_table():
+    """(coll, loan) -> [lltv, …] всех НАШИХ рынков пары. Ленивая: адреса живут в execute."""
+    from chain.execute import (_CBBTC, _CBLTC, _CBXRP, _CBDOGE, _CBADA, _CBETH, _LBTC,
+                               _WSTETH, _WEETH, _EURC, _UNIV3_USDC, _UNIV3_WETH)
+    return {
+        (_CBBTC, _EURC): [0.860],                    # 0x67ebd84b… -> 4.3841%
+        (_CBLTC, _UNIV3_USDC): [0.625],              # 0x9125d0fa… -> 12.6761%
+        # ДВА рынка (#76): мега 0xd4a903dc… lltv 0.625 (бонус 12.68%) И 0xfdfecf85… lltv 0.770
+        # (7.41%). Связывает ТЕСНЕЙШИЙ — маршрут один на оба, кап тоже один.
+        (_CBXRP, _UNIV3_USDC): [0.625, 0.770],       # -> 7.4114%
+        (_CBBTC, _UNIV3_USDC): [0.860],              # 0x9103c3b4… -> 4.3841%
+        (_LBTC, _CBBTC): [0.915, 0.945],             # 0x4944a116…, 0x30767836… -> 1.6777%
+        (_WSTETH, _UNIV3_WETH): [0.945, 0.965],      # 0x3a4048c6…, 0x6aa81f51… -> 1.0611%
+        (_WEETH, _UNIV3_WETH): [0.915, 0.945],       # 0x78d11c03…, 0xfd0895ba… -> 1.6777%
+        (_CBETH, _UNIV3_WETH): [0.945],              # 0x84662b4f… -> 1.6777%
+        # WETH/USDC 0x8793cf30… — в INCLUDE_MARKETS, но НЕ в covered_markets.json: без этой
+        # строки канарейка судила рынок по дефолту 10% при настоящем бонусе 4.38%.
+        (_UNIV3_WETH, _UNIV3_USDC): [0.860],         # -> 4.3841%
+        (_CBDOGE, _UNIV3_USDC): [0.625],             # 0x73527ddd… -> 12.6761%
+        (_CBADA, _UNIV3_USDC): [0.625, 0.770],       # 0xd7520ad1…, 0xf2a59ad1… -> 7.4114%
+    }
+
+
+_ROUTE_BONUS: dict = {}
+
+
+def route_bonus_pct(token_in, token_out):
+    """Бонус ТЕСНЕЙШЕГО рынка пары в процентах либо None (пары нет в таблице).
+
+    Минимум, а не максимум: маршрут обслуживает все рынки пары, кап у него один, и связывает
+    самый тесный. Комментарий #76 брал у cbXRP бонус ЖИРНОГО рынка (12.7%) и объявлял запас
+    2.6x там, где по тесному (7.41%) он был 1.85x."""
+    if not _ROUTE_BONUS:
+        for (c, l), lltvs in _lltv_table().items():
+            _ROUTE_BONUS[(c.lower(), l.lower())] = min(lif_bonus_pct(x) for x in lltvs)
+    return _ROUTE_BONUS.get((token_in.lower(), token_out.lower()))
+
+
+def impact_budget_pct(token_in, token_out):
+    """Порог импакта для роута: доля бонуса рынка (либо ручной плоский оверрайд).
+
+    Роут без бонуса в таблице = НЕЗНАНИЕ, и оно закрывает гард: берём самый тесный бонус
+    таблицы, а не щедрый дефолт (канон «незнание обязано закрывать гард»)."""
+    if LIVE_CAP_MAX_IMPACT_PCT > 0:
+        return LIVE_CAP_MAX_IMPACT_PCT
+    b = route_bonus_pct(token_in, token_out)          # он же прогревает _ROUTE_BONUS
+    if b is None:
+        b = min(_ROUTE_BONUS.values()) if _ROUTE_BONUS else 1.0
+    return b * LIVE_CAP_BONUS_SHARE
 
 
 def _quote_batch(rpc, calls):
@@ -66,31 +162,48 @@ def measure_route_cap(rpc, token_in, token_out, batch_fn=None, log_fn=None):
         _log("LIVECAP transport-fail %s->%s: %s (статик остаётся)"
              % (token_in[:8], token_out[:8], type(e).__name__))
         return None
+    bonus = route_bonus_pct(token_in, token_out)
+    budget = impact_budget_pct(token_in, token_out)
+    ruin = bonus if bonus is not None else budget / max(LIVE_CAP_BONUS_SHARE, 1e-9)
     ok0, d0 = res[0]
     rungs = []           # сырая лестница для SHRINK-телеметрии (ревью 05.08: спор «80 vs 300»
-    if not ok0 or len(d0) < 32:                        # решается в секунду сырыми ступенями)
-        cap = 0          # базовая квота ревертнула: пул мёртв -> прямой роут закрыт, Kyber
-        rungs.append("base:REV")
-    else:
+    if not ok0 or len(d0) < 32:      # решается в секунду сырыми ступенями). Ступени — В ДОЛЯХ
+        cap = 0          # СТАТИКА: раньше делились на 1e18 при любых decimals, и cbDOGE (8
+        rungs.append("base:REV")     # знаков) приезжал в журнал как 5e-14 — диагност, врущий
+    else:                            # о величине, которую сам же и печатает
         base = int.from_bytes(d0[:32], "big") / sizes[0]
-        cap = 0
+        cap = 0                      # верхняя ступень, укладывающаяся в бюджет
+        safe = 0                     # верхняя ступень, про которую ЗАМЕРОМ известно, что она
+        cliff_seen = False           # не разорительна — нижняя граница обрыва
+        over_budget = False
         for (ok, d), s in zip(res[1:], sizes[1:]):
             if not ok or len(d) < 32:
-                rungs.append("%.6g:REV" % (s / 1e18))
-                break                                  # реверт ступени = данные: дальше хуже
+                rungs.append("%.4gx:REV" % (s / static))
+                cliff_seen = True     # реверт ступени = данные: дальше хуже, ниже — не знаем
+                break
             ratio = int.from_bytes(d[:32], "big") / s
             imp = (1.0 - ratio / base) * 100.0 if base > 0 else 100.0
-            rungs.append("%.6g:%.2f%%" % (s / 1e18, imp))
-            if base <= 0 or imp > LIVE_CAP_MAX_IMPACT_PCT:
-                break                                  # AMM-импакт монотонен по размеру
-            cap = s
+            rungs.append("%.4gx:%.2f%%" % (s / static, imp))
+            if base <= 0 or imp >= ruin:
+                cliff_seen = True     # с этого размера выход съедает ВЕСЬ бонус
+                break                 # обрыв ЗАЖАТ между safe и s; ниже по построению не идём
+            safe = s
+            if base <= 0 or imp > budget:
+                over_budget = True    # мягкий член исчерпан, но лестницу НЕ бросаем: жёсткому
+            elif not over_budget:     # члену нужно ещё найти разорительную ступень
+                cap = s
+        if cliff_seen:
+            # Обрыв зажат в (safe, s]; фейл-клоуз берёт НИЖНЮЮ границу: мы знаем лишь, что до
+            # safe пул цел. Держимся вдвое ниже неё — сам обрыв ездит в 2x за сутки.
+            cap = min(cap, int(safe / LIVE_CAP_CLIFF_SAFETY))
         if cap == 0:
             cap = static // 10   # даже 0.25x не тянет: крошечный прямой сайз, остальное Kyber
     from chain.execute import _effective_cap
     prev = _effective_cap((token_in.lower(), token_out.lower()))
     eff = set_live_cap(token_in, token_out, cap)
-    _log("LIVECAP %s->%s: static=%d live=%s (x%.2f)"
-         % (token_in[:8], token_out[:8], static, eff, (eff or 0) / static))
+    _log("LIVECAP %s->%s: static=%d live=%s (x%.2f) бюджет=%.2f%% (бонус %s)"
+         % (token_in[:8], token_out[:8], static, eff, (eff or 0) / static, budget,
+            ("%.2f%%" % bonus) if bonus is not None else "НЕИЗВЕСТЕН"))
     if prev and eff is not None and eff * 2 <= prev:   # сжатие >=x2 — сырые ступени в журнал
         _log("LIVECAP SHRINK %s->%s: %d -> %d, ступени=[%s]"
              % (token_in[:8], token_out[:8], prev, eff, " ".join(rungs)))

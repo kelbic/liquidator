@@ -16,7 +16,7 @@ from chain.execute import (direct_swap, route_max_in, set_live_cap, partial_shar
 from chain.route_depth import measure_route_cap, maybe_refresh, RouteDepthWatcher
 
 KEY = (_WEETH, _UNIV3_WETH.lower())
-STATIC = 160 * 10**18
+STATIC = 140 * 10**18          # #75 (09.08): 160 -> 140 по замеру обрыва (287 weETH) / 2
 NOW = {"t": 1000.0}
 
 
@@ -55,7 +55,12 @@ sp = partial_shares_for_cap(1000, 100 * 10**18, route_max_in(_WEETH, _UNIV3_WETH
 assert 0 < sp < 1000                                                  # дробим до живого капа
 print("OK 2: direct_swap/слайс-гейт по живому капу (168 в прямой пул при live 240)")
 
-# ---- 3) measure_route_cap: кривая -> кап на верхней проходной ступени ----
+# ---- 3) measure_route_cap: кривая -> кап = min(верхняя проходная ступень, обрыв/2) ----
+# #75 (09.08): порог импакта больше НЕ плоские 0.5%, а доля бонуса рынка (weETH/WETH: бонус
+# 1.6777% по lltv 0.945 -> бюджет 0.839%), И появился ЖЁСТКИЙ член: ступень, на которой импакт
+# достигает ПОЛНОГО бонуса, — это размер-разоритель, и кап держится вдвое ниже него. На профиле
+# «плоско -> обрыв» связывает именно он: между «плоско» и «обрыв» нет размера с промежуточным
+# импактом, поэтому ЛЮБОЙ порог дал бы одну и ту же ступень — вплотную к обрыву.
 _LIVE_CAPS.clear()
 def batch_flat_to(limit_frac):
     def fn(rpc, calls):
@@ -69,10 +74,37 @@ def batch_flat_to(limit_frac):
         return out
     return fn
 cap = measure_route_cap(None, _WEETH, _UNIV3_WETH, batch_fn=batch_flat_to(1.5), log_fn=lambda m: None)
-assert cap == int(STATIC * 1.5), cap                                  # сегодня (04.08): плоско до 1.5x
+assert cap == int(STATIC * 1.5 / rd.LIVE_CAP_CLIFF_SAFETY), cap       # цел до 1.5x, разорителен 2x
 cap = measure_route_cap(None, _WEETH, _UNIV3_WETH, batch_fn=batch_flat_to(0.5), log_fn=lambda m: None)
-assert cap == int(STATIC * 0.5), cap                                  # просел до полкапа
-print("OK 3: лестница -> кап на верхней проходной ступени (обе стороны)")
+assert cap == int(STATIC * 0.5 / rd.LIVE_CAP_CLIFF_SAFETY), cap       # цел до 0.5x, разорителен 0.75x
+# Пул БЕЗ обрыва в пределах лестницы растёт до потолка (иначе живой слой не нужен вовсе)
+cap = measure_route_cap(None, _WEETH, _UNIV3_WETH, batch_fn=batch_flat_to(99), log_fn=lambda m: None)
+assert cap == int(STATIC * ex.LIVE_CAP_GROW_MAX), cap
+# КОНТРОЛЬ длины лестницы: она обязана доставать ДАЛЬШЕ того, что мы готовы исполнить.
+# Первая редакция #75 мерила до 2x = ровно до потолка роста, обрыва не находила НИКОГДА и на
+# живом узле подняла wstETH со 150 обратно на 300 при разорительном размере 318.
+assert max(rd.LIVE_CAP_LADDER) > ex.LIVE_CAP_GROW_MAX, \
+    "лестница не выходит за потолок роста: «обрыв не найден» станет неотличим от «обрыва нет»"
+print("OK 3: лестница -> min(проходная ступень, safe/2); без обрыва — рост до потолка")
+
+# ---- 3b) плоский оверрайд LIVE_CAP_MAX_IMPACT_PCT возвращает поведение до #75 в мягкой
+#          части (жёсткий член остаётся: он про разорение, а не про маржу) ----
+_LIVE_CAPS.clear()
+_saved_flat = rd.LIVE_CAP_MAX_IMPACT_PCT
+rd.LIVE_CAP_MAX_IMPACT_PCT = 0.5
+assert rd.impact_budget_pct(_WEETH, _UNIV3_WETH) == 0.5               # оверрайд бьёт бонус
+rd.LIVE_CAP_MAX_IMPACT_PCT = _saved_flat
+assert abs(rd.impact_budget_pct(_WEETH, _UNIV3_WETH)
+           - rd.route_bonus_pct(_WEETH, _UNIV3_WETH) * rd.LIVE_CAP_BONUS_SHARE) < 1e-12
+# бонус берётся у ТЕСНЕЙШЕГО рынка пары: у weETH/WETH их два (lltv 0.915 и 0.945)
+assert abs(rd.route_bonus_pct(_WEETH, _UNIV3_WETH) - rd.lif_bonus_pct(0.945)) < 1e-9
+assert rd.lif_bonus_pct(0.945) < rd.lif_bonus_pct(0.915)
+# #76: у cbXRP/USDC на паре ДВА рынка (0.625 и 0.770) — связывает 0.770, а НЕ жирный 0.625
+assert abs(rd.route_bonus_pct(ex._CBXRP, ex._UNIV3_USDC) - rd.lif_bonus_pct(0.770)) < 1e-9
+assert abs(rd.lif_bonus_pct(0.625) - 12.6761) < 1e-3                  # это бонус cbDOGE, не cbXRP
+assert abs(rd.lif_bonus_pct(0.770) - 7.4114) < 1e-3
+assert abs(rd.lif_bonus_pct(0.860) - 4.3841) < 1e-3
+print("OK 3b: бюджет = доля бонуса тесного рынка; плоский оверрайд как откат")
 
 # ---- 4) семантика ошибок: реверт базы = пул мёртв (кап 0 -> Kyber), обрыв ниже 0.25x =
 #         статик//10, транспортная ошибка = fail-open (кап не тронут) ----
