@@ -68,10 +68,14 @@ assert _lo("cbETH") == "ETH", "cbETH — пег (ETH-нога), predict не а�
 print("UNIT_OK: cbETH-роут (кап 300) + EURC-кап 1.5; пег-семантика верна")
 
 # 8) 25.07: капы мем-путей по замеру обрыва (cbDOGE 100k ток., cbADA 60k)
-assert _SWAP_ROUTES[(_CBDOGE, _UNIV3_USDC)]["max_in"] == 100_000 * 10**8
+# #71 (09.08): кап понижен 100k -> 50k по ЗАМЕРУ канарейки — на 100k пул отдавал impact
+# 43.50% при бонусе 12.7% (обрыв, не деградация: 50% капа = 0.94%). Значение здесь
+# ЖЁСТКОЕ намеренно: оно защищает деньги, и менять его можно только с новым замером.
+assert _SWAP_ROUTES[(_CBDOGE, _UNIV3_USDC)]["max_in"] == 50_000 * 10**8
 assert _SWAP_ROUTES[(_CBADA, _UNIV3_USDC)]["max_in"] == 60_000 * 10**6
-assert direct_swap(_CBDOGE, _UNIV3_USDC, 90_000 * 10**8, LIQ, LIQ, repaid_assets=1) is not None
-assert direct_swap(_CBDOGE, _UNIV3_USDC, 135_000 * 10**8, LIQ, LIQ, repaid_assets=1) is None
+# границы двигаются ВМЕСТЕ с капом: 40k под ним (директ), 60k сверх (Kyber)
+assert direct_swap(_CBDOGE, _UNIV3_USDC, 40_000 * 10**8, LIQ, LIQ, repaid_assets=1) is not None
+assert direct_swap(_CBDOGE, _UNIV3_USDC, 60_000 * 10**8, LIQ, LIQ, repaid_assets=1) is None
 assert direct_swap(_CBADA, _UNIV3_USDC, 120_000 * 10**6, LIQ, LIQ, repaid_assets=1) is None
 print("UNIT_OK: капы cbDOGE/cbADA — под обрывом директ, сверх — Kyber")
 
