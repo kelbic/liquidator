@@ -30,7 +30,10 @@ def _mk_env(events, dispatch_results=None, blocked_after=None):
             return "test-cap"
         return None
 
-    guard = types.SimpleNamespace(blocked_reason=_blocked)
+    # #52: фейк обязан нести ВЕСЬ контракт гарда — горячий путь теперь спрашивает, транзиентна
+    # ли причина («нет слотов» рассосётся сама, дневной кап — нет)
+    from strategy.guard import KillSwitch
+    guard = types.SimpleNamespace(blocked_reason=_blocked, is_transient=KillSwitch.is_transient)
     alerter = types.SimpleNamespace(send_async=lambda *a, **k: None)
     cfg = types.SimpleNamespace(mode="live", hot_min_repaid_usd=1000.0, fast_lane=False,
                                 positions_from_cache=False, max_inflight=4)

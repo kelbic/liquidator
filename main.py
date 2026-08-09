@@ -664,8 +664,19 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     _bg = rpc
                 proxies = resolve_feed_proxies(rpc, markets)
                 if not proxies:
-                    log.warning("predict-shadow: прокси не разрезолвились — слой не стартует")
-                    return
+                    # #50: раньше это был RETURN НАВСЕГДА — при RPC-шторме на буте слой не
+                    # поднимался до рестарта. Тот же класс, ради которого hot_loop получил
+                    # self-heal после инцидента 07-21. Здесь — внешняя петля ретрая.
+                    log.warning("predict-shadow: прокси не разрезолвились — повтор через %.0fс",
+                                _PREDICT_RETRY_SEC)
+                    return "retry"
+                _expected = len(markets or {}) or None
+                if _expected and len(proxies) < _expected:
+                    # частичный резолв — слой стартует «живым» с УРЕЗАННЫМ покрытием фидов,
+                    # и PendingDetect наследует тот же урезанный список. Молчать нельзя.
+                    log.error("predict-shadow: резолв ЧАСТИЧЕН — %d фидов из %d ожидаемых "
+                              "(покрытие урезано, детект наследует тот же список)",
+                              len(proxies), _expected)
                 engine = PredictEngine()
                 pf = PriceFeed(symbols=list(proxies), log=lambda m: log.info("%s", m))
                 pf.start()
@@ -762,9 +773,26 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                 drv.start()
                 log.warning("PREDICT SHADOW ENABLED — %d feeds (%s), меряет lead/FP, не стреляет",
                             len(proxies), ",".join(sorted(proxies)))
+                return "ok"
             except Exception:
-                log.exception("predict-shadow не стартовал (слой опционален, бот не задет)")
-        threading.Thread(target=_run_predict, daemon=True).start()
+                log.exception("predict-shadow не стартовал — повтор через %.0fс", _PREDICT_RETRY_SEC)
+                return "retry"
+
+        def _run_predict_supervised():
+            """#50: слой стартовал ОДНОКРАТНО — пустой резолв или исключение оставляли предиктор
+            мёртвым до рестарта, а он и есть верх сигнального тракта. Петля с бэкоффом: как у
+            _run_hot, получившего self-heal после инцидента той же природы."""
+            _delay = _PREDICT_RETRY_SEC
+            while True:
+                try:
+                    if _run_predict() == "ok":
+                        return                     # слой поднялся и живёт в своих тредах
+                except Exception:
+                    log.exception("predict-shadow: надзор поймал исключение")
+                time.sleep(_delay)
+                _delay = min(_delay * 2, _PREDICT_RETRY_MAX_SEC)
+
+        threading.Thread(target=_run_predict_supervised, daemon=True).start()
     def _assess_block(blk, st):
         """Пер-блочный ассессмент — бывшее тело recv-цикла, 1:1. st — состояние ассессора
         (hf_cache/троттлы/пульс), локальное для его потока.
@@ -903,6 +931,10 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                   "(fallback#%d restore#%d)", fbret.n_fallbacks, fbret.n_restores)
                         alerter.send_async("\U0001F504 flashblocks -> newHeads fallback", key="fbfallback")
             await asyncio.sleep(3)
+
+
+_PREDICT_RETRY_SEC = float(os.environ.get("PREDICT_RETRY_SEC", "30"))
+_PREDICT_RETRY_MAX_SEC = float(os.environ.get("PREDICT_RETRY_MAX_SEC", "300"))
 
 
 def main():

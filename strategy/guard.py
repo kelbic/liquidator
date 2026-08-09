@@ -27,3 +27,13 @@ class KillSwitch:
         if st.inflight >= self.max_inflight:
             return f"inflight {st.inflight} >= {self.max_inflight}"
         return None
+
+    @staticmethod
+    def is_transient(reason: str) -> bool:
+        """#52: причина блокировки ВРЕМЕННАЯ (сама рассосётся) или ТЕРМИНАЛЬНАЯ (нужен человек)?
+
+        Слоты inflight освобождаются на квитанции — за секунды; дневные капы до полуночи UTC не
+        меняются. Инкрементальный диспатч защёлкивался на ЛЮБОЙ причине и не пере-проверялся
+        внутри транзита, поэтому транзиентная нехватка слотов выключала хвост каскада на ТОМ
+        САМОМ транзите, который и есть FCFS-гонка."""
+        return bool(reason) and reason.startswith("inflight ")

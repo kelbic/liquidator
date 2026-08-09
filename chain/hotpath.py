@@ -1446,6 +1446,16 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                                                   gas_spent_today=today["gas"] + specfire_gas_today(),
                                                   inflight=current_inflight()))
         if blocked:
+            # #52: ТРАНЗИЕНТНУЮ причину (нет свободных слотов inflight) НЕ защёлкиваем — слоты
+            # освобождаются на квитанции за секунды, а латч выключал хвост каскада на ТОМ САМОМ
+            # транзите, который и есть FCFS-гонка. Защёлкиваются только терминальные причины
+            # (дневные капы): они до полуночи UTC не рассосутся, и там латч — это защита.
+            if guard.is_transient(blocked):
+                _incr_state["skipped_transient"] = _incr_state.get("skipped_transient", 0) + 1
+                if _incr_state.get("skipped_transient", 0) % 20 == 1:
+                    log.info("HOT incr: слот занят (%s) — цель пропущена, латч НЕ ставим "
+                             "(пропусков %d)", blocked, _incr_state["skipped_transient"])
+                return
             _incr_state["blocked"] = blocked
             log.error("HOT kill switch engaged: %s — инкрементальный dispatch остановлен", blocked)
             alerter.send_async("\U0001F6D1 hot path halted: %s" % blocked, key="hot-killswitch")
