@@ -48,13 +48,39 @@ assert _seized_exact(capped, LIF_WAD, PRICE, TBA, TBS) <= COLL, \
 small = _cap_repaid_shares(BS, COLL // 4, PRICE, LIF_WAD, TBA, TBS)
 assert small < BS, "при вчетверо меньшем залоге шеры не урезаны"
 
-# --- 4. СТРУКТУРНО: путь доски зовёт ТЕ ЖЕ функции, что горячий путь ---------------------
+# --- 4. СТРУКТУРНО: ВСЯ функция _build, а не её первая треть -----------------------------
+# Прежний гард резал исходник до `liq = self.cfg.liquidator_address` и по построению не видел
+# ЧАСТИЧНУЮ ветку, которая идёт ниже, — а она-то и осталась на оценке сверху (шов подменён выше
+# дефекта). Берём тело функции целиком: от её def до следующего метода класса.
 src = pathlib.Path("chain/spec_fire_live.py").read_text()
-blk = src[src.index("repaid_shares = _cap_repaid_shares"):]
-blk = blk[:blk.index("liq = self.cfg.liquidator_address")]
-assert "_seized_exact(" in blk, "доска снова считает seize не точной функцией"
-assert "expected_seized(" not in blk, "оценка СВЕРХУ вернулась в путь доски"
-assert "_cap_repaid_shares(" in src[:src.index("liq = self.cfg.liquidator_address")], \
-    "кап шер не применяется в пути доски"
+_s = src.index("    def _build(self, mid, borrower, debt_usd):")
+build = src[_s:src.index("\n    def ", _s + 10)]
+assert "liq = self.cfg.liquidator_address" in build and "SPEC_FIRE_PARTIAL" in build, \
+    "срез не покрывает обе ветки _build — гард снова слеп"
+assert build.count("_seized_exact(") >= 2, \
+    "точную функцию зовёт не каждая ветка _build (главная + частичная)"
+assert "expected_seized(" not in build, "оценка СВЕРХУ вернулась в путь доски"
+assert "_cap_repaid_shares(" in build, "кап шер не применяется в пути доски"
 
-print("OK: доска считает amount_in точно и не превышает залог (#74)")
+# --- 5. ПОРОГ ЦЕНЫ считается по ПОЛНОЙ позиции, а не по величине плана (#77) -------------
+# Дефект: trigger = repaid_assets*1e54/(coll*lltv), где в частичной ветке repaid_assets уже
+# урезан, а coll остался полным. Контракт видел px > trig и МОЛЧА выходил — ни Liquidate, ни
+# PlanFailed, газ 52k. Числа боевые: кит 0xd57c4cee из блока 49666338, роут режет до 26% долга.
+LLTV_WAD = 625 * 10 ** 15
+SP_PARTIAL = 4127634976292605                       # sp из partial_shares_for_cap на живом капе
+assert SP_PARTIAL < BS, "пример обязан быть ЧАСТИЧНЫМ, иначе дефект не воспроизводится"
+_full = to_assets_up(BS, TBA, TBS)
+_part = to_assets_up(SP_PARTIAL, TBA, TBS)
+trig_ok = _full * 10 ** 54 // (COLL * LLTV_WAD)     # как считаем теперь
+trig_bad = _part * 10 ** 54 // (COLL * LLTV_WAD)    # как считали до #77
+assert trig_ok > PRICE, "порог по полной позиции обязан пропускать ликвидируемого кита"
+assert trig_bad < PRICE, "пример не воспроизводит молчание: старый порог не ниже цены"
+assert trig_ok > trig_bad * 3, "разрыв порогов меньше троекратного — пример потерял остроту"
+
+# и то же самое СТРУКТУРНО: числитель порога — полный долг позиции, не величина плана
+_tr = build[build.index("trigger = 0"):]
+assert "to_assets_up(int(bs), tba, tbs)" in _tr, "порог снова считается не от полного долга"
+assert "int(repaid_assets) * 10**54" not in _tr, "порог вернулся к величине ПЛАНА (#77)"
+
+print("OK: доска считает amount_in точно, не превышает залог (#74), "
+      "порог цены — по полной позиции (#77)")

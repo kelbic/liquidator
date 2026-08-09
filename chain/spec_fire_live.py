@@ -514,8 +514,7 @@ class SpecFireLive:
             encode_position_call, decode_position, encode_price_call, decode_price)
         from chain.simulate import to_assets_up
         from strategy.pnl import lif_from_lltv
-        from chain.execute import (expected_seized, direct_swap, encode_liquidate,
-                                   _MORPHO_BLUE)
+        from chain.execute import direct_swap, encode_liquidate, _MORPHO_BLUE
         from chain.prearm import prearm_get
         m32 = self.rpc.to_bytes32(mid)
         r1 = aggregate3(self.rpc, [(_MORPHO_BLUE, encode_id_to_market_params_call(m32)),
@@ -526,6 +525,12 @@ class SpecFireLive:
         bs, coll_amt = decode_position(r1[2][1])
         if bs == 0:
             return "gone"                         # позиция разобрана (конкурент/погашение) — LOSS-стоп
+        if coll_amt == 0:
+            # #78 (09.08, находка ревьюера): долг есть, залога нет — брать нечего ни по какой
+            # цене. Раньше такая цель падала в `return None` ниже и оставалась в списке: вечная
+            # пересборка по быстрому каденсу _arm_retry, а на вершине _top_fat (k=1) она ещё и
+            # глушила прогрев склада. Семантика та же, что у разобранной позиции, — LOSS-стоп.
+            return "gone"
         price = decode_price(aggregate3(self.rpc, [(oracle, encode_price_call())])[0][1])
         # #74 (09.08, находка ревьюера): путь ДОСКИ считал amount_in оценкой СВЕРХУ
         # (полные шеры + to_assets_up + expected_seized), тогда как горячий путь после фикса
@@ -566,7 +571,12 @@ class SpecFireLive:
             sp = partial_shares_for_cap(repaid_shares, seized, cap) if cap is not None else 0
             if sp > 0:
                 ap = to_assets_up(sp, tba, tbs)
-                zp = expected_seized(ap, lif_from_lltv(lltv_wad / 10**18), price)
+                # #74 хвост (ревьюер 09.08): ЧАСТИЧНАЯ ветка осталась на оценке СВЕРХУ, хотя
+                # главная уже считала по канону — а `zp` уходит в amount_in свопа, и контракт
+                # аппрувит РОВНО фактический баланс. Замер на ките: +2 wei. Мало, но инварианта
+                # «оценка <= факт» в пути доски нет, и спасает нас сейчас лишь направление
+                # дрейфа цены между армом и выстрелом, а не код.
+                zp = _seized_exact(sp, _lif_wad, int(price), tba, tbs)
                 sw = direct_swap(coll, loan, zp, liq, liq, repaid_assets=ap)
                 if sw is not None:
                     self._log("SPECFIRE probe partial %s/%s: сейз %d > кап %d — режем до "
@@ -587,7 +597,17 @@ class SpecFireLive:
         trigger = 0
         try:
             if coll_amt and lltv_wad:
-                _b = int(repaid_assets) * 10**54 // (int(coll_amt) * int(lltv_wad))
+                # #77 (09.08, находка ревьюера): порог считался из repaid_assets — величины
+                # ПЛАНА, а не позиции. В частичной ветке repaid_assets переприсвоен на урезанный
+                # долг, а coll_amt остался ПОЛНЫМ, и порог проваливался в разы ниже настоящей
+                # границы здоровья. Контракт видел px > trig и МОЛЧА выходил: status=1, логов
+                # ноль, газ 52k — ни Liquidate, ни PlanFailed. План армирован, флот стреляет,
+                # не происходит НИЧЕГО, и диагностировать нечем. Бьёт ровно по классу жира,
+                # ради которого доска и строилась (кит $16.5k: trigger 2.64e35 против цены
+                # 1.01e36). Граница здоровья Morpho — свойство ВСЕЙ позиции, обе величины
+                # полные: price = borrowed*1e54/(collateral*lltv).
+                _debt_full = to_assets_up(int(bs), tba, tbs)
+                _b = int(_debt_full) * 10**54 // (int(coll_amt) * int(lltv_wad))
                 trigger = _b * (10000 + SPEC_FIRE_V2_TRIGGER_MARGIN_BPS) // 10000
         except Exception:
             trigger = 0                           # не посчитали -> 0 = фильтра нет (fail-open)
@@ -963,6 +983,11 @@ class SpecFireLive:
             probe = (self._build_fn or self._build)(mid, b, d)
             if not isinstance(probe, dict):
                 self._arm_retry(feed, "проба не собралась")
+                # #78: склад и прогрев патрона НЕ зависят от того, собралась ли эта цель.
+                # Раньше _engine() жил только внутри ветки dict, и одна несобираемая цель на
+                # вершине _top_fat (k=1) оставляла пул на пустых лестницах — ~0.8с молчания
+                # ровно на старте окна победы, при том что подписывать можно было заранее.
+                self._engine()
             if isinstance(probe, dict):
                 if not self._arm_board(probe, mid, b, feed, debt=d):
                     self._arm_retry(feed, "setPlan не подтвердился")
