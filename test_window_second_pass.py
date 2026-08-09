@@ -76,3 +76,23 @@ assert "if fat_mode:      # тир: залп по подтверждённому
     "залп V1 сняли с fat-гейта — это уже другой пакет и другие деньги"
 
 print("OK: окно №2 греется сразу, доска не протухает под живым планом, транзит даёт право огня")
+
+# --- 5. #64: фазовый гейт решётки не должен глушить ПРАВО ОГНЯ ---------------------------
+# Гейт экономит газ кадансовых проб главного кошелька. Но он стоял ВЫШЕ единственной точки
+# keepalive в тике, а закрытая фаза решётки 26с из 30 против TTL права огня 1.5с — стена флота
+# гасла до транзита, включая замеренные ~4% пушей ВНЕ узла.
+_sk = SRC[SRC.index('self.stats["lattice_skips"] += 1') - 1200:]
+_sk = _sk[:_sk.index('self.stats["lattice_skips"] += 1')]
+assert "if fat_mode and SPEC_FIRE_LATTICE_KEEPALIVE:" in _sk and "_engine_fat_keepalive" in _sk, \
+    "в закрытую секунду решётки право огня снова не выдаётся — стена гаснет до транзита (#64)"
+assert sfl.SPEC_FIRE_LATTICE_KEEPALIVE is True, "дефолт ручки #64 должен быть включён"
+# КОНТРОЛЬ: сама экономия газа сохранена — проба в закрытую секунду по-прежнему НЕ шлётся
+assert "self.stats[\"lattice_skips\"] += 1" in _sk + 'self.stats["lattice_skips"] += 1'
+_after = SRC[SRC.index('if fat_mode and SPEC_FIRE_LATTICE_KEEPALIVE:'):]
+_after = _after[:_after.index("continue") + 8]
+assert "stop.wait(SPEC_FIRE_POLL_SEC)" in _after and "continue" in _after, \
+    "ветка пропуска сломана — гейт перестал экономить газ кадансовых проб"
+assert "(self._send_fn or self._send)" not in _after, \
+    "в закрытую секунду решётки снова уходит проба — экономия газа потеряна"
+
+print("OK: право огня переживает закрытую секунду решётки, экономия газа сохранена")

@@ -52,6 +52,9 @@ COLLECT_POLL_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_POLL_SEC", "1.
 # Каденс флотского прогрева патрона. Величина меняется только когда нога стреляет (расход
 # книжится по квитанции) или когда её доливают — чаще одного мультиколла в минуту незачем.
 ENGINE_WARM_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_WARM_SEC", "60"))
+# Каденс аудита ЦЕНЫ лестниц (#63): базу читаем один раз на весь флот, подпись жжём только
+# у тех ног, чья лестница действительно протухла по цене.
+ENGINE_AUDIT_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_AUDIT_SEC", "120"))
 COLLECT_TIMEOUT_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_TIMEOUT_SEC", "180"))
 COLLECT_BATCH = int(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_BATCH", "200"))
 
@@ -164,16 +167,19 @@ class FireEngine:
 
     def __init__(self, legs_fn, send_fn, collector=None, refill_fn=None, depth_fn=None,
                  log=None, threads=None, rate=None, ttl=None, now=None, sleep=None,
-                 fleet_warm_fn=None):
+                 fleet_warm_fn=None, audit_fn=None):
         """legs_fn() -> [addr,...] (ноги со склада); send_fn(addr) -> hash|None (рассылка пробы);
         refill_fn(addr) -> None (фоновое пополнение склада); depth_fn(addr) -> int (остаток);
-        fleet_warm_fn([addr,...]) -> None (освежить патрон ВСЕГО флота одним вызовом)."""
+        fleet_warm_fn([addr,...]) -> None (освежить патрон ВСЕГО флота одним вызовом);
+        audit_fn([addr,...]) -> None (проверить ЦЕНУ лестниц; см. #63)."""
         self._legs_fn = legs_fn
         self._send_fn = send_fn
         self._refill_fn = refill_fn
         self._depth_fn = depth_fn
         self._fleet_warm_fn = fleet_warm_fn
         self._warm_ts = 0.0
+        self._audit_fn = audit_fn
+        self._audit_ts = 0.0
         self._collector = collector
         self._log = log
         self._nthreads = ENGINE_THREADS if threads is None else int(threads)
@@ -304,6 +310,18 @@ class FireEngine:
             except Exception as e:
                 if self._log:
                     self._log("FIRE пополнение склада: %s" % type(e).__name__)
+            try:
+                # #63: аудит ЦЕНЫ лестниц — свой каденс и свой try. Триггер «глубина < порога»
+                # не срабатывает, когда лестница протухла по цене: протухание САМО останавливает
+                # огонь, очередь не расходуется, глубина не падает. Без этого прохода нога с
+                # вздутой (или невалидной) лестницей нема до рестарта.
+                if self._audit_fn is not None and (
+                        self._now() - self._audit_ts) >= ENGINE_AUDIT_SEC:
+                    self._audit_ts = self._now()
+                    self._audit_fn(self._legs_fn() or [])
+            except Exception as e:
+                if self._log:
+                    self._log("FIRE аудит лестниц: %s" % type(e).__name__)
             try:
                 # СВОЙ try: прогрев патрона не должен отменяться осечкой пополнения склада
                 # (одна нога с 429 оставляла бы весь флот без свежего патрона до следующего

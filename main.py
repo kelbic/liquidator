@@ -911,8 +911,7 @@ def main():
     log = logging.getLogger("liquidator")
 
     store = Store(cfg.db_path)
-    alerter = Alerter(cfg.tg_bot_token, cfg.tg_admin_id, cfg.alert_antiflood_sec,
-                      tag=cfg.bot_tag, group_id=cfg.tg_group_id)
+    alerter = Alerter(cfg.tg_bot_token, cfg.tg_admin_id, cfg.alert_antiflood_sec, tag=cfg.bot_tag)
     guard = KillSwitch(cfg.max_daily_loss_usd, cfg.max_daily_gas_usd, cfg.max_inflight)
     markets = load_covered_markets(cfg.covered_markets_path)
     rpc = BaseRpc(cfg.rpc_url, cfg.chain_id) if cfg.rpc_url else None

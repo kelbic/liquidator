@@ -311,3 +311,57 @@ ex._VOLLEY_LADDER[ADDR]["max_fee"] = int(_normal * 1.5)
 ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=6, start_nonce=0)
 assert id(ex._VOLLEY_LADDER[ADDR]["q"]) == _q_id, "рябь basefee жжёт подпись впустую"
 print("UNIT_OK: вздутая лестница пересобирается вниз, рябь — нет")
+
+# ---- 13. #63: САМОЗАПИРАНИЕ ЛЕСТНИЦЫ — аудит цены оживляет ногу БЕЗ падения глубины ----
+# Пересборка висела на единственном триггере «глубина склада < 12», но обе формы протухания
+# лестницы САМИ останавливают огонь: вздутый max_fee закрывает гейт патрона, заниженный делает
+# tx невключаемой. Очередь не расходуется -> глубина не падает -> пополнение не зовётся ->
+# лестница не пересобирается НИКОГДА. Разрыв защёлки из #60 был по той же причине недостижим.
+rpc = fresh()
+ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=40, start_nonce=0)
+_norm = ex._VOLLEY_LADDER[ADDR]["max_fee"]
+_tip = int(cfg.tip_gwei * 1e9)
+
+# (а) ВЗДУТАЯ лестница при ПОЛНОМ складе распознана как требующая пересборки
+ex._VOLLEY_LADDER[ADDR]["max_fee"] = _norm * 50
+assert ex.ladder_depth(ADDR) == 40, "предпосылка теста: склад полон"
+assert ex.ladder_resign_needed(ADDR, BASEFEE, _tip) is True, \
+    "вздутая лестница при полном складе не опознана — нога немеет до рестарта"
+
+# (б) ЗАНИЖЕННАЯ (базa выросла) — tx невключаема, тоже пересборка
+ex._VOLLEY_LADDER[ADDR]["max_fee"] = _norm // 4
+assert ex.ladder_resign_needed(ADDR, BASEFEE, _tip) is True, \
+    "лестница дешевле нынешней базы не опознана — пробы не включаются"
+
+# (в) КОНТРОЛЬ: нормальная лестница пересборки НЕ требует (подпись впустую не жжём)
+ex._VOLLEY_LADDER[ADDR]["max_fee"] = _norm
+assert ex.ladder_resign_needed(ADDR, BASEFEE, _tip) is False, "аудит гоняет здоровую ногу"
+# и рябь в пределах множителя тоже не требует
+ex._VOLLEY_LADDER[ADDR]["max_fee"] = int(_norm * 2.5)
+assert ex.ladder_resign_needed(ADDR, BASEFEE, _tip) is False, "рябь базы жжёт подпись"
+
+# (г) КОНТРОЛЬ: пустая лестница — не дело аудита (её поднимет триггер глубины)
+ex._VOLLEY_LADDER[ADDR]["q"] = []
+assert ex.ladder_resign_needed(ADDR, BASEFEE, _tip) is False
+ex._VOLLEY_LADDER.pop(ADDR, None)
+assert ex.ladder_resign_needed(ADDR, BASEFEE, _tip) is False, "нет лестницы — нет и аудита"
+
+# (д) СКВОЗНОЕ: вздутая лестница ОЖИВАЕТ пересборкой по переданной базе, глубина не падала
+rpc = fresh()
+ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=40, start_nonce=0)
+ex._VOLLEY_LADDER[ADDR]["max_fee"] = _norm * 50
+ex.invalidate_ladder(ADDR)
+ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=40, base_fee=BASEFEE, start_nonce=0)
+assert ex._VOLLEY_LADDER[ADDR]["max_fee"] == _norm, ex._VOLLEY_LADDER[ADDR]["max_fee"]
+assert ex.ladder_depth(ADDR) == 40
+print("UNIT_OK: аудит цены оживляет ногу при полном складе (#63)")
+
+# (е) СТРУКТУРНО: у движка есть отдельный каденс аудита, и он НЕ в одном try с пополнением
+import chain.fire_engine as _fe
+import pathlib as _pl
+_src = _pl.Path("chain/fire_engine.py").read_text()
+assert "self._audit_fn" in _src and "ENGINE_AUDIT_SEC" in _src, "аудит не подключён к движку"
+_loop = _src[_src.index("def _refill_loop"):]
+assert _loop.index("_audit_fn") > _loop.index("FIRE пополнение склада"), \
+    "аудит стоит в одном try с пополнением — осечка одной ноги отменит его целиком"
+assert _fe.ENGINE_AUDIT_SEC >= 30, "каденс аудита %.0fс — это лишние чтения базы" % _fe.ENGINE_AUDIT_SEC

@@ -199,6 +199,10 @@ SPEC_FIRE_HANDOFF_KEEPALIVE = os.environ.get(
     "SPEC_FIRE_HANDOFF_KEEPALIVE", "1").lower() not in ("0", "false", "no")
 # Как часто переиздавать отметку probe_board, пока план жив (потребители гейтят 10с).
 SPEC_FIRE_BOARD_RESTAMP_SEC = float(os.environ.get("SPEC_FIRE_BOARD_RESTAMP_SEC", "4"))
+# Право огня движку в ЗАКРЫТУЮ секунду фазового гейта (#64): гейт экономит газ кадансовых
+# проб, а не выключает плотность. Откат: SPEC_FIRE_LATTICE_KEEPALIVE=0.
+SPEC_FIRE_LATTICE_KEEPALIVE = os.environ.get(
+    "SPEC_FIRE_LATTICE_KEEPALIVE", "1").lower() not in ("0", "false", "no")
 # #49: предел доверия к `updatedAt` оракула. Больше — часы разъехались (или апдейт из
 # прошлого), метка встаёт на время детекта, и это видно счётчиком lattice_skew_bad.
 SPEC_FIRE_LATTICE_MAX_SKEW_SEC = float(os.environ.get("SPEC_FIRE_LATTICE_MAX_SKEW_SEC", "120"))
@@ -1024,12 +1028,36 @@ class SpecFireLive:
                 return _ex.send_presigned_probe(self.rpc, self.cfg, addr, log=log,
                                                 broadcast_raw_urls=bcast)
 
-            def _refill(addr):
+            def _refill(addr, base_fee=None):
                 for a, k in (self._volley_accounts_fn or _ex.volley_accounts)():
                     if a == addr:
                         _ex.presign_ladder(self.rpc, self.cfg, addr, k,
-                                           SPEC_FIRE_V2_FIRE_GAS, log=log)
+                                           SPEC_FIRE_V2_FIRE_GAS, base_fee=base_fee, log=log)
                         return
+
+            def _audit(addrs):
+                """#63: аудит ЦЕНЫ лестниц. База читается ОДИН раз на весь флот (иначе это
+                110 запросов вместо одного — урок квоты 09.08), подпись жжём только у ног,
+                чья лестница действительно протухла: вздута (гейт патрона закрыт) либо ниже
+                нынешней базы (tx не включаема). Обе формы САМИ останавливают огонь, поэтому
+                триггер по глубине склада тут не срабатывает никогда."""
+                try:
+                    bf = int(self.rpc._web3().eth.get_block("latest").get("baseFeePerGas") or 0)
+                except Exception as e:
+                    self._log("SPECFIRE аудит лестниц: база не прочитана (%s)" % _diag(e))
+                    return
+                tip = int(float(getattr(self.cfg, "tip_gwei", 0.05)) * 1e9)
+                stale = [a for a in (addrs or []) if _ex.ladder_resign_needed(a, bf, tip)]
+                if not stale:
+                    return
+                self._log("SPECFIRE аудит лестниц: %d ног с протухшей ценой (база %.4f gwei) — "
+                          "пересборка" % (len(stale), bf / 1e9))
+                for a in stale:
+                    try:
+                        _ex.invalidate_ladder(a)      # иначе compat удержит старую цену
+                        _refill(a, base_fee=bf)
+                    except Exception as e:
+                        self._log("SPECFIRE аудит %s: %s" % (a[:10], _diag(e)))
 
             col = _fe.ReceiptCollector(
                 receipts_fn=lambda hs: _ex.batch_receipts(rpc_url, hs),
@@ -1039,7 +1067,7 @@ class SpecFireLive:
                                  refill_fn=_refill, depth_fn=_ex.ladder_depth,
                                  fleet_warm_fn=lambda addrs: _ex.volley_bal_warm_fleet(
                                      self.rpc, addrs, log=log),
-                                 log=self._log)
+                                 audit_fn=_audit, log=self._log)
             self._fire_engine = eng
             eng.start()
             return eng
@@ -1342,6 +1370,14 @@ class SpecFireLive:
                     # фазовый гейт: секунда доказуемо холостая (пуш садится на узел решётки).
                     # Патроны не тратим — когда слот откроется, условие интервала уже выполнено
                     # и проба уйдёт сразу, т.е. бюджет сам стягивается в живые секунды.
+                    # #64 (ревью 09.08, CONFIRMED): гейт задумывался как экономия ГАЗА кадансовых
+                    # проб главного кошелька, но стоял ВЫШЕ единственной точки права огня в тике,
+                    # и потому глушил ПЛОТНОСТЬ: на решётке 30с закрытая фаза 26с, а TTL права
+                    # огня 1.5с — стена флота гасла до транзита, включая замеренные ~4% пушей
+                    # ВНЕ узла. Право огня выдаём и в закрытую секунду: пробы движка стоят
+                    # ~$0.0004 и держатся своими бакетами и полом патрона.
+                    if fat_mode and SPEC_FIRE_LATTICE_KEEPALIVE:
+                        self._engine_fat_keepalive(feed)
                     self.stats["lattice_skips"] += 1
                     stop.wait(SPEC_FIRE_POLL_SEC)
                     continue

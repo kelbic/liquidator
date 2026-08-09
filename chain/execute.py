@@ -864,6 +864,27 @@ _VOLLEY_PRESIGN_MAXFEE_MULT = int(os.environ.get(
     os.environ.get("SPEC_FIRE_PRESIGN_MAXFEE_MULT", "20")))
 
 
+def ladder_resign_needed(addr: str, base_fee: int, tip_wei: int) -> bool:
+    """Нужна ли лестнице ПЕРЕСБОРКА по цене — независимо от того, сколько в ней записей (#63).
+
+    Пересборка висела на ЕДИНСТВЕННОМ триггере «глубина склада < порога», а обе формы
+    протухания лестницы САМИ останавливают огонь: (1) записанный max_fee вздут (гейт патрона по
+    худшему случаю закрыт — отправок нет); (2) записанный max_fee ниже нынешней базы (tx вообще
+    не включаема). В обоих случаях очередь не расходуется, глубина не падает, пополнение не
+    зовётся — и лестница не пересобирается НИКОГДА. Разрыв защёлки из #60 по той же причине был
+    недостижим: его триггер стоял за тем же гейтом глубины.
+
+    Считается БЕЗ сети: базу вызывающий читает ОДИН раз на весь флот."""
+    st = _VOLLEY_LADDER.get(addr)
+    if not st or not st.get("q"):
+        return False                      # пустую лестницу поднимет обычный триггер глубины
+    want = int(base_fee) * _VOLLEY_PRESIGN_MAXFEE_MULT + int(tip_wei)
+    have = int(st.get("max_fee") or 0)
+    if want <= 0:
+        return False
+    return have < want or have > want * _VOLLEY_MAXFEE_RESIGN_MULT
+
+
 def ladder_depth(addr: str) -> int:
     """Сколько готовых проб осталось у ноги (0 = лестницы нет)."""
     st = _VOLLEY_LADDER.get(addr)
