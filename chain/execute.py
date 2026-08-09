@@ -548,6 +548,8 @@ _VOLLEY_EXPECTED_GAS = int(os.environ.get("SPEC_FIRE_VOLLEY_EXPECTED_GAS", "4500
 _VOLLEY_BAL_MAX_AGE = float(os.environ.get("SPEC_FIRE_VOLLEY_BAL_MAX_AGE_SEC", "600"))
 _VOLLEY_BAL_REFRESHING: set = set()      # addr с дозором в полёте (без него 8 тредов = шторм)
 _VOLLEY_REFRESH_MAX = int(os.environ.get("SPEC_FIRE_VOLLEY_REFRESH_MAX", "4"))   # потолок на флот
+_VOLLEY_REFRESH_TS: dict = {}            # addr -> ts последнего дозора (ограничение ТЕМПА)
+_VOLLEY_REFRESH_MIN_GAP = float(os.environ.get("SPEC_FIRE_VOLLEY_REFRESH_GAP_SEC", "15"))
 # Во сколько раз записанный max_fee должен превышать нынешний, чтобы лестницу пересобрать
 # ВНИЗ (разрыв защёлки). 3x: обычную рябь basefee не трогаем, вздутие всплеска — снимаем.
 _VOLLEY_MAXFEE_RESIGN_MULT = float(os.environ.get("SPEC_FIRE_PRESIGN_RESIGN_MULT", "3"))
@@ -650,9 +652,15 @@ def volley_bal_refresh_async(rpc, addr: str):
     """Дозор патрона мимо пути огня: один в полёте на ногу И не более _VOLLEY_REFRESH_MAX на
     весь флот. Без общего потолка 110 стухших ног за один круг round-robin дали бы 110 тредов
     и ~3000 CU/с в боевой ключ — самоподдерживающийся 429-шторм ровно в горячем окне."""
+    _now = time.monotonic()
     with _INFLIGHT_LOCK:
         if addr in _VOLLEY_BAL_REFRESHING or len(_VOLLEY_BAL_REFRESHING) >= _VOLLEY_REFRESH_MAX:
             return
+        # #65: потолок держит ЧИСЛО одновременных дозоров, но не ТЕМП — без этого интервала
+        # нога, у которой дозор ничего не меняет, перезапускала бы его каждый RTT.
+        if _now - _VOLLEY_REFRESH_TS.get(addr, -1e9) < _VOLLEY_REFRESH_MIN_GAP:
+            return
+        _VOLLEY_REFRESH_TS[addr] = _now
         _VOLLEY_BAL_REFRESHING.add(addr)
 
     def _run():
@@ -1027,8 +1035,11 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
                 _VOLLEY_MAXFEE_MUTE.add(addr)   # У2: немота по комиссии обязана КРИЧАТЬ, иначе
                                                 # в горячий каскад флот молча встанет, а мы
                                                 # прочтём это как «не было целей»
-            if rpc is not None:
-                volley_bal_refresh_async(rpc, addr)   # вдруг ногу долили — узнаем без рестарта
+            # #65 (ревью 09.08): дозор здесь НЕ будим. Немоту по полу определяет РЕЗЕРВ
+            # (gas x max_fee), а не свежесть баланса — обновление ничего не меняет, зато на
+            # армированном окне даёт устойчивый поток get_balance в боевой ключ (потолок
+            # ограничивал ЧИСЛО одновременных дозоров, но не ТЕМП: они завершаются за RTT и
+            # спавнятся снова). Долив ноги увидит штатный флотский прогрев раз в 60с.
             if log:
                 log.info("VOLLEY %s молчит: патрон на поле %.4f ETH", addr[:10], bal[0] / 1e18)
             return None

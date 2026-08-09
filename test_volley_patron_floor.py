@@ -204,10 +204,42 @@ try:
     eng2.stop()
     assert not refilled2, "пополнение зовут при полном складе: %d" % len(refilled2)
 
+    # 8г. #65: ТЕМП дозора ограничен, а не только ЧИСЛО. Потолок держал 4 одновременных, но
+    #     они завершаются за RTT и спавнились снова — на армированном окне это устойчивый поток
+    #     get_balance в боевой ключ. Плюс floor-skip дозор больше НЕ будит: немоту по полу
+    #     определяет резерв (gas x max_fee), а не свежесть баланса.
+    ex._VOLLEY_BAL.pop(ADDR, None)
+    with ex._INFLIGHT_LOCK:
+        ex._VOLLEY_BAL_REFRESHING.clear()
+        ex._VOLLEY_REFRESH_TS.pop(ADDR, None)
+    _rpc_rate = _Rpc()
+    ex.volley_bal_refresh_async(_rpc_rate, ADDR)
+    time.sleep(0.25)                                   # дозор завершился, слот свободен
+    ex.volley_bal_refresh_async(_rpc_rate, ADDR)        # повтор сразу — обязан быть отклонён
+    time.sleep(0.25)
+    assert len(_rpc_rate.reads) == 1, \
+        "дозор перезапускается каждый RTT: %d чтений подряд" % len(_rpc_rate.reads)
+
+    # 8д. floor-skip НЕ будит дозор (свежесть баланса пол не снимает)
+    seed_ladder()
+    ex._VOLLEY_BAL[ADDR] = [ex._VOLLEY_BAL_FLOOR_WEI + GAS * MAXFEE - 1, time.monotonic()]
+    _rpc_floor = _Rpc()
+    with ex._INFLIGHT_LOCK:
+        ex._VOLLEY_REFRESH_TS.pop(ADDR, None)
+    assert ex.send_presigned_probe(_rpc_floor, None, ADDR, broadcast_raw_urls=SEQ) is None
+    time.sleep(0.25)
+    assert _rpc_floor.reads == [], "floor-skip снова будит дозор — поток в боевой ключ (#65)"
+    _src_fn = pathlib.Path("chain/execute.py").read_text()
+    _fn2 = _src_fn[_src_fn.index("def send_presigned_probe"):_src_fn.index("def _post_raw_sync")]
+    _floor_blk = _fn2[_fn2.index("_VOLLEY_FLOOR_SKIPS += 1"):]
+    assert "volley_bal_refresh_async" not in _floor_blk.split("nonce, raw_hex, h =")[0], \
+        "в ветке пола снова стоит пробуждение дозора"
+
     # 8в. ПОТОЛОК ДОЗОРА на весь флот: 110 стухших ног не должны дать 110 тредов в боевой ключ
     ex._VOLLEY_REFRESH_MAX = 4
     with ex._INFLIGHT_LOCK:
         ex._VOLLEY_BAL_REFRESHING.clear()
+        ex._VOLLEY_REFRESH_TS.clear()
     _slow = _Rpc()
     for i in range(110):
         ex.volley_bal_refresh_async(_slow, "0x%040x" % i)
