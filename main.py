@@ -713,6 +713,9 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                         _sfl = SpecFireLive(rpc, cfg, shared,
                                             ret_fn=lambda lbl: engine.ret(_l2s.get(lbl.upper(), lbl)),
                                             dev_by=_dev)
+                        # У2 (09.08): немота ног по комиссии требует человека (долив либо
+                        # ручка MAXFEE_RESERVE_MULT) — даём окну канал к владельцу
+                        _sfl._alert = lambda _t, _k: alerter.send_async(_t, key=_k)
                         _handlers.append(_sfl.handle_event)
                         from chain.failover import set_windows_probe
                         set_windows_probe(lambda: len(_sfl._windows))   # назад-свитч не посреди окна

@@ -49,6 +49,9 @@ ENGINE_IDLE_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_IDLE_SEC", "0.05"))
 ENGINE_REFILL_AT = int(os.environ.get("SPEC_FIRE_ENGINE_REFILL_AT", "12"))
 ENGINE_REFILL_POLL_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_REFILL_POLL_SEC", "0.5"))
 COLLECT_POLL_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_POLL_SEC", "1.0"))
+# Каденс флотского прогрева патрона. Величина меняется только когда нога стреляет (расход
+# книжится по квитанции) или когда её доливают — чаще одного мультиколла в минуту незачем.
+ENGINE_WARM_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_WARM_SEC", "60"))
 COLLECT_TIMEOUT_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_TIMEOUT_SEC", "180"))
 COLLECT_BATCH = int(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_BATCH", "200"))
 
@@ -161,15 +164,16 @@ class FireEngine:
 
     def __init__(self, legs_fn, send_fn, collector=None, refill_fn=None, depth_fn=None,
                  log=None, threads=None, rate=None, ttl=None, now=None, sleep=None,
-                 stale_fn=None):
+                 fleet_warm_fn=None):
         """legs_fn() -> [addr,...] (ноги со склада); send_fn(addr) -> hash|None (рассылка пробы);
         refill_fn(addr) -> None (фоновое пополнение склада); depth_fn(addr) -> int (остаток);
-        stale_fn(addr) -> bool (данные ноги протухли и их надо освежить ФОНОМ, а не в огне)."""
+        fleet_warm_fn([addr,...]) -> None (освежить патрон ВСЕГО флота одним вызовом)."""
         self._legs_fn = legs_fn
         self._send_fn = send_fn
         self._refill_fn = refill_fn
         self._depth_fn = depth_fn
-        self._stale_fn = stale_fn
+        self._fleet_warm_fn = fleet_warm_fn
+        self._warm_ts = 0.0
         self._collector = collector
         self._log = log
         self._nthreads = ENGINE_THREADS if threads is None else int(threads)
@@ -291,14 +295,16 @@ class FireEngine:
                     if self._stop.is_set():
                         break
                     d = self._depth_fn(addr) if self._depth_fn else 0
-                    # Полный склад НЕ означает готовую ногу: у пробы есть ещё и данные
-                    # (патрон), которые протухают сами по себе. Раньше пополнение звалось
-                    # ТОЛЬКО по остатку — между fat-окнами (недели) склад полон, refill не
-                    # зовётся, кэш патрона стареет, и на старте окна fail-closed гейт глушил
-                    # бы ВЕСЬ флот разом. Освежение — фоном, до огня, а не в горячей фазе.
-                    _stale = bool(self._stale_fn(addr)) if self._stale_fn else False
-                    if d < ENGINE_REFILL_AT or _stale:
+                    if d < ENGINE_REFILL_AT:
                         self._refill_fn(addr)
+                # Патрон ноги протухает САМ ПО СЕБЕ, а полный склад пополнения не зовёт:
+                # между fat-окнами (недели) кэш стареет, и на старте окна fail-closed гейт
+                # заглушил бы ВЕСЬ флот разом. Освежаем фоном и ОДНИМ вызовом на весь флот —
+                # пер-ноговое чтение стоило бы ~7 запросов/с круглосуточно в боевой ключ.
+                if self._fleet_warm_fn is not None and (
+                        self._now() - self._warm_ts) >= ENGINE_WARM_SEC:
+                    self._warm_ts = self._now()
+                    self._fleet_warm_fn(self._legs_fn() or [])
             except Exception as e:
                 if self._log:
                     self._log("FIRE пополнение склада: %s" % type(e).__name__)

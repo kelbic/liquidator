@@ -461,6 +461,9 @@ class SpecFireLive:
         self.pending_fire: dict = {}              # feed -> (mid, b, debt, ts): атомарный handoff (A2)
         self.pending_healthy_fn = None            # () -> bool: pending-цикл жив (A3-кипэлайв)
         self._ws_handoff_ts: dict = {}            # feed -> ts последнего WS-handoff (кулдаун дублей)
+        self._alert = None                        # (text, key) -> None: канал к ЧЕЛОВЕКУ. Ставится
+                                                  # снаружи; нужен там, где состояние само не
+                                                  # рассосётся (немота ног по комиссии)
         self._board_next_try: dict = {}           # feed -> ts следующей попытки арма (#57): осечка
                                                   # арма обязана перепробовать БЫСТРО, а не через
                                                   # каденс переарма — окно короче ретрая иначе
@@ -1029,7 +1032,9 @@ class SpecFireLive:
                 log=self._log)
             eng = _fe.FireEngine(legs_fn=_legs, send_fn=_send, collector=col,
                                  refill_fn=_refill, depth_fn=_ex.ladder_depth,
-                                 stale_fn=_ex.volley_bal_stale, log=self._log)
+                                 fleet_warm_fn=lambda addrs: _ex.volley_bal_warm_fleet(
+                                     self.rpc, addrs, log=log),
+                                 log=self._log)
             self._fire_engine = eng
             eng.start()
             return eng
@@ -1446,15 +1451,24 @@ class SpecFireLive:
             # никто не чинит: нога, замолчавшая на полу или без кэша патрона, до этого была
             # неотличима от «окно было пустым».
             try:
-                from chain.execute import volley_probe_skips
+                from chain.execute import volley_probe_skips, volley_maxfee_muted
                 _fs, _us = volley_probe_skips()
+                _mm = len(volley_maxfee_muted())
             except Exception:
-                _fs = _us = -1
+                _fs = _us = _mm = -1
+            if _mm > 0 and self._alert is not None:
+                # У2 (решение kelbic 09.08): немота ног по комиссии = состояние, которое
+                # само не рассосётся (долив или ручка MAXFEE_RESERVE_MULT) и которое иначе
+                # читается как «не было целей». Антифлуд держит Alerter по ключу.
+                self._alert("\U0001F507 флот: %d ног немы ПО КОМИССИИ (резерв gas x maxFee "
+                            "съел патрон) — долив ноги или MAXFEE_RESERVE_MULT" % _mm,
+                            "leg-maxfee-mute")
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
-                      "patron_floor_skips=%d patron_unknown_skips=%d stats=%s" % (
+                      "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
+                      "stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _fs, _us, self.stats))
+                          _fs, _us, _mm, self.stats))
 
     def handle_event(self, ev: dict):
         try:

@@ -173,29 +173,36 @@ try:
     ex._VOLLEY_BAL[ADDR] = [FUNDED, time.monotonic()]
     assert ex.volley_bal_stale(ADDR) is False, "свежий патрон гоняют на пополнение впустую"
 
-    refilled = []
-    eng = fe.FireEngine(legs_fn=lambda: ["0xLegStale"], send_fn=lambda a: None,
-                        collector=None, threads=1, rate=50.0, ttl=0.2,
-                        refill_fn=refilled.append,
-                        depth_fn=lambda a: 40,             # СКЛАД ПОЛОН — прежний триггер молчит
-                        stale_fn=lambda a: True)
-    eng.start()
-    _dl = time.time() + 3.0
-    while time.time() < _dl and not refilled:
-        time.sleep(0.02)
-    eng.stop()
-    assert refilled, "полный склад + протухший патрон = пополнение не позвано (флот немеет)"
+    # Освежение патрона идёт ФЛОТСКИМ прогревом (один мультиколл), а не пер-ноговым
+    # пополнением: пер-ноговое стоило бы ~7 запросов/с круглосуточно в боевой ключ.
+    warmed = []
+    _sv_warm = fe.ENGINE_WARM_SEC
+    fe.ENGINE_WARM_SEC = 0.05
+    try:
+        eng = fe.FireEngine(legs_fn=lambda: ["0xLegStale"], send_fn=lambda a: None,
+                            collector=None, threads=1, rate=50.0, ttl=0.2,
+                            refill_fn=lambda a: None,
+                            depth_fn=lambda a: 40,         # СКЛАД ПОЛОН — пополнение молчит
+                            fleet_warm_fn=warmed.append)
+        eng.start()
+        _dl = time.time() + 3.0
+        while time.time() < _dl and not warmed:
+            time.sleep(0.02)
+        eng.stop()
+    finally:
+        fe.ENGINE_WARM_SEC = _sv_warm
+    assert warmed, "полный склад = прогрев патрона не позван (через 600с флот немеет целиком)"
+    assert warmed[0] == ["0xLegStale"], "прогрев обязан идти СПИСКОМ ног (один вызов на флот)"
 
-    # 8б. КОНТРОЛЬ: свежий патрон и полный склад пополнение НЕ дёргают (иначе жжём CPU/RTT)
+    # 8б. КОНТРОЛЬ: пополнение склада при полном складе НЕ дёргается (подпись впустую не жжём)
     refilled2 = []
     eng2 = fe.FireEngine(legs_fn=lambda: ["0xLegFresh"], send_fn=lambda a: None,
                          collector=None, threads=1, rate=50.0, ttl=0.2,
-                         refill_fn=refilled2.append,
-                         depth_fn=lambda a: 40, stale_fn=lambda a: False)
+                         refill_fn=refilled2.append, depth_fn=lambda a: 40)
     eng2.start()
-    time.sleep(1.2)
+    time.sleep(1.0)
     eng2.stop()
-    assert not refilled2, "пополнение зовут при полном складе и свежем патроне: %d" % len(refilled2)
+    assert not refilled2, "пополнение зовут при полном складе: %d" % len(refilled2)
 
     # 8в. ПОТОЛОК ДОЗОРА на весь флот: 110 стухших ног не должны дать 110 тредов в боевой ключ
     ex._VOLLEY_REFRESH_MAX = 4

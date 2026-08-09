@@ -553,6 +553,9 @@ _VOLLEY_REFRESH_MAX = int(os.environ.get("SPEC_FIRE_VOLLEY_REFRESH_MAX", "4"))  
 _VOLLEY_MAXFEE_RESIGN_MULT = float(os.environ.get("SPEC_FIRE_PRESIGN_RESIGN_MULT", "3"))
 _VOLLEY_FLOOR_SKIPS = 0                  # отказов «патрон на поле»
 _VOLLEY_UNKNOWN_SKIPS = 0                # отказов «баланс неизвестен/протух» (fail-closed)
+_VOLLEY_MAXFEE_MUTE: set = set()         # ноги, отключённые ПОЛОМ ПАТРОНА (gas x max_fee):
+                                         # это состояние требует человека — долив или
+                                         # ручка множителя, поэтому оно кричит, а не молчит
 # Пробы движка мимо гейта _INFLIGHT (решение kelbic 08.08 по замеру немоты: p50=1.8с/tx,
 # в каскаде 17:00 три слепых пятна съели 75% горячего окна, а окно фида закрылось ВНУТРИ
 # первой немоты). Касается ТОЛЬКО send_presigned_probe (1-байт со склада, свои nonce-потоки);
@@ -567,6 +570,52 @@ def volley_probe_skips():
     неотличим от «окно было пустым», и нога, замолчавшая на 135-й пробе, выглядела бы штилем."""
     with _INFLIGHT_LOCK:
         return (_VOLLEY_FLOOR_SKIPS, _VOLLEY_UNKNOWN_SKIPS)
+
+
+def volley_maxfee_muted():
+    """Ноги, отключённые полом патрона (резерв gas x max_fee съел бюджет). Состояние
+    требует ЧЕЛОВЕКА: долив ноги либо ручка MAXFEE_RESERVE_MULT — само не рассосётся."""
+    with _INFLIGHT_LOCK:
+        return set(_VOLLEY_MAXFEE_MUTE)
+
+
+_MC3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
+_MC3_GETBAL_SEL = "0x4d2301cc"           # getEthBalance(address)
+
+
+def volley_bal_warm_fleet(rpc, addrs, log=None) -> int:
+    """Освежить патрон ВСЕГО флота ОДНИМ мультиколлом. Возврат: сколько ног обновлено.
+
+    КВОТА (напоминание владельца 09.08 и урок rpc-key-striping-drift): пер-ноговое освежение
+    по возрасту стоило бы 110 x (get_balance + get_block) каждые полминуты — ~7 запросов/с
+    круглосуточно в БОЕВОЙ ключ, то есть сотни миллионов CU в месяц ради величины, которая
+    меняется только когда нога стреляет (а расход мы и так книжим по квитанции) или когда её
+    доливают. Один aggregate3 на весь флот стоит один запрос."""
+    addrs = [a for a in (addrs or []) if a]
+    if not addrs:
+        return 0
+    try:
+        from chain.multicall import aggregate3
+        calls = [(_MC3, True, bytes.fromhex(_MC3_GETBAL_SEL[2:]) + bytes(12) +
+                  bytes.fromhex(str(a)[2:])) for a in addrs]
+        res = aggregate3(rpc, calls)
+    except Exception as e:
+        if log:
+            log.info("VOLLEY патрон флота: мультиколл не удался (%s) — ноги под fail-closed гейтом",
+                     type(e).__name__)
+        return 0
+    n = 0
+    now = time.monotonic()
+    for a, r in zip(addrs, res or []):
+        try:
+            ok, data = (r[0], r[1]) if isinstance(r, (list, tuple)) else (False, None)
+            if not ok or not data:
+                continue
+            _VOLLEY_BAL[a] = [int.from_bytes(bytes(data)[-32:], "big"), now]
+            n += 1
+        except Exception:
+            continue
+    return n
 
 
 def volley_bal_stale(addr: str) -> bool:
@@ -799,7 +848,18 @@ def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, lo
 # запись НА МЕСТО, а не пропускает её.
 _VOLLEY_LADDER: dict = {}       # addr -> {"q": [(nonce, raw_hex, hash)], "gas":, "max_fee":, "ts":}
 _VOLLEY_PRESIGN_DEPTH = int(os.environ.get("SPEC_FIRE_PRESIGN_DEPTH", "40"))
-_VOLLEY_PRESIGN_MAXFEE_MULT = int(os.environ.get("SPEC_FIRE_PRESIGN_MAXFEE_MULT", "100"))
+# МНОЖИТЕЛЬ РЕЗЕРВА (решение kelbic 09.08, 100 -> 20). Он задаёт maxFee пред-подписанной
+# пробы, а через неё — резерв гейта патрона (gas x max_fee). На Base порядок в блоке FCFS:
+# maxFee НЕ покупает позицию, она нужна лишь для ВАЛИДНОСТИ (tx включаема, пока maxFee
+# покрывает basefee). Значит ×100 не давал ничего, кроме запертого капитала: при заправке
+# 0.008 ETH и поле 0.003 нога немела, если лестница подписана при basefee > 0.0162 gwei —
+# запас всего 3.2x над полом Base 0.005, а каскад и есть всплеск загрузки (замер по блоку
+# 49666338: 4 блока подряд на 99.9-100% заполнения, basefee растёт максимальным шагом).
+# При ×20 порог немоты уезжает на 0.081 gwei (запас 16x), а maxFee лестницы 0.147 gwei
+# остаётся 29x над базой — валидность не страдает. Откат: MAXFEE_RESERVE_MULT=100.
+_VOLLEY_PRESIGN_MAXFEE_MULT = int(os.environ.get(
+    "MAXFEE_RESERVE_MULT",
+    os.environ.get("SPEC_FIRE_PRESIGN_MAXFEE_MULT", "20")))
 
 
 def ladder_depth(addr: str) -> int:
@@ -941,6 +1001,9 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
         if bal[0] - int(st["gas"]) * int(st["max_fee"]) < _VOLLEY_BAL_FLOOR_WEI:
             with _INFLIGHT_LOCK:
                 _VOLLEY_FLOOR_SKIPS += 1
+                _VOLLEY_MAXFEE_MUTE.add(addr)   # У2: немота по комиссии обязана КРИЧАТЬ, иначе
+                                                # в горячий каскад флот молча встанет, а мы
+                                                # прочтём это как «не было целей»
             if rpc is not None:
                 volley_bal_refresh_async(rpc, addr)   # вдруг ногу долили — узнаем без рестарта
             if log:
@@ -978,6 +1041,9 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
         # запись потрачена по назначению, возвращать её нельзя.
     with lk:
         _VOLLEY_NONCE[addr] = nonce + 1
+        if addr in _VOLLEY_MAXFEE_MUTE:
+            with _INFLIGHT_LOCK:
+                _VOLLEY_MAXFEE_MUTE.discard(addr)   # ожила (долив/пересборка лестницы)
         # ДЕКРЕМЕНТ ПО ФАКТУ (#45): эстимейт здесь завышал расход no-op пробы в ~250 раз и
         # глушил ногу за ~135 проб. Истину приносит коллектор квитанций (volley_bal_charge),
         # а верхнюю границу дрейфа держит дозор по возрасту кэша.
