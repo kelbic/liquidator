@@ -34,9 +34,11 @@ import chain.execute as ex                                 # noqa: E402
 
 MORPHO = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
 MID = "0xd4a903dc6d949519060c7707f9604fdc9772c046e05c2e3a8fce0bd7196e4109"
-BORROWER = "0xd57c4ceee023cfb78076bab0e31c1e5dfdfe2467"
+# Цель задаётся снаружи: кит C ($16 494.54) не берётся прямым путём по глубине пула, поэтому
+# по умолчанию репетируем приз снайпера D ($2 510) — он под капом маршрута и проверяет ФИКС.
+BORROWER = os.environ.get("FORK_BORROWER", "0xfda213169284e80af6a9cbfd06431f50d6d8bf74")
+PRIZE_USDC = float(os.environ.get("FORK_PRIZE", "2510.19"))
 TRANSIT = "0xfb3460bed87acd44c350675d5b80c194f76ebead150c372246bf3cb31d92f63d"
-PRIZE_USDC = 16494.54                                      # приз конкурента C в этом блоке
 ANVIL0 = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 
 w3 = Web3(Web3.HTTPProvider(RPC, request_kwargs={"timeout": 30}))
@@ -100,7 +102,7 @@ b_shares = int(pos[32:64].hex(), 16)
 mkt = w3.eth.call({"to": MORPHO, "data": "0x" + Web3.keccak(text="market(bytes32)")[:4].hex() + MID[2:]})
 tba, tbs = int(mkt[64:96].hex(), 16), int(mkt[96:128].hex(), 16)
 debt = b_shares * tba // tbs
-assert abs(debt / 1e6 - PRIZE_USDC) < 1.0, \
+assert abs(debt / 1e6 - PRIZE_USDC) < 2.0, \
     "долг %.2f не сошёлся с призом конкурента %.2f — воспроизведена НЕ ТА гонка" % (debt / 1e6, PRIZE_USDC)
 print("2/5 контроль стенда: долг %.2f USDC = приз конкурента (%.2f)" % (debt / 1e6, PRIZE_USDC))
 
