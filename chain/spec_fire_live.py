@@ -194,6 +194,11 @@ SPEC_FIRE_V2_REARM_SEC = float(os.environ.get("SPEC_FIRE_V2_REARM_SEC", "240"))
 # ОДНОГО setPlan при каденсе переарма 240с оставляла окно короче ретрая вовсе без доски: движок
 # выглядит здоровым, проб ноль. Поэтому неудача переспрашивается БЫСТРО, а не через каденс.
 SPEC_FIRE_V2_ARM_RETRY_SEC = float(os.environ.get("SPEC_FIRE_V2_ARM_RETRY_SEC", "5"))
+# Право огня движку по подтверждённому транзиту вне зависимости от порога огня (#47+#41).
+SPEC_FIRE_HANDOFF_KEEPALIVE = os.environ.get(
+    "SPEC_FIRE_HANDOFF_KEEPALIVE", "1").lower() not in ("0", "false", "no")
+# Как часто переиздавать отметку probe_board, пока план жив (потребители гейтят 10с).
+SPEC_FIRE_BOARD_RESTAMP_SEC = float(os.environ.get("SPEC_FIRE_BOARD_RESTAMP_SEC", "4"))
 # #49: предел доверия к `updatedAt` оракула. Больше — часы разъехались (или апдейт из
 # прошлого), метка встаёт на время детекта, и это видно счётчиком lattice_skew_bad.
 SPEC_FIRE_LATTICE_MAX_SKEW_SEC = float(os.environ.get("SPEC_FIRE_LATTICE_MAX_SKEW_SEC", "120"))
@@ -1238,7 +1243,13 @@ class SpecFireLive:
                     # Стреляем вне очереди: без ret-гейта, без интервала, без арбитра (B).
                     # Тот же send-шов (send_spec_fire_probe, единый nonce) — fire-путь не менялся.
                     _pm, _pb, _pd = pf[0], pf[1], pf[2]
-                    if fat_mode:
+                    # ПОДТВЕРЖДЁННЫЙ ТРАНЗИТ — сильнейший сигнал, какой мы умеем видеть, и он
+                    # приходит В ТОМ ЧИСЛЕ в окна НИЖЕ порога огня (класс cbXRP: оракул -0.50%
+                    # при нашем ret -0.43%) — ровно те, ради которых делался #47. Раньше право
+                    # огня здесь висело на fat_mode, который выставляется только в горячей
+                    # ветке: детект открыли, а флот в этом блоке оставался нем структурно
+                    # (ревью 09.08, CONFIRMED). Откат: SPEC_FIRE_HANDOFF_KEEPALIVE=0.
+                    if fat_mode or SPEC_FIRE_HANDOFF_KEEPALIVE:
                         self._engine_fat_keepalive(feed)   # право огня ДО сборки/отправки пробы
                     try:
                         probe, _bts = cache.get((_pm, _pb), (None, 0.0))
@@ -1294,6 +1305,14 @@ class SpecFireLive:
                 was_raw_hot = raw_hot
                 self._owed[feed] = owed_until if SPEC_FIRE_PEAK_OWED else 0.0
                 hot = raw_hot or owed_fire
+                _pbd = self.probe_board.get(feed)
+                if (_pbd is not None and _n - _pbd[5] > SPEC_FIRE_BOARD_RESTAMP_SEC
+                        and self._board_plan_live() is not None):
+                    # Потребители (tier-2, ws-handoff) гейтят ВОЗРАСТ доски 10с, а переиздать её
+                    # прогрев может не раньше 240с и не может вовсе, пока план армлен под ту же
+                    # цель (TTL 870с) — фикс #47 жил ~4% окна (ревью 09.08, CONFIRMED). Пока план
+                    # ЖИВ on-chain, проба валидна: обновляем ОТМЕТКУ, без RPC и без пересборки.
+                    self.probe_board[feed] = _pbd[:5] + (_n,)
                 if SPEC_FIRE_V2_BOARD and _n >= self._board_next_try.get(feed, next_board_try):
                     # доску армим ЗАРАНЕЕ и переармливаем по каденсу (роут протухает так же,
                     # как у обычной пробы). Свой тред: сборка плана не крадёт мс у огня.
@@ -1444,6 +1463,12 @@ class SpecFireLive:
             self._owed.pop(feed, None)   # окно закрыто — долг не переживает петлю
             self._prio.pop(feed, None)   # заявка на слот снята (пакет B)
             self.probe_board.pop(feed, None)
+            # РЕГРЕССИЯ #57 (ревью 09.08, CONFIRMED): расписание арма переехало в словарь
+            # ИНСТАНСА и переживало закрытие окна — окна 2..N того же фида в пределах 240с не
+            # грелись ВОВСЕ (ни доски, ни probe_board), то есть детект-пути выбрасывали уже
+            # пойманный транзит. В каскаде каждый пуш ре-якорит фид, и это ровно окна 2..N.
+            # Лишних setPlan это не создаёт: дедуп «свежая и та же цель» стоит в _arm_board.
+            self._board_next_try.pop(feed, None)
             _g = sorted(gaps)
             # close-строка: B3-метрика (gap p95 горячей фазы) + кумулятивные счётчики (C5:
             # owed_probes/sticky_windows/pending_fires видны grep'ом без маркеров)
