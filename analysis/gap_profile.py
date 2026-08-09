@@ -37,6 +37,7 @@ def main():
     from chain.rpc import BaseRpc
     from chain.feeds import _resolve_one
     from strategy.scanner import load_covered_markets
+    from analysis.units import usd_of, fmt_skipped
 
     cfg = Config.from_env()
     if not cfg.rpc_url:
@@ -77,6 +78,7 @@ def main():
         sys.exit("Morpho API tx-hash поле не найдено")
 
     winners, skip = [], 0
+    skipped_n, skipped_tok = 0, {}   # #30: строки вне долларового счёта
     while skip <= 4000:
         d = gql(field, skip)
         if d.get("errors"):
@@ -95,7 +97,15 @@ def main():
             liq = (dd.get("liquidator") or "").lower()
             if liq in ours:
                 continue
-            repaid = int(dd.get("repaidAssets") or 0) / 10 ** int(la.get("decimals") or 18)
+            # #30: токен — НЕ доллар. Прежде здесь делили на decimals и тут же сравнивали с
+            # порогом В ДОЛЛАРАХ: для USDC совпадало случайно, для любого другого loan-токена
+            # ошибка на порядки (0.197 WETH читались как «$0.197» вместо ~$670).
+            repaid, _tok = usd_of(dd.get("repaidAssets"), la.get("symbol"), la.get("decimals"))
+            if repaid is None:
+                skipped_n += 1
+                skipped_tok[(la.get("symbol") or "?").upper()] = \
+                    skipped_tok.get((la.get("symbol") or "?").upper(), 0.0) + _tok
+                continue
             if repaid < MIN_REPAID_USD:
                 continue
             winners.append({"txh": it.get(field), "mid": mid, "liq": liq, "repaid": repaid,
@@ -103,6 +113,9 @@ def main():
         if stop:
             break
         skip += 100
+    _sk = fmt_skipped(skipped_n, skipped_tok)
+    if _sk:
+        print(_sk)      # #30: молча приравнивать токены к долларам больше нельзя
     winners.sort(key=lambda x: -x["repaid"])
     sample = winners[:MAX_WINNERS]
     print(f"==== GAP-профиль: {len(sample)}/{len(winners)} ликвидаций (top по $, {DAYS:.0f}д) ====")
