@@ -1,0 +1,283 @@
+"""Канарейка выходов НА КРОНЕ: порог = LIF конкретного рынка, адресат = агент (#72).
+
+Зачем регулярно. Роут — не константа, а срез чужой ликвидности: cbXRP протух за недели
+(269x мимо), cbDOGE стоял РОВНО НА КРАЮ обрыва (impact 43.5% при бонусе 12.7%). Оба раза
+мы узнавали об этом от реверта в бою либо от ручной проверки одной пары. Замер стоит
+десятка read-only квот на публичном узле, поэтому дешевле держать его на расписании, чем
+ждать следующего молчаливого промаха.
+
+ПОРОГ. «10% на все маршруты» — не порог, а цифра: у cbBTC/USDC весь бонус 4.38% (10% =
+гарантированный минус задолго до тревоги), у cbDOGE/USDC бонус 12.68% (10% = тревога на
+здоровом маршруте). Порог берём из covered_markets.json — это LIF рынка (bonus = LIF-1),
+то есть ровно та величина, которую выход обязан не съесть. Пар, которых в файле нет
+(WETH/USDC), касается дефолт 10%.
+Пара с НЕСКОЛЬКИМИ рынками (wstETH/WETH, cbADA/USDC, LBTC/cbBTC) берёт МИНИМАЛЬНЫЙ бонус:
+маршрут один на всех, а связывающий предел — самый тесный рынок.
+
+ЧЕГО ЭТА КАНАРЕЙКА НЕ ГОВОРИТ (граница, не чинить её видимостью покрытия):
+  * impact считается против МАЛОГО референса (1% рабочего объёма), то есть это форма
+    кривой пула, а не абсолютная цена выхода. Оракульная цена тут не участвует вовсе.
+  * порог сверяется со СТАТИЧЕСКИМ max_in. Живой кап (ROUTE_LIVE_CAP) может увести
+    боевой размер и вверх, и вниз — см. задачу #75.
+  * «НЕ ОПРОШЕН» ничего не утверждает о маршруте: это лимит узла. Он не алертит, он
+    вызывает повторный проход. Но полная слепота (ни одного опрошенного маршрута) — это
+    уже отказ самого сторожа, и он ОБЯЗАН быть слышен: мёртвый сторож хуже отсутствующего.
+
+Адресат — инбокс агента (hil=False): протухший роут чинит агент (пересчёт капа, смена
+венью), человеку тут решать нечего, пока дело не упрётся в подпись/капитал.
+
+    python3 -m analysis.route_canary_watch          # прогон (крон)
+    ROUTE_CANARY_MARGIN=0.5 …                       # тревожить на половине бонуса
+"""
+import hashlib
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from analysis import route_canary as rc  # noqa: E402
+
+DEFAULT_PCT = 10.0                 # пар нет в covered_markets.json -> прежний общий порог
+WATCH_DIR = os.path.expanduser("~/.fleet-watch")
+SOURCE = "route-canary"
+
+# Хвост имени венью в константах chain.execute: _UNIV3_USDC — это USDC, а не отдельный токен.
+_VENUE_PREFIXES = ("UNIV3_", "AERO_", "SLIP_")
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def load_markets(path=None):
+    """covered_markets.json — список рынков с bonus (=LIF-1). Отсутствие файла НЕ фатально:
+    порог просто становится дефолтным, а канарейка обязана продолжать мерить."""
+    path = path or os.path.join(rc._repo_root(), "covered_markets.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def norm_name(name):
+    """Имя константы chain.execute -> символ токена в нижнем регистре ('_UNIV3_USDC' -> 'usdc')."""
+    n = str(name).lstrip("_")
+    for p in _VENUE_PREFIXES:
+        if n.startswith(p):
+            n = n[len(p):]
+    return n.lower()
+
+
+def token_symbols(module=None, markets=None):
+    """Карта адрес -> символ рынка. Адреса токенов лежат в chain.execute ИМЕНОВАННЫМИ
+    константами (_CBBTC, _UNIV3_USDC …); сверяем их с символами covered_markets.json
+    без регистра. Спрашивать symbol() у узла не нужно: лишние RPC на том же лимите,
+    из-за которого мы и так получаем «НЕ ОПРОШЕН».
+
+    Имена берём только ЗАГЛАВНЫЕ с ведущим подчёркиванием — иначе в карту попадает
+    случайная переменная цикла (`_coll` в chain/execute.py указывает на cbXRP)."""
+    if module is None:
+        _, module = rc.routes()
+    known = {}
+    for m in (markets if markets is not None else load_markets()):
+        for k in ("collateral_token", "loan_token"):
+            s = m.get(k)
+            if s:
+                known[str(s).lower()] = str(s)
+    out = {}
+    for name, val in vars(module).items():
+        if not (isinstance(name, str) and name.startswith("_") and name[1:].isupper()):
+            continue
+        if not (isinstance(val, str) and val.startswith("0x") and len(val) == 42):
+            continue
+        sym = known.get(norm_name(name))
+        if sym:
+            out[val.lower()] = sym       # совпало с рынком — это и есть символ
+        else:
+            out.setdefault(val.lower(), norm_name(name).upper())
+    return out
+
+
+def threshold_for(coll_sym, loan_sym, markets, default_pct=DEFAULT_PCT, margin=1.0):
+    """Порог impact в процентах + откуда он взят.
+
+    Порог = бонус ликвидации (LIF-1) самого тесного рынка этой пары × margin. Выход,
+    съедающий бонус целиком, делает ликвидацию убыточной ПО ПОСТРОЕНИЮ — газ и
+    заложенный slippage сверху.
+    """
+    if coll_sym and loan_sym:
+        hits = [m for m in markets
+                if str(m.get("collateral_token", "")).lower() == str(coll_sym).lower()
+                and str(m.get("loan_token", "")).lower() == str(loan_sym).lower()]
+        bonuses = [float(m["bonus"]) for m in hits if isinstance(m.get("bonus"), (int, float))]
+        if bonuses:
+            pct = min(bonuses) * 100.0 * margin
+            src = "LIF %s/%s (рынков %d, бонус %.2f%%)" % (
+                coll_sym, loan_sym, len(hits), min(bonuses) * 100.0)
+            return pct, src
+    return default_pct * margin, "дефолт %.0f%% (пары нет в covered_markets)" % default_pct
+
+
+def thresholds_for_rows(rows, markets=None, symbols=None, default_pct=DEFAULT_PCT, margin=1.0):
+    """(coll, loan) -> (порог, откуда) для готовых строк замера."""
+    markets = load_markets() if markets is None else markets
+    symbols = token_symbols(markets=markets) if symbols is None else symbols
+    out = {}
+    for r in rows:
+        cs = symbols.get(r["coll"].lower())
+        ls = symbols.get(r["loan"].lower())
+        out[(r["coll"], r["loan"])] = threshold_for(cs, ls, markets, default_pct, margin)
+    return out
+
+
+def evaluate(rows, thresholds, symbols=None):
+    """Проблемные маршруты. НЕ ОПРОШЕН сюда не попадает НИКОГДА — это лимит узла."""
+    symbols = symbols or {}
+    probs = []
+    for r in rows:
+        th, src = thresholds.get((r["coll"], r["loan"]), (DEFAULT_PCT, "дефолт"))
+        name = "%s→%s" % (symbols.get(r["coll"].lower(), r["coll"][:10]),
+                          symbols.get(r["loan"].lower(), r["loan"][:10]))
+        if r["status"] == rc.DEAD:
+            probs.append({"kind": "dead", "name": name, "row": r,
+                          "th": th, "src": src,
+                          "text": "%s %s МЁРТВ: %s" % (name, r["router"], r["err"])})
+        elif r["status"] == rc.ALIVE and r["impact"] >= th:
+            probs.append({"kind": "deep", "name": name, "row": r,
+                          "th": th, "src": src,
+                          "text": "%s %s impact %.2f%% ≥ порога %.2f%% [%s], "
+                                  "max_in=%s (ед. token_in)" % (
+                              name, r["router"], r["impact"], th, src,
+                              r["cap"] if r["cap"] is not None else "нет")})
+    return probs
+
+
+def fingerprint(probs, blind=False):
+    """Отпечаток СОСТОЯНИЯ (какие маршруты и чем плохи), без числового шума: тревога по
+    осциллирующей величине обязана звонить на смену состояния, а не на каждый тик."""
+    key = ";".join(sorted("%s:%s" % (p["name"], p["kind"]) for p in probs))
+    if blind:
+        key = "blind|" + key
+    return hashlib.sha1(key.encode()).hexdigest()[:8] if key else "-"
+
+
+def format_alert(probs, rows, blind=False):
+    n = len(rows)
+    unpolled = [r for r in rows if r["status"] == rc.UNPOLLED]
+    if blind:
+        head = ("КАНАРЕЙКА ОСЛЕПЛА: ни один из %d маршрутов не опрошен за все проходы. "
+                "Это отказ сторожа, а не деградация роутов — проверить узел %s."
+                % (n, rc.RPC))
+        return head
+    head = "выходы: %d маршрут(ов) из %d под тревогой" % (len(probs), n)
+    lines = [head] + ["  " + p["text"] for p in probs]
+    if unpolled:
+        lines.append("  не опрошено (лимит узла, НЕ деградация): %d" % len(unpolled))
+    lines.append("  замер: analysis/route_canary_watch.py, лог %s/route-canary.log"
+                 % WATCH_DIR)
+    return "\n".join(lines)
+
+
+def _fleet_notify():
+    """Канал тревоги. Недоступный канал — сам по себе отказ: возвращаем None, вызывающий
+    обязан крикнуть в лог (тишина неотличима от «всё спокойно»)."""
+    sys.path.insert(0, WATCH_DIR)
+    try:
+        from notify import notify  # noqa: PLC0415
+        return notify
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def run(*, passes=None, repass_sleep=None, call=None, notify_fn=None, markets=None,
+        module=None, items=None, out=print, sleep=time.sleep, default_pct=DEFAULT_PCT,
+        margin=None, dedup_sec=None, **kw):
+    """Полный цикл: замер -> повторные проходы по неопрошенным -> порог -> алерт -> лог.
+
+    Возвращает сводку (dict) — тестам и вызывающему; печать идёт через `out`.
+    """
+    passes = int(_env_float("ROUTE_CANARY_PASSES", 3) if passes is None else passes)
+    repass_sleep = (_env_float("ROUTE_CANARY_REPASS_SEC", 20.0)
+                    if repass_sleep is None else repass_sleep)
+    margin = _env_float("ROUTE_CANARY_MARGIN", 1.0) if margin is None else margin
+    dedup_sec = _env_float("ROUTE_CANARY_DEDUP_SEC", 86400) if dedup_sec is None else dedup_sec
+
+    if items is None:
+        items, module = rc.routes(module)
+    by_key = {k: (k, r) for k, r in items}
+    rows = rc.scan(items, module=module, call=call, **kw)
+    used = 1
+    while used < passes:
+        pending = [by_key[(r["coll"], r["loan"])] for r in rows
+                   if r["status"] == rc.UNPOLLED and (r["coll"], r["loan"]) in by_key]
+        if not pending:
+            break
+        sleep(repass_sleep)
+        used += 1
+        fresh = {(r["coll"], r["loan"]): r for r in
+                 rc.scan(pending, module=module, call=call, **kw)}
+        rows = [fresh.get((r["coll"], r["loan"]), r) for r in rows]
+
+    markets = load_markets() if markets is None else markets
+    symbols = token_symbols(module=module, markets=markets)
+    th = thresholds_for_rows(rows, markets=markets, symbols=symbols,
+                             default_pct=default_pct, margin=margin)
+    probs = evaluate(rows, th, symbols)
+    polled = sum(1 for r in rows if r["status"] != rc.UNPOLLED)
+    blind = bool(rows) and polled == 0
+
+    rc.render(rows, th, out=out)
+    fp = fingerprint(probs, blind)
+    verdict = "inbox" if (probs or blind) else "нет"
+    if probs or blind:
+        notify_fn = notify_fn or _fleet_notify()
+        text = format_alert(probs, rows, blind)
+        if notify_fn is None:
+            verdict = "КАНАЛ НЕДОСТУПЕН"
+            out("route-canary: КАНАЛ ТРЕВОГИ НЕДОСТУПЕН (~/.fleet-watch/notify.py), текст ниже")
+            out(text)
+        else:
+            verdict = notify_fn(text, source=SOURCE, hil=False,
+                                key="route-canary:" + fp, dedup_sec=dedup_sec)
+    summary = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "passes": used, "routes": len(rows),
+        "alive": sum(1 for r in rows if r["status"] == rc.ALIVE),
+        "dead": sum(1 for r in rows if r["status"] == rc.DEAD),
+        "unpolled": len(rows) - polled,
+        "problems": len(probs), "blind": blind, "fp": fp, "alert": verdict,
+        "rows": rows, "thresholds": th,
+    }
+    out("%s route-canary: проходов=%d маршрутов=%d жив=%d мёртв=%d не_опрошен=%d "
+        "проблем=%d слепота=%s alert=%s fp=%s"
+        % (summary["ts"], used, summary["routes"], summary["alive"], summary["dead"],
+           summary["unpolled"], summary["problems"], "да" if blind else "нет",
+           verdict, fp))
+    return summary
+
+
+def main():
+    try:
+        s = run()
+    except Exception as e:  # noqa: BLE001 — падение самой канарейки обязано быть слышно
+        import traceback
+        traceback.print_exc()
+        n = _fleet_notify()
+        msg = "канарейка выходов УПАЛА: %s: %s" % (type(e).__name__, e)
+        if n:
+            n(msg, source=SOURCE, hil=False, key="route-canary:crash", dedup_sec=21600)
+        print("%s route-canary: ОШИБКА %s"
+              % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg))
+        return 2
+    return 1 if (s["problems"] or s["blind"]) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
