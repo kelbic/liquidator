@@ -655,13 +655,26 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
             try:
                 from chain.pricefeed import PriceFeed
                 from chain.predict import PredictEngine, PredictDriver, resolve_feed_proxies, make_poll_fn
-                _bg = rpc                       # predict-полл агрегаторов = фоновое чтение (CU 25.07)
+                # predict-полл агрегаторов = фоновое чтение (CU 25.07). #33 (09.08): у полла
+                # СВОЯ ручка, потому что деление bg-ключа с прочими фоновыми потребителями
+                # замерено как потеря оси предвидения: за сутки 226 отказов 429, из них 127 с
+                # экспоненциальным backoff — 1725с ≈ 29 МИНУТ слепоты, и слепнет именно тот
+                # слой, который даёт нам упреждение (реакция гонки не берёт). Пустая
+                # PREDICT_RPC_URL = прежнее поведение (bg-ключ), то есть откат мгновенный.
+                _bg, _src = rpc, "боевой"
                 try:
-                    _bgu = str(getattr(cfg, "bg_rpc_url", "") or "")
-                    if _bgu and _bgu != cfg.rpc_url:
-                        _bg = BaseRpc(_bgu, cfg.chain_id, request_timeout=10)
+                    from chain.predict import pick_poll_endpoint
+                    _url, _src = pick_poll_endpoint(
+                        os.environ.get("PREDICT_RPC_URL", ""),
+                        str(getattr(cfg, "bg_rpc_url", "") or ""), cfg.rpc_url)
+                    if _url:
+                        _bg = BaseRpc(_url, cfg.chain_id, request_timeout=10)
                 except Exception:
-                    _bg = rpc
+                    _bg, _src = rpc, "боевой"
+                # КАТЕГОРИЯ, а не URL: в URL живёт ключ, и однажды он уже уехал в журнал
+                # через str(e) сетевого слоя. Знать, на чьём ключе сидит полл, надо — но по
+                # имени источника, не по адресу.
+                log.warning("predict-полл: узел=%s (429 на этом узле = слепота предвидения)", _src)
                 proxies = resolve_feed_proxies(rpc, markets)
                 if not proxies:
                     # #50: раньше это был RETURN НАВСЕГДА — при RPC-шторме на буте слой не

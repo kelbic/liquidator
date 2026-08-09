@@ -98,6 +98,27 @@ def resolve_feed_proxies(rpc, markets) -> dict:
     return out
 
 
+def pick_poll_endpoint(predict_url: str, bg_url: str, combat_url: str):
+    """(url|None, источник) — на чьём узле сидит полл агрегаторов (#33).
+
+    Приоритет: своя ручка -> bg -> боевой. Возврат None означает «отдельного клиента не
+    создаём, берём боевой rpc» — это ФОЛБЭК, а не выбор: полл на боевом ключе жжёт квоту
+    горячего пути. Совпадение с боевым URL считается боевым независимо от того, из какой
+    ручки он приехал, иначе «bg» в журнале врал бы про источник.
+
+    Замер, ради которого ручка появилась (Шарлотта, сутки 08-09.08): полл делил bg-ключ с
+    прочими фоновыми потребителями и получал 226 отказов 429, из них 127 с экспоненциальным
+    backoff — 1725с ≈ 29 минут в сутки, когда слой упреждения НЕ СМОТРИТ на агрегаторы."""
+    _c = (combat_url or "").strip()
+    for url, src in ((predict_url, "свой"), (bg_url, "bg")):
+        u = (url or "").strip()
+        if u and u != _c:
+            return (u, src)
+        if u and u == _c:
+            return (None, "боевой")           # ручка задана, но указывает в боевой ключ
+    return (None, "боевой")
+
+
 def make_poll_fn(rpc, proxies: dict):
     """poll_fn() -> {symbol: (updatedAt, price_float)} — ОДИН aggregate3 latestRoundData по всем
     прокси (лёгкий, каждые poll_interval сек на Alchemy). Ошибку транспорта бросает — driver._poll
