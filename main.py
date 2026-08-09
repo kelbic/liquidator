@@ -670,13 +670,16 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     log.warning("predict-shadow: прокси не разрезолвились — повтор через %.0fс",
                                 _PREDICT_RETRY_SEC)
                     return "retry"
-                _expected = len(markets or {}) or None
-                if _expected and len(proxies) < _expected:
-                    # частичный резолв — слой стартует «живым» с УРЕЗАННЫМ покрытием фидов,
-                    # и PendingDetect наследует тот же урезанный список. Молчать нельзя.
-                    log.error("predict-shadow: резолв ЧАСТИЧЕН — %d фидов из %d ожидаемых "
-                              "(покрытие урезано, детект наследует тот же список)",
-                              len(proxies), _expected)
+                # ЗНАМЕНАТЕЛЬ — ФИДЫ, А НЕ РЫНКИ (мой ложный алерт 09.08: «7 из 41», где 41 —
+                # число рынков; десятки рынков делят один фид, а у стабл-пар его нет вовсе —
+                # тот же класс «не тот объект в знаменателе», что уже стоил разбора).
+                # Сравнивать честно можно только с ПРЕДЫДУЩИМ успешным резолвом этого процесса:
+                # просадка покрытия = деградация, а первый резолв — просто факт.
+                _prev = _predict_feeds_seen.get("n")
+                if _prev is not None and len(proxies) < _prev:
+                    log.error("predict-shadow: покрытие фидов ПРОСЕЛО %d -> %d "
+                              "(детект наследует урезанный список)", _prev, len(proxies))
+                _predict_feeds_seen["n"] = max(_prev or 0, len(proxies))
                 engine = PredictEngine()
                 pf = PriceFeed(symbols=list(proxies), log=lambda m: log.info("%s", m))
                 pf.start()
@@ -935,6 +938,7 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
             await asyncio.sleep(3)
 
 
+_predict_feeds_seen: dict = {}          # максимум покрытия фидов, виденный процессом
 _PREDICT_RETRY_SEC = float(os.environ.get("PREDICT_RETRY_SEC", "30"))
 _PREDICT_RETRY_MAX_SEC = float(os.environ.get("PREDICT_RETRY_MAX_SEC", "300"))
 
