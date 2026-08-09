@@ -44,9 +44,23 @@ class _Rpc:
         return _W3
 
 
+
 def _fake_aggregate3(rpc, calls, chunk=500, block_identifier=None):
+    """Заглушка ТРАНСПОРТА, повторяющая РАСПАКОВКУ настоящего aggregate3.
+
+    Урок 09.08 (повтор канона seam-stubbed-above-the-defect): прежняя заглушка принимала ЛЮБЫЕ
+    кортежи, и мой дефект — volley_bal_warm_fleet кормил тремя элементами при ожидаемых двух —
+    жил за зелёным тестом, а в бою прогрев падал ValueError на КАЖДОМ вызове и весь флот немел
+    через MAX_AGE. web3 на этой машине не установлен, исполнить настоящую функцию нельзя,
+    поэтому: (1) распаковываем ровно как она, (2) ниже стоит структурная привязка к её коду.
+    """
     rpc.multicalls += 1
-    return [(True, FUNDED.to_bytes(32, "big")) for _ in calls]
+    out = []
+    for (t, cd) in calls:                      # ТА ЖЕ форма, что в chain/multicall.py
+        assert isinstance(cd, (bytes, bytearray)) and len(cd) == 36, \
+            "calldata getEthBalance должна быть 4+32 байта, а не %r" % (len(cd) if cd else None)
+        out.append((True, FUNDED.to_bytes(32, "big")))
+    return out
 
 
 def seed_fleet(age_sec):
@@ -136,5 +150,12 @@ finally:
     with ex._INFLIGHT_LOCK:
         ex._VOLLEY_BAL_REFRESHING.clear()
         ex._VOLLEY_MAXFEE_MUTE.clear()
+
+_mc_src = pathlib.Path("chain/multicall.py").read_text()
+_agg = _mc_src[_mc_src.index("def aggregate3"):_mc_src.index("def batch_positions")]
+assert "for (t, cd) in calls[" in _agg, \
+    "aggregate3 сменил форму вызова — заглушка теста больше не повторяет настоящую распаковку"
+assert "(Web3.to_checksum_address(t), True, cd)" in _agg, \
+    "aggregate3 больше не ставит allowFailure сам — проверить volley_bal_warm_fleet"
 
 print("OK: после недели штиля все 110 ног стреляют, прогрев — один мультиколл, шторма нет")

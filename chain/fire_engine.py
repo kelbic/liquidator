@@ -301,11 +301,18 @@ class FireEngine:
                 # между fat-окнами (недели) кэш стареет, и на старте окна fail-closed гейт
                 # заглушил бы ВЕСЬ флот разом. Освежаем фоном и ОДНИМ вызовом на весь флот —
                 # пер-ноговое чтение стоило бы ~7 запросов/с круглосуточно в боевой ключ.
+            except Exception as e:
+                if self._log:
+                    self._log("FIRE пополнение склада: %s" % type(e).__name__)
+            try:
+                # СВОЙ try: прогрев патрона не должен отменяться осечкой пополнения склада
+                # (одна нога с 429 оставляла бы весь флот без свежего патрона до следующего
+                # круга — а через MAX_AGE это немота всего флота)
                 if self._fleet_warm_fn is not None and (
                         self._now() - self._warm_ts) >= ENGINE_WARM_SEC:
                     self._warm_ts = self._now()
                     self._fleet_warm_fn(self._legs_fn() or [])
             except Exception as e:
                 if self._log:
-                    self._log("FIRE пополнение склада: %s" % type(e).__name__)
+                    self._log("FIRE прогрев патрона: %s" % type(e).__name__)
             self._sleep(ENGINE_REFILL_POLL_SEC)

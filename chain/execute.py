@@ -596,7 +596,9 @@ def volley_bal_warm_fleet(rpc, addrs, log=None) -> int:
         return 0
     try:
         from chain.multicall import aggregate3
-        calls = [(_MC3, True, bytes.fromhex(_MC3_GETBAL_SEL[2:]) + bytes(12) +
+        # aggregate3 принимает (target, calldata) и сам ставит allowFailure — трёхкортежи
+        # роняли его ValueError'ом НА КАЖДОМ вызове (мой дефект 09.08, поймало ревью)
+        calls = [(_MC3, bytes.fromhex(_MC3_GETBAL_SEL[2:]) + bytes(12) +
                   bytes.fromhex(str(a)[2:])) for a in addrs]
         res = aggregate3(rpc, calls)
     except Exception as e:
