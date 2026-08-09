@@ -193,10 +193,15 @@ def _fl_record(is_fast: bool, status, threshold: int, log=None, xray=None):
     global _FL_CONSEC_REVERTS, _FL_DISABLED, _FL_TRIP_MSG
     if not is_fast or status is None:
         return
-    if status != 1 and xray == "race":
+    if status != 1 and xray in ("race", "self-win"):
+        # #44: self-win — жертву взял НАШ ЖЕ тракт (проба доски/движка/ноги). Для брейкера это
+        # тот же класс «не шторм», но называем вещи своими именами: иначе собственная победа
+        # копится как проигранная гонка.
         if log:
-            log.info("II.6 breaker: реверт = проигранная гонка (xray нашёл победителя) — "
-                     "серия не растёт (%d/%d)", _FL_CONSEC_REVERTS, threshold)
+            log.info("II.6 breaker: реверт = %s — серия не растёт (%d/%d)",
+                     "НАША победа (взял свой же тракт)" if xray == "self-win"
+                     else "проигранная гонка (xray нашёл победителя)",
+                     _FL_CONSEC_REVERTS, threshold)
         return
     with _INFLIGHT_LOCK:
         if status == 1:
@@ -377,6 +382,46 @@ def _specfire_roll_day_locked():
     if d != _SPECFIRE_DAY:
         _SPECFIRE_DAY = d
         _SPECFIRE_GAS_USD = 0.0
+
+
+def _is_ours(waddr: str, wto: str, cfg=None) -> bool:
+    """Победитель — это МЫ? Сверяем и получателя (наш контракт-ликвидатор), и отправителя
+    (главный кошелёк или любая нога флота). Тихо False при любой неопределённости."""
+    try:
+        _mine = set()
+        for a in (getattr(cfg, "liquidator_address", None), getattr(cfg, "wallet_address", None)):
+            if a:
+                _mine.add(str(a).lower())
+        try:
+            for a, _k in volley_accounts():
+                _mine.add(str(a).lower())
+        except Exception:
+            pass
+        return str(waddr).lower() in _mine or str(wto).lower() in _mine
+    except Exception:
+        return False
+
+
+def probe_budget_total() -> float:
+    """Сумма бакетов ПРОБНЫХ слоёв ($ в сутки). Нужна для перекрёстной проверки на старте."""
+    return float(_SPECFIRE_MAX_GAS_USD) + float(CASCADE_TIER_GAS_USD)
+
+
+def check_gas_budget_sane(max_daily_gas_usd: float, log=None) -> bool:
+    """#53: дневной кап kill-switch обязан ПЕРЕКРЫВАТЬ санкционированный расход проб.
+
+    Дефолты разъехались (кап $100 против $40+$150), и выпадение MAX_DAILY_GAS_USD из .env
+    превращало САНКЦИОНИРОВАННЫЙ расход тира в остановку ВСЕГО боевого огня посреди каскада.
+    Правим не значение, а отсутствие сверки: несогласованность обязана быть громкой на старте,
+    когда её ещё можно исправить, а не в каскаде, когда уже поздно."""
+    need = probe_budget_total()
+    ok = float(max_daily_gas_usd or 0.0) > need
+    if not ok and log:
+        log.error("КОНФИГ: дневной газ-кап $%.0f НЕ перекрывает бакеты проб $%.0f "
+                  "(спек $%.0f + тир $%.0f) — расход проб остановит БОЕВОЙ огонь. "
+                  "Подними MAX_DAILY_GAS_USD либо опусти SPEC_FIRE_MAX_GAS_USD/CASCADE_TIER_GAS_USD",
+                  float(max_daily_gas_usd or 0.0), need, _SPECFIRE_MAX_GAS_USD, CASCADE_TIER_GAS_USD)
+    return ok
 
 
 def specfire_stats():
@@ -2231,6 +2276,11 @@ def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4, cfg=No
         try:                                            # обогащение: кто и с каким tip (2 RPC, реверты редки)
             tx = w3.eth.get_transaction(wtx)
             waddr, wto = str(tx.get("from") or "?"), str(tx.get("to") or "?")
+            # #44: победителем может быть НАШ СОБСТВЕННЫЙ тракт — проба доски/движка/ноги берёт
+            # жертву раньше боевой tx. Без тега такая строка уходит в эмпирическую tip-функцию
+            # конкурентов и в счётчик оспоренных гонок как ЧУЖАЯ победа, то есть наша победа
+            # засчитывается нам же в поражение.
+            _self = _is_ours(waddr, wto, cfg)
             tip = tx.get("maxPriorityFeePerGas")
             if tip is None:                             # legacy-tx: tip = gasPrice - baseFee блока
                 bf = int(w3.eth.get_block(wblk).get("baseFeePerGas") or 0)
@@ -2241,16 +2291,19 @@ def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4, cfg=No
         blk_off = (int(block_number) - int(wblk)) if isinstance(wblk, int) else "?"
         if log:
             log.info("submit-xray: победитель blk=%s idx=%s (наш blk=%s idx=%s, отстали блоков=%s) "
-                     "tx=%s | race-winner addr=%s to=%s tip_gwei=%s",
-                     wblk, widx, block_number, our_index, blk_off, wtx_hex, waddr, wto, tip_s)
-        if cfg is not None and tip_s != "?":            # tip победителя > нашего -> взвести каскад
+                     "tx=%s | %s addr=%s to=%s tip_gwei=%s",
+                     wblk, widx, block_number, our_index, blk_off, wtx_hex,
+                     "self-win" if _self else "race-winner", waddr, wto, tip_s)
+        if cfg is not None and tip_s != "?" and not _self:   # своя победа каскад не эскалирует
             try:
                 from chain.hotpath import dynamic_tip_gwei, note_race_loss_for_cascade
                 our_tip = dynamic_tip_gwei(cfg, our_debt_usd)
                 note_race_loss_for_cascade(float(tip_s), our_tip, log=log)
             except Exception:
                 pass
-        return "race"
+        # #44: своя победа — НЕ проигранная гонка. Для брейкера класс тот же (не шторм), но
+        # счётчик оспоренных гонок и tip-функция конкурентов обязаны её отличать.
+        return "self-win" if _self else "race"
     except Exception as e:
         if log:
             log.info("submit-xray fail: %s", type(e).__name__)

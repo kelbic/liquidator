@@ -75,8 +75,18 @@ assert not ex.fast_lane_disabled(), "таймаут и не-fast путь не �
 # --- 7. вердикты, которые обязан отдавать _submit_xray -----------------------------------
 # Проверяем СИГНАТУРУ контракта: без строк-вердиктов пункты выше проверяли бы фикцию.
 src = pathlib.Path("chain/execute.py").read_text()
-for v in ('return "race"', 'return "not-race"', 'return "unknown"'):
+for v in ('return "self-win" if _self else "race"', 'return "not-race"', 'return "unknown"'):
     assert v in src, "у _submit_xray нет ветки %s — брейкеру нечего передавать" % v
+
+# --- 8. #44: своя победа — отдельный вердикт, серию тоже не растит -----------------------
+# Победителем бывает НАШ тракт (проба доски/движка/ноги взяла жертву раньше боевой tx).
+# Для брейкера класс тот же «не шторм», но вердикт обязан отличаться: иначе наша победа
+# копится как проигранная гонка в счётчике оспоренных и в tip-функции конкурентов.
+reset()
+for _ in range(10):
+    ex._fl_record(True, 0, 3, xray="self-win")
+assert not ex.fast_lane_disabled() and ex._FL_CONSEC_REVERTS == 0, ex._FL_CONSEC_REVERTS
+reset()
 
 reset()
 print("OK: проигранная гонка не выключает fast-lane, настоящий шторм выключает")
