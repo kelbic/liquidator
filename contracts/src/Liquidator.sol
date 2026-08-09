@@ -118,6 +118,8 @@ contract Liquidator {
     event PlanCleared();
     /// @notice v5: plan consumed by a successful probe (borrower is public knowledge by then).
     event PlanExecuted(address indexed borrower, uint256 profit);
+    /// @notice Плановая проба дошла до исполнения и ОТКАЗАЛА: 4 байта причины (#70).
+    event PlanFailed(bytes4 reason);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -229,7 +231,16 @@ contract Liquidator {
         ) returns (uint256 profit) {
             delete _plan;                         // one-shot: next volley leg is a 2-SLOAD no-op
             emit PlanExecuted(p.borrower, profit);
-        } catch {}                                // healthy / CannotRepay / raced: plan retained
+        } catch (bytes memory reason) {
+            // #70 (09.08): МОЛЧАЛИВЫЙ ОТКАЗ БЫЛ ХУЖЕ ОТКАЗА. Пустой catch делал неудачу
+            // неотличимой от холостой пробы: tx успешна, логов ноль, а газ сожжён на уровне
+            // настоящей ликвидации (замер на форке: 445-710k). В журнале бота это читалось
+            // как «проба ушла», и диагностировать было НЕЧЕМ.
+            // Утечка минимальна намеренно: только 4 байта селектора, без borrower — цель по
+            // этому событию не восстанавливается, а причина отказа читается. Эмитится ТОЛЬКО
+            // на неудаче: холостая проба по пустому плану сюда не заходит вовсе.
+            emit PlanFailed(bytes4(reason));
+        }
     }
 
     /// @notice Liquidate `borrower` on market `mp`, repaying `repaidShares` of debt, swapping the

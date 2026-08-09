@@ -134,9 +134,14 @@ LIQ_TOPIC = Web3.keccak(text="Liquidate(bytes32,address,address,uint256,uint256,
 fired = [lg for lg in rec["logs"] if lg["topics"] and lg["topics"][0] == LIQ_TOPIC]
 if not fired:
     print("   логов в квитанции: %d, газ %d" % (len(rec["logs"]), rec["gasUsed"]))
-    for lg in rec["logs"][:8]:
-        print("     from=%s topic0=%s" % (lg["address"][:12],
-                                          lg["topics"][0].hex()[:20] if lg["topics"] else "—"))
+    # #70: контракт теперь НАЗЫВАЕТ причину — читаем PlanFailed(bytes4)
+    PF = Web3.keccak(text="PlanFailed(bytes4)")
+    for lg in rec["logs"]:
+        t0 = lg["topics"][0] if lg["topics"] else b""
+        if t0 == PF:
+            print("   ПРИЧИНА ОТКАЗА (селектор): 0x%s" % lg["data"].hex()[:8])
+        else:
+            print("     from=%s topic0=%s" % (lg["address"][:12], t0.hex()[:20]))
 assert fired, "СОБЫТИЯ Liquidate НЕТ — план не сработал (газ %d)" % rec["gasUsed"]
 repaid = int(fired[0]["data"][:32].hex(), 16)
 print("4/5 ПРОБА СРАБОТАЛА: Liquidate, погашено %.2f USDC, газ %d" % (repaid / 1e6, rec["gasUsed"]))
