@@ -80,7 +80,10 @@ def _receipts(hs):
 
 results = []
 col = ReceiptCollector(receipts_fn=_receipts, on_result=lambda m, h, r: results.append((m, h)),
-                       poll_sec=0.01, timeout_sec=100.0, batch=200)
+                       poll_sec=0.01, timeout_sec=100.0, batch=200,
+                       # #66: зрелость выключена — здесь экзаменуется ПАРТИОННОСТЬ, а не
+                       # ожидание блока (боевой дефолт 2.0с проверяется отдельным тестом)
+                       min_age_sec=0.0)
 base_threads = threading.active_count()
 col.start()
 for i in range(500):
@@ -117,6 +120,7 @@ col2 = ReceiptCollector(receipts_fn=lambda hs: {h: {"status": 1} for h in hs},
                         on_timeout=lambda m, h: dropped2.append(h),
                         timeout_sec=60.0, now=clk.now, sleep=clk.sleep)
 col2.track("0xbb", ("0xEA", None))
+clk.t += 3.0                      # #66: квитанция не может прийти раньше блока — ждём зрелости
 col2.tick()
 assert done2 == ["0xbb"] and not dropped2
 print("UNIT_OK: нет квитанции != дроп — приговор только по таймауту")
@@ -124,7 +128,7 @@ print("UNIT_OK: нет квитанции != дроп — приговор то�
 # ---- 5. Обработчик-паникёр не роняет коллектор и не подвешивает очередь ----
 col3 = ReceiptCollector(receipts_fn=lambda hs: {h: {"status": 1} for h in hs},
                         on_result=lambda m, h, r: (_ for _ in ()).throw(RuntimeError("boom")),
-                        log=lambda s: None)
+                        log=lambda s: None, min_age_sec=0.0)
 col3.track("0xcc", ("0xEA", None))
 col3.tick()
 assert col3.pending() == 0, "упавший обработчик не должен оставлять пробу висеть вечно"

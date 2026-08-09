@@ -719,6 +719,12 @@ def volley_accounts():
                     break
                 _add(k)
             kf = os.environ.get("SPEC_FIRE_EOA_KEYFILE", "").strip()
+            if kf and not os.path.exists(kf):
+                # #48: путь указан, файла нет — флот исчезает ЦЕЛИКОМ, а движок выглядит живым.
+                # Прежде это был тихий скип: ни строки в журнале, ноль проб, и читается как
+                # «не было целей». Отказ громкий и виден деадману.
+                log.error("VOLLEY keyfile %s НЕ НАЙДЕН — ФЛОТ НЕ ЗАГРУЖЕН (остались только "
+                          "именованные ключи: %d)", kf, len(accs))
             if kf and os.path.exists(kf):
                 mode = os.stat(kf).st_mode & 0o077
                 if mode:
@@ -728,7 +734,12 @@ def volley_accounts():
                     n0 = len(accs)
                     for line in open(kf):
                         _add(line)
-                    log.info("VOLLEY флот: +%d ключей из keyfile", len(accs) - n0)
+                    _added = len(accs) - n0
+                    if _added == 0:
+                        log.error("VOLLEY keyfile %s ПУСТ или не дал ни одного ключа — "
+                                  "флот не загружен", kf)
+                    else:
+                        log.info("VOLLEY флот: +%d ключей из keyfile", _added)
         except Exception as e:
             log.warning("VOLLEY реестр ключей: %s — тир молчит", type(e).__name__)
             accs = []

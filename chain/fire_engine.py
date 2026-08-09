@@ -56,7 +56,12 @@ ENGINE_WARM_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_WARM_SEC", "60"))
 # у тех ног, чья лестница действительно протухла по цене.
 ENGINE_AUDIT_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_AUDIT_SEC", "120"))
 COLLECT_TIMEOUT_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_TIMEOUT_SEC", "180"))
-COLLECT_BATCH = int(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_BATCH", "200"))
+COLLECT_BATCH = int(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_BATCH", "64"))
+# Возраст, младше которого квитанцию спрашивать бессмысленно (блок Base ~2с).
+COLLECT_MIN_AGE_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_MIN_AGE_SEC", "2.0"))
+# Цена eth_getTransactionReceipt в CU — для учёта расхода коллектора (он ходит батчем
+# мимо обычного пути, поэтому считает себя сам).
+CU_PER_RECEIPT = float(os.environ.get("SPEC_FIRE_ENGINE_CU_PER_RECEIPT", "15"))
 
 
 class ReceiptCollector:
@@ -71,7 +76,7 @@ class ReceiptCollector:
     """
 
     def __init__(self, receipts_fn, on_result, on_timeout=None, log=None,
-                 poll_sec=None, timeout_sec=None, batch=None, now=None, sleep=None):
+                 poll_sec=None, timeout_sec=None, batch=None, now=None, sleep=None, min_age_sec=None):
         self._receipts_fn = receipts_fn
         self._on_result = on_result
         self._on_timeout = on_timeout
@@ -79,19 +84,20 @@ class ReceiptCollector:
         self._poll = COLLECT_POLL_SEC if poll_sec is None else float(poll_sec)
         self._timeout = COLLECT_TIMEOUT_SEC if timeout_sec is None else float(timeout_sec)
         self._batch = COLLECT_BATCH if batch is None else int(batch)
+        self._min_age = COLLECT_MIN_AGE_SEC if min_age_sec is None else float(min_age_sec)
         self._now = now or time.monotonic
         self._sleep = sleep or time.sleep
         self._lock = threading.Lock()
         self._pending = {}          # hash -> (meta, deadline)
         self._stop = threading.Event()
         self._thr = None
-        self.stats = {"tracked": 0, "resolved": 0, "timeouts": 0, "polls": 0}
+        self.stats = {"tracked": 0, "resolved": 0, "timeouts": 0, "polls": 0, "cu": 0.0}
 
     def track(self, h, meta):
         with self._lock:
             if h in self._pending:
                 return
-            self._pending[h] = (meta, self._now() + self._timeout)
+            self._pending[h] = (meta, self._now() + self._timeout, self._now())
             self.stats["tracked"] += 1
 
     def pending(self):
@@ -113,7 +119,16 @@ class ReceiptCollector:
         with self._lock:
             if not self._pending:
                 return 0
-            hashes = list(self._pending.keys())[:self._batch]
+            # #66: не опрашиваем хэши МОЛОЖЕ блока — квитанции у них быть не может по
+            # построению (Base ~2с), а стоят они те же CU. Без этого 200 проб/с давали
+            # ~3000 CU/с в боевой ключ ровно в окне победы: коллектор сам себе устраивал
+            # 429 в тот момент, когда квитанции побед и нужны.
+            _now = self._now()
+            hashes = [h for h, e in self._pending.items()
+                      if _now - (e[2] if len(e) > 2 else 0.0) >= self._min_age][:self._batch]
+            if not hashes:
+                return 0
+        self.stats["cu"] = self.stats.get("cu", 0.0) + len(hashes) * CU_PER_RECEIPT
         try:
             got = self._receipts_fn(hashes) or {}
         except Exception as e:

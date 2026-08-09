@@ -1043,8 +1043,15 @@ class SpecFireLive:
                 return [a for a, _k in (self._volley_accounts_fn or _ex.volley_accounts)()]
 
             def _send(addr):
-                return _ex.send_presigned_probe(self.rpc, self.cfg, addr, log=log,
-                                                broadcast_raw_urls=bcast)
+                h = _ex.send_presigned_probe(self.rpc, self.cfg, addr, log=log,
+                                             broadcast_raw_urls=bcast)
+                if h is not None:
+                    # #56: огонь движка был НЕВИДИМ — board_probes не рос, и согласованный
+                    # критерий приёмки «board_probes>0 при включённом движке» был недостижим
+                    # ПО ПОСТРОЕНИЮ. Считаем там же, где приёмка их ищет.
+                    self.stats["board_probes"] = self.stats.get("board_probes", 0) + 1
+                    self.stats["engine_probes"] = self.stats.get("engine_probes", 0) + 1
+                return h
 
             def _refill(addr, base_fee=None):
                 for a, k in (self._volley_accounts_fn or _ex.volley_accounts)():
@@ -1078,7 +1085,10 @@ class SpecFireLive:
                         self._log("SPECFIRE аудит %s: %s" % (a[:10], _diag(e)))
 
             col = _fe.ReceiptCollector(
-                receipts_fn=lambda hs: _ex.batch_receipts(rpc_url, hs),
+                # #66: url берём У RPC В МОМЕНТ ВЫЗОВА — failover переключает его на живой
+                # узел, а фиксированный на старте адрес держал бы коллектор на мёртвом
+                receipts_fn=lambda hs: _ex.batch_receipts(
+                    getattr(self.rpc, "rpc_url", None) or rpc_url, hs),
                 on_result=self._engine_result, on_timeout=self._engine_timeout,
                 log=self._log)
             eng = _fe.FireEngine(legs_fn=_legs, send_fn=_send, collector=col,
@@ -1542,12 +1552,15 @@ class SpecFireLive:
                 self._alert("\U0001F507 флот: %d ног немы ПО КОМИССИИ (резерв gas x maxFee "
                             "съел патрон) — долив ноги или MAXFEE_RESERVE_MULT" % _mm,
                             "leg-maxfee-mute")
+            _eng = getattr(self, "_fire_engine", None)
+            _es = dict(getattr(_eng, "stats", {}) or {}) if _eng is not None else {}
+            _cs = dict(getattr(getattr(_eng, "_collector", None), "stats", {}) or {}) if _eng else {}
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
-                      "stats=%s" % (
+                      "engine=%s collector=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _fs, _us, _mm, self.stats))
+                          _fs, _us, _mm, _es or "—", _cs or "—", self.stats))
 
     def handle_event(self, ev: dict):
         try:
