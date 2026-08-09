@@ -84,3 +84,40 @@ assert src.count('self._set_cooldown(feed, "probe"') == 3, \
 assert "if self._cooldown_active(feed):" in src, "арм читает паузу мимо пер-фид скоупа"
 
 print("OK: паузу ставит только подтверждённая боевая победа, гасит только свой фид")
+
+# --- 6. #58: боевая победа доходит до паузы ЧЕРЕЗ ХУК (механизм больше не вакуумный) -----
+import chain.execute as ex                                # noqa: E402
+
+sf = mk()
+sf.probe_board = {"XRP": ("0xMID", "0xBOR", 1.0, "0x", 1, 0.0)}
+sf._board = {"key": ("0xMID", "0xBOR")}
+sf._windows = {"XRP": True}
+_sv_hook = ex._COMBAT_WIN_HOOK
+try:
+    ex.set_combat_win_hook(sf.note_combat_win_by_market)
+    assert ex._note_combat_win("0xMID", "0xBOR", proven=True) is True, "хук не довёл победу"
+    assert sf._cooldown_active("XRP"), "боевая победа не взвела паузу на своём фиде"
+    assert not sf._cooldown_active("DOGE"), "пауза утекла на соседний фид"
+
+    # КОНТРОЛЬ: неизвестный рынок паузу НЕ ставит и не падает (скоуп пер-фид)
+    sf2 = mk()
+    sf2.probe_board = {}
+    sf2._board = {}
+    sf2._windows = {}
+    ex.set_combat_win_hook(sf2.note_combat_win_by_market)
+    assert ex._note_combat_win("0xUNKNOWN", "0xB", proven=True) is False
+    assert any("фид для рынка" in m for m in sf2._logs), sf2._logs
+
+    # КОНТРОЛЬ: без хука путь молчит и не роняет диспатч
+    ex.set_combat_win_hook(None)
+    assert ex._note_combat_win("0xMID", "0xBOR", proven=True) is False
+finally:
+    ex._COMBAT_WIN_HOOK = _sv_hook
+
+# структурно: диспатч зовёт хук на ПОДТВЕРЖДЁННОЙ квитанции, main его ставит
+_ex_src = pathlib.Path("chain/execute.py").read_text()
+assert "_note_combat_win(mid, borrower, proven=True, log=log)" in _ex_src, "диспатч не зовёт хук"
+assert "set_combat_win_hook(_sfl.note_combat_win_by_market)" in pathlib.Path("main.py").read_text(), \
+    "хук не подключён на старте — механизм снова вакуумный"
+
+print("OK: боевая победа доходит до паузы через хук, чужие фиды не гасит")

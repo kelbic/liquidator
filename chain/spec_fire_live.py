@@ -1005,6 +1005,26 @@ class SpecFireLive:
             return True
         return n < self._cooldown_feed.get(feed, 0.0)
 
+    def note_combat_win_by_market(self, mid, borrower, proven=True):
+        """#58: диспатч знает рынок и заёмщика, но не фид — резолвим сами.
+
+        Ищем по опубликованной доске и по армленным окнам; не нашли — паузу НЕ ставим (скоуп
+        пер-фид, гасить нечего) и говорим об этом, чтобы молчание не читалось как работа."""
+        feed = None
+        for f, b in list(self.probe_board.items()):
+            if str(b[0]).lower() == str(mid).lower():
+                feed = f
+                break
+        if feed is None:
+            _k = (self._board or {}).get("key") or ()
+            if _k and str(_k[0]).lower() == str(mid).lower():
+                feed = next(iter(self._windows), None)
+        if feed is None:
+            self._log("SPECFIRE WIN-пауза: фид для рынка %s не найден — пауза не ставится"
+                      % str(mid)[:10])
+            return False
+        return self.note_combat_win(feed, proven=proven)
+
     def note_combat_win(self, feed=None, proven=False):
         """Точка входа боевой победы (#46): зовётся из разбора квитанции БОЕВОЙ tx, когда захват
         подтверждён (repaidAssets>0). proven=False (например, SEND-3 uncertain) паузу НЕ ставит —

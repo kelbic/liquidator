@@ -727,6 +727,8 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                         # У2 (09.08): немота ног по комиссии требует человека (долив либо
                         # ручка MAXFEE_RESERVE_MULT) — даём окну канал к владельцу
                         _sfl._alert = lambda _t, _k: alerter.send_async(_t, key=_k)
+                        from chain.execute import set_combat_win_hook
+                        set_combat_win_hook(_sfl.note_combat_win_by_market)   # #58
                         _handlers.append(_sfl.handle_event)
                         from chain.failover import set_windows_probe
                         set_windows_probe(lambda: len(_sfl._windows))   # назад-свитч не посреди окна

@@ -447,6 +447,30 @@ def specfire_gas_add(gas_usd: float):
         _SPECFIRE_GAS_USD += max(0.0, gas_usd)
 
 
+_COMBAT_WIN_HOOK = None
+
+
+def set_combat_win_hook(fn):
+    """#58: точка, куда диспатч сообщает о БОЕВОЙ победе с подтверждённым захватом.
+
+    Кулдаун (#46) по решению владельца взводит только боевая победа, но вызов не был подключён —
+    механизм оставался вакуумным, а вакуумный механизм со временем читается как работающий."""
+    global _COMBAT_WIN_HOOK
+    _COMBAT_WIN_HOOK = fn
+
+
+def _note_combat_win(mid, borrower, proven=True, log=None):
+    fn = _COMBAT_WIN_HOOK
+    if fn is None:
+        return False
+    try:
+        return bool(fn(mid, borrower, proven=proven))
+    except Exception as e:
+        if log:
+            log.info("combat-win hook fail: %s", type(e).__name__)
+        return False
+
+
 def mark_recent_send(market_id: str, borrower: str):
     """WIN спек-пробы: жертва взята — гасим последующий реактивный дубль (дешевле $0.01 реверта)."""
     with _SEND_LOCK:
@@ -461,26 +485,39 @@ def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
     газ-бакет / мин-интервал / _INFLIGHT==0 (боевая tx главнее). Возвращает hash или None."""
     global _SPECFIRE_PROBES, _SPECFIRE_LAST_TS
     _now = time.monotonic()
+    # #51 (ревью 09.08): ЧТЕНИЯ СЕТИ — ВНЕ _SEND_LOCK. Раньше под локом сидели get_balance (TTL
+    # 60с) и _pending_nonce при холодном кэше, то есть НЕ-боевой отправитель держал критическую
+    # секцию боевого raw на ~60-75мс ровно в момент транзита. Лок обязан покрывать только
+    # раздачу nonce и саму отправку — то, где важен ПОРЯДОК.
+    with _INFLIGHT_LOCK:                       # дешёвый предгейт: без I/O
+        _specfire_roll_day_locked()
+        if (_SPECFIRE_GAS_USD >= _specfire_cap(_now)
+                or _now - _SPECFIRE_LAST_TS < _SPECFIRE_MIN_INTERVAL
+                or _INFLIGHT > 0):
+            return None
+    w3 = rpc._web3()
+    bot = account_for(w3, cfg.wallet_key).address
+    # патронный резерв: расходники не грызут выстрел (см. BULLET_RESERVE_WEI)
+    _cost = int(gas) * int(max_fee if max_fee else int(cfg.tip_gwei * 1e9) * 3)
+    if not probe_allowed_by_reserve(cached_balance_wei(rpc, bot), _cost):
+        if log:
+            log.info("SPECFIRE проба молчит: баланс не покрывает патрон %.3f ETH + пробу",
+                     BULLET_RESERVE_WEI / 1e18)
+        return None
+    _pre_nonce = None
+    if _LOCAL_NONCE.get(bot) is None:          # холодный кэш: RTT платим ДО лока
+        try:
+            _pre_nonce = _pending_nonce(w3, bot)
+        except Exception:
+            return None
     with _SEND_LOCK:
-        with _INFLIGHT_LOCK:
-            _specfire_roll_day_locked()
-            if (_SPECFIRE_GAS_USD >= _specfire_cap(_now)
-                    or _now - _SPECFIRE_LAST_TS < _SPECFIRE_MIN_INTERVAL
+        with _INFLIGHT_LOCK:                   # пере-проверка под локом: гейты те же, I/O нет
+            if (_SPECFIRE_GAS_USD >= _specfire_cap(time.monotonic())
                     or _INFLIGHT > 0):
                 return None
-        # патронный резерв: расходники не грызут выстрел (см. BULLET_RESERVE_WEI)
-        _bot_addr = account_for(rpc._web3(), cfg.wallet_key).address
-        _cost = int(gas) * int(max_fee if max_fee else int(cfg.tip_gwei * 1e9) * 3)
-        if not probe_allowed_by_reserve(cached_balance_wei(rpc, _bot_addr), _cost):
-            if log:
-                log.info("SPECFIRE проба молчит: баланс не покрывает патрон %.3f ETH + пробу",
-                         BULLET_RESERVE_WEI / 1e18)
-            return None
-        w3 = rpc._web3()
-        bot = account_for(w3, cfg.wallet_key).address
         base_nonce = _LOCAL_NONCE.get(bot)
         if base_nonce is None:
-            base_nonce = _pending_nonce(w3, bot)
+            base_nonce = _pre_nonce if _pre_nonce is not None else _pending_nonce(w3, bot)
         # tip-гард плотного режима (31.07): переданный tip капнут вызывающим слоем
         # (SPEC_FIRE_TIP_CAP_GWEI) — min_tip_wei обязан уважать кап, иначе send-слой
         # поднимет пробу обратно до боевого cfg.tip_gwei (FCFS: tip места не покупает).
@@ -2642,8 +2679,12 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                 row = {"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
                        "status": status, "gas_used": rcpt.get("gasUsed"),
                        "net_usd": net_usd, "gas_usd": gas_usd, "tx_index": _txi}
-                if status == 1 and log:
-                    log.info("submit-xray: WIN idx=%s block=%s tx=%s", _txi, _blk, h)
+                if status == 1:
+                    if log:
+                        log.info("submit-xray: WIN idx=%s block=%s tx=%s", _txi, _blk, h)
+                    # #58: победа боевой tx подтверждена КВИТАНЦИЕЙ (не «uncertain») — только
+                    # она взводит WIN-паузу, и только на своём фиде (решение владельца #46)
+                    _note_combat_win(mid, borrower, proven=True, log=log)
                 if status != 1:
                     reason = _revert_reason(rpc, h, _blk)
                     row["revert_reason"] = reason
@@ -2680,6 +2721,7 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                         _gu = rcpt.get("gasUsed") if j == 0 else 0
                         if _key in wins:                      # Liquidated(borrower,loan,profit) = взято
                             n_win += 1
+                            _note_combat_win(mid, borrower, proven=True, log=log)
                             profit_usd_i = (wins[_key] * prep["debt_usd"] / prep["debt_assets"]
                                             if prep.get("debt_assets") else 0.0)   # арифметика _net_gate
                             results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,
