@@ -1420,6 +1420,7 @@ _AERO_DEADLINE = 2 ** 63               # v1-форма требует deadline; 
 UNIV3_PATHS = {  # collateral(lower) -> fee tier of coll/WETH pool (re-verified 24.07)
     "0xcb585250f852c6c6bf90434ab21a00f02833a4af": 10000,  # cbXRP/WETH (3000 умер, 1% живой)
 }
+_CBXRP = "0xcb585250f852c6c6bf90434ab21a00f02833a4af"
 _CBDOGE = "0xcbd06e5a2b0c65597161de254aa074e489deb510"
 _CBADA = "0xcbada732173e39521cdbe8bf59a6dc85a9fc7b8c"
 
@@ -1440,6 +1441,17 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
                       "max_in": 15 * 10**7},
     (_CBLTC, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_CBLTC, 200, _UNIV3_WETH, 100, _UNIV3_USDC)},
+    # cbXRP/USDC 09.08 (замер на форке 49666337, #69): прямого роута НЕ БЫЛО — путь собирался
+    # по фи-карте в UniV3 fee=10000, и это ПРОТУХЛО ровно как предупреждал урок 24.07: на
+    # seized кита 18 333 cbXRP UniV3 отдаёт 0.0176 WETH против 4.7342 у Slipstream ts=2000
+    # (269x). Глубина уехала в Slipstream, как у cbDOGE (ts=2000) и cbADA (ts=200).
+    # ПРОФИЛЬ ts=2000 (WETH за 1 cbXRP): 100 шт 0.000530204 (референс), 500 -0.41%,
+    # 1000 -0.92%, 2000 -1.93%, 5000 -4.84%, 10000 -11.4%, 18333 -51.3% (пул исчерпан).
+    # Кап 5000: impact 4.84% против LIF 12.7% — тот же запас, что у cbBTC (2.59% против 4.38%).
+    # Сверх капа — Kyber (в доску не помещается: она quote-free, см. #69 п.2 про частичный план).
+    (_CBXRP, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
+                            "path": _pack_path(_CBXRP, 2000, _UNIV3_WETH, 100, _UNIV3_USDC),
+                            "max_in": 5000 * 10**6},
     # cbBTC/USDC 28.07: UniV3 fee=500 -> Aerodrome Slipstream ts=100 (пул 0x4e962bb3, liq 3.7e12
     # против 2.1e12, fee динамический 30-162 = 0.003-0.016% против наших 0.05%). Урок разбора
     # победителя cbBTC $65.6k (27.07 23:04): его РЕАЛЬНЫЙ выход через этот пул стоил 0.52% против
@@ -1500,10 +1512,18 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
                             "path": _pack_path(_CBADA, 200, _UNIV3_WETH, 100, _UNIV3_USDC),
                             "max_in": 60_000 * 10**6},
 }
-for _coll, _fee in UNIV3_PATHS.items():   # существующие UniV3-пути -> та же таблица (loan=USDC)
-    _SWAP_ROUTES[(_coll, _UNIV3_USDC)] = {"router": UNIV3_SWAP_ROUTER, "style": "02",
-                                          "path": _pack_path(_coll, _fee, _UNIV3_WETH,
-                                                             _UNIV3_WETH_USDC_FEE, _UNIV3_USDC)}
+# UniV3-пути из фи-карты -> та же таблица (loan=USDC). setdefault, А НЕ ПРИСВАИВАНИЕ (#69,
+# 09.08): цикл идёт ПОСЛЕ литерала и раньше молча ЗАТИРАЛ явные записи. Из-за этого cbXRP не
+# мог иметь осознанного маршрута вовсе — он порождался здесь и всегда получался UniV3, а когда
+# глубина ушла в Slipstream (как у cbDOGE/cbADA), выразить это в фи-карте стало нечем: она
+# умеет только тир UniV3. Замер 09.08 на форке: UniV3 fee=10000 отдавал 0.0176 WETH там, где
+# Slipstream ts=2000 отдаёт 4.7342 — 269x, и план молча ревертил по minOut.
+# Класс дефекта тот же, что у защёлки в #63: механизм, который нельзя переопределить снаружи.
+for _coll, _fee in UNIV3_PATHS.items():
+    _SWAP_ROUTES.setdefault((_coll, _UNIV3_USDC),
+                            {"router": UNIV3_SWAP_ROUTER, "style": "02",
+                             "path": _pack_path(_coll, _fee, _UNIV3_WETH,
+                                                _UNIV3_WETH_USDC_FEE, _UNIV3_USDC)})
 ROUTE_COLLATERALS = {c for (c, _l) in _SWAP_ROUTES}   # scope слоя 2 (кэш позиций) и fast-lane
 
 
