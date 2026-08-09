@@ -1505,9 +1505,14 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     # cbADA чист до 60k (imp 2.3%), обрыв на 120k. Сверх капа -> Kyber. NB: Kyber на ките $80k
     # cbDOGE отдаёт лишь $17.3k (21.5% номинала) — ВСЯ DOGE-ликвидность Base мелкая; жирный
     # cbDOGE-кандидат экономически несобираем целиком, minProfit-floor отсечёт сам.
+    # cbDOGE кап 09.08 (канарейка выходов #71): у пула не деградация, а ОБРЫВ. Профиль impact
+    # по долям прежнего капа 100k: 1% -> 0.01%, 5% -> 0.08%, 10% -> 0.17%, 25% -> 0.44%,
+    # 50% -> 0.94%, 100% -> 43.50%. То есть кап стоял РОВНО НА КРАЮ обрыва: на нём выход съедал
+    # 43.5% при бонусе 12.7% — гарантированный минус либо реверт по minOut. Ставим 50k: замерено
+    # 0.94%, запас к LIF больше, чем у cbBTC (2.59% против 4.38%). Сверх — Kyber, как у всех.
     (_CBDOGE, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
                              "path": _pack_path(_CBDOGE, 2000, _UNIV3_WETH, 100, _UNIV3_USDC),
-                             "max_in": 100_000 * 10**8},
+                             "max_in": 50_000 * 10**8},
     (_CBADA, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_CBADA, 200, _UNIV3_WETH, 100, _UNIV3_USDC),
                             "max_in": 60_000 * 10**6},
