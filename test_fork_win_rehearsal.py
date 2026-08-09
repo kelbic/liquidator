@@ -30,7 +30,8 @@ import requests                                            # noqa: E402
 from eth_account import Account                            # noqa: E402
 from web3 import Web3                                      # noqa: E402
 
-import chain.execute as ex                                 # noqa: E402
+import chain.execute as ex
+from strategy.pnl import lif_from_lltv                                 # noqa: E402
 
 MORPHO = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
 MID = "0xd4a903dc6d949519060c7707f9604fdc9772c046e05c2e3a8fce0bd7196e4109"
@@ -116,9 +117,17 @@ mp = MP
 # expected_seized(repaid, LIF, price): второй аргумент — МНОЖИТЕЛЬ (1.127), а не bps.
 # Передав 1270, я умножал долг на 1270 и получал число, не влезающее в uint256 —
 # ошибка единиц ровно того класса, что чинилась в #30 часом раньше.
-seized = ex.expected_seized(debt, 1.127, price_after)      # бонус 12.7% рынка cbXRP
+# #74: LIF ТОЧНЫЙ (хардкод 1.127 завышал amount_in на ~0.02% — достаточно для реверта),
+# и seize считается тем же _seized_exact, что и боевой путь после фикса
+from chain.hotpath import _seized_exact
+_lif = lif_from_lltv(MP["lltv"] / 10**18)
+seized = _seized_exact(b_shares, int(round(_lif * 10**18)), price_after, tba, tbs)
+# ДИАГНОСТИЧЕСКАЯ РУЧКА (#73): minOut в плане равен ПОЛНОМУ долгу. Если своп падает
+# именно на пороге, то с minOut=1 проба обязана пройти — это и разделяет «виноват порог»
+# (лечится частичным планом, #69) и «виноват approve внутри контракта» (правка контракта).
+_min_out = 1 if os.environ.get("FORK_MINOUT_ONE") else debt
 swap = ex.direct_swap(mp["collateralToken"], mp["loanToken"], seized, LIQ, LIQ,
-                      repaid_assets=debt)
+                      repaid_assets=_min_out)
 assert swap, "прямой роут cbXRP->USDC не собрался — план не построить"
 print("   аргументы плана: lltv=%s shares=%s router=%s cd_len=%d" % (
     mp["lltv"], b_shares, swap["router"], len(swap["calldata"])))
@@ -136,9 +145,14 @@ if not fired:
     print("   логов в квитанции: %d, газ %d" % (len(rec["logs"]), rec["gasUsed"]))
     # #70: контракт теперь НАЗЫВАЕТ причину — читаем PlanFailed(bytes4)
     PF = Web3.keccak(text="PlanFailed(bytes4)")
+    SI = Web3.keccak(text="SwapInput(uint256)")
     for lg in rec["logs"]:
         t0 = lg["topics"][0] if lg["topics"] else b""
-        if t0 == PF:
+        if t0 == SI:
+            _got = int(lg["data"].hex(), 16)
+            print("   ФАКТИЧЕСКИЙ seize: %d | НАША ОЦЕНКА: %d | разница: %+d (%.2f%%)" % (
+                _got, seized, _got - seized, (_got / seized - 1) * 100 if seized else 0))
+        elif t0 == PF:
             print("   ПРИЧИНА ОТКАЗА (селектор): 0x%s" % lg["data"].hex()[:8])
         else:
             print("     from=%s topic0=%s" % (lg["address"][:12], t0.hex()[:20]))

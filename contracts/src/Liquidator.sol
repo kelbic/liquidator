@@ -120,6 +120,8 @@ contract Liquidator {
     event PlanExecuted(address indexed borrower, uint256 profit);
     /// @notice Плановая проба дошла до исполнения и ОТКАЗАЛА: 4 байта причины (#70).
     event PlanFailed(bytes4 reason);
+    /// @dev #73: сколько коллатерала контракт РЕАЛЬНО получил перед свопом (диагностика).
+    event SwapInput(uint256 collateral);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -318,6 +320,7 @@ contract Liquidator {
             );
         }
         uint256 collBal = IERC20(s.collateralToken).balanceOf(address(this));
+        emit SwapInput(collBal);              // #73: ФАКТИЧЕСКИЙ seize против нашей оценки в плане
         _forceApprove(s.collateralToken, s.swapTarget, collBal);
         (bool ok, ) = s.swapTarget.call(s.swapCallData);
         if (!ok) revert SwapFailed();

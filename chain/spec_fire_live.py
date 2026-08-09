@@ -527,9 +527,20 @@ class SpecFireLive:
         if bs == 0:
             return "gone"                         # позиция разобрана (конкурент/погашение) — LOSS-стоп
         price = decode_price(aggregate3(self.rpc, [(oracle, encode_price_call())])[0][1])
-        repaid_shares = int(bs)
-        repaid_assets = to_assets_up(repaid_shares, tba, tbs)
-        seized = expected_seized(repaid_assets, lif_from_lltv(lltv_wad / 10**18), price)
+        # #74 (09.08, находка ревьюера): путь ДОСКИ считал amount_in оценкой СВЕРХУ
+        # (полные шеры + to_assets_up + expected_seized), тогда как горячий путь после фикса
+        # P1-7 считает ТОЧНО по канону Morpho. Контракт аппрувит РОВНО фактический баланс
+        # (Liquidator.sol:320-321), поэтому завышенный amount_in в предсобранной калдате
+        # заставлял роутер тянуть больше, чем есть -> revert -> SwapFailed(). Именно это и
+        # ловила форк-репетиция: одинаковый газ при minOut=долг и minOut=1, живая квота
+        # канарейки. Плюс без капа шер глубокая позиция даёт Panic 0x11 внутри Morpho.
+        from chain.hotpath import _seized_exact, _cap_repaid_shares
+        _lif_wad = int(round(lif_from_lltv(lltv_wad / 10**18) * 10**18))
+        repaid_shares = _cap_repaid_shares(int(bs), int(coll_amt), int(price), _lif_wad, tba, tbs)
+        if repaid_shares <= 0:
+            return None
+        repaid_assets = to_assets_up(repaid_shares, tba, tbs)   # репэй-сторона: вверх, как и было
+        seized = _seized_exact(repaid_shares, _lif_wad, int(price), tba, tbs)
         if seized == 0:
             return None
         liq = self.cfg.liquidator_address

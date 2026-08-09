@@ -73,7 +73,11 @@ mc.encode_position_call = lambda m32, b: b""
 mc.encode_price_call = lambda: b""
 mc.decode_id_to_market_params = lambda d: ("0xLOAN", "0xCOLL", "0xORCL", "0xIRM", 625 * 10**15)
 mc.decode_market = lambda d: (0, 0, TBA, TBS)
-mc.decode_position = lambda d: (BS, 0)
+# #74: залог теперь УЧАСТВУЕТ в сборке плана (_cap_repaid_shares держит seize в его
+# пределах). Прежняя фикстура отдавала 0 — с ней новый код честно отказывается строить
+# план (по нулевому залогу забирать нечего), и это правильное поведение. Даём залог с
+# запасом, чтобы экзаменовать то, ради чего тест написан: дробление по капу РОУТА.
+mc.decode_position = lambda d: (BS, 10**30)
 mc.decode_price = lambda d: PRICE
 ex.direct_swap = fake_direct
 ex.encode_liquidate = fake_encode
