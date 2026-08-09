@@ -41,6 +41,7 @@ class Config:
     max_inflight: int = 5            # cap on parallel sends per block (cascade)
     tg_bot_token: str = ""
     tg_admin_id: int = 0
+    tg_group_id: str = ""        # чат флота; пусто = только DM владельцу (см. alerts.Alerter)
     alert_antiflood_sec: int = 600
     bot_tag: str = ""                     # префикс алертов в общем TG-чате флота ("[base] ...") — LIQ_BOT_TAG
     poll_interval_sec: float = 2.0
@@ -141,6 +142,7 @@ class Config:
             max_inflight=i("MAX_INFLIGHT", d.max_inflight),
             tg_bot_token=s("TG_BOT_TOKEN"),
             tg_admin_id=i("TG_ADMIN_ID", d.tg_admin_id),
+            tg_group_id=os.environ.get("TG_GROUP_ID", d.tg_group_id).strip(),
             alert_antiflood_sec=i("ALERT_ANTIFLOOD_SEC", d.alert_antiflood_sec),
             bot_tag=s("LIQ_BOT_TAG", d.bot_tag),
             poll_interval_sec=f("POLL_INTERVAL_SEC", d.poll_interval_sec),
