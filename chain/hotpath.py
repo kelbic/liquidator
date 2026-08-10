@@ -477,7 +477,43 @@ def read_preconf_price(preconf_rpc, oracle):
 
 
 _PX_HEDGE_SEC = float(os.environ.get("PX_HEDGE_TIMEOUT_SEC", "0.4"))
+# #101 (10.08): вторая нога хеджа — ТОЛЬКО в деградацию, а не всегда.
+# Замер за 6 часов: px_pre=1/1, 2/2, 3/3 — preconf отвечает в 100% случаев, промахов НОЛЬ.
+# Значит confirmed-нога, летящая параллельно в боевой Alchemy, не пригодилась НИ РАЗУ, а её
+# результат выбрасывается — это ровно половина eth_call горячего пути. А eth_call даёт 74%
+# суточного расхода (672.2K из 909.1K) при скользящей проекции 61-64M/мес против лимита 30M,
+# и именно он топит боевой ключ: COMBAT-FAILOVER флапал раз в 6 минут.
+# Теперь: штатно идёт ОДНА нога (preconf) с тем же таймаутом; промах включает режим деградации
+# на PX_HEDGE_DEGRADE_SEC, и в нём возвращается прежний параллельный хедж бит-в-бит.
+# Цена риска названа честно: при ВНЕЗАПНОЙ смерти preconf первое чтение потеряет таймаут
+# (0.4с) прежде чем поднимем confirmed. Сейчас за эту страховку платят ВСЕ чтения подряд.
+# Откат: PX_HEDGE_ALWAYS=1 — обе ноги всегда, как было.
+_PX_HEDGE_ALWAYS = os.environ.get("PX_HEDGE_ALWAYS", "0").lower() in ("1", "true", "yes")
+_PX_HEDGE_DEGRADE_SEC = float(os.environ.get("PX_HEDGE_DEGRADE_SEC", "60"))
+_PX_HEDGE_DEGRADED_UNTIL = 0.0
+
+
+def px_hedge_degraded(now=None) -> bool:
+    """Идём ли сейчас обеими ногами (preconf промахнулся недавно)."""
+    n = time.monotonic() if now is None else now
+    return _PX_HEDGE_ALWAYS or n < _PX_HEDGE_DEGRADED_UNTIL
+
+
+def px_hedge_note_miss(now=None):
+    """Промах preconf -> держим обе ноги ближайшие PX_HEDGE_DEGRADE_SEC."""
+    global _PX_HEDGE_DEGRADED_UNTIL
+    n = time.monotonic() if now is None else now
+    _PX_HEDGE_DEGRADED_UNTIL = n + _PX_HEDGE_DEGRADE_SEC
 _POS_HEDGE_SEC = float(os.environ.get("POS_HEDGE_TIMEOUT_SEC", "0.5"))
+
+
+def _leg_once(price_fn, r, oracle, ev, box):
+    try:
+        box.append(price_fn(r, oracle))
+    except Exception:
+        pass
+    finally:
+        ev.set()
 
 
 def read_price_hedged(preconf_rpc, rpc, oracle, price_fn=read_preconf_price):
@@ -489,6 +525,22 @@ def read_price_hedged(preconf_rpc, rpc, oracle, price_fn=read_preconf_price):
     (как раньше при None), флип и по старой -> жертва легитимна. Оба легга через price_fn."""
     if rpc is None:
         return price_fn(preconf_rpc, oracle)
+    if not px_hedge_degraded():
+        # ШТАТНО: одна нога. Таймаут тот же, поэтому латентная гарантия не меняется —
+        # меняется только то, что мы больше не платим за неиспользуемую страховку.
+        ev1, box1 = threading.Event(), []
+        threading.Thread(target=_leg_once, args=(price_fn, preconf_rpc, oracle, ev1, box1),
+                         daemon=True).start()
+        ev1.wait(timeout=_PX_HEDGE_SEC)
+        if box1 and box1[0] is not None:
+            px_preconf_note(True)
+            return box1[0]
+        px_preconf_note(False)
+        px_hedge_note_miss()          # с этого момента и ещё минуту идём обеими ногами
+        try:
+            return price_fn(rpc, oracle)
+        except Exception:
+            return box1[0] if box1 else None
     ev_p, box_p = threading.Event(), []
     ev_c, box_c = threading.Event(), []
 
