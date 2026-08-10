@@ -23,6 +23,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import chain.spec_fire_live as sfl                          # noqa: E402
 
+DL = 1786400000            # уникальный дедлайн НАШЕГО арма
 MID = "0x" + "11" * 32
 BOR = "0x" + "22" * 20
 FEED = "XRP"
@@ -74,7 +75,7 @@ def mk():
     sf.cfg = type("C", (), {"liquidator_address": "0x" + "ff" * 20})()
     sf.rpc = None
     sf._board = {"key": (MID, BOR), "armed_ts": 1000.0, "until": 2000.0,
-                 "ready_at": 900.0, "verified": False, "tx": "0xdead"}
+                 "ready_at": 900.0, "verified": False, "tx": "0xdead", "dl": DL}
     return sf
 
 
@@ -90,53 +91,77 @@ sfl.SPEC_FIRE_V2_BOARD = _v2
 print("OK 3/4: доска не живая до подтверждения, живая после (гейт различает оба состояния)")
 
 # --- 4. НЕ СЕЛА -> доску снимаем ГРОМКО (деградация в V1), а не молчим --------------------
+# Приёмка форком 10.08 вскрыла: сверки одного borrower МАЛО. Кит держится в top-1 часами,
+# переарм идёт по ТОЙ ЖЕ цели, и несевший арм засчитывался по ПРЕЖНЕМУ плану того же
+# заёмщика. Доказательств теперь два, оба привязаны к НАШЕЙ tx: квитанция нашего хэша
+# (status==1) и дедлайн в слоте, равный НАШЕМУ dl.
 import chain.execute as ex                                  # noqa: E402
 
-_saved = ex.read_plan_info
+_saved = (ex.read_plan_info, ex.batch_receipts)
 _settle = sfl.SPEC_FIRE_V2_BOARD_SETTLE_SEC
+
+
+def stub(status=1, dl_on_chain=DL, borrower=BOR):
+    ex.batch_receipts = lambda url, hs, timeout=5: (
+        {hs[0]: {"status": hex(status)}} if status is not None else {})
+    ex.read_plan_info = lambda rpc, addr: (borrower, dl_on_chain, 1)
+
+
 try:
     sfl.SPEC_FIRE_V2_BOARD_SETTLE_SEC = 0.0                 # тест не ждёт боевые 6с
 
-    # 4a. пустой planInfo (ровно то, что было в бою: tx сгорела, план не записан)
-    ex.read_plan_info = lambda rpc, addr: ("0x" + "00" * 20, 0, 0)
-    sf = mk()
-    sf._verify_board((MID, BOR), FEED, "0xdead")
-    assert sf._board == {}, "доска НЕ снята при пустом плане — ноги били бы в пустой сторадж"
-    assert sf.stats["board_fails"] == 1 and sf.stats.get("board_unlanded") == 1
-    assert any("НЕ СЕЛА" in s for s in sf._logs), "осечка посадки молчит в журнале"
-    assert sf._board_next_try.get(FEED), "переспрос арма не взведён"
+    # 4a. КОНТРОЛЬ: наша tx села И дедлайн наш -> подтверждаем
+    stub(status=1, dl_on_chain=DL)
+    sf = mk(); sf._verify_board((MID, BOR), FEED, "0xdead", DL)
+    assert sf._board.get("verified") is True, "живой подтверждённый план не засчитан"
+    assert sf.stats.get("board_verified") == 1 and sf.stats["board_fails"] == 0
 
-    # 4b. чтение упало -> незнание ЗАКРЫВАЕТ гард (не «считаем, что село»)
+    # 4b. ГЛАВНОЕ: tx НЕ села, но в слоте лежит ПРЕЖНИЙ план ТОГО ЖЕ заёмщика (другой dl).
+    # Ровно этот случай форк-стенд показал как ложное подтверждение.
+    stub(status=0, dl_on_chain=DL - 500)
+    sf = mk(); sf._verify_board((MID, BOR), FEED, "0xdead", DL)
+    assert sf._board == {}, "несевший арм засчитан по ПРЕЖНЕМУ плану того же заёмщика"
+    assert sf.stats.get("board_unlanded") == 1
+    assert any("НЕ СЕЛА" in s for s in sf._logs), "осечка посадки молчит в журнале"
+
+    # 4c. tx села, но слот уже перезаписан чужим планом (дедлайн не наш) -> не доверяем
+    stub(status=1, dl_on_chain=DL + 900)
+    sf = mk(); sf._verify_board((MID, BOR), FEED, "0xdead", DL)
+    assert sf._board == {}, "чужой дедлайн в слоте засчитан как наш план"
+
+    # 4d. квитанции нет вовсе (узел молчит) -> незнание ЗАКРЫВАЕТ гард
+    ex.batch_receipts = lambda url, hs, timeout=5: {}
+    ex.read_plan_info = lambda rpc, addr: (BOR, DL, 1)
+    sf = mk(); sf._verify_board((MID, BOR), FEED, "0xdead", DL)
+    assert sf._board == {}, "без квитанции доска осталась живой — незнание как разрешение"
+
+    # 4e. чтение плана падает -> тоже снимаем
+    stub(status=1, dl_on_chain=DL)
+
     def _boom(rpc, addr):
         raise RuntimeError("узел не ответил")
 
     ex.read_plan_info = _boom
-    sf = mk()
-    sf._verify_board((MID, BOR), FEED, "0xdead")
-    assert sf._board == {}, "чтение упало, а доска осталась живой — незнание как разрешение"
+    sf = mk(); sf._verify_board((MID, BOR), FEED, "0xdead", DL)
+    assert sf._board == {}, "чтение упало, а доска жива"
 
-    # 4c. КОНТРОЛЬ: план на месте и на НАШЕГО заёмщика -> подтверждаем
-    ex.read_plan_info = lambda rpc, addr: (BOR, int(time.time()) + 600, 12345)
+    # 4f. ГОНКА: доску уже переписал ДРУГОЙ арм (другой dl) -> наш вердикт её не трогает
+    stub(status=0, dl_on_chain=DL - 500)
     sf = mk()
-    sf._verify_board((MID, BOR), FEED, "0xdead")
-    assert sf._board.get("verified") is True, "живой план не подтверждён — тракт был бы мёртв"
-    assert sf.stats.get("board_verified") == 1
-    assert sf.stats["board_fails"] == 0
+    sf._board["dl"] = DL + 777                 # доска принадлежит следующему арму
+    sf._verify_board((MID, BOR), FEED, "0xdead", DL)
+    assert sf._board.get("dl") == DL + 777 and sf._board != {}, \
+        "тред старого арма затёр доску нового — гонка не закрыта"
+    assert sf.stats["board_fails"] == 0, "чужой доске приписан наш отказ"
 
-    # 4d. КОНТРОЛЬ: план на ЧУЖОГО заёмщика подтверждением не считается
-    ex.read_plan_info = lambda rpc, addr: ("0x" + "99" * 20, int(time.time()) + 600, 1)
-    sf = mk()
-    sf._verify_board((MID, BOR), FEED, "0xdead")
-    assert sf._board == {}, "чужой план засчитан как наш — доска стреляла бы по чужой цели"
-
-    # 4e. КОНТРОЛЬ: протухший дедлайн — не подтверждение
-    ex.read_plan_info = lambda rpc, addr: (BOR, int(time.time()) - 10, 1)
-    sf = mk()
-    sf._verify_board((MID, BOR), FEED, "0xdead")
-    assert sf._board == {}, "протухший план засчитан как живой"
+    # 4g. чужой заёмщик в слоте -> не наш план
+    stub(status=1, dl_on_chain=DL, borrower="0x" + "99" * 20)
+    sf = mk(); sf._verify_board((MID, BOR), FEED, "0xdead", DL)
+    assert sf._board == {}, "план чужого заёмщика засчитан как наш"
 finally:
-    ex.read_plan_info = _saved
+    ex.read_plan_info, ex.batch_receipts = _saved
     sfl.SPEC_FIRE_V2_BOARD_SETTLE_SEC = _settle
 
-print("OK 4/4: не села / чтение упало / чужой / протухший — доска снимается; живая — подтверждается")
+print("OK 4/4: подтверждение привязано к НАШЕЙ tx (квитанция + свой dl); прежний план,")
+print("        чужой дедлайн, чужой заёмщик, немой узел и гонка армов — доска снимается")
 print("=== #84 ЗАКРЫТ: арм доски садится и проверяется ===")

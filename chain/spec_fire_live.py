@@ -920,9 +920,9 @@ class SpecFireLive:
                            # не живая: иначе осечка арма хуже отсутствия доски (ноги бьют 1
                            # байтом в пустой сторадж ~840с, а штатная деградация в V1 не
                            # срабатывает, потому что код считает доску исправной).
-                           "verified": False, "tx": h}
+                           "verified": False, "tx": h, "dl": int(dl)}
             self.stats["board_arms"] += 1
-            threading.Thread(target=self._verify_board, args=((mid, b), feed, h),
+            threading.Thread(target=self._verify_board, args=((mid, b), feed, h, int(dl)),
                              daemon=True).start()
             self._log("SPECFIRE доска armed feed=%s %s/%s trigger=%s TTL=%dс tx=%s" % (
                 feed, mid[:10], b[:10],
@@ -936,7 +936,7 @@ class SpecFireLive:
         finally:
             self._board_lock.release()
 
-    def _verify_board(self, key, feed, txh):
+    def _verify_board(self, key, feed, txh, dl):
         """#84: ПОДТВЕРДИТЬ, что план ДЕЙСТВИТЕЛЬНО лежит в контракте.
 
         Своим тредом — путь огня не платит за это чтение. Отправка идёт без ожидания
@@ -947,22 +947,37 @@ class SpecFireLive:
         import time as _t
         try:
             _t.sleep(max(1.0, float(SPEC_FIRE_V2_BOARD_SETTLE_SEC)))
-            from chain.execute import read_plan_info
-            # Читаем до трёх раз: одиночный сбой сети не должен снимать ЖИВУЮ доску (это
-            # стоило бы окна), но и «не смогли прочитать» не превращается в «считаем, что
-            # село» — после трёх попыток гард закрывается.
+            from chain.execute import batch_receipts, read_plan_info
+            # #84 хвост (форк-приёмка 10.08): сверки одного borrower МАЛО. Кит держится в
+            # top-1 часами, поэтому переарм всегда идёт по ТОЙ ЖЕ цели — и несевший арм
+            # засчитывался по ПРЕЖНЕМУ плану того же заёмщика (проверено на стенде:
+            # verified=True при том, что setPlan не доехал). Доказательств теперь два, и оба
+            # привязаны к НАШЕЙ tx: (а) квитанция нашего хэша со status==1; (б) дедлайн в
+            # слоте равен НАШЕМУ dl — прежний план несёт другой, поэтому сверка ловит и
+            # чужой слот, и протухший.
+            _url = getattr(self.rpc, "rpc_url", "") or ""
             info = None
+            landed = None
             for _i in range(3):
+                if landed is not True:
+                    try:
+                        _rc = (batch_receipts(_url, [txh]) or {}).get(txh)
+                    except Exception:
+                        _rc = None
+                    if _rc is not None:
+                        _s = _rc.get("status")
+                        _s = int(_s, 16) if isinstance(_s, str) else int(_s or 0)
+                        landed = (_s == 1)
                 info = read_plan_info(self.rpc, self.cfg.liquidator_address)
-                if info and info[0] and str(info[0]).lower() == str(key[1]).lower():
+                if landed and info and int(info[1] or 0) == int(dl):
                     break
                 if _i < 2:
                     _t.sleep(1.0)
             st = self._board
-            if st.get("key") != key:
-                return                            # доску уже переписал другой арм — не наше дело
-            ok = bool(info and info[0] and int(info[1] or 0) > int(_t.time())
-                      and str(info[0]).lower() == str(key[1]).lower())
+            if st.get("key") != key or int(st.get("dl", -1)) != int(dl):
+                return                            # доску переписал другой арм — вердикт не наш
+            ok = bool(landed and info and int(info[1] or 0) == int(dl)
+                      and info[0] and str(info[0]).lower() == str(key[1]).lower())
             if ok:
                 st["verified"] = True
                 self.stats["board_verified"] = self.stats.get("board_verified", 0) + 1
@@ -973,8 +988,11 @@ class SpecFireLive:
             self._board = {}
             self.stats["board_fails"] += 1
             self.stats["board_unlanded"] = self.stats.get("board_unlanded", 0) + 1
-            self._log("SPECFIRE доска НЕ СЕЛА feed=%s %s/%s — planInfo=%s tx=%s; доска снята, "
-                      "залп деградирует в V1" % (feed, key[0][:10], key[1][:10], info, txh))
+            self._log("SPECFIRE доска НЕ СЕЛА feed=%s %s/%s — квитанция=%s ждали dl=%s "
+                      "в слоте=%s tx=%s; доска снята, залп деградирует в V1" % (
+                          feed, key[0][:10], key[1][:10],
+                          {True: "status=1", False: "status=0", None: "нет"}.get(landed),
+                          dl, (info[1] if info else None), txh))
             self._arm_retry(feed, "план не подтверждён на цепи")
         except Exception as e:
             # Незнание закрывает гард: не подтвердили — значит не доверяем.
