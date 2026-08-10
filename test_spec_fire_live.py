@@ -312,9 +312,14 @@ print("UNIT_OK: кэш пробы — build 1 раз на TTL, плотност�
 
 # 12) TIP-ГАРД: проба никогда не наследует каскадные ступени — кап 0.1 gwei поверх cfg
 from chain.spec_fire_live import _probe_tip_wei
-assert _probe_tip_wei(0.05) == int(0.05e9)        # боевой ниже капа — берём боевой
-assert _probe_tip_wei(30.0) == int(0.1e9)         # каскадная ступень 30 -> кап 0.1
-assert _probe_tip_wei(6.0) == int(0.1e9)          # старый TIP_GWEI=6 -> кап 0.1
+# #91: проба идёт на ПОЛУ рынка независимо от боевого tip. Прежние утверждения экзаменовали
+# кап каскадной ступени и потому НЕ ловили дыру: кадансовая проба платила 0.05 = 50 полов и
+# сортировалась в голову суб-блока, прочь от транзита (анализатор Ш10 на блоке 49789768).
+import chain.execute as _ex_tip
+assert _probe_tip_wei(0.05) == _ex_tip._PROBE_TIP_WEI, "кадансовая проба не на полу"
+assert _probe_tip_wei(30.0) == _ex_tip._PROBE_TIP_WEI, "каскадная ступень протекла в пробу"
+assert _probe_tip_wei(6.0) == _ex_tip._PROBE_TIP_WEI
+assert _ex_tip._PROBE_TIP_WEI < int(0.05e9), "пол не ниже прежнего боевого tip — фикс пустой"
 print("UNIT_OK: tip-гард — проба копеечная даже при поднятом боевом tip (FCFS)")
 
 # 12b) send-слой уважает капнутый tip и в min_tip_wei (иначе поднял бы обратно до cfg)
