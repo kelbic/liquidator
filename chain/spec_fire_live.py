@@ -286,6 +286,13 @@ SPEC_FIRE_PARTIAL = os.environ.get("SPEC_FIRE_PARTIAL", "1").lower() not in ("0"
 SPEC_FIRE_CASCADE_WINDOWS = int(os.environ.get("SPEC_FIRE_CASCADE_WINDOWS", "4"))
 SPEC_FIRE_HYBRID = os.environ.get("SPEC_FIRE_HYBRID", "1").lower() not in ("0", "false", "no")
 SPEC_FIRE_FACTS_FLAG = os.environ.get("SPEC_FIRE_FACTS_FLAG", "state/cascade_facts.flag")
+# Узел КОЛЛЕКТОРА КВИТАНЦИЙ. Он не в горячем пути (пробы уходят прямо в секвенсер), но с #93
+# от него зависит СНЯТИЕ БРОНИ газа: гейт огня решает по «факт + бронь», и если квитанции не
+# приходят, брони копятся и гейт закрывается НА НАС ЖЕ. Поэтому увод на отдельный ключ имеет
+# смысл (замер 10.08: 78 450 CU за окно с огнём, проекции монитора до 84M/мес при лимите 30M
+# на ключ), но ТОЛЬКО со страховкой: пустой ответ выделенного узла = берём боевой.
+# Пустая ручка = прежнее поведение (всё на боевом).
+SPEC_FIRE_COLLECTOR_RPC_URL = os.environ.get("SPEC_FIRE_COLLECTOR_RPC_URL", "")
 SPEC_FIRE_FACTS_TTL_SEC = float(os.environ.get("SPEC_FIRE_FACTS_TTL_SEC", "900"))
 # Право огня движку в fat-окне выдаёт САМО окно, не тир выше (вскрытие 07.08 17:00, блок
 # 49666338). Гонка живёт в одном блоке, а тир (армы>=N/час И свежий факт-флаг) в решающий
@@ -1320,11 +1327,29 @@ class SpecFireLive:
                     except Exception as e:
                         self._log("SPECFIRE аудит %s: %s" % (a[:10], _diag(e)))
 
-            col = _fe.ReceiptCollector(
+            def _combat_url():
                 # #66: url берём У RPC В МОМЕНТ ВЫЗОВА — failover переключает его на живой
                 # узел, а фиксированный на старте адрес держал бы коллектор на мёртвом
-                receipts_fn=lambda hs: _ex.batch_receipts(
-                    getattr(self.rpc, "rpc_url", None) or rpc_url, hs),
+                return getattr(self.rpc, "rpc_url", None) or rpc_url
+
+            def _receipts(hs):
+                """Квитанции с ВЫДЕЛЕННОГО узла, со страховкой боевым.
+
+                batch_receipts на отказе транспорта возвращает ПУСТОЙ словарь («не знаю» != 
+                «дропнуто»), и по этому признаку страховка отличима от «ещё не намайнено»:
+                непришедшая квитанция приезжает как {hash: None}, то есть словарь НЕ пуст.
+                Без страховки увод коллектора ударил бы по готовности: брони #93 не снялись бы
+                и гейт огня закрылся бы сам на себе."""
+                if not SPEC_FIRE_COLLECTOR_RPC_URL:
+                    return _ex.batch_receipts(_combat_url(), hs)
+                out = _ex.batch_receipts(SPEC_FIRE_COLLECTOR_RPC_URL, hs)
+                if out:
+                    return out
+                self.stats["collector_fallback"] = self.stats.get("collector_fallback", 0) + 1
+                return _ex.batch_receipts(_combat_url(), hs)
+
+            col = _fe.ReceiptCollector(
+                receipts_fn=_receipts,
                 on_result=self._engine_result, on_timeout=self._engine_timeout,
                 log=self._log)
             eng = _fe.FireEngine(legs_fn=_legs, send_fn=_send, collector=col,
