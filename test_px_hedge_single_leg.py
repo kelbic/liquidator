@@ -43,6 +43,17 @@ def reset():
     hp.px_preconf_take()                    # обнулить счётчики окна
 
 
+# --- 0. ГАРД: одноногая ветка ОБЯЗАНА уступать канал preconf (дефект, пойманный боем) --------
+# Без preconf_mark_reactive() фоновый полл конкурирует с горячим чтением, preconf не
+# укладывается в таймаут, и промахи выросли с НУЛЯ до 45% (px_pre 7/13, 10/18, 11/20).
+# В одноногом режиме промах дороже: confirmed стартует ПОСЛЕ таймаута, а не параллельно.
+_src = pathlib.Path("chain/hotpath.py").read_text()
+_i = _src.index("if not px_hedge_degraded():")
+_blk = _src[_i:_src.index("ev_p, box_p", _i)]
+assert "preconf_mark_reactive()" in _blk, \
+    "одноногая ветка не уступает канал preconf — вернутся 45% промахов"
+print("OK 0/5: одноногая ветка уступает канал preconf (preconf_mark_reactive на месте)")
+
 # --- 1. ГЛАВНОЕ: preconf здоров -> боевой узел НЕ трогаем вовсе ---------------------------
 reset()
 px = hp.read_price_hedged(PRE, CONF, ORACLE, price_fn=mk(123))

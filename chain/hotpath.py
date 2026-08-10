@@ -528,6 +528,13 @@ def read_price_hedged(preconf_rpc, rpc, oracle, price_fn=read_preconf_price):
     if not px_hedge_degraded():
         # ШТАТНО: одна нога. Таймаут тот же, поэтому латентная гарантия не меняется —
         # меняется только то, что мы больше не платим за неиспользуемую страховку.
+        # ДЕФЕКТ МОЕЙ ЖЕ ПРАВКИ, пойман замером через 10 минут после раскатки: здесь не звался
+        # preconf_mark_reactive(), а он уступает канал preconf горячему чтению, отодвигая фоновый
+        # полл. Без него полл конкурировал с чтением, preconf не укладывался в 0.4с и промахи
+        # выросли с НУЛЯ до 45% (px_pre 7/13, 10/18, 11/20 против прежних 1/1, 2/2, 3/3).
+        # Каждый промах в одноногом режиме дороже, чем в старом: там confirmed уже летел
+        # параллельно, здесь он стартует ПОСЛЕ таймаута.
+        preconf_mark_reactive()
         ev1, box1 = threading.Event(), []
         threading.Thread(target=_leg_once, args=(price_fn, preconf_rpc, oracle, ev1, box1),
                          daemon=True).start()
