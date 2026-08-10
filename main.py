@@ -784,7 +784,21 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                                 log.exception("predict on_event handler упал (изолирован)")
                 # 05.08 bg-CU: полл latestRoundData 2с -> 4с (~11M CU/мес с bg-ключа; confirmed-
                 # метка грубеет на ±2с при lead med 67с — незаметно). Откат PREDICT_POLL_SEC=2.
+                # #82: запасной узел на время отказа основного. Замер: отказов основного ~1%
+                # (226/21600 в сутки), но backoff превращает их в ~29 минут ПОЛНОЙ слепоты;
+                # публичный узел даёт 26% отказов, то есть 74% успеха — несравнимо лучше нуля.
+                # Пустая PREDICT_FALLBACK_RPC_URL = прежнее поведение (уход в backoff).
+                _fb_fn = None
+                try:
+                    _fbu = str(os.environ.get("PREDICT_FALLBACK_RPC_URL",
+                                              "https://mainnet.base.org") or "")
+                    if _fbu and _fbu != _url:
+                        _fb_fn = make_poll_fn(BaseRpc(_fbu, cfg.chain_id, request_timeout=10),
+                                              proxies)
+                except Exception:
+                    _fb_fn = None
                 drv = PredictDriver(engine, mid_fn=pf.mid, poll_fn=make_poll_fn(_bg, proxies),
+                                    fallback_poll_fn=_fb_fn,
                                     on_event=_on_event,
                                     poll_interval=float(os.environ.get("PREDICT_POLL_SEC", "4.0")),
                                     log=lambda m: log.info("%s", m))

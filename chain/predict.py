@@ -307,11 +307,15 @@ class PredictDriver:
     не клин. mid_fn(sym)->(mid,ts)|None; poll_fn()->{sym:(updatedAt,price)}; on_arm(set)|None."""
 
     def __init__(self, engine: PredictEngine, mid_fn, poll_fn, on_arm=None, on_event=None,
+                 fallback_poll_fn=None,
                  log=print, interval: float = 0.5, poll_interval: float = 2.0,
                  stale_sec: float = MID_STALE_SEC,
                  now=time.monotonic, sleep=time.sleep, wall=time.time):
         self.engine = engine
         self.mid_fn, self.poll_fn = mid_fn, poll_fn
+        # #82: запасной узел на время отказа основного. None = прежнее поведение
+        # (уход в backoff и полная слепота на 5-30с).
+        self.fallback_poll_fn = fallback_poll_fn
         self.on_arm = on_arm
         self.on_event = on_event      # шов потребителей событий (spec-канарейка, позже pre-arm)
         self.log = log
@@ -414,6 +418,25 @@ class PredictDriver:
             self._poll_fail_streak = 0
             self._poll_backoff_until = 0.0
         except Exception as e:
+            # #82 (10.08): ОТСТУПАТЬ В НИКУДА — не то же, что отступать. Замер на боевом ключе:
+            # отказов всего ~1% (226 на 21600 опросов/сутки), но POLL_BACKOFF_AFTER=3 + база 5с
+            # + кап 30с превращают их в 1725с ≈ 29 МИНУТ полной слепоты в сутки (127 событий
+            # backoff, среднее 13.6с = до 7 пропущенных опросов подряд). Слепнет при этом ровно
+            # тот слой, на котором мы вообще можем выигрывать: гонку берут предвидением.
+            # Запасной узел даёт 74% успеха (замер публичного: 26% отказов) — несравнимо лучше
+            # 100% немоты. Пробуем его ДО того, как уйти в backoff.
+            if self.fallback_poll_fn is not None:
+                try:
+                    reads = self.fallback_poll_fn() or {}
+                    self.stats["poll_fallback_ok"] = self.stats.get("poll_fallback_ok", 0) + 1
+                    self._poll_fail_streak = 0        # запасной ответил — слепоты не было
+                    self._poll_backoff_until = 0.0
+                    self.log("[predict] основной узел отказал, ответил ЗАПАСНОЙ (%s)"
+                             % str(e)[:80])
+                    return self._apply_reads(reads, wall, stale)
+                except Exception as e2:
+                    self.stats["poll_fallback_fail"] = self.stats.get("poll_fallback_fail", 0) + 1
+                    self.log("[predict] запасной узел тоже отказал: %s" % str(e2)[:80])
             self.stats["poll_fail"] += 1
             self._poll_fail_streak += 1
             if POLL_BACKOFF_ON and self._poll_fail_streak >= POLL_BACKOFF_AFTER:
@@ -425,8 +448,13 @@ class PredictDriver:
             else:
                 self.log("[predict] aggregator poll failed (skipped): %s" % str(e)[:120])
             return []
+        return self._apply_reads(reads, wall, stale)
+
+    def _apply_reads(self, reads, wall, stale=None) -> list:
+        """Показания -> события. Вынесено из _poll, чтобы запасной узел кормил ТУ ЖЕ обработку
+        (#82): иначе фолбэк пришлось бы дублировать, а дубль разошёлся бы при первой правке."""
         events = []
-        for sym, val in reads.items():
+        for sym, val in (reads or {}).items():
             sym = sym.upper()
             if sym not in self.engine.feeds or not val:
                 continue
