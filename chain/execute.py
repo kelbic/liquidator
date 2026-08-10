@@ -270,6 +270,24 @@ def canary_record_gas(gas_usd: float):
         _CANARY_GAS_USD += max(0.0, gas_usd)
 
 
+# #91 (10.08) — ЦЕНА ПРИОРИТЕТА, а не плотность, держала нас вне призового окна.
+# Блок Base не плоский FCFS: это склейка суб-блоков (флэшблоки 200мс), и ВНУТРИ каждого порядок
+# идёт по УБЫВАНИЮ tip. Обновление оракула приходит на ПОЛУ рынка (0.001 gwei) и потому лежит
+# глубоко в хвосте своего суб-блока; все призы — там же. Замер блока 49666338: позиции 2164..2191
+# (включая транзит 2170 и взятые призы 2176/2179/2181/2182/2187) — ВСЕ на 0.001 gwei, ни одной
+# точки роста на 27 подряд позициях.
+# Значит плата ВЫШЕ пола не помогает, а ДИСКВАЛИФИЦИРУЕТ: сортировка выносит пробу в голову
+# суб-блока, на сотни позиций РАНЬШЕ транзита, где жертва ещё здорова (наши «position is
+# healthy»). Мы платили cfg.tip_gwei = 0.05 (50 полов), а в каскаде dynamic_tip_gwei поднимал
+# до 0.5 — максимум платы ровно там, где призы. В призовом окне [T+1, T+20] у победителей было
+# 8/8/3/1 tx, у нас 0.
+# ПОЛИТИКА ДВУХРЕЖИМНАЯ, и режимы уже разведены по путям: ПРОБЫ флота (здесь) идут на полу и
+# садятся в хвост рядом с транзитом; БОЕВОЙ dispatch с главного кошелька остаётся на высоком
+# tip — в суб-блоках зачистки правило переворачивается (приз на idx 2860 взяла tx с 24.65 gwei).
+# Прежний канон «tip места не покупает» верен МЕЖДУ суб-блоками и ложен ВНУТРИ одного.
+_PROBE_TIP_WEI = int(os.environ.get("SPEC_FIRE_PROBE_TIP_WEI", "1000000"))   # 0.001 gwei = пол
+
+
 def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=None,
                 spec_interval_sec=None, spec_max_probes=None):
     """⭐ Минимальная 0-value self-transfer от БОЕВОГО кошелька под ОБЩИМ _SEND_LOCK/_LOCAL_NONCE
@@ -966,7 +984,7 @@ def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, lo
         nonce = _VOLLEY_NONCE.get(addr)
         if nonce is None:
             nonce = _pending_nonce(w3, addr)
-        tip_wei = int(tip) if tip else int(cfg.tip_gwei * 1e9)
+        tip_wei = int(tip) if tip else _PROBE_TIP_WEI   # #91: V1-проба залпа — на ПОЛУ рынка
         _tx = {"to": cfg.liquidator_address, "data": calldata, "nonce": nonce, "gas": int(gas)}
         if max_fee is not None:
             _tx["maxFeePerGas"] = int(max_fee)
@@ -1070,7 +1088,7 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
         return 0
     depth = int(depth or _VOLLEY_PRESIGN_DEPTH)
     w3 = rpc._web3()
-    tip_wei = int(tip) if tip else int(cfg.tip_gwei * 1e9)
+    tip_wei = int(tip) if tip else _PROBE_TIP_WEI   # #91: лестница пред-подписанных проб — на ПОЛУ рынка
     with lk:
         if base_fee is None:
             base_fee = int(w3.eth.get_block("latest").get("baseFeePerGas") or 0)

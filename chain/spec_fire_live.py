@@ -1254,7 +1254,10 @@ class SpecFireLive:
                 except Exception as e:
                     self._log("SPECFIRE аудит лестниц: база не прочитана (%s)" % _diag(e))
                     return
-                tip = int(float(getattr(self.cfg, "tip_gwei", 0.05)) * 1e9)
+                # #91: лестница подписана ПОЛОМ рынка, значит и аудит цены обязан считать по
+                # полу. Сверка с боевым cfg.tip_gwei объявила бы протухшими ВСЕ 110 ног разом
+                # и запустила бы вечную пересборку — регрессия, пойманная тестом.
+                tip = int(_ex._PROBE_TIP_WEI)
                 stale = [a for a in (addrs or []) if _ex.ladder_resign_needed(a, bf, tip)]
                 if not stale:
                     return
