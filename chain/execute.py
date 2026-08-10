@@ -601,6 +601,12 @@ def canary_invalidate_nonce(rpc, cfg):
 SPEC_FIRE_VOLLEY = os.environ.get("SPEC_FIRE_VOLLEY", "1").lower() not in ("0", "false", "no")
 CASCADE_TIER_GAS_USD = float(os.environ.get("CASCADE_TIER_GAS_USD", "150"))
 _VOLLEY_GAS_USD = 0.0
+_VOLLEY_GAS_RESERVED = 0.0        # #93: газ отправленных проб, чьи квитанции ещё в пути
+_VOLLEY_RESERVE_BY_HASH = {}      # hash -> $ брони: освобождаем РОВНО то, что заняли
+# Худший случай пробы ПОСЛЕ срабатывания триггера: копия KB-плана + вызов Morpho.
+# Замер на форке (#70): 445-710k. Бронируем по верхней границе — недобронировать
+# опаснее, чем перебронировать: бронь живёт секунды до квитанции.
+_VOLLEY_PROBE_GAS_WORST = int(os.environ.get("SPEC_FIRE_PROBE_GAS_WORST", "710000"))
 _VOLLEY_PROBES = 0
 _VOLLEY_DAY = int(time.time() // 86400)
 _VOLLEY_ACCTS = None            # lazy: [(addr, key)] из env; [] = ключей нет -> тир молчит
@@ -854,9 +860,46 @@ def _volley_roll_day_locked():
     if d != _VOLLEY_DAY:
         _VOLLEY_DAY = d
         _VOLLEY_GAS_USD = 0.0
+        globals()["_VOLLEY_GAS_RESERVED"] = 0.0
+        _VOLLEY_RESERVE_BY_HASH.clear()
+
+
+def volley_gas_reserve(txh: str, usd: float):
+    """#93: ЗАБРОНИРОВАТЬ газ в момент ОТПРАВКИ, не дожидаясь квитанции.
+
+    Прежде расход рос только в `_engine_result`, то есть по пришедшей квитанции. Коллектор
+    разбирает 64 квитанции/с, а движок настроен на 400 отправок/с — учёт отставал ВШЕСТЕРО.
+    Пока триггер не сработал, проба стоит 23.6k и отставание безобидно; но ПОСЛЕ пересечения
+    триггера проба копирует KB-план и зовёт Morpho — 445-710k. Полный магазин 110x40 = 4400 проб
+    это ~$290 против бакета $150 и суточного выключателя $500, а `check_gas_budget_sane`
+    перелёта не моделирует вовсе. То есть проигранная гонка могла сжечь половину суточного
+    выключателя раньше, чем тормоз это увидит, — а сработавший выключатель глушит И БОЕВОЙ путь.
+
+    Бронь ВРЕМЕННАЯ и держится ПО ХЭШУ: квитанция освобождает ровно ту сумму, что заняла эта
+    же проба. Поэтому суточный ФАКТ от брони не растёт — она ограничивает мгновенную экспозицию."""
+    global _VOLLEY_GAS_RESERVED
+    if not txh:
+        return
+    with _INFLIGHT_LOCK:
+        _volley_roll_day_locked()
+        u = max(0.0, float(usd or 0.0))
+        _VOLLEY_RESERVE_BY_HASH[txh] = u
+        _VOLLEY_GAS_RESERVED += u
+
+
+def volley_gas_settle(txh: str, gas_usd: float):
+    """Записать ФАКТ по квитанции и снять бронь ИМЕННО этой пробы."""
+    global _VOLLEY_GAS_USD, _VOLLEY_GAS_RESERVED
+    with _INFLIGHT_LOCK:
+        _volley_roll_day_locked()
+        _VOLLEY_GAS_USD += max(0.0, float(gas_usd or 0.0))
+        u = _VOLLEY_RESERVE_BY_HASH.pop(txh, 0.0)
+        if u:
+            _VOLLEY_GAS_RESERVED = max(0.0, _VOLLEY_GAS_RESERVED - u)
 
 
 def volley_gas_add(gas_usd: float):
+    """Совместимость: только ФАКТ, без снятия брони (путь V1 брони не ставит)."""
     global _VOLLEY_GAS_USD
     with _INFLIGHT_LOCK:
         _volley_roll_day_locked()
@@ -864,9 +907,17 @@ def volley_gas_add(gas_usd: float):
 
 
 def volley_gas_today() -> float:
+    """ФАКТ за сутки (без брони) — для отчётов и дневного kill-switch."""
     with _INFLIGHT_LOCK:
         _volley_roll_day_locked()
         return _VOLLEY_GAS_USD
+
+
+def volley_gas_committed() -> float:
+    """ФАКТ + бронь в полёте — величина, по которой обязаны решать ГЕЙТЫ огня."""
+    with _INFLIGHT_LOCK:
+        _volley_roll_day_locked()
+        return _VOLLEY_GAS_USD + _VOLLEY_GAS_RESERVED
 
 
 def volley_invalidate_nonce(addr: str):
@@ -887,7 +938,7 @@ def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, lo
     global _VOLLEY_PROBES
     with _INFLIGHT_LOCK:
         _volley_roll_day_locked()
-        if _VOLLEY_GAS_USD >= CASCADE_TIER_GAS_USD or _INFLIGHT > 0:
+        if (_VOLLEY_GAS_USD + _VOLLEY_GAS_RESERVED) >= CASCADE_TIER_GAS_USD or _INFLIGHT > 0:
             return None
     lk = _VOLLEY_LOCKS.get(addr)
     if lk is None:
@@ -1090,10 +1141,10 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
     Откат: SPEC_FIRE_ENGINE_IGNORE_INFLIGHT=0 — движок снова молчит при боевой tx в полёте.
     Возврат hash|None. При неудаче запись возвращается В НАЧАЛО очереди (инвариант подряд).
     """
-    global _VOLLEY_PROBES, _VOLLEY_FLOOR_SKIPS, _VOLLEY_UNKNOWN_SKIPS
+    global _VOLLEY_PROBES, _VOLLEY_FLOOR_SKIPS, _VOLLEY_UNKNOWN_SKIPS, _VOLLEY_GAS_RESERVED
     with _INFLIGHT_LOCK:
         _volley_roll_day_locked()
-        if (_VOLLEY_GAS_USD >= CASCADE_TIER_GAS_USD
+        if ((_VOLLEY_GAS_USD + _VOLLEY_GAS_RESERVED) >= CASCADE_TIER_GAS_USD
                 or (_INFLIGHT > 0 and not _ENGINE_PROBE_IGNORE_INFLIGHT)):
             return None
     lk = _VOLLEY_LOCKS.get(addr)
@@ -1176,6 +1227,17 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
         # а верхнюю границу дрейфа держит дозор по возрасту кэша.
     with _INFLIGHT_LOCK:
         _VOLLEY_PROBES += 1
+        # #93: БРОНЬ В МОМЕНТ ОТПРАВКИ. Гейт огня решает по ФАКТ+БРОНЬ, поэтому магазин
+        # не может уйти в перелёт быстрее, чем коллектор успевает считать. Бронируем по
+        # ХУДШЕМУ случаю (проба после срабатывания триггера), квитанция её освободит и
+        # запишет истину — суточный ФАКТ от этого не растёт.
+        try:
+            _res = (_VOLLEY_PROBE_GAS_WORST * int(st["max_fee"])
+                    * float(getattr(cfg, "eth_price_usd", 0.0) or 0.0) / 1e18)
+            _VOLLEY_RESERVE_BY_HASH[h] = max(0.0, _res)
+            _VOLLEY_GAS_RESERVED += max(0.0, _res)
+        except Exception:
+            pass
     return h
 
 

@@ -1006,6 +1006,35 @@ class SpecFireLive:
             except Exception:
                 pass
 
+    def _clear_board(self, mid, b, feed, why):
+        """#94: СНЯТЬ план с контракта, когда жертву забрали.
+
+        `encode_clear_plan()` был написан и не вызывался НИКЕМ. Последствие дорогое: после
+        проигранной гонки план лежит на цепи весь TTL (900с) с УЖЕ ВЫПОЛНЕННЫМ триггером —
+        значит фильтр `px > trig` больше не отсекает, и каждая следующая проба ноги проходит
+        внутрь и платит полные 445-710k вместо 23 619 холостых. Это и есть механизм, которым
+        проигранная гонка выжигает бакет: сценарий не редкий, а базовый (0 побед из 9794).
+
+        Зовём только если доска армлена ИМЕННО под эту цель — чужой план снимать нельзя."""
+        st = self._board or {}
+        if st.get("key") != (mid, b):
+            return False
+        try:
+            import chain.execute as _ex
+            cd = _ex.encode_clear_plan()
+            h = (self._board_arm_fn or (lambda c, g, tag: _ex.send_board_tx(
+                self.rpc, self.cfg, c, g, log=log, tag=tag)))(cd, 120_000, "clearPlan")
+            self._board = {}                  # локально доска мертва независимо от исхода tx
+            self.stats["board_cleared"] = self.stats.get("board_cleared", 0) + 1
+            self._log("SPECFIRE доска СНЯТА feed=%s %s/%s (%s) tx=%s — план больше не пускает "
+                      "пробы внутрь" % (feed, mid[:10], b[:10], why, h))
+            return True
+        except Exception as e:
+            self._board = {}                  # не смогли снять на цепи — хотя бы не стреляем
+            self._log("SPECFIRE доска: снятие не удалось feed=%s: %s (локально снята)" % (
+                feed, _diag(e)))
+            return False
+
     def _board_live(self, mid, b) -> bool:
         """Доска армлена, ПРОТУХНУТЬ не успела, запись села И ПОДТВЕРЖДЕНА чтением контракта."""
         st = self._board
@@ -1257,14 +1286,18 @@ class SpecFireLive:
     def _engine_result(self, meta, h, r):
         """Исход пробы движка. Вердикт победы — ТОЛЬКО по событию Liquidated (см. LIQUIDATED_TOPIC0):
         у пробы доски status=1 бывает и у холостой, и у неудачной попытки."""
-        from chain.execute import volley_gas_add, volley_bal_charge
+        from chain.execute import volley_bal_charge
         addr, tgt = (meta or (None, None))
         try:
             _wei = int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
             gas_usd = _wei * float(self.cfg.eth_price_usd) / 1e18
         except Exception:
             _wei, gas_usd = 0, 0.0
-        volley_gas_add(gas_usd)
+        # #93: записываем ФАКТ и освобождаем бронь, поставленную при отправке этой же пробы.
+        # Бронь покрывает только окно «в полёте» (учёт отставал от отправок вшестеро), поэтому
+        # суточный факт от неё не растёт — она ограничивает мгновенную экспозицию.
+        from chain.execute import volley_gas_settle
+        volley_gas_settle(h, gas_usd)
         volley_bal_charge(addr, _wei)     # #45: патрон списывается по ФАКТУ, не по эстимейту
         if _receipt_has_win(r, self.cfg.liquidator_address) is not True:
             self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
@@ -1290,7 +1323,10 @@ class SpecFireLive:
     def _engine_timeout(self, meta, h):
         """Квитанции нет за таймаут: nonce ноги под вопросом — склад этой ноги сбрасываем,
         иначе вся её лестница висит за возможной дырой."""
-        from chain.execute import volley_invalidate_nonce, invalidate_ladder
+        from chain.execute import volley_invalidate_nonce, invalidate_ladder, volley_gas_settle
+        # #93: квитанции не будет — бронь этой пробы обязана освободиться, иначе она копится
+        # навсегда и гейт огня самозапирается. Факт при этом НЕ пишем: расход неизвестен.
+        volley_gas_settle(h, 0.0)
         addr = (meta or (None, None))[0]
         if addr:
             volley_invalidate_nonce(addr)
@@ -1630,6 +1666,7 @@ class SpecFireLive:
                                 if probe == "gone":   # LOSS-стоп (ревью 31.07): жертву разобрали —
                                     dead.add((mid, b))    # кап не догорает ревертами по мёртвой цели
                                     cache.pop((mid, b), None)
+                                    self._clear_board(mid, b, feed, "жертву забрали")   # #94
                                     self._log("SPECFIRE loss-stop feed=%s %s/%s: позиция разобрана "
                                               "(конкурент/погашение) — цель снята" % (feed, mid[:10], b[:10]))
                                     continue
