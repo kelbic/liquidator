@@ -893,9 +893,19 @@ class SpecFireLive:
             cd = _ex.encode_set_plan(
                 plan["mp"], plan["borrower"], plan["repaid_shares"], plan["router"],
                 plan["swap_calldata"], plan["min_profit"], dl, plan["trigger"])
-            # газ: запись плана пишет KB-скейл роут в сторадж — считаем по длине калдаты,
-            # 22 газа/байт с запасом (16 калдата + ~6 на слово стораджа) плюс постоянная часть
-            gas = 120_000 + 22 * (len(cd) // 2)
+            # #84 (аудит 10.08) — КОРНЕВОЙ ДЕФЕКТ ВСЕГО ТРАКТА. Прежняя формула
+            # `120_000 + 22*байт` была МЕНЬШЕ стоимости самой записи, и арм не садился НИ РАЗУ
+            # за всю историю: на боевой калдате 772 Б она даёт лимит 137 006 при estimate
+            # 505 718 (×3.69). Проверено на цепи — все 4 setPlan (0x3e73d952, 0xf25f8369,
+            # 0x6c6dcc8c, 0x754ec513) имеют status=0 и gasUsed == gasLimit == 137 006 ровно,
+            # логов ноль. Наклон 22/байт был взят как «16 калдата + ~6 стораджа», но байт
+            # роута ложится в bytes-поле стораджа: холодный SSTORE = 20k на слово, то есть
+            # ~625 газа НА БАЙТ, плюс ~12 холодных слотов фиксированных полей (240k).
+            # Отсюда: постоянная 300k и наклон 800/байт (запас ~1.8x к замеренному estimate).
+            # Щедрый лимит здесь ничего не стоит: по EIP-1559 платим за gasUsed, а не за
+            # лимит; цена ошибки в другую сторону — мёртвый тракт, что и было три недели.
+            _nb = len(cd) // 2                     # байт калдаты (cd — hex со схемой 0x)
+            gas = max(700_000, 300_000 + 800 * _nb)
             h = (self._board_arm_fn or (lambda c, g, tag: _ex.send_board_tx(
                 self.rpc, self.cfg, c, g, log=log, tag=tag)))(cd, gas, "setPlan")
             if h is None:
@@ -905,8 +915,15 @@ class SpecFireLive:
                            # доска считается годной только ПОСЛЕ того, как tx могла сесть;
                            # до этого 1-байт пробы ушли бы в пустоту (плана в сторадже нет)
                            "until": self._now() + SPEC_FIRE_V2_PLAN_TTL_SEC - 30.0,
-                           "ready_at": self._now() + SPEC_FIRE_V2_BOARD_SETTLE_SEC}
+                           "ready_at": self._now() + SPEC_FIRE_V2_BOARD_SETTLE_SEC,
+                           # #84: ХЭШ — НЕ ПОСАДКА. Пока план не прочитан С КОНТРАКТА, доска
+                           # не живая: иначе осечка арма хуже отсутствия доски (ноги бьют 1
+                           # байтом в пустой сторадж ~840с, а штатная деградация в V1 не
+                           # срабатывает, потому что код считает доску исправной).
+                           "verified": False, "tx": h}
             self.stats["board_arms"] += 1
+            threading.Thread(target=self._verify_board, args=((mid, b), feed, h),
+                             daemon=True).start()
             self._log("SPECFIRE доска armed feed=%s %s/%s trigger=%s TTL=%dс tx=%s" % (
                 feed, mid[:10], b[:10],
                 ("%.4g" % (plan["trigger"] / 1e36)) if plan["trigger"] else "нет(fail-open)",
@@ -919,10 +936,63 @@ class SpecFireLive:
         finally:
             self._board_lock.release()
 
+    def _verify_board(self, key, feed, txh):
+        """#84: ПОДТВЕРДИТЬ, что план ДЕЙСТВИТЕЛЬНО лежит в контракте.
+
+        Своим тредом — путь огня не платит за это чтение. Отправка идёт без ожидания
+        квитанции (латентность), поэтому единственное доказательство посадки — прочитать
+        planInfo() с контракта. Три недели `_arm_board` признавал арм по возвращённому хэшу
+        и писал «доска armed» на транзакциях, сгоревших по газу: 4 из 4 боевых setPlan имели
+        status=0 при gasUsed == gasLimit. Ложноположительный арм ХУЖЕ отсутствия арма."""
+        import time as _t
+        try:
+            _t.sleep(max(1.0, float(SPEC_FIRE_V2_BOARD_SETTLE_SEC)))
+            from chain.execute import read_plan_info
+            # Читаем до трёх раз: одиночный сбой сети не должен снимать ЖИВУЮ доску (это
+            # стоило бы окна), но и «не смогли прочитать» не превращается в «считаем, что
+            # село» — после трёх попыток гард закрывается.
+            info = None
+            for _i in range(3):
+                info = read_plan_info(self.rpc, self.cfg.liquidator_address)
+                if info and info[0] and str(info[0]).lower() == str(key[1]).lower():
+                    break
+                if _i < 2:
+                    _t.sleep(1.0)
+            st = self._board
+            if st.get("key") != key:
+                return                            # доску уже переписал другой арм — не наше дело
+            ok = bool(info and info[0] and int(info[1] or 0) > int(_t.time())
+                      and str(info[0]).lower() == str(key[1]).lower())
+            if ok:
+                st["verified"] = True
+                self.stats["board_verified"] = self.stats.get("board_verified", 0) + 1
+                self._log("SPECFIRE доска ПОДТВЕРЖДЕНА на цепи feed=%s %s/%s dl=%s tx=%s" % (
+                    feed, key[0][:10], key[1][:10], info[1], txh))
+                return
+            # Не села. Громко и с деградацией: доску снимаем, залп уходит по V1.
+            self._board = {}
+            self.stats["board_fails"] += 1
+            self.stats["board_unlanded"] = self.stats.get("board_unlanded", 0) + 1
+            self._log("SPECFIRE доска НЕ СЕЛА feed=%s %s/%s — planInfo=%s tx=%s; доска снята, "
+                      "залп деградирует в V1" % (feed, key[0][:10], key[1][:10], info, txh))
+            self._arm_retry(feed, "план не подтверждён на цепи")
+        except Exception as e:
+            # Незнание закрывает гард: не подтвердили — значит не доверяем.
+            try:
+                if (self._board or {}).get("key") == key:
+                    self._board = {}
+                    self.stats["board_fails"] += 1
+                self._log("SPECFIRE доска: проверка посадки не удалась feed=%s: %s — "
+                          "доска снята (незнание = запрет)" % (feed, _diag(e)))
+                self._arm_retry(feed, "проверка посадки не удалась")
+            except Exception:
+                pass
+
     def _board_live(self, mid, b) -> bool:
-        """Доска армлена, ПРОТУХНУТЬ не успела И запись уже могла сесть в блок."""
+        """Доска армлена, ПРОТУХНУТЬ не успела, запись села И ПОДТВЕРЖДЕНА чтением контракта."""
         st = self._board
-        return bool(self._board_ready(mid, b) and self._now() >= st.get("ready_at", 0.0))
+        return bool(self._board_ready(mid, b) and self._now() >= st.get("ready_at", 0.0)
+                    and st.get("verified"))
 
     def _board_plan_live(self):
         """(mid, b) ЖИВОГО армленного плана (запись успела сесть) или None.

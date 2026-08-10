@@ -112,6 +112,12 @@ print("UNIT_OK: до оседания setPlan ноги идут по V1 (про�
 
 # ---- 3. Оседание прошло -> 1 байт ----
 CLOCK["t"] += sfl_mod.SPEC_FIRE_V2_BOARD_SETTLE_SEC + 0.1
+# #84: одного оседания по часам МАЛО. Доска живая только после того, как план ПРОЧИТАН с
+# контракта: три недели арм признавался по возвращённому хэшу, а все 4 боевых setPlan
+# сгорели по газу (status=0, gasUsed==gasLimit==137006) — доска «жила» над пустым стораджем.
+assert sf._board_live("0xbtc", FAT) is False, \
+    "оседание по часам без подтверждения посадки снова делает доску живой"
+sf._board["verified"] = True          # в бою это ставит _verify_board, прочитав planInfo()
 assert sf._board_live("0xbtc", FAT) is True
 volley(sf)
 assert len(SENT) == 2, SENT

@@ -74,7 +74,11 @@ def mk(now=1000.0, ready_delta=-1.0, until_delta=100.0):
     sf._now = lambda: now
     sf._board = {"key": ("0xMID", "0xBOR"), "debt": 31000.0,
                  "until": now + until_delta, "ready_at": now + ready_delta,
-                 "armed_ts": now - 10.0}
+                 "armed_ts": now - 10.0,
+                 # #84: план ПОДТВЕРЖДЁН чтением с контракта. Без этого флага доска не живая
+                 # (три недели она считалась живой по одному факту отправки, а все боевые
+                 # setPlan сгорали по газу) — и право огня движку выдавать не с чего.
+                 "verified": True}
     sf._fire_engine = FakeEng()
     sf._logs = []
     sf._log = sf._logs.append
