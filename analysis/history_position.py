@@ -29,7 +29,14 @@ import sys
 import time
 import urllib.request
 
-RPC = os.environ.get("RECON_RPC_URL", "https://base-rpc.publicnode.com")
+# ДВА узла по назначению — замерено 11.08, каждый проверен позитивным контролем:
+#   * архивные eth_getLogs: base.org отдаёт (21 лог на 49666338), publicnode требует платный
+#     токен («Archive requests require a personal token»);
+#   * ПОЛНЫЕ блоки: publicnode отдаёт (4139 tx на 49666338), base.org отвечает «response too
+#     large».
+# Первая редакция ходила одним узлом и молча получала пустоту на логах.
+LOG_RPC = os.environ.get("RECON_LOG_RPC", "https://mainnet.base.org")
+BLOCK_RPC = os.environ.get("RECON_BLOCK_RPC", "https://base-rpc.publicnode.com")
 THROTTLE = float(os.environ.get("RECON_THROTTLE_SEC", "0.25"))
 CACHE = pathlib.Path(os.environ.get("HP_CACHE", "/home/claude-agent/.claude/jobs/c5adabde/tmp/blkcache"))
 
@@ -52,13 +59,13 @@ OUR_TO = {
 OUR_FROM = {"0xe2aca8e68ae3b7efcfce4fd82abdfc2a9d7908fe"}   # главный кошелёк
 
 
-def rpc(method, params, tries=4):
+def rpc(method, params, tries=4, url=None):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
     last = None
     for _ in range(tries):
         try:
             req = urllib.request.Request(
-                RPC, data=body,
+                url or LOG_RPC, data=body,
                 headers={"content-type": "application/json", "User-Agent": "curl/8.5"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 j = json.loads(r.read())
@@ -80,7 +87,7 @@ def get_block(n):
             return json.loads(f.read_text())
         except Exception:                            # noqa: BLE001
             pass
-    b = rpc("eth_getBlockByNumber", [hex(n), True])
+    b = rpc("eth_getBlockByNumber", [hex(n), True], url=BLOCK_RPC)
     if isinstance(b, dict) and "__err__" not in b and b.get("transactions") is not None:
         f.write_text(json.dumps(b))
         time.sleep(THROTTLE)
@@ -97,16 +104,21 @@ def liquidate_blocks(lo, hi, step=2000):
     out = {}
     n = lo
     while n <= hi:
-        end = min(n + step - 1, hi)
-        logs = rpc("eth_getLogs", [{"fromBlock": hex(n), "toBlock": hex(end),
-                                    "address": MORPHO, "topics": [LIQUIDATE]}])
-        if isinstance(logs, dict) and "__err__" in logs:
-            if step > 100:                            # сузить окно и повторить
-                step //= 4
-                continue
-            sys.stderr.write("окно %d..%d не отдалось: %s\n" % (n, end, logs["__err__"]))
-            n = end + 1
-            continue
+        # #Ш22: сужение окна ЛОКАЛЬНОЕ. В первой редакции `step` дробился навсегда, поэтому
+        # после пары отказов скан шёл окнами по 31 блоку и уходил в часы — прогон убило по
+        # таймауту, и это был МОЙ дефект, а не медленная нода.
+        w = step
+        while True:
+            end = min(n + w - 1, hi)
+            logs = rpc("eth_getLogs", [{"fromBlock": hex(n), "toBlock": hex(end),
+                                        "address": MORPHO, "topics": [LIQUIDATE]}])
+            if not (isinstance(logs, dict) and "__err__" in logs):
+                break
+            if w <= 100:
+                sys.stderr.write("окно %d..%d не отдалось: %s\n" % (n, end, logs["__err__"]))
+                logs = []
+                break
+            w //= 4
         for lg in logs or []:
             out.setdefault(int(lg["blockNumber"], 16), []).append(lg)
         sys.stderr.write("  сканировано до %d, блоков с ликвидацией %d\r" % (end, len(out)))
@@ -157,6 +169,22 @@ def main():
     ap.add_argument("--out", default="/home/claude-agent/.claude/jobs/c5adabde/tmp/hp_report.json")
     ap.add_argument("--max-blocks", type=int, default=200)
     a = ap.parse_args()
+
+    # ПОЗИТИВНЫЙ КОНТРОЛЬ ИНСТРУМЕНТА — до всякой работы.
+    # Блок 49666338 (каскад 07.08) достоверно несёт 21 событие Liquidate и 4139 транзакций.
+    # Без этой проверки пустой результат неотличим от «узел молча не отдаёт архив»: сегодня я
+    # уже чуть не объявил ноды сломанными, перепутав hex блока (0x2f5c0e2 вместо 0x2f5d922).
+    CTRL_BLOCK, CTRL_LOGS, CTRL_TX = 49666338, 21, 4139
+    cl = rpc("eth_getLogs", [{"fromBlock": hex(CTRL_BLOCK), "toBlock": hex(CTRL_BLOCK),
+                              "address": MORPHO, "topics": [LIQUIDATE]}])
+    cb = get_block(CTRL_BLOCK)
+    n_l = len(cl) if isinstance(cl, list) else -1
+    n_t = len(cb["transactions"]) if cb else -1
+    print("КОНТРОЛЬ на блоке %d: логов %d (ждём %d), tx %d (ждём %d)"
+          % (CTRL_BLOCK, n_l, CTRL_LOGS, n_t, CTRL_TX))
+    if n_l != CTRL_LOGS or n_t != CTRL_TX:
+        print("КОНТРОЛЬ ПРОВАЛЕН — инструмент не способен увидеть явление. Считать нечего.")
+        return 2
 
     head = int(rpc("eth_blockNumber", []), 16)
     span = int(a.days * 24 * 3600 / 2)               # блок Base = 2с
