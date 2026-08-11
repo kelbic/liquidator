@@ -938,6 +938,28 @@ def volley_gas_committed() -> float:
         return _VOLLEY_GAS_USD + _VOLLEY_GAS_RESERVED
 
 
+def volley_leg_landed(rpc, addr: str) -> bool:
+    """#102: села ли ВСЯ отправленная очередь этой ноги — сверка nonce с ЦЕПЬЮ.
+
+    «Квитанция не пришла за таймаут» НЕ равно «нога сломана»: 10.08 сборщик квитанций
+    захлебнулся под плотным огнём, выдал 33 ложных NO-RECEIPT подряд, и каждый из них сбросил
+    лестницу — весь флот ушёл в пересборку на 28-32с. Окно молчания пришлось РОВНО на транзит
+    ценой $600-900. При этом транзакции САДИЛИСЬ: за 16 блоков момента отправки с главного
+    кошелька село 20 tx, с одной ноги 9. То есть код принял незнание за факт поломки — тот же
+    класс, что мы уже ловили дважды.
+
+    Возврат True = на цепи nonce догнал наш локальный, значит дыр нет и сбрасывать нечего.
+    Ошибка чтения -> False (незнание закрывает гард: лучше лишняя пересборка, чем дыра nonce)."""
+    try:
+        local = _VOLLEY_NONCE.get(addr)
+        if local is None:
+            return False
+        on_chain = int(rpc._web3().eth.get_transaction_count(addr, "pending"))
+        return on_chain >= int(local)
+    except Exception:
+        return False
+
+
 def volley_invalidate_nonce(addr: str):
     """NO-RECEIPT ноги залпа: nonce EOA возможно впереди чейна — пере-читать на следующей."""
     lk = _VOLLEY_LOCKS.get(addr)

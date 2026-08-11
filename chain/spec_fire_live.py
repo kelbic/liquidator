@@ -1422,16 +1422,25 @@ class SpecFireLive:
     def _engine_timeout(self, meta, h):
         """Квитанции нет за таймаут: nonce ноги под вопросом — склад этой ноги сбрасываем,
         иначе вся её лестница висит за возможной дырой."""
-        from chain.execute import volley_invalidate_nonce, invalidate_ladder, volley_gas_settle
+        from chain.execute import (volley_invalidate_nonce, invalidate_ladder,
+                                   volley_gas_settle, volley_leg_landed)
         # #93: квитанции не будет — бронь этой пробы обязана освободиться, иначе она копится
         # навсегда и гейт огня самозапирается. Факт при этом НЕ пишем: расход неизвестен.
         volley_gas_settle(h, 0.0)
         addr = (meta or (None, None))[0]
         if addr:
+            # #102: СПЕРВА спрашиваем цепь. Сброс склада стоит 40 пред-подписанных проб и
+            # 28-32с пересборки всего флота, поэтому «не знаю» не имеет права его запускать.
+            if volley_leg_landed(self.rpc, addr):
+                self.stats["noreceipt_spared"] = self.stats.get("noreceipt_spared", 0) + 1
+                self._log("SPECFIRE движок NO-RECEIPT eoa=%s tx=%s — но nonce на ЦЕПИ догнал: "
+                          "tx села, склад СОХРАНЁН" % (addr[:10], h))
+                return
+            self.stats["noreceipt_dropped"] = self.stats.get("noreceipt_dropped", 0) + 1
             volley_invalidate_nonce(addr)
             invalidate_ladder(addr)
-            self._log("SPECFIRE движок NO-RECEIPT eoa=%s tx=%s — склад ноги сброшен" % (
-                addr[:10], h))
+            self._log("SPECFIRE движок NO-RECEIPT eoa=%s tx=%s — nonce на цепи ОТСТАЁТ, "
+                      "склад ноги сброшен" % (addr[:10], h))
 
     def _volley(self, probe, mid, b, d, feed, simultaneous=False):
         """Залп вслед за успешной пробой главного кошелька: тот же calldata на v4 от каждого

@@ -84,8 +84,13 @@ def segments(rows):
     return starts
 
 
-def analyse(block, ours, feed=None, half=60):
-    """Разбор одного блока. ours — множество наших адресов (from) в нижнем регистре."""
+def analyse(block, ours, feed=None, half=60, ours_to=None):
+    """Разбор одного блока.
+
+    ours — наши отправители (from). ours_to — наши ПОЛУЧАТЕЛИ (наш контракт-ликвидатор):
+    по нему ловятся пробы ВСЕГО флота разом, не требуя списка 110 адресов ног. Это и есть
+    рабочий способ: любая наша проба идёт В наш контракт, кем бы она ни была отправлена."""
+    ours_to = {a.lower() for a in (ours_to or set())}
     tr = find_transit(block, feed)
     if not tr:
         return {"block": block, "transit": None, "error": "пуша оракула в блоке нет"}
@@ -95,7 +100,7 @@ def analyse(block, ours, feed=None, half=60):
     floor = min((r[3] for r in rows), default=0)
     seg_starts = segments(rows)
 
-    mine = [r for r in rows if r[1] in ours]
+    mine = [r for r in rows if r[1] in ours or (r[2] and r[2] in ours_to)]
     prize = [r for r in mine if t_idx < r[0] <= t_idx + PRIZE_WINDOW]
     prize_floor = [r for r in prize if r[3] == floor]
     # кто ВООБЩЕ стоял в призовом окне — для честного знаменателя «сколько там мест»
@@ -142,9 +147,11 @@ def main():
             half = int(sys.argv[i + 1])
     ours = {a.strip().lower() for a in
             (os.environ.get("OUR_SENDERS", "") or "").split(",") if a.strip()}
+    ours_to = {a.strip().lower() for a in
+               (os.environ.get("OUR_CONTRACTS", "") or "").split(",") if a.strip()}
     if not ours:
         print("OUR_SENDERS не задан (список наших from через запятую) — считаю только транзит")
-    res = analyse(block, ours, feed=feed, half=half)
+    res = analyse(block, ours, feed=feed, half=half, ours_to=ours_to)
     print(_fmt(res))
     if os.environ.get("BLOCK_POSITION_JSON"):
         print(json.dumps(res, ensure_ascii=False))
