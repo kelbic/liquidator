@@ -1820,6 +1820,10 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     _fl_trip = pop_fast_lane_trip()                # II.6: breaker сработал в receipt-цикле dispatch -> TG-пейдж
     if _fl_trip:
         alerter.send_async(_fl_trip, key="fastlane-breaker")
+    from chain.execute import pop_lost_race        # Ш16: деньги прошли мимо -> сообщение
+    _lr = pop_lost_race()
+    if _lr:
+        alerter.send_async(_lr, key="lost-race")
     from chain.execute import pop_batch_empty_trip
     _be_trip = pop_batch_empty_trip()              # мультибатч: серия пустых батчей (nOk=0) -> TG-пейдж
     if _be_trip:

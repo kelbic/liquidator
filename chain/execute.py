@@ -201,6 +201,72 @@ def fast_lane_disabled() -> bool:
         return _FL_DISABLED
 
 
+# Ш16: ДЕНЬГИ ПРОШЛИ МИМО — проигранная гонка обязана СООБЩАТЬ О СЕБЕ.
+#
+# 11.08: за сутки мимо прошло 79 ликвидаций в 9 блоках, включая каскад на $52 320, и НИ ОДНОГО
+# сообщения владельцу не ушло — потери находились вручную в журнале постфактум. `_submit_xray`
+# уже отличает «нас обогнали» (race) от «позиция была здорова» (not-race), вердикт вычислялся и
+# выбрасывался.
+#
+# ДВЕ ЗАЩИТЫ, обе из наших же канонов:
+#  * ПОРОГ ПО ДЕНЬГАМ — мелочь не будит. Пол берём от нашего же порога огня, а не с потолка.
+#  * ОКНО АНТИСПАМА — каскад из 44 ликвидаций не должен дать 44 сообщения. Первая потеря в окне
+#    уходит сразу, остальные КОПЯТСЯ и приезжают итогом со следующей. Счёт не теряется: в
+#    сообщении всегда видно, сколько гонок и на какую сумму накопилось.
+#
+# Транспорта здесь нет по устройству модуля: кладём one-shot сообщение, забирает вызывающий с
+# алертером (тот же образец, что у брейкера).
+_LOST_RACE_MSG = None
+_LOST_RACE_TS = 0.0
+_LOST_RACE_ACC = [0, 0.0]        # [гонок накоплено, сумма долга $]
+LOST_RACE_ALERT_USD = float(os.environ.get("LOST_RACE_ALERT_USD", "500"))
+LOST_RACE_WINDOW_SEC = float(os.environ.get("LOST_RACE_WINDOW_SEC", "300"))
+
+
+def note_lost_race(borrower, debt_usd, winner, our_blocks_behind, win_tip_gwei=None,
+                   our_tip_gwei=None, market=None, now=None):
+    """Учесть проигранную гонку и, если пора, приготовить сообщение владельцу.
+
+    Возвращает True, если сообщение положено (для теста и диагностики)."""
+    global _LOST_RACE_MSG, _LOST_RACE_TS
+    try:
+        d = float(debt_usd or 0.0)
+    except Exception:                                   # noqa: BLE001
+        d = 0.0
+    if d < LOST_RACE_ALERT_USD:
+        return False                                    # ниже нашего же пола огня — не будим
+    n = float(now if now is not None else time.time())
+    with _INFLIGHT_LOCK:
+        _LOST_RACE_ACC[0] += 1
+        _LOST_RACE_ACC[1] += d
+        if (n - _LOST_RACE_TS) < LOST_RACE_WINDOW_SEC and _LOST_RACE_TS > 0:
+            return False                                # копим, сообщение придёт следующим
+        cnt, total = _LOST_RACE_ACC[0], _LOST_RACE_ACC[1]
+        _LOST_RACE_ACC[0], _LOST_RACE_ACC[1] = 0, 0.0
+        _LOST_RACE_TS = n
+        tips = ""
+        if win_tip_gwei is not None and our_tip_gwei is not None:
+            tips = " | tip победителя %.4f против нашего %.4f gwei" % (
+                float(win_tip_gwei), float(our_tip_gwei))
+        _LOST_RACE_MSG = (
+            "💸 ДЕНЬГИ МИМО: проиграна гонка, долг $%.0f, отстали блоков %s\n"
+            "жертва %s%s\nпобедитель %s%s\n"
+            "за окно накоплено гонок: %d на $%.0f" % (
+                d, our_blocks_behind, str(borrower)[:12],
+                (" рынок %s" % str(market)[:10]) if market else "",
+                str(winner)[:12], tips, cnt, total))
+    return True
+
+
+def pop_lost_race() -> str | None:
+    """One-shot: сообщение о проигранной гонке. Зовёт caller с алертером."""
+    global _LOST_RACE_MSG
+    with _INFLIGHT_LOCK:
+        m = _LOST_RACE_MSG
+        _LOST_RACE_MSG = None
+        return m
+
+
 def pop_fast_lane_trip() -> str | None:
     """One-shot: сообщение о срабатывании breaker'а для TG, затем очистка. Зовёт caller с alerter'ом."""
     global _FL_TRIP_MSG
@@ -2668,6 +2734,20 @@ def _submit_xray(rpc, borrower, block_number, our_index, log, lookback=4, cfg=No
                 note_race_loss_for_cascade(float(tip_s), our_tip, log=log)
             except Exception:
                 pass
+        # Ш16: проигранная гонка обязана СООБЩАТЬ О СЕБЕ. Вердикт уже вычислен здесь и раньше
+        # просто возвращался наверх — деньги проходили мимо молча (11.08: 79 ликвидаций за
+        # сутки, ни одного сообщения). Своя победа сообщением не считается.
+        if not _self:
+            try:
+                _our_tip = None
+                if cfg is not None:
+                    from chain.hotpath import dynamic_tip_gwei as _dtg
+                    _our_tip = _dtg(cfg, our_debt_usd)
+                note_lost_race(borrower, our_debt_usd, waddr, blk_off,
+                               win_tip_gwei=(float(tip_s) if tip_s != "?" else None),
+                               our_tip_gwei=_our_tip)
+            except Exception:
+                pass                                    # диагностика не роняет receipt-путь
         # #44: своя победа — НЕ проигранная гонка. Для брейкера класс тот же (не шторм), но
         # счётчик оспоренных гонок и tip-функция конкурентов обязаны её отличать.
         return "self-win" if _self else "race"
