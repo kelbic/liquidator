@@ -32,15 +32,63 @@ _LOCAL_NONCE: dict = {}         # bot address -> next unused nonce
 _NONCE_FALLBACK_RPC = os.environ.get("NONCE_FALLBACK_RPC", "https://mainnet.base.org")
 
 
+# #67: ТЁПЛАЯ сессия фолбэка + ХЕДЖ.
+#
+# ЗАМЕР 11.08 (разбор гонки 14:51 и трассы окна): боевая латентность ready->провод 2.129с, из
+# них ~2.093с (98%) съел ОДИН вызов — этот. Alchemy отдал 429, и прежняя редакция строила НОВЫЙ
+# Web3-провайдер прямо здесь: свежее TCP+TLS рукопожатие в самой горячей точке. Комментарий
+# выше это честно признавал («тёплую сессию не держим») — держим теперь.
+#
+# Хедж вместо «сначала основная, потом запасная»: последовательная схема платит полный таймаут
+# основной ноды ПЕРЕД тем, как начать вторую попытку, и именно так набежали две секунды. Обе
+# ноги отвечают ОДНО И ТО ЖЕ значение из цепи, поэтому взять первый успешный ответ безопасно.
+_NONCE_FB_W3 = None
+_NONCE_FB_W3_LOCK = threading.Lock()
+_NONCE_HEDGE_SEC = float(os.environ.get("NONCE_HEDGE_SEC", "0.25"))
+
+
+def _nonce_fb_w3():
+    """Переиспользуемый клиент запасной ноды. Строится ОДИН раз, живёт весь процесс."""
+    global _NONCE_FB_W3
+    with _NONCE_FB_W3_LOCK:
+        if _NONCE_FB_W3 is None:
+            from web3 import Web3   # локальный импорт: модуль обязан грузиться без web3
+            _NONCE_FB_W3 = Web3(Web3.HTTPProvider(
+                _NONCE_FALLBACK_RPC, request_kwargs={"timeout": 4}))
+        return _NONCE_FB_W3
+
+
 def _pending_nonce(w3, addr: str) -> int:
-    try:
-        return int(w3.eth.get_transaction_count(addr, "pending"))
-    except Exception:
-        from web3 import Web3   # локальный импорт: модуль обязан грузиться без web3 (см. док-стринг)
-        w3f = Web3(Web3.HTTPProvider(_NONCE_FALLBACK_RPC, request_kwargs={"timeout": 5}))
-        n = int(w3f.eth.get_transaction_count(addr, "pending"))
-        log.warning("nonce via fallback %s (основная нода бросила)", _NONCE_FALLBACK_RPC)
-        return n
+    box = {}
+    done = threading.Event()
+
+    def _leg(name, getter):
+        try:
+            v = int(getter())
+        except Exception:
+            return
+        if name not in box:
+            box.setdefault(name, v)
+            box.setdefault("first", v)
+            done.set()
+
+    t1 = threading.Thread(target=_leg, args=("main", lambda: w3.eth.get_transaction_count(addr, "pending")),
+                          daemon=True)
+    t1.start()
+    # запасную ногу пускаем не сразу: в норме основная отвечает за десятки мс, и лишний запрос
+    # к публичной ноде не нужен. Задержка = цена хеджа, а не цена отказа.
+    if not done.wait(_NONCE_HEDGE_SEC):
+        threading.Thread(target=_leg, args=("fb", lambda: _nonce_fb_w3().eth.get_transaction_count(addr, "pending")),
+                         daemon=True).start()
+    done.wait(6.0)
+    if "first" in box:
+        if "main" not in box:
+            log.warning("nonce via fallback %s (основная не успела за %.2fс)",
+                        _NONCE_FALLBACK_RPC, _NONCE_HEDGE_SEC)
+        return int(box["first"])
+    # НЕЗНАНИЕ ЗАКРЫВАЕТ ГАРД: обе ноги молчат -> последняя синхронная попытка, и пусть
+    # исключение уйдёт наверх. Выдумывать nonce на денежном пути нельзя.
+    return int(_nonce_fb_w3().eth.get_transaction_count(addr, "pending"))
 
 
 def prewarm_local_nonce(rpc, wallet_key: str) -> bool:

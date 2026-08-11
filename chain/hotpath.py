@@ -429,6 +429,97 @@ def set_ws_transmit_hook(fn):
 _TIP_LADDER_LEGACY = os.environ.get("TIP_LADDER_LEGACY", "0").lower() in ("1", "true", "yes")
 
 
+# ============ Ш28: ИЗМЕРЕННЫЙ КЛАСС tip ДЛЯ БОЕВОГО ПУТИ ============
+#
+# ЖИВАЯ ГОНКА 11.08 14:51, вскрытие по цепи. Победитель: блок 49835262, idx 309, tip
+# 1 600 000 wei — РОВНО доминирующий класс блока (75.2% транзакций там же). Мы: блок 49835264
+# (на ДВА блока позже), idx 99, tip 500 000 000 wei = 0.5 gwei = **312 крат поля**.
+# Приз: три цели, крупнейшая $15 594 погашения при net >= $207. Наш итог: −$0.11 и −$0.47×2.
+#
+# То есть в денежном тракте мы делали ровно то, за что уже заплатили дефектом #91, только
+# грубее: переплата не покупает место, она телепортирует в ГОЛОВУ суб-блока — туда, где цена
+# ещё старая и позиция здорова. Пробы мы сегодня в класс привели (Ш24), боевой путь — нет.
+#
+# Канон STATE «tip места не покупает» верен МЕЖДУ суб-блоками и ровно поэтому лестницу
+# сплющили 31.07. Но остаток 0.05/0.5 gwei внутри суб-блока продолжает нас выносить.
+#
+# КЛАСС ИЗМЕРЯЕТСЯ, А НЕ УГАДЫВАЕТСЯ: eth_feeHistory p50 сверен с модой полного блока до
+# последней цифры на четырёх известных блоках (Ш24-А). Живёт значение медианно ~2 секунды,
+# поэтому держим его свежим фоном, а горячий путь только ЧИТАЕТ кэш — ни одного сетевого
+# вызова в момент решения.
+_DOM_TIP_WEI = 0
+_DOM_TIP_TS = 0.0
+_DOM_TIP_LOCK = threading.Lock()
+_DOM_TIP_TTL = float(os.environ.get("COMBAT_TIP_TTL_SEC", "45"))
+_DOM_TIP_POLL = float(os.environ.get("COMBAT_TIP_POLL_SEC", "10"))
+# Границы здравого смысла: ниже пола рынка не платим (не сядем), выше — уже переплата, ради
+# которой всё и затевалось. Замер 5407 блоков: класс жил в 1.0-1.8M, выбросы до 17.7M.
+_DOM_TIP_MIN = int(os.environ.get("COMBAT_TIP_MIN_WEI", "1000000"))
+_DOM_TIP_MAX = int(os.environ.get("COMBAT_TIP_MAX_WEI", "20000000"))
+_COMBAT_TIP_LEGACY = os.environ.get("COMBAT_TIP_LEGACY", "0") == "1"
+_DOM_TIP_THREAD = None
+
+
+def note_dominant_tip(wei, now=None):
+    """Записать измеренный класс. Значения вне здравых границ ОТБРАСЫВАЕМ, а не клэмпим:
+    клэмп превратил бы аномалию узла в «правдоподобную» цену на денежном пути."""
+    global _DOM_TIP_WEI, _DOM_TIP_TS
+    try:
+        w = int(wei)
+    except Exception:                                        # noqa: BLE001
+        return False
+    if not (_DOM_TIP_MIN <= w <= _DOM_TIP_MAX):
+        return False
+    with _DOM_TIP_LOCK:
+        _DOM_TIP_WEI = w
+        _DOM_TIP_TS = float(now if now is not None else time.monotonic())
+    return True
+
+
+def dominant_tip_wei(now=None):
+    """Свежий измеренный класс или 0. НЕЗНАНИЕ ЗАКРЫВАЕТ ГАРД: протухшее значение не
+    возвращаем вовсе, вызывающий откатывается на прежнее поведение."""
+    with _DOM_TIP_LOCK:
+        w, ts = _DOM_TIP_WEI, _DOM_TIP_TS
+    if not w:
+        return 0
+    n = float(now if now is not None else time.monotonic())
+    return w if (n - ts) <= _DOM_TIP_TTL else 0
+
+
+def start_tip_sampler(url, log=None):
+    """Фоновый замер класса. Ходит НЕ по боевому ключу — это диагностика, а не деньги."""
+    global _DOM_TIP_THREAD
+    if _DOM_TIP_THREAD is not None or not url:
+        return
+    import json as _json
+    import urllib.request as _u
+
+    def _loop():
+        while True:
+            try:
+                body = _json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_feeHistory",
+                                    "params": [12, "latest", [50]]}).encode()
+                rq = _u.Request(url, data=body, headers={"content-type": "application/json",
+                                                         "User-Agent": "curl/8.5"})
+                with _u.urlopen(rq, timeout=8) as r:
+                    j = _json.loads(r.read())
+                rw = (j.get("result") or {}).get("reward") or []
+                vals = [int(x[0], 16) for x in rw if x]
+                if vals:
+                    vals.sort()
+                    note_dominant_tip(vals[len(vals) // 2])
+            except Exception:
+                pass                                          # молча: это не денежный путь
+            time.sleep(_DOM_TIP_POLL)
+
+    _DOM_TIP_THREAD = threading.Thread(target=_loop, daemon=True, name="tip-class")
+    _DOM_TIP_THREAD.start()
+    if log:
+        log.info("TIP-CLASS: замер класса поднят (каждые %.0fс, TTL %.0fс)",
+                 _DOM_TIP_POLL, _DOM_TIP_TTL)
+
+
 def dynamic_tip_gwei(cfg, debt_usd, now=None):
     """PURE-ish (now инжектируем). ЛЕСТНИЦА СПЛЮЩЕНА (31.07, решение владельца по гонке 14:07):
     FCFS обслуживает по прибытию — tip места не покупает (наши 30 gwei легли блоком ПОЗЖЕ
@@ -452,6 +543,14 @@ def dynamic_tip_gwei(cfg, debt_usd, now=None):
         if cascade_active(now):
             stage = min(stage + 1, 2)
         return (base, mid, big)[stage]
+    # Ш28: платим ИЗМЕРЕННЫЙ класс — и в каскаде тоже. Победитель гонки 14:51 стоял ровно на
+    # классе (1 600 000 wei) ВО ВРЕМЯ каскада и взял приз, а наши 0.5 gwei вынесли нас в голову
+    # блока. Ступень «в давку» страховала риск, которого нет: место покупается позицией
+    # относительно транзита, а не размером чаевых.
+    _dom = dominant_tip_wei(now)
+    if _dom and not _COMBAT_TIP_LEGACY:
+        return _dom / 1e9
+    # НЕЗНАНИЕ ЗАКРЫВАЕТ ГАРД: класс не измерен или протух -> прежнее поведение бит-в-бит.
     if cascade_active(now):
         return max(base, float(getattr(cfg, "tip_step_gwei", 0.5)))
     return base

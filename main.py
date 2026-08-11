@@ -629,6 +629,19 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     log.exception("hot_loop упал — self-heal перезапуск через %.0fс (backoff #%d)" % (_hw, _heal_n))
                     time.sleep(_hw)
         threading.Thread(target=_run_hot, daemon=True).start()
+        # Ш28: замер ДОМИНИРУЮЩЕГО КЛАССА tip. Без этого вызова dominant_tip_wei() всегда 0,
+        # горячий путь молча откатывается на прежние 0.05/0.5 gwei, и правка мертва — ровно
+        # тот шов, на котором мы уже горели (арм доски пять суток жил под заглушкой).
+        # Ходит по bg-стрипу, НЕ по боевому ключу: это диагностика, а не деньги.
+        try:
+            from chain.hotpath import start_tip_sampler
+            start_tip_sampler(os.environ.get("COMBAT_TIP_RPC_URL", "")
+                              or os.environ.get("BG_RPC_URL_2", "")
+                              or os.environ.get("BG_RPC_URL", "")
+                              or "https://mainnet.base.org", log=log)
+        except Exception as _e:
+            log.error("TIP-CLASS: замер класса НЕ поднят (%s) — боевой tip останется прежним",
+                      type(_e).__name__)
         log.warning("HOT PATH ENABLED — preconf trigger live (tip=%.2f gwei, daily-loss<=$%.0f, repaid>=$%.0f)",
                     cfg.tip_gwei, cfg.max_daily_loss_usd, getattr(cfg, "hot_min_repaid_usd", 2000.0))
     # LIVE-CAP вотчер (04.08, weETH tail): держит живой кап капнутых роутов, пока на паре
