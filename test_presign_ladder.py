@@ -102,7 +102,9 @@ assert [e[0] for e in st["q"]] == list(range(100, 108)), "nonce'ы обязан�
 assert st["gas"] == GAS
 # #91: пробы несут ПОЛ рынка, а не боевой cfg.tip_gwei — внутри суб-блока сортировка идёт
 # по убыванию tip, и плата выше пола выносит пробу в голову, ПРОЧЬ от транзита.
-assert st["max_fee"] == BASEFEE * ex._VOLLEY_PRESIGN_MAXFEE_MULT + ex._PROBE_TIP_WEI
+# Ш24: tip лестницы — ТИР ЭТОЙ НОГИ, а не общая константа (флот разложен по четырём
+# классам, потому что доминирующий класс блока живёт ~2 секунды и подписью не угадывается).
+assert st["max_fee"] == BASEFEE * ex._VOLLEY_PRESIGN_MAXFEE_MULT + ex.probe_tip_for(ADDR)
 # подписанные байты обязаны нести РОВНО пробу доски и наш адрес назначения
 _decoded = Account.recover_transaction(st["q"][0][1])
 assert _decoded == ADDR, "подпись обязана принадлежать ноге"

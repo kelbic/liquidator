@@ -60,7 +60,13 @@ ENGINE_IDLE_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_IDLE_SEC", "0.05"))
 # позволяет 16 тредам выплеснуть накопленное разом, и «тонкий поток» пошёл бы рывками с
 # паузами. Пауза, попавшая на транзит, снова обнуляет присутствие. Держим бурст 2.
 ENGINE_HOLD_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_SEC", "180"))
-ENGINE_HOLD_RATE = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_RATE", "4"))
+# Ш24: темп поднят 4 -> 16. Флот разделён на ЧЕТЫРЕ тира tip, поэтому в классе решающего
+# блока стоит примерно четверть ног. При 16/с блок Base (2с) несёт 32 пробы, из них ~8 в
+# классе — ровно столько было у победителей в призовом окне (8, 8, 3, 1). При прежних 4/с
+# попавший тир давал бы лишь 2 пробы на блок.
+# Цена: 180с × 16/с × 8 окон = 23 040 проб/сутки ≈ $4.6 при дневном капе $100.
+# Потолок приёма (замер: отказы начались при ~115/с) не задевается с семикратным запасом.
+ENGINE_HOLD_RATE = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_RATE", "16"))
 ENGINE_HOLD_BURST = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_BURST", "2"))
 # Пополнение склада: ниже какой глубины лестницу дотачивать и как часто смотреть.
 ENGINE_REFILL_AT = int(os.environ.get("SPEC_FIRE_ENGINE_REFILL_AT", "12"))

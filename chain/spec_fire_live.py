@@ -1332,8 +1332,10 @@ class SpecFireLive:
                 # #91: лестница подписана ПОЛОМ рынка, значит и аудит цены обязан считать по
                 # полу. Сверка с боевым cfg.tip_gwei объявила бы протухшими ВСЕ 110 ног разом
                 # и запустила бы вечную пересборку — регрессия, пойманная тестом.
-                tip = int(_ex._PROBE_TIP_WEI)
-                stale = [a for a in (addrs or []) if _ex.ladder_resign_needed(a, bf, tip)]
+                # Ш24: у каждой ноги СВОЙ тир — аудит обязан сверять лестницу с ЕЁ tip,
+                # иначе весь флот мерился бы по чужой цене и половина объявлялась протухшей.
+                stale = [a for a in (addrs or [])
+                         if _ex.ladder_resign_needed(a, bf, _ex.probe_tip_for(a))]
                 if not stale:
                     return
                 self._log("SPECFIRE аудит лестниц: %d ног с протухшей ценой (база %.4f gwei) — "
