@@ -74,7 +74,9 @@ class SpecCanary:
         from chain.execute import send_canary
         from chain.hotpath import _fresh_basefee
         fb = _fresh_basefee()
-        tip = int(self.cfg.tip_gwei * 1e9)
+        # Ш30: тот же tip, что у боевого пути (см. hotpath). Прибор обязан мерить ТОТ объект.
+        from chain.hotpath import dynamic_tip_gwei as _dyn
+        tip = int(_dyn(self.cfg, 0.0) * 1e9)
         seq = str(getattr(self.cfg, "sequencer_rpc", "") or "")
         bcast = [seq] if (seq and seq.lower() not in ("off", "none", "0")) else None
         return send_canary(self.rpc, self.cfg, log,

@@ -1476,7 +1476,13 @@ def _maybe_canary(agg, block, subidx, rpc, cfg, log, t0=None):
     if current_inflight() > 0:                    # боевая tx в полёте -> не соревноваться за nonce
         return
     _fb = _fresh_basefee()
-    _tip = int(cfg.tip_gwei * 1e9)
+    # Ш30: канарейка обязана платить ТО ЖЕ, что боевой путь. Здесь стоял cfg.tip_gwei
+    # напрямую (0.05 gwei), поэтому после Ш28 прибор мерил ЧУЖОЙ класс: боевые tx платят
+    # измеренный класс (~0.0016 gwei), а канарейка — в тридцать раз больше, и её delta
+    # описывала позицию, которой у боевой tx нет. Замер прибором, настроенным не на тот
+    # объект, — канон, на котором мы уже горели (оракульная цена вместо цены выхода).
+    # Побочно канарейка дешевеет в ~30 раз.
+    _tip = int(dynamic_tip_gwei(cfg, 0.0) * 1e9)
     _seq = str(getattr(cfg, "sequencer_rpc", "") or "")
     _bcast = [_seq] if (_seq and _seq.lower() not in ("off", "none", "0")) else None
     _ss = time.perf_counter()
