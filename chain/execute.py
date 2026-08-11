@@ -1103,6 +1103,31 @@ _VOLLEY_PRESIGN_MAXFEE_MULT = int(os.environ.get(
     os.environ.get("SPEC_FIRE_PRESIGN_MAXFEE_MULT", "20")))
 
 
+# #103/Ш19: ПОЛ ПЕРЕСБОРКИ — отдельно от резерва подписи.
+#
+# Множитель резерва (20) отвечает на вопрос «какой запас закладываем, КОГДА подписываем».
+# Этот — на вопрос «когда подпись становится опасной». Раньше обе роли играла одна константа,
+# и полоса годности выходила ОДНОСТОРОННЕЙ: лестница, подписанная при базе b0, получает
+# maxFee = b0*20 + tip, поэтому требование b*20 нарушается, едва база станет ВЫШЕ b0 — хоть на
+# один wei. Вниз запас тройной, вверх нулевой.
+#
+# БОЕВОЕ ПОДТВЕРЖДЕНИЕ 11.08 14:28-14:52: аудит пересобрал ВСЕ 110 ног ТРИЖДЫ за 24 минуты,
+# и переподписка дала 31 коллизию nonce («replacement transaction underpriced») — флот
+# перетряхивался вместо того, чтобы стоять. Утром этих коллизий было НОЛЬ.
+#
+# Включаемость требует maxFee >= base, а не base*20. При поле 3 лестница с резервом 20 годна,
+# пока база не вырастет в 6.7 раза — это смена режима, а не рябь.
+_VOLLEY_RESIGN_FLOOR_MULT = int(os.environ.get("SPEC_FIRE_RESIGN_FLOOR_MULT", "3"))
+if _VOLLEY_RESIGN_FLOOR_MULT >= _VOLLEY_PRESIGN_MAXFEE_MULT:
+    # ИНВАРИАНТ (замечание ревьюера): пол пересборки обязан быть НИЖЕ резерва подписи. Иначе
+    # свежеподписанная лестница протухшая СРАЗУ и флот уходит в вечную пересборку. Ручка
+    # MAXFEE_RESERVE_MULT уже крутилась владельцем (100 -> 20), поэтому отказ ГРОМКИЙ.
+    raise RuntimeError(
+        "SPEC_FIRE_RESIGN_FLOOR_MULT=%d >= MAXFEE_RESERVE_MULT=%d — свежая лестница будет "
+        "протухшей сразу, флот уйдёт в вечную пересборку"
+        % (_VOLLEY_RESIGN_FLOOR_MULT, _VOLLEY_PRESIGN_MAXFEE_MULT))
+
+
 def ladder_resign_needed(addr: str, base_fee: int, tip_wei: int) -> bool:
     """Нужна ли лестнице ПЕРЕСБОРКА по цене — независимо от того, сколько в ней записей (#63).
 
@@ -1121,7 +1146,11 @@ def ladder_resign_needed(addr: str, base_fee: int, tip_wei: int) -> bool:
     have = int(st.get("max_fee") or 0)
     if want <= 0:
         return False
-    return have < want or have > want * _VOLLEY_MAXFEE_RESIGN_MULT
+    # НИЖНЯЯ граница — по полу ВКЛЮЧАЕМОСТИ, а не по резерву подписи (иначе верхняя граница
+    # годности совпадает с базой момента подписи и любой рост базы обнуляет весь флот разом).
+    # Верхняя (вздутый maxFee запирает гейт патрона, #60) — прежняя.
+    floor = int(base_fee) * _VOLLEY_RESIGN_FLOOR_MULT + int(tip_wei)
+    return have < floor or have > want * _VOLLEY_MAXFEE_RESIGN_MULT
 
 
 def _send_fail_diag(e) -> str:
