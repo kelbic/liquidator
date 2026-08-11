@@ -143,9 +143,29 @@ class FailoverRpc(BaseRpc):
                 return True
             log.warning("COMBAT-FAILOVER: кандидат %s отстаёт (head=%d < %d) — пропуск",
                         _short(self.providers[j].rpc_url), bn, self._last_head)
+        # #105: ВОТ ЗДЕСЬ человек нужен — переключаться некуда, и следующий отказ боевого
+        # ключа оставит нас слепыми. Раньше этот случай молчал в журнале, а в телеграм уходило
+        # рутинное переключение, которое лечится само. Тревоги были ровно наоборот.
         log.warning("COMBAT-FAILOVER: все кандидаты мертвы/отстают — остаёмся на %s",
                     _short(self.providers[self._idx].rpc_url))
+        self._alert_all_dead()
         return False
+
+    def _alert_all_dead(self):
+        """Тревога «резерва не осталось» — с защёлкой, чтобы не звонить на каждом опросе.
+
+        Защёлка снимается, когда снова нашёлся живой кандидат (см. _switch): состояние
+        изменилось — значит и право позвонить вернулось. Без защёлки один затяжной отказ
+        провайдера дал бы сотни сообщений, и следующая настоящая беда утонула бы в них."""
+        if self._alerter is None or getattr(self, "_all_dead_latched", False):
+            return
+        self._all_dead_latched = True
+        try:
+            self._alerter.send_async(
+                "⛑ RPC: РЕЗЕРВА НЕ ОСТАЛОСЬ — все кандидаты мертвы/отстают, сидим на %s. "
+                "Следующий отказ = слепота." % _short(self.providers[self._idx].rpc_url))
+        except Exception:
+            pass
 
     def _try_return(self):
         """Назад на primary: только здоровый >= BACK_HEALTHY_SEC подряд И 0 активных окон."""
@@ -176,6 +196,7 @@ class FailoverRpc(BaseRpc):
             self._idx = j                          # атомарное присвоение — горячий путь видит сразу
             self._fail_streak = 0
             self._primary_ok_since = None
+            self._all_dead_latched = False      # #105: нашёлся живой — право звонить вернулось
             self.stats["switches"] += 1
         new = self.providers[j].rpc_url
         try:                                       # nonce мог быть прочитан со старой ноды
@@ -188,11 +209,17 @@ class FailoverRpc(BaseRpc):
             _short(old), _short(new), reason,
             " | bg уступает ключ" if self._bg_collision() else "")
         log.warning(msg)
-        if self._alerter is not None:
-            try:
-                self._alerter.send_async("⛑ " + msg)
-            except Exception:
-                pass
+        # #105: рутинное переключение в ТЕЛЕГРАМ БОЛЬШЕ НЕ ИДЁТ.
+        #
+        # Канон проекта: тревога только там, где нужен ЧЕЛОВЕК. Здесь человек не нужен ни в
+        # одном сценарии — резерв подхватывает сам, деньги не теряются. Замер 11.08: 77
+        # переключений за сутки, из них 26 за один час; каждое слало сообщение владельцу.
+        # Плюс это осциллирующая величина, а по нашему же канону повтор тревоги допустим лишь
+        # на ЭСКАЛАЦИИ, а не на каждом зубе пилы.
+        #
+        # Диагностическая ценность при этом НЕ теряется: строка остаётся в журнале, а частота
+        # переключений — термометр нагрузки на боевой ключ (наш собственный огонь его и топит,
+        # см. #100). Мерить её надо после каждой правки темпа — но глазами, а не будильником.
 
 
 def _short(url: str) -> str:
