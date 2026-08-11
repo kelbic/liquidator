@@ -45,6 +45,23 @@ ENGINE_BURST = float(os.environ.get("SPEC_FIRE_ENGINE_BURST", "40"))
 # меньше — обычная задержка тика гасит огонь в середине горячей фазы.
 ENGINE_TTL_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_TTL_SEC", "1.5"))
 ENGINE_IDLE_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_IDLE_SEC", "0.05"))
+# Ш26: СТОЯЧЕЕ ПРИСУТСТВИЕ («долго и тонко» вместо вспышки).
+#
+# Замер 11.08, блоки 49820459..49820472: стена жила 5 блоков / 10 секунд (1155 проб, 231 на
+# блок при нужных ПОБЕДИТЕЛЮ восьми), затем 8 блоков / 16 секунд пустоты — и ровно там прошли
+# 30 ликвидаций. В блоках с деньгами наших tx НОЛЬ. Причина ровно в TTL выше: право огня гаснет
+# через 1.5с после последнего тика, то есть стена привязана к СОБЫТИЮ и умирает вместе с ним.
+#
+# Поэтому после прекращения тиков держим ТОНКИЙ поток ещё HOLD_SEC. Арифметика: 4 пробы/с на
+# 180с = 720 проб (~$0.15), покрытие 90 блоков вместо пяти, темп в 60 раз ниже лимита приёма —
+# те самые 901 отказ «over rate limit» мы устраивали себе сами, вываливая боезапас за 10 секунд.
+#
+# Отдельный БУРСТ для фазы удержания — замечание kelbic про непрерывность: общий бурст 40
+# позволяет 16 тредам выплеснуть накопленное разом, и «тонкий поток» пошёл бы рывками с
+# паузами. Пауза, попавшая на транзит, снова обнуляет присутствие. Держим бурст 2.
+ENGINE_HOLD_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_SEC", "180"))
+ENGINE_HOLD_RATE = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_RATE", "4"))
+ENGINE_HOLD_BURST = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_BURST", "2"))
 # Пополнение склада: ниже какой глубины лестницу дотачивать и как часто смотреть.
 ENGINE_REFILL_AT = int(os.environ.get("SPEC_FIRE_ENGINE_REFILL_AT", "12"))
 ENGINE_REFILL_POLL_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_REFILL_POLL_SEC", "0.5"))
@@ -204,6 +221,7 @@ class FireEngine:
         self._sleep = sleep or time.sleep
         self._lock = threading.Lock()
         self._until = 0.0
+        self._hold_until = 0.0   # Ш26: фаза удержания
         self._target = None        # (feed, mid, borrower, debt_usd) — чей план сейчас на доске
         self._rr = 0
         self._tokens = ENGINE_BURST
@@ -235,31 +253,55 @@ class FireEngine:
         self._stop.set()
         with self._lock:
             self._until = 0.0
+            self._hold_until = 0.0     # Ш26: остановка гасит и удержание, иначе флот стрелял
+            #                            бы ещё 3 минуты после команды «стоп»
         if self._collector is not None:
             self._collector.stop()
 
     def keepalive(self, target=None, ttl=None):
-        """Тик окна: продлить право стрелять. Перестали звать — огонь гаснет сам за TTL."""
+        """Тик окна: продлить право стрелять. Перестали звать — ГОРЯЧАЯ фаза гаснет за TTL,
+        но присутствие держится ещё ENGINE_HOLD_SEC тонким потоком (Ш26)."""
         with self._lock:
-            self._until = self._now() + (self._ttl if ttl is None else float(ttl))
+            n = self._now()
+            self._until = n + (self._ttl if ttl is None else float(ttl))
+            self._hold_until = n + ENGINE_HOLD_SEC
             if target is not None:
                 self._target = target
 
     def disarm(self):
         with self._lock:
             self._until = 0.0
+            self._hold_until = 0.0
             self._target = None
 
     def armed(self) -> bool:
+        """Право стрелять: горячая фаза ИЛИ фаза удержания.
+
+        Ш26: раньше здесь стоял только `_until`, и стена умирала через 1.5с после последнего
+        тика. Деньги приходили через 16 секунд после этого."""
+        with self._lock:
+            n = self._now()
+            return n < self._until or n < self._hold_until
+
+    def in_hot(self) -> bool:
+        """Горячая фаза (полный темп) против фазы удержания (тонкий ровный поток)."""
         with self._lock:
             return self._now() < self._until
 
     # ---- внутреннее ----
     def _take_token(self) -> bool:
-        """Token bucket: общий на все треды потолок отправок/с."""
+        """Token bucket: общий на все треды потолок отправок/с.
+
+        Ш26: у фазы удержания СВОИ темп и бурст. Бурст здесь важнее темпа — с общим бурстом 40
+        шестнадцать тредов выплёскивают накопленное разом, и «тонкий поток» идёт рывками с
+        паузами между ними. Пауза, попавшая на транзит, обнуляет присутствие ровно так же, как
+        обнуляла его вспышка на 10 секунд."""
         with self._lock:
             n = self._now()
-            self._tokens = min(ENGINE_BURST, self._tokens + (n - self._tok_ts) * self._rate)
+            hot = n < self._until
+            rate = self._rate if hot else ENGINE_HOLD_RATE
+            burst = ENGINE_BURST if hot else ENGINE_HOLD_BURST
+            self._tokens = min(burst, self._tokens + (n - self._tok_ts) * rate)
             self._tok_ts = n
             if self._tokens < 1.0:
                 return False
@@ -291,6 +333,7 @@ class FireEngine:
                 continue
             with self._lock:
                 tgt = self._target
+                hot_at_send = self._now() < self._until
             try:
                 h = self._send_fn(addr)
             except Exception as e:
@@ -304,6 +347,8 @@ class FireEngine:
                 self._sleep(ENGINE_IDLE_SEC)
                 continue
             self.stats["sent"] += 1
+            if not hot_at_send:
+                self.stats["sent_hold"] = self.stats.get("sent_hold", 0) + 1
             if self._collector is not None:
                 self._collector.track(h, (addr, tgt))
 

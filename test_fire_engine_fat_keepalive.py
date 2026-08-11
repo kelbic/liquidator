@@ -39,10 +39,27 @@ eng.keepalive()
 assert _wait(lambda: len(sent) >= 5), "keepalive дан, а огня нет (sent=%d)" % len(sent)
 assert {"0xLegA", "0xLegB"} <= set(sent), "round-robin не задел обе ноги: %s" % set(sent)
 
-assert _wait(lambda: not eng.armed(), timeout=3.0), "TTL истёк, а право огня живо"
+# Ш26: после TTL умирает ГОРЯЧАЯ фаза; присутствие продолжается тонким потоком, и это
+# намеренно — стена, умиравшая через 1.5с после тика, не доживала до денег (замер 11.08:
+# деньги через 16с, наших tx в тех блоках 0). Гарантия «отказ в молчание» сохранена: обе
+# фазы конечны, что проверяется ниже сжатым горизонтом удержания.
+assert _wait(lambda: not eng.in_hot(), timeout=3.0), "TTL истёк, а ГОРЯЧАЯ фаза жива"
 n1 = len(sent)
 time.sleep(0.3)
-assert len(sent) == n1, "огонь пережил свой TTL: %d -> %d" % (n1, len(sent))
+d_hold = len(sent) - n1
+# в удержании темп обязан РУХНУТЬ: боевой 500/с против ~4/с — за 0.3с это единицы, не сотни
+assert d_hold <= 5, "в удержании темп не упал: %d отправок за 0.3с (ждём единицы)" % d_hold
+print("  удержание: %d отправок за 0.3с (горячая фаза дала бы ~150)" % d_hold)
+
+# КОНЕЧНОСТЬ удержания — на сжатом горизонте, иначе тест ждал бы 3 минуты
+_saved_hold = fe.ENGINE_HOLD_SEC
+try:
+    fe.ENGINE_HOLD_SEC = 0.5
+    eng.keepalive()
+    assert _wait(lambda: not eng.armed(), timeout=4.0), \
+        "удержание НЕ истекает — флот стрелял бы вечно"
+finally:
+    fe.ENGINE_HOLD_SEC = _saved_hold
 
 eng.keepalive(ttl=30.0)
 assert eng.armed()
