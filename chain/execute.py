@@ -1084,6 +1084,25 @@ def ladder_resign_needed(addr: str, base_fee: int, tip_wei: int) -> bool:
     return have < want or have > want * _VOLLEY_MAXFEE_RESIGN_MULT
 
 
+def _send_fail_diag(e) -> str:
+    """Класс отказа рассылки + его ТЕКСТ, отредактированный от ключей провайдера.
+
+    Ш19: печатался голый type(e).__name__, поэтому ВСЕ отказы рассылки выглядели одинаково —
+    «RuntimeError». По такой строке неразличимы минимум три причины: лимит темпа секвенсера,
+    «replacement transaction underpriced» от коллизии nonce и отказ транспорта. Из-за этого
+    всплеск 644 отказов за минуту в каскаде 10.08 не был ПРОЧИТАН из журнала — причину ему
+    назначили переносом цифры с отдельной дрели #69. Ровно тот урок, что дала сама дрель:
+    цифра без ПРИЧИНЫ читается как что угодно.
+
+    redact обязателен: текст сетевой ошибки несёт ключ в URL (урок 07.08). Проверено, что
+    режется и в URL, и без схемы — литеральный реестр ловит второе."""
+    try:
+        from chain.rpc import redact
+        return "%s: %s" % (type(e).__name__, redact(e)[:200])
+    except Exception:
+        return type(e).__name__
+
+
 def ladder_depth(addr: str) -> int:
     """Сколько готовых проб осталось у ноги (0 = лестницы нет)."""
     st = _VOLLEY_LADDER.get(addr)
@@ -1260,7 +1279,7 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
                     st["q"].insert(0, (nonce, raw_hex, h))
             if log:
                 log.info("VOLLEY лестница %s: рассылка не удалась (%s), запись возвращена",
-                         addr[:10], type(e).__name__)
+                         addr[:10], _send_fail_diag(e))
             return None
         # «already known»/«nonce too low» — байты УЖЕ у секвенсера (SEND-3 обогнал):
         # запись потрачена по назначению, возвращать её нельзя.

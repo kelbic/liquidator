@@ -1,0 +1,66 @@
+"""Отказ рассылки обязан называть ПРИЧИНУ, а не класс исключения (Ш19).
+
+Печатался голый type(e).__name__, поэтому все отказы выглядели как «RuntimeError». По такой
+строке неразличимы минимум три причины: лимит темпа секвенсера, «replacement transaction
+underpriced» от коллизии nonce и отказ транспорта. Из-за этого всплеск 644 отказов за минуту
+в каскаде 10.08 не был ПРОЧИТАН из журнала — причину ему назначили переносом цифры с дрели
+#69. Тот же урок, что дала сама дрель: цифра без ПРИЧИНЫ читается как что угодно.
+
+Вторая половина теста — про безопасность: текст сетевой ошибки несёт ключ провайдера, и
+именно так он однажды уехал в журнал (07.08).
+"""
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import chain.execute as ex                                    # noqa: E402
+import chain.rpc as rpc                                       # noqa: E402
+
+# --- 1. ГЛАВНОЕ: три причины стали различимы ---------------------------------------------
+cases = {
+    "over rate limit": "лимит темпа секвенсера",
+    "replacement transaction underpriced": "коллизия nonce",
+    "connection reset by peer": "отказ транспорта",
+}
+seen = {}
+for msg, what in cases.items():
+    out = ex._send_fail_diag(RuntimeError(msg))
+    assert msg in out, "причина «%s» потеряна: %s" % (what, out)
+    seen[out] = what
+assert len(seen) == 3, "разные причины дали одинаковую строку — журнал по-прежнему слеп"
+assert all(o.startswith("RuntimeError: ") for o in seen), seen
+print("OK 1/4: три причины дают три РАЗНЫЕ строки (было три одинаковых «RuntimeError»)")
+
+# --- 2. БЕЗОПАСНОСТЬ: ключ в URL режется -------------------------------------------------
+KEY = "aB3xK9mQ7pL2vR5tN8wY4cE6hJ1sD0fG"          # 32 симв., как боевой ключ Alchemy
+out = ex._send_fail_diag(RuntimeError("https://base-mainnet.g.alchemy.com/v2/%s refused" % KEY))
+assert KEY not in out, "КЛЮЧ УЕХАЛ В ЖУРНАЛ: %s" % out
+assert "скрыт" in out and "alchemy.com" in out, "вместе с ключом потерян и диагноз: %s" % out
+print("OK 2/4: ключ внутри URL вырезан, хост для диагноза остался")
+
+# --- 3. БЕЗОПАСНОСТЬ: ключ БЕЗ схемы (ошибки транспорта теряют «://») --------------------
+rpc.note_secret(KEY)
+out = ex._send_fail_diag(RuntimeError("gaierror base-mainnet.g.alchemy.com/v2/%s" % KEY))
+assert KEY not in out, "ключ без схемы уехал в журнал: %s" % out
+print("OK 3/4: ключ без схемы режется литеральным реестром")
+
+# --- 4. КОНТРОЛЬ: диагност не роняет горячий путь ----------------------------------------
+class Nasty(Exception):
+    def __str__(self):
+        raise ValueError("строка не отдаётся")
+
+
+# redact сам ловит отказ и отдаёт заглушку, поэтому строка получается говорящей, но
+# главное здесь — что путь отказа не падает ВТОРЫМ исключением поверх первого.
+_out = ex._send_fail_diag(Nasty())
+assert _out.startswith("Nasty"), _out
+print("OK 4/4: КОНТРОЛЬ — неотображаемое исключение не роняет путь отказа (%s)" % _out)
+
+# --- СТРУКТУРНО: боевая строка зовёт диагност, а не голый класс --------------------------
+src = pathlib.Path("chain/execute.py").read_text()
+i = src.index("рассылка не удалась")
+blk = src[i:i + 300]
+assert "_send_fail_diag(e)" in blk, "боевая строка снова печатает голый класс"
+assert "type(e).__name__" not in blk, "голый класс вернулся в строку отказа"
+print("СТРУКТУРНО: боевая строка отказа зовёт _send_fail_diag")
+print("=== Ш19: журнал отказов заговорил ===")
