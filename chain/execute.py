@@ -44,7 +44,6 @@ _NONCE_FALLBACK_RPC = os.environ.get("NONCE_FALLBACK_RPC", "https://mainnet.base
 # ноги отвечают ОДНО И ТО ЖЕ значение из цепи, поэтому взять первый успешный ответ безопасно.
 _NONCE_FB_W3 = None
 _NONCE_FB_W3_LOCK = threading.Lock()
-_NONCE_HEDGE_SEC = float(os.environ.get("NONCE_HEDGE_SEC", "0.25"))
 
 
 def _nonce_fb_w3():
@@ -59,37 +58,27 @@ def _nonce_fb_w3():
 
 
 def _pending_nonce(w3, addr: str) -> int:
-    box = {}
-    done = threading.Event()
+    """Nonce с ТЁПЛОЙ запасной сессией. БЕЗ тредов.
 
-    def _leg(name, getter):
-        try:
-            v = int(getter())
-        except Exception:
-            return
-        if name not in box:
-            box.setdefault(name, v)
-            box.setdefault("first", v)
-            done.set()
+    #67 дал 2.09с из 2.13с боевой латентности: Alchemy отвечал 429, и прежняя редакция строила
+    НОВЫЙ Web3-провайдер прямо здесь — свежее TCP+TLS рукопожатие в самой горячей точке.
+    Тёплая переиспользуемая сессия убирает именно это.
 
-    t1 = threading.Thread(target=_leg, args=("main", lambda: w3.eth.get_transaction_count(addr, "pending")),
-                          daemon=True)
-    t1.start()
-    # запасную ногу пускаем не сразу: в норме основная отвечает за десятки мс, и лишний запрос
-    # к публичной ноде не нужен. Задержка = цена хеджа, а не цена отказа.
-    if not done.wait(_NONCE_HEDGE_SEC):
-        threading.Thread(target=_leg, args=("fb", lambda: _nonce_fb_w3().eth.get_transaction_count(addr, "pending")),
-                         daemon=True).start()
-    done.wait(6.0)
-    if "first" in box:
-        if "main" not in box:
-            log.warning("nonce via fallback %s (основная не успела за %.2fс)",
-                        _NONCE_FALLBACK_RPC, _NONCE_HEDGE_SEC)
-        return int(box["first"])
-    # НЕЗНАНИЕ ЗАКРЫВАЕТ ГАРД: обе ноги молчат -> последняя синхронная попытка, и пусть
-    # исключение уйдёт наверх. Выдумывать nonce на денежном пути нельзя.
-    return int(_nonce_fb_w3().eth.get_transaction_count(addr, "pending"))
-
+    ОТКАТ ХЕДЖА (11.08 15:41, боевой инцидент). Первая редакция этой правки пускала обе ноги
+    ПАРАЛЛЕЛЬНО, по треду на каждую. Функция стоит на горячем пути, а при зависшей ноде тред
+    живёт до её таймаута — треды копились и пробили cgroup-кап юнита:
+    `RuntimeError: can't start new thread` шесть раз, падение hot_loop, self-heal перезапуск.
+    Скорость, купленная тредами на горячем пути, стоит дороже, чем экономит: отказ пришёлся бы
+    на каскад — то есть ровно на деньги. Возвращаемся к последовательной схеме, сохраняя
+    тёплую сессию (это и был главный выигрыш).
+    """
+    try:
+        return int(w3.eth.get_transaction_count(addr, "pending"))
+    except Exception:
+        n = int(_nonce_fb_w3().eth.get_transaction_count(addr, "pending"))
+        log.warning("nonce via fallback %s (основная нода бросила, сессия тёплая)",
+                    _NONCE_FALLBACK_RPC)
+        return n
 
 def prewarm_local_nonce(rpc, wallet_key: str) -> bool:
     """Однократный best-effort прогрев _LOCAL_NONCE на старте (наших in-flight tx на старте нет):
