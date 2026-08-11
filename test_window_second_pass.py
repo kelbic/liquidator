@@ -58,8 +58,11 @@ _re = _pb[:5] + (777.0,)
 assert len(_re) == 6 and _re[:5] == _pb[:5] and _re[5] == 777.0, _re
 
 # --- 3. право огня по ПОДТВЕРЖДЁННОМУ транзиту, а не только в fat-режиме ------------------
+# Окно ветки handoff. Терминатор «except Exception as e:» больше НЕ годится: с Ш29 внутри
+# ветки появился собственный try/except (залп по транзиту), и окно обрывалось на нём — раньше
+# проверяемой строки. Режем по следующему методу класса, это устойчиво к вставкам внутрь ветки.
 _ho = SRC[SRC.index("pf = self.pending_fire.pop(feed, None)"):]
-_ho = _ho[:_ho.index("except Exception as e:")]
+_ho = _ho[:_ho.index("\n    def ")]
 assert "if fat_mode or SPEC_FIRE_HANDOFF_KEEPALIVE:" in _ho, \
     "право огня по handoff снова висит только на fat_mode — флот нем в подтверждённом транзите"
 assert sfl.SPEC_FIRE_HANDOFF_KEEPALIVE is True, "дефолт ручки должен быть включён"

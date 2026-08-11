@@ -194,6 +194,8 @@ SPEC_FIRE_V2_REARM_SEC = float(os.environ.get("SPEC_FIRE_V2_REARM_SEC", "240"))
 # ОДНОГО setPlan при каденсе переарма 240с оставляла окно короче ретрая вовсе без доски: движок
 # выглядит здоровым, проб ноль. Поэтому неудача переспрашивается БЫСТРО, а не через каденс.
 SPEC_FIRE_V2_ARM_RETRY_SEC = float(os.environ.get("SPEC_FIRE_V2_ARM_RETRY_SEC", "5"))
+# Ш29: залп по подтверждённому транзиту (откат SPEC_FIRE_TRANSIT_BURST=0).
+SPEC_FIRE_TRANSIT_BURST_ON = os.environ.get("SPEC_FIRE_TRANSIT_BURST", "1") == "1"
 # Право огня движку по подтверждённому транзиту вне зависимости от порога огня (#47+#41).
 SPEC_FIRE_HANDOFF_KEEPALIVE = os.environ.get(
     "SPEC_FIRE_HANDOFF_KEEPALIVE", "1").lower() not in ("0", "false", "no")
@@ -1607,6 +1609,19 @@ class SpecFireLive:
                     # (ревью 09.08, CONFIRMED). Откат: SPEC_FIRE_HANDOFF_KEEPALIVE=0.
                     if fat_mode or SPEC_FIRE_HANDOFF_KEEPALIVE:
                         self._engine_fat_keepalive(feed)   # право огня ДО сборки/отправки пробы
+                        # Ш29: ЗАЛП ПО ФАКТУ ТРАНЗИТА. Здесь момент ИЗВЕСТЕН (жертва флипнута
+                        # в формируемом блоке), и это ровно та точка, где бьёт конкурент:
+                        # вскрытие 49834406 показало двадцать его транзакций подряд в призовом
+                        # окне [436..455] на НАШЕМ же классе tip, тогда как наши двадцать легли
+                        # на 407..426 — на 29 позиций раньше, потому что мы льём ровно, а он
+                        # выбрасывает залп за миллисекунды. Порядок важен: право огня СНАЧАЛА,
+                        # иначе жетоны некому тратить (armed() ещё ложно).
+                        try:
+                            eng = self._engine()
+                            if eng is not None and SPEC_FIRE_TRANSIT_BURST_ON:
+                                eng.transit_burst()
+                        except Exception as e:
+                            self._log("SPECFIRE залп по транзиту: %s" % _diag(e))
                     try:
                         probe, _bts = cache.get((_pm, _pb), (None, 0.0))
                         if not isinstance(probe, dict):

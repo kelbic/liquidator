@@ -68,6 +68,22 @@ ENGINE_HOLD_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_SEC", "180"))
 # Потолок приёма (замер: отказы начались при ~115/с) не задевается с семикратным запасом.
 ENGINE_HOLD_RATE = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_RATE", "16"))
 ENGINE_HOLD_BURST = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_BURST", "2"))
+# Ш29: ЗАЛП ПО ФАКТУ ТРАНЗИТА.
+#
+# ВСКРЫТИЕ блока 49834406 (11.08). Призовое окно [436..455] заняли ДВАДЦАТЬ транзакций ОДНОГО
+# адреса 0x7de3002da4, все на tip 1 000 000 — том же классе, что и наши пробы. Наши двадцать
+# стояли на 407..426, то есть класс мы угадали верно и окно ОБХВАТИЛИ, но встали на 29 позиций
+# раньше: транзит лёг на 435, ровно между их серией и нашей.
+#
+# Наши пробы шли РОВНЫМ потоком (~4мс между соседними). Конкурент уместил двадцать транзакций
+# МЕЖДУ двумя нашими соседними — то есть выбросил залп за миллисекунды, синхронно с транзитом.
+# Разница не в темпе и не в цене, а в МОМЕНТЕ: он бьёт точечно по факту прихода транзита.
+#
+# Жетоны залпа держим ОТДЕЛЬНО от ведра. Ведро КЛАМПИТ остаток к burst-капу
+# (`min(burst, ...)`), и в фазе удержания кап равен 2 — добавленные в ведро жетоны залпа были
+# бы срезаны в тот же миг. Отдельный счётчик клампу не подвержен и тратится первым.
+ENGINE_TRANSIT_BURST = float(os.environ.get("SPEC_FIRE_ENGINE_TRANSIT_BURST", "24"))
+ENGINE_TRANSIT_BURST_MAX = float(os.environ.get("SPEC_FIRE_ENGINE_TRANSIT_BURST_MAX", "40"))
 # Пополнение склада: ниже какой глубины лестницу дотачивать и как часто смотреть.
 ENGINE_REFILL_AT = int(os.environ.get("SPEC_FIRE_ENGINE_REFILL_AT", "12"))
 ENGINE_REFILL_POLL_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_REFILL_POLL_SEC", "0.5"))
@@ -228,6 +244,7 @@ class FireEngine:
         self._lock = threading.Lock()
         self._until = 0.0
         self._hold_until = 0.0   # Ш26: фаза удержания
+        self._burst_tokens = 0.0  # Ш29: жетоны залпа по транзиту (вне ведра, без клампа)
         self._target = None        # (feed, mid, borrower, debt_usd) — чей план сейчас на доске
         self._rr = 0
         self._tokens = ENGINE_BURST
@@ -295,6 +312,25 @@ class FireEngine:
             return self._now() < self._until
 
     # ---- внутреннее ----
+    def transit_burst(self, n=None):
+        """Ш29: одноразовый ЗАЛП по подтверждённому транзиту.
+
+        Зовётся из ветки pending-handoff, где жертва флипнута в ФОРМИРУЕМОМ блоке — то есть
+        момент транзита ИЗВЕСТЕН, а не предсказан. Выдаёт пачку жетонов сверх ведра, чтобы
+        шестнадцать уже существующих тредов выбросили пробы за миллисекунды, а не размазали
+        их по 4мс, как делает ровный поток.
+
+        НОВЫХ ТРЕДОВ НЕ СОЗДАЁТ (урок инцидента 15:41: треды на горячем пути пробили cgroup-кап
+        и уронили hot_loop). Кап держит экспозицию: даже при потоке событий больше
+        ENGINE_TRANSIT_BURST_MAX жетонов в воздухе не окажется."""
+        add = float(ENGINE_TRANSIT_BURST if n is None else n)
+        if add <= 0:
+            return 0.0
+        with self._lock:
+            self._burst_tokens = min(ENGINE_TRANSIT_BURST_MAX, self._burst_tokens + add)
+            self.stats["transit_bursts"] = self.stats.get("transit_bursts", 0) + 1
+            return self._burst_tokens
+
     def _take_token(self) -> bool:
         """Token bucket: общий на все треды потолок отправок/с.
 
@@ -303,6 +339,12 @@ class FireEngine:
         паузами между ними. Пауза, попавшая на транзит, обнуляет присутствие ровно так же, как
         обнуляла его вспышка на 10 секунд."""
         with self._lock:
+            # Ш29: жетоны залпа тратятся ПЕРВЫМИ и мимо ведра — ведро кламповало бы их к
+            # burst-капу фазы (в удержании он равен 2), и залп исчез бы в тот же миг.
+            if self._burst_tokens >= 1.0:
+                self._burst_tokens -= 1.0
+                self.stats["sent_burst"] = self.stats.get("sent_burst", 0) + 1
+                return True
             n = self._now()
             hot = n < self._until
             rate = self._rate if hot else ENGINE_HOLD_RATE
