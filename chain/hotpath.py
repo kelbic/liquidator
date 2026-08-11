@@ -615,6 +615,42 @@ def _leg_once(price_fn, r, oracle, ev, box):
         ev.set()
 
 
+# Ш31: ВТОРАЯ НОГА ЦЕНЫ — НА РЕЗЕРВНЫЙ КЛЮЧ (решение kelbic).
+#
+# Вторую ногу снимать НЕЛЬЗЯ — это проверено и подтверждено замером: preconf отвечает лишь в
+# 40.3% случаев (3459 из 8579 за сутки), поэтому одноногий режим удлинил бы денежный путь на
+# таймаут в шести случаях из десяти. Но она же — крупнейший потребитель БОЕВОГО ключа:
+# read_preconf_price(s) даёт 206 вызовов из ~650, около трети, и её результат выбрасывается,
+# когда preconf успел.
+#
+# Отсюда развязка: нога остаётся, но идёт по РЕЗЕРВНОМУ ключу Alchemy. Он уже оплачен, лежит
+# в COMBAT_FAILOVER_URLS и до сих пор простаивал — использовался только как аварийное
+# переключение «всё или ничего», а не как вторая полоса. Итог: страховка сохранена, а с
+# боевого ключа уходит треть нагрузки, из-за которой 429 убивали цели ДО гонки (за сутки 11
+# отказов из 45, среди них приз $18 026).
+#
+# Пусто -> прежнее поведение бит-в-бит (обе ноги на боевом).
+_PX_CONFIRMED_RPC = None
+_PX_CONFIRMED_LOCK = threading.Lock()
+
+
+def px_confirmed_rpc(rpc):
+    """RPC для confirmed-ноги: резервный ключ, если задан, иначе боевой (прежнее поведение)."""
+    url = os.environ.get("PX_CONFIRMED_RPC_URL", "").strip()
+    if not url:
+        return rpc
+    global _PX_CONFIRMED_RPC
+    with _PX_CONFIRMED_LOCK:
+        if _PX_CONFIRMED_RPC is None:
+            try:
+                from chain.rpc import BaseRpc
+                _PX_CONFIRMED_RPC = BaseRpc(url, int(os.environ.get("CHAIN_ID", "8453")),
+                                            request_timeout=8)
+            except Exception:
+                _PX_CONFIRMED_RPC = False          # не смогли -> навсегда откат на боевой
+    return _PX_CONFIRMED_RPC or rpc
+
+
 def read_price_hedged(preconf_rpc, rpc, oracle, price_fn=read_preconf_price):
     """Хедж-чтение цены оракула: preconf-pending (лид ~1.8с) и confirmed стартуют ПАРАЛЛЕЛЬНО,
     preconf ждём не дольше _PX_HEDGE_SEC. Штатно preconf отвечает ~100мс -> берём его значение,
@@ -624,6 +660,7 @@ def read_price_hedged(preconf_rpc, rpc, oracle, price_fn=read_preconf_price):
     (как раньше при None), флип и по старой -> жертва легитимна. Оба легга через price_fn."""
     if rpc is None:
         return price_fn(preconf_rpc, oracle)
+    rpc = px_confirmed_rpc(rpc)      # Ш31: confirmed-нога — на резервный ключ, если задан
     if not px_hedge_degraded():
         # ШТАТНО: одна нога. Таймаут тот же, поэтому латентная гарантия не меняется —
         # меняется только то, что мы больше не платим за неиспользуемую страховку.
