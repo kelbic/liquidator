@@ -324,9 +324,18 @@ SPEC_FIRE_COLLECTOR_FALLBACK_ON_EMPTY = os.environ.get(
 # Прореживание строки о срабатывании страховки: при лежащем узле она иначе идёт каждый полл.
 SPEC_FIRE_COLLECTOR_FALLBACK_LOG_SEC = float(
     os.environ.get("SPEC_FIRE_COLLECTOR_FALLBACK_LOG_SEC", "300"))
+# #101-b: РАЗМЕР ПАРТИИ ДЛЯ ВЫДЕЛЕННОГО УЗЛА. Замер 12.08 прямо на боевой машине: lb.drpc.live
+# принимает JSON-RPC-массив длиной 1-3 и отдаёт HTTP 500 начиная с ЧЕТЫРЁХ (n=3 принят дважды,
+# n=4 отказ — граница проверена повтором, а не одиночным тыком). Наш COLLECT_BATCH=64, поэтому
+# увод #99 отказывал на 100% поллов с самого деплоя и МОЛЧА уходил на платный Alchemy:
+# collector_fallback РАВЕН polls в каждом из 134 окон. Лечится нарезкой, а не страховкой.
+# 0 = не резать (так ходим в боевой Alchemy: он держит большие батчи и тарифицирует поштучно).
+SPEC_FIRE_COLLECTOR_BATCH_CHUNK = int(
+    os.environ.get("SPEC_FIRE_COLLECTOR_BATCH_CHUNK", "3"))
 
 
-def collect_receipts(hs, dedicated_url, combat_url, batch_fn, on_fallback=None):
+def collect_receipts(hs, dedicated_url, combat_url, batch_fn, on_fallback=None,
+                     dedicated_chunk=0):
     """Квитанции с ВЫДЕЛЕННОГО узла; страховка боевым — ТОЛЬКО на реальном отказе выделенного.
 
     Почему это отдельная функция, а не тело замыкания внутри _engine: замыкание нельзя позвать
@@ -345,7 +354,11 @@ def collect_receipts(hs, dedicated_url, combat_url, batch_fn, on_fallback=None):
         return batch_fn(combat_url, hs)
     why = None
     try:
-        out = batch_fn(dedicated_url, hs)
+        # chunk передаём ТОЛЬКО выделенному узлу и только когда он задан: боевой Alchemy держит
+        # большие батчи, резать его незачем. Ключевой аргумент, чтобы тестовые двойники с
+        # сигнатурой (url, hs) не ломались, когда нарезка выключена.
+        out = (batch_fn(dedicated_url, hs, chunk=dedicated_chunk) if dedicated_chunk > 0
+               else batch_fn(dedicated_url, hs))
         if not SPEC_FIRE_COLLECTOR_FALLBACK_ON_EMPTY:
             return out                              # узел ответил — боевой ключ не трогаем
         if any(v is not None for v in (out or {}).values()):
@@ -1347,7 +1360,8 @@ class SpecFireLive:
         from chain import execute as _ex
         return lambda hs: collect_receipts(hs, SPEC_FIRE_COLLECTOR_RPC_URL, combat_url(),
                                            _ex.batch_receipts,
-                                           on_fallback=self._note_collector_fallback)
+                                           on_fallback=self._note_collector_fallback,
+                                           dedicated_chunk=SPEC_FIRE_COLLECTOR_BATCH_CHUNK)
 
     # ---- движок огня (#32, 07.08): постоянный пул вместо порождения залпа на тик ----
     def _engine(self):

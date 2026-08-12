@@ -1545,8 +1545,20 @@ def _note_batch_cu(url: str, n: int):
         pass
 
 
-def batch_receipts(url: str, hashes, timeout: int = 5):
-    """Партия eth_getTransactionReceipt ОДНИМ HTTP-запросом.
+def batch_receipts(url: str, hashes, timeout: int = 5, chunk: int = 0):
+    """Партия eth_getTransactionReceipt (одним HTTP-запросом либо нарезкой по `chunk`).
+
+    НАРЕЗКА (#101-b, замер 12.08). Узел-коллектор `lb.drpc.live` принимает JSON-RPC-массив
+    длиной 1-3 и отдаёт HTTP 500 начиная с ЧЕТЫРЁХ (граница проверена повтором: n=3 принят
+    дважды, n=4 отказ). Наш COLLECT_BATCH=64, поэтому увод #99 отказывал на 100% поллов с
+    самого деплоя и молча уходил на платный Alchemy: collector_fallback РАВЕН polls в каждом
+    из 134 окон. Это не «узел лёг» — это несовместимость размера партии, и лечится она
+    нарезкой, а не страховкой.
+
+    `chunk<=0` — прежнее поведение (весь список одним постом; так ходим в Alchemy, он держит
+    большие батчи). `chunk>0` — режем на куски такой длины. Отказ ЛЮБОГО куска = отказ всей
+    партии (ReceiptsUnavailable): полупустой результат хуже честного «не знаю», потому что
+    ненайденный хэш коллектор досчитывает до таймаута и инвалидирует nonce ноги.
 
     КОНТРАКТ (#101): возвращается словарь, где КАЖДЫЙ запрошенный хэш присутствует ключом;
     значение — квитанция либо None («запрошен, но ещё не намайнен»). Отказ транспорта
@@ -1564,6 +1576,15 @@ def batch_receipts(url: str, hashes, timeout: int = 5):
     if not hs:
         return {}
     host = _url_host(url)
+    chunk = int(chunk or 0)
+    if chunk > 0 and len(hs) > chunk:
+        # Нарезка: каждый кусок — отдельный пост через ЭТУ ЖЕ функцию (chunk=0), поэтому
+        # разбор ответа, учёт CU и классификация отказа остаются в одном месте. Отказ куска
+        # летит наружу как есть — партия целиком объявляется неизвестной.
+        out = {}
+        for i in range(0, len(hs), chunk):
+            out.update(batch_receipts(url, hs[i:i + chunk], timeout=timeout, chunk=0))
+        return out
     out = {h: None for h in hs}                    # контракт: ключ есть у КАЖДОГО запрошенного
     s = _seq_session(url)
     if s is None:
