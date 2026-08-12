@@ -54,13 +54,21 @@ def note_secret(value: str):
 
 
 def note_secrets_from_url(url: str):
-    """Разобрать наш URL и запомнить всё, что похоже на ключ: сегменты пути и значения query."""
+    """Разобрать наши URL и запомнить всё, что похоже на ключ: сегменты пути и значения query.
+
+    Принимает и СПИСОК URL в одной строке. Это не удобство, а починка (12.08): переменные вида
+    BG_RPC_URL / COMBAT_FAILOVER_URLS / PENDING_RPC_URLS несут несколько адресов через запятую,
+    а прежний разбор брал строку как ОДИН URL — `_AUTHORITY_RE` цеплялся за первый хост, и
+    ключи остальных адресов в реестр не попадали. Из-за этого ключ второго узла ушёл в боевой
+    журнал строкой предиктора, хотя переменная была «зарегистрирована».
+    """
     try:
-        m = _AUTHORITY_RE.match(str(url) or "")
-        if not m:
-            return
-        for part in re.split(r"[/?&#]", m.group(2) or ""):
-            note_secret(part.split("=", 1)[1] if "=" in part else part)
+        for one in re.split(r"[,;\s]+", str(url) or ""):
+            m = _AUTHORITY_RE.match(one.strip())
+            if not m:
+                continue
+            for part in re.split(r"[/?&#]", m.group(2) or ""):
+                note_secret((part.split("=", 1)[1] if "=" in part else part).strip())
     except Exception:
         pass
 
