@@ -27,7 +27,7 @@ import os
 import threading
 import time
 
-from chain.rpc import BaseRpc
+from chain.rpc import BaseRpc, redact_clip
 
 log = logging.getLogger("liquidator")
 
@@ -125,7 +125,7 @@ class FailoverRpc(BaseRpc):
             self._fail_streak += 1                # исключений не бросает и сюда не попадает
             self.stats["check_fails"] += 1
             log.warning("COMBAT-FAILOVER: health-fail #%d на %s: %s",
-                        self._fail_streak, _short(cur.rpc_url), str(e)[:100])
+                        self._fail_streak, _short(cur.rpc_url), redact_clip(e, 100))
             if COMBAT_FAILOVER and self._fail_streak >= COMBAT_HC_FAILS:
                 self._failover("серия %d жёстких отказов" % self._fail_streak)
                 return

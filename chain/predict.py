@@ -23,6 +23,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from chain.rpc import redact_clip
 
 # Binance-символ -> {label, dev} (deviation Chainlink-фида на Base; arm=0.9*dev, disarm=0.7*dev).
 # ПРОКСИ-адреса фидов резолвятся у чейна (resolve_feed_proxies) — стабильны при ротации агрегаторов.
@@ -350,7 +351,7 @@ class PredictDriver:
             try:
                 self.step()
             except Exception as e:                 # баг драйвера не убивает тред
-                self.log("[predict] driver step error: %s" % str(e)[:160])
+                self.log("[predict] driver step error: %s" % redact_clip(e, 160))
             self._sleep(self.interval)
 
     def step(self):
@@ -409,7 +410,7 @@ class PredictDriver:
                 try:
                     self.on_event(ev)
                 except Exception as e:            # потребитель не роняет драйвер
-                    self.log("[predict] on_event error: %s" % str(e)[:120])
+                    self.log("[predict] on_event error: %s" % redact_clip(e, 120))
         self._publish()
 
     def _poll(self, wall, stale: set | None = None) -> list:
@@ -432,11 +433,11 @@ class PredictDriver:
                     self._poll_fail_streak = 0        # запасной ответил — слепоты не было
                     self._poll_backoff_until = 0.0
                     self.log("[predict] основной узел отказал, ответил ЗАПАСНОЙ (%s)"
-                             % str(e)[:80])
+                             % redact_clip(e, 80))
                     return self._apply_reads(reads, wall, stale)
                 except Exception as e2:
                     self.stats["poll_fallback_fail"] = self.stats.get("poll_fallback_fail", 0) + 1
-                    self.log("[predict] запасной узел тоже отказал: %s" % str(e2)[:80])
+                    self.log("[predict] запасной узел тоже отказал: %s" % redact_clip(e2, 80))
             self.stats["poll_fail"] += 1
             self._poll_fail_streak += 1
             if POLL_BACKOFF_ON and self._poll_fail_streak >= POLL_BACKOFF_AFTER:
@@ -444,9 +445,9 @@ class PredictDriver:
                             POLL_BACKOFF_CAP_SEC)
                 self._poll_backoff_until = self._now() + delay
                 self.log("[predict] aggregator poll failed #%d — backoff %.0fs: %s"
-                         % (self._poll_fail_streak, delay, str(e)[:120]))
+                         % (self._poll_fail_streak, delay, redact_clip(e, 120)))
             else:
-                self.log("[predict] aggregator poll failed (skipped): %s" % str(e)[:120])
+                self.log("[predict] aggregator poll failed (skipped): %s" % redact_clip(e, 120))
             return []
         return self._apply_reads(reads, wall, stale)
 
@@ -483,4 +484,4 @@ class PredictDriver:
             try:
                 self.on_arm(armed)
             except Exception as e:
-                self.log("[predict] on_arm error: %s" % str(e)[:120])
+                self.log("[predict] on_arm error: %s" % redact_clip(e, 120))

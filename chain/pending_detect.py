@@ -35,6 +35,7 @@ import os
 import threading
 import time
 import urllib.request
+from chain.rpc import redact_clip
 
 log = logging.getLogger("liq.pending")
 
@@ -152,7 +153,7 @@ class PendingDetect:
                 if n - self._errlog_ts >= 30.0:
                     self._errlog_ts = n
                     self._log("PENDING провайдер %s остыл на %.0fс: %s: %s" % (
-                        host, PENDING_DEAD_COOLDOWN_SEC, type(e).__name__, str(e)[:60]))
+                        host, PENDING_DEAD_COOLDOWN_SEC, type(e).__name__, redact_clip(e, 60)))
             raise
         self._pfails[idx] = 0
         if "error" in out:

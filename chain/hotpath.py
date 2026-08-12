@@ -19,6 +19,12 @@ import os
 import threading
 import time
 
+# Модульный импорт, а не внутрифункциональный: redact_clip зовут шесть разных функций, и
+# локальный импорт в одной из них оставил бы остальные с NameError (поймано статическим
+# тестом test_unresolved_names.py, #35 — ровно тот случай, ради которого он писался).
+# Цикла нет: chain/rpc.py ничего из chain/hotpath.py не импортирует.
+from chain.rpc import redact_clip
+
 log = logging.getLogger(__name__)
 
 MORPHO_BLUE = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
@@ -82,7 +88,7 @@ def stage_report(now=None) -> str:
 def CU_TOP_KEY(kv):
     """Сортировка по ВКЛАДУ в CU (n × цена), а не по числу вызовов. Ключ может быть
     'method@caller' (CU_ATTRIBUTION=1) — цену берём по части до '@'."""
-    from chain.rpc import CU_COST
+    from chain.rpc import CU_COST, redact_clip
     return CU_COST.get(str(kv[0]).split("@", 1)[0], 20) * kv[1]
 
 
@@ -759,7 +765,7 @@ def read_positions(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
         try:
             res = aggregate3(rpc, calls)                     # confirmed-only путь (stale-дочитка кэша и тесты)
         except Exception as e:
-            log.info("DIAG read_positions fallback-fail market=%s err=%s", mid[:10], str(e)[:60])
+            log.info("DIAG read_positions fallback-fail market=%s err=%s", mid[:10], redact_clip(e, 60))
             return None
     if src_out is not None:
         src_out["src"] = _src
@@ -823,7 +829,7 @@ def refresh_position_cache(cache_rpc, mid, borrowers):
     try:
         res = aggregate3(cache_rpc, calls, block_identifier="latest")
     except Exception as e:
-        log.info("DIAG position-cache refresh-fail market=%s err=%s", mid[:10], str(e)[:80])
+        log.info("DIAG position-cache refresh-fail market=%s err=%s", mid[:10], redact_clip(e, 80))
         return
     if not res or not res[0][0] or not res[0][1]:
         log.info("DIAG position-cache refresh-fail market=%s reason=market-call-failed", mid[:10])
@@ -885,7 +891,7 @@ def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
         except Exception as e:
             live = None
             log.info("DIAG position-cache live-subset fail market=%s n=%d err=%s",
-                     mid[:10], len(stale), str(e)[:60])
+                     mid[:10], len(stale), redact_clip(e, 60))
         if live is not None:
             tba, tbs, live_pos = live                        # живые totals свежее кэшевых
             pos.extend(live_pos)
@@ -1352,7 +1358,7 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
             _prep["tip"] = _tip
         return _prep
     except Exception as e:
-        return {"ok": False, "reason": f"error: {type(e).__name__}: {str(e)[:120]}"}
+        return {"ok": False, "reason": f"error: {type(e).__name__}: {redact_clip(e, 120)}"}
 
 
 def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_assets, price, state):
@@ -1427,7 +1433,7 @@ def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asse
                 "swap_calldata": swap["calldata"], "min_profit": min_profit, "debt_usd": debt_usd,
                 "debt_assets": debt_assets, "swap_meta": (coll, loan, int(seized))}
     except Exception as e:
-        return {"ok": False, "reason": f"fast error: {type(e).__name__}: {str(e)[:80]}"}
+        return {"ok": False, "reason": f"fast error: {type(e).__name__}: {redact_clip(e, 80)}"}
 
 
 # ---- per-transmit worker (reaction filter + kill-switch + dispatch) ----
@@ -1668,7 +1674,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                 r = dispatch_fn(rpc, cfg, [it], log=log, max_inflight=cfg.max_inflight)
             except Exception as e:                # bare-тред: исключение не должно пропасть молча
                 log.error("HOT incr-dispatch error %s/%s: %s: %s",
-                          it[0][:10], it[1][:10], type(e).__name__, str(e)[:80])
+                          it[0][:10], it[1][:10], type(e).__name__, redact_clip(e, 80))
                 r = []
             with _incr_state["rlock"]:
                 _incr_results.extend(r)           # t_send = СУММА по тредам (может превышать wall)
