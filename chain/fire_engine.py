@@ -168,16 +168,28 @@ class ReceiptCollector:
             if not hashes:
                 return 0
         self.stats["cu"] = self.stats.get("cu", 0.0) + len(hashes) * CU_PER_RECEIPT
+        got = {}
         try:
             got = self._receipts_fn(hashes) or {}
         except Exception as e:
+            # РАННИЙ ВЫХОД ЗДЕСЬ БЫЛ РЕГРЕССИЕЙ (#101, поймано ревью 12.08). Снятие брони #93
+            # живёт в цикле НИЖЕ (_on_timeout -> volley_gas_settle), поэтому `return 0` на
+            # отказе означал: оба узла молчат -> брони не снимаются НИКОГДА -> гейт
+            # CASCADE_TIER_GAS_USD закрыт до рестарта или полуночи UTC. Прежняя редакция
+            # самоисцелялась за 180с ровно потому, что batch_receipts возвращал {} и цикл
+            # всё равно отрабатывал таймауты.
+            # Незнание обязано закрывать гард, а НЕ запирать наш собственный огонь: отказ узла
+            # — это «не знаю про квитанции», а не «держи бронь вечно». Дедлайн считает время,
+            # а не ответы узла, поэтому цикл ниже исполняется в ЛЮБОМ случае с пустым `got`.
+            self.stats["batch_fail"] = self.stats.get("batch_fail", 0) + 1
             if self._log:
-                # ПРИЧИНА, а не только тип: отказ узла квитанций теперь приезжает
+                # ПРИЧИНА, а не только тип: отказ узла квитанций приезжает
                 # ReceiptsUnavailable(host: причина), и по одному имени класса не понять,
                 # какой контур лёг (в тексте только хост — ключ живёт в пути URL).
-                self._log("FIRE collect batch fail: %s %s" % (type(e).__name__, str(e)[:140]))
-            return 0
-        self.stats["polls"] += 1
+                self._log("FIRE collect batch fail: %s %s (таймауты обрабатываются)"
+                          % (type(e).__name__, str(e)[:140]))
+        else:
+            self.stats["polls"] += 1
         done = 0
         now = self._now()
         for h in hashes:
