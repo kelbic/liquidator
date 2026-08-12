@@ -52,10 +52,16 @@ def setup_logging(level: str):
     # журнал отдавал оба drpc-ключа всякому, у кого есть доступ к хосту. Фильтр вешаем на
     # ХЕНДЛЕР, а не на логгер: у logging фильтры логгера не применяются к записям, всплывшим
     # от дочерних логгеров, а «liq.*» пишут все модули бота.
-    from chain.rpc import RedactingFilter
+    from chain.rpc import RedactingFilter, note_secrets_from_env
     for h in logging.getLogger().handlers:
         if not any(isinstance(f, RedactingFilter) for f in h.filters):
             h.addFilter(RedactingFilter())
+    # Реестр литералов наполняем СРАЗУ из окружения, а не ждём, пока каждый контур построит
+    # BaseRpc. 12.08 ключ dRPC (9 символов) уехал в журнал строкой предиктора: его URL до
+    # конструктора BaseRpc не доходил, а оба эвристических рубежа (сегмент >=20, литерал >=16)
+    # короткий ключ пропускали. Регистрация до первой сетевой строки — единственный порядок,
+    # при котором фильтр закрывает и то, что случится в первую секунду работы.
+    note_secrets_from_env()
 
 
 def _empty_summary(n_markets: int) -> dict:
