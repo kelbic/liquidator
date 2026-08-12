@@ -313,6 +313,49 @@ def _collector_node_kind() -> str:
     if SPEC_FIRE_COLLECTOR_RPC_URL:
         return "bg"
     return "боевой"
+
+
+# ОТКАТ МЕХАНИЗМА строгой страховки (#101). =1 возвращает ПРЕЖНЕЕ решение целиком: «в партии не
+# резолвилось ничего -> переспросить боевым», то есть ровно тот дефект, ради которого правка и
+# делалась. Снимается не параметр (порог/таймаут), а сам механизм различения «отказ» vs «ещё не
+# намайнено» — путь становится бит-в-бит прежним. Покрыт тестом test_collector_no_fallback.py.
+SPEC_FIRE_COLLECTOR_FALLBACK_ON_EMPTY = os.environ.get(
+    "SPEC_FIRE_COLLECTOR_FALLBACK_ON_EMPTY", "0").lower() in ("1", "true", "yes", "on")
+# Прореживание строки о срабатывании страховки: при лежащем узле она иначе идёт каждый полл.
+SPEC_FIRE_COLLECTOR_FALLBACK_LOG_SEC = float(
+    os.environ.get("SPEC_FIRE_COLLECTOR_FALLBACK_LOG_SEC", "300"))
+
+
+def collect_receipts(hs, dedicated_url, combat_url, batch_fn, on_fallback=None):
+    """Квитанции с ВЫДЕЛЕННОГО узла; страховка боевым — ТОЛЬКО на реальном отказе выделенного.
+
+    Почему это отдельная функция, а не тело замыкания внутри _engine: замыкание нельзя позвать
+    из теста, и прежний тест экзаменовал СВОЮ КОПИЮ этой ветки («повторяет боевую ветку
+    один-в-один») — то есть заглушку этажом выше дефекта. Копия была верна, боевая ветка нет.
+
+    Различие исходов — НАСТОЯЩЕЕ: отказ приезжает исключением ReceiptsUnavailable, а «ещё не
+    намайнено» приезжает значением None у запрошенного ключа. Пустота словаря не значит ничего.
+
+    Отказ ОБОИХ узлов пробрасывается наружу: коллектор пропустит тик и переспросит через
+    секунду. Прежнее «вернуть {}» в этом случае гнало партию в таймаут, а таймаут инвалидирует
+    nonce ноги и рушит её лестницу — приговор по слепому узлу («незнание обязано закрывать гард»).
+    """
+    from chain.execute import ReceiptsUnavailable
+    if not dedicated_url:
+        return batch_fn(combat_url, hs)
+    why = None
+    try:
+        out = batch_fn(dedicated_url, hs)
+        if not SPEC_FIRE_COLLECTOR_FALLBACK_ON_EMPTY:
+            return out                              # узел ответил — боевой ключ не трогаем
+        if any(v is not None for v in (out or {}).values()):
+            return out
+        why = "откат: в партии ничего не резолвилось"
+    except ReceiptsUnavailable as e:
+        why = "отказ узла (%s)" % e
+    if on_fallback is not None:
+        on_fallback(why)
+    return batch_fn(combat_url, hs)
 SPEC_FIRE_FACTS_TTL_SEC = float(os.environ.get("SPEC_FIRE_FACTS_TTL_SEC", "900"))
 # Право огня движку в fat-окне выдаёт САМО окно, не тир выше (вскрытие 07.08 17:00, блок
 # 49666338). Гонка живёт в одном блоке, а тир (армы>=N/час И свежий факт-флаг) в решающий
@@ -1281,6 +1324,31 @@ class SpecFireLive:
         self._log("SPECFIRE доска: арм НЕ ВЗВЁЛСЯ feed=%s (%s) — переспрос через %.0fс "
                   "(без доски флот нем)" % (feed, why, SPEC_FIRE_V2_ARM_RETRY_SEC))
 
+    def _note_collector_fallback(self, why):
+        """Страховка сработала — это ГРОМКО. Молчание уже стоило суток: коллектор уходил на
+        боевой Alchemy на 100% поллов (замер 12.08: collector_fallback == polls в 134 окнах
+        подряд), а в журнале не было ни строки, и по нулю НАШЕГО же счётчика был вынесен
+        вердикт «трафик квитанций на Alchemy не наш». Печатаем с прореживанием: при отказе
+        узла строка иначе идёт каждую секунду."""
+        n = self.stats.get("collector_fallback", 0) + 1
+        self.stats["collector_fallback"] = n
+        now = self._now()
+        last = getattr(self, "_collector_fb_logged", 0.0)
+        if now - last < SPEC_FIRE_COLLECTOR_FALLBACK_LOG_SEC and n > 1:
+            return
+        self._collector_fb_logged = now
+        self._log("SPECFIRE коллектор: партия уведена на БОЕВОЙ узел — %s (узел=%s, "
+                  "срабатываний %d). Увод #99 в этот момент не работает: квитанции жгут "
+                  "платную квоту" % (why, _collector_node_kind(), n))
+
+    def _receipts_fn(self, combat_url):
+        """Шов квитанций для коллектора. МЕТОД, а не замыкание внутри _engine: замыкание
+        нельзя позвать из теста, и приёмка сползала на пересказ боевой ветки."""
+        from chain import execute as _ex
+        return lambda hs: collect_receipts(hs, SPEC_FIRE_COLLECTOR_RPC_URL, combat_url(),
+                                           _ex.batch_receipts,
+                                           on_fallback=self._note_collector_fallback)
+
     # ---- движок огня (#32, 07.08): постоянный пул вместо порождения залпа на тик ----
     def _engine(self):
         """Ленивый подъём движка. Выключен -> None, и путь залпа идёт как прежде бит-в-бит."""
@@ -1354,27 +1422,12 @@ class SpecFireLive:
                 # узел, а фиксированный на старте адрес держал бы коллектор на мёртвом
                 return getattr(self.rpc, "rpc_url", None) or rpc_url
 
-            def _receipts(hs):
-                """Квитанции с ВЫДЕЛЕННОГО узла, со страховкой боевым.
-
-                batch_receipts на отказе транспорта возвращает ПУСТОЙ словарь («не знаю» != 
-                «дропнуто»), и по этому признаку страховка отличима от «ещё не намайнено»:
-                непришедшая квитанция приезжает как {hash: None}, то есть словарь НЕ пуст.
-                Без страховки увод коллектора ударил бы по готовности: брони #93 не снялись бы
-                и гейт огня закрылся бы сам на себе."""
-                if not SPEC_FIRE_COLLECTOR_RPC_URL:
-                    return _ex.batch_receipts(_combat_url(), hs)
-                out = _ex.batch_receipts(SPEC_FIRE_COLLECTOR_RPC_URL, hs)
-                if out:
-                    return out
-                self.stats["collector_fallback"] = self.stats.get("collector_fallback", 0) + 1
-                return _ex.batch_receipts(_combat_url(), hs)
-
-            self._log("SPECFIRE коллектор квитанций: узел=%s (страховка боевым при пустом "
-                      "ответе — иначе брони #93 не снимутся и гейт огня закроется на нас)"
+            self._log("SPECFIRE коллектор квитанций: узел=%s (страховка боевым ТОЛЬКО на "
+                      "отказе выделенного — иначе брони #93 не снимутся и гейт огня закроется "
+                      "на нас; откат SPEC_FIRE_COLLECTOR_FALLBACK_ON_EMPTY=1)"
                       % _collector_node_kind())
             col = _fe.ReceiptCollector(
-                receipts_fn=_receipts,
+                receipts_fn=self._receipts_fn(_combat_url),
                 on_result=self._engine_result, on_timeout=self._engine_timeout,
                 log=self._log)
             eng = _fe.FireEngine(legs_fn=_legs, send_fn=_send, collector=col,

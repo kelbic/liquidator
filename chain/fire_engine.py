@@ -172,7 +172,10 @@ class ReceiptCollector:
             got = self._receipts_fn(hashes) or {}
         except Exception as e:
             if self._log:
-                self._log("FIRE collect batch fail: %s" % type(e).__name__)
+                # ПРИЧИНА, а не только тип: отказ узла квитанций теперь приезжает
+                # ReceiptsUnavailable(host: причина), и по одному имени класса не понять,
+                # какой контур лёг (в тексте только хост — ключ живёт в пути URL).
+                self._log("FIRE collect batch fail: %s %s" % (type(e).__name__, str(e)[:140]))
             return 0
         self.stats["polls"] += 1
         done = 0

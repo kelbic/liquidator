@@ -1509,36 +1509,100 @@ def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5):
         return False, type(e).__name__
 
 
+class ReceiptsUnavailable(RuntimeError):
+    """Узел НЕ ответил на партию квитанций. Это «не знаю», а НЕ «ещё не намайнено».
+
+    Существует потому, что различать эти два исхода пустым словарём НЕЛЬЗЯ (#101): прежняя
+    редакция клала в словарь только пришедшие квитанции, поэтому «узел молчит» и «ни одна из
+    64 проб ещё не в блоке» давали одинаковый {} — и страховка боевым Alchemy срабатывала на
+    КАЖДОМ полле. Отличие обязано быть в типе исхода, а не в соглашении о размере словаря.
+
+    Секрет наружу не выносим: в сообщении только ХОСТ и причина, ключ живёт в пути URL.
+    """
+
+    def __init__(self, reason: str, host: str = ""):
+        self.reason = str(reason)[:120]
+        self.host = host or "?"
+        super().__init__("%s: %s" % (self.host, self.reason))
+
+
+def _url_host(url: str) -> str:
+    """Хост без пути. В пути URL живёт ключ провайдера — в текст исключения он не попадает."""
+    try:
+        return str(url).split("//")[-1].split("/")[0] or "?"
+    except Exception:
+        return "?"
+
+
+def _note_batch_cu(url: str, n: int):
+    """Батч под общий учёт CU. У Alchemy КАЖДЫЙ подзапрос батча тарифицируется отдельно
+    (64 квитанции = 64 x 15 CU), поэтому счётчику передаём число подзапросов, а не постов.
+    Считаем ДО отправки: недосчёт прячет дыру, а ради этого счётчик и заводится."""
+    try:
+        from chain import rpc as _rpc
+        _rpc.rpc_usage_note("eth_getTransactionReceipt", url, n)
+    except Exception:
+        pass
+
+
 def batch_receipts(url: str, hashes, timeout: int = 5):
-    """Партия eth_getTransactionReceipt ОДНИМ HTTP-запросом -> {hash: receipt|None}.
+    """Партия eth_getTransactionReceipt ОДНИМ HTTP-запросом.
+
+    КОНТРАКТ (#101): возвращается словарь, где КАЖДЫЙ запрошенный хэш присутствует ключом;
+    значение — квитанция либо None («запрошен, но ещё не намайнен»). Отказ транспорта
+    словарём НЕ выражается вовсе — он поднимает ReceiptsUnavailable.
+
+    Зачем так. Вызывающий (коллектор движка) на «пусто» уводит партию на боевой Alchemy, и
+    ровно на этом различии держится весь увод нагрузки #99. Прежняя редакция обещала в
+    комментарии «{hash: None}», но клала в словарь только `if r is not None` — обещанного
+    ключа не появлялось НИКОГДА, и «не намайнено» было неотличимо от «узел лёг».
 
     При сотнях проб в секунду поштучный полл — это и есть тот самый шторм, который мы себе
-    уже устраивали. Батч JSON-RPC стоит один round-trip на всю партию. Ошибка транспорта
-    возвращает пустой словарь: «не знаю» != «дропнуто», приговор выносит таймаут коллектора.
+    уже устраивали; батч стоит один round-trip, но тарифицируется поштучно (см. _note_batch_cu).
     """
-    out = {}
-    if not hashes:
-        return out
+    hs = list(hashes or [])
+    if not hs:
+        return {}
+    host = _url_host(url)
+    out = {h: None for h in hs}                    # контракт: ключ есть у КАЖДОГО запрошенного
+    s = _seq_session(url)
+    if s is None:
+        raise ReceiptsUnavailable("нет http-сессии (requests недоступен)", host)
+    payload = [{"jsonrpc": "2.0", "id": i, "method": "eth_getTransactionReceipt",
+                "params": [h]} for i, h in enumerate(hs)]
+    _note_batch_cu(url, len(hs))
     try:
-        s = _seq_session(url)
-        if s is None:
-            return out
-        payload = [{"jsonrpc": "2.0", "id": i, "method": "eth_getTransactionReceipt",
-                    "params": [h]} for i, h in enumerate(hashes)]
         resp = s.post(url, json=payload, timeout=timeout).json()
-        if isinstance(resp, dict):                 # узел ответил одиночной ошибкой на батч
-            return out
-        for item in resp:
-            try:
-                i = int(item.get("id"))
-            except Exception:
-                continue
-            if 0 <= i < len(hashes) and not item.get("error"):
-                r = item.get("result")
-                if r is not None:
-                    out[hashes[i]] = r
-    except Exception:
-        return out
+    except Exception as e:
+        raise ReceiptsUnavailable("транспорт %s" % type(e).__name__, host) from None
+    if not isinstance(resp, list):
+        # Узел ответил одиночной ошибкой на батч (или отдал не-JSON-RPC тело). Батч не принят —
+        # это отказ узла, а не «квитанций нет». Именно так молчал dRPC-коллектор (12.08).
+        _msg = ""
+        try:
+            _msg = str((resp or {}).get("error", {}).get("message", ""))[:80]
+        except Exception:
+            pass
+        raise ReceiptsUnavailable("батч не принят %s" % (_msg or type(resp).__name__), host)
+    seen = 0
+    errs = 0
+    for item in resp:
+        if not isinstance(item, dict):
+            continue
+        try:
+            i = int(item.get("id"))
+        except Exception:
+            continue
+        if not (0 <= i < len(hs)):
+            continue
+        seen += 1
+        if item.get("error"):
+            errs += 1                              # поэлементный отказ узла: НЕ «не намайнено»
+            continue
+        out[hs[i]] = item.get("result")            # None = запрошен, но ещё не в блоке
+    if seen == 0 or errs == seen:
+        raise ReceiptsUnavailable("ни одного пригодного ответа (%d ошибок из %d)" % (errs, seen),
+                                  host)
     return out
 
 

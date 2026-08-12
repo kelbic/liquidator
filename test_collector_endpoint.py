@@ -14,8 +14,14 @@
 Если выделенный узел молчит, брони копятся и гейт закрывается НА НАС ЖЕ — то есть увод на
 худший узел ударил бы по готовности, хотя коллектор и не в горячем пути. Отсюда страховка.
 
-Признак отказа транспорта отличим от «ещё не намайнено»: `batch_receipts` на отказе возвращает
-ПУСТОЙ словарь, а непришедшая квитанция приезжает как {hash: None} — словарь не пуст.
+ПРАВКА 12.08 (#101). Прежняя редакция этого файла утверждала: «batch_receipts на отказе
+возвращает ПУСТОЙ словарь, а непришедшая квитанция приезжает как {hash: None} — словарь не
+пуст». Утверждение было ЛОЖНЫМ: вставка шла под `if r is not None`, ключа со значением None не
+появлялось никогда, и «не намайнено» было неотличимо от «узел лёг». Раздел 3 этого файла
+проверял СВОЮ КОПИЮ боевой ветки («повторяет боевую ветку один-в-один») — копия была верна,
+боевая ветка нет: классическая заглушка этажом выше дефекта. Решение теперь живёт в
+`collect_receipts`, и экзаменуется ОНО САМО в test_collector_no_fallback.py; здесь остаётся
+адресат узла и ПРОВОДКА (что боевой коллектор получает именно этот шов).
 """
 import pathlib
 import sys
@@ -25,6 +31,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 SRC = pathlib.Path("chain/spec_fire_live.py").read_text()
 
 # --- 1. Ручка есть и по умолчанию ИНЕРТНА (прежнее поведение) ----------------------------
+import chain.execute as ex                                    # noqa: E402
 import chain.spec_fire_live as sfl                            # noqa: E402
 
 assert hasattr(sfl, "SPEC_FIRE_COLLECTOR_RPC_URL"), "ручки узла коллектора нет"
@@ -41,67 +48,76 @@ assert "BG_RPC_URL_2" in _src_ch and "BG_RPC_URL" in _src_ch, \
     "цепочка приоритета не берёт bg-страйп — увод потребует ручной правки .env"
 print("OK 1/4: цепочка узлов своя->bg-2->bg->боевой; без ручек остаёмся на боевом")
 
-# --- 2. СТРУКТУРНО: страховка боевым есть, и она НЕ обходится ----------------------------
-i = SRC.index("def _receipts(hs):")
-blk = SRC[i:SRC.index("col = _fe.ReceiptCollector(", i)]
-assert "if not SPEC_FIRE_COLLECTOR_RPC_URL:" in blk, "нет ветки «ручка пуста -> боевой»"
-assert blk.count("_combat_url()") >= 2, \
+# --- 2. ПРОВОДКА: боевой коллектор получает шов _receipts_fn, а тот зовёт collect_receipts -
+# Проверяем не наличие текста «страховка», а что решение принимает ОДНА функция, и что она же
+# стоит в конструкторе ReceiptCollector. Иначе повторится #101: тест экзаменует копию ветки.
+i = SRC.index("col = _fe.ReceiptCollector(")
+blk = SRC[i:SRC.index(")", SRC.index("log=self._log", i))]
+assert "receipts_fn=self._receipts_fn(" in blk, \
+    "коллектор получает не боевой шов — проводка разорвана: %s" % blk[:200]
+j = SRC.index("def _receipts_fn(self, combat_url):")
+fblk = SRC[j:SRC.index("\n    # ---- движок огня", j)]
+assert "collect_receipts(" in fblk and "batch_receipts" in fblk, \
+    "шов не делегирует решение collect_receipts"
+assert "if out" not in fblk, "в шве завелась своя логика решения — решение обязано быть одно"
+dblk = SRC[SRC.index("def collect_receipts("):SRC.index("SPEC_FIRE_FACTS_TTL_SEC = ")]
+assert "ReceiptsUnavailable" in dblk, \
+    "страховка снова решает по ПУСТОТЕ словаря, а не по отказу узла — это и был #101"
+assert dblk.count("batch_fn(combat_url") >= 2, \
     "боевой узел не используется как страховка — брони не снимутся при молчании выделенного"
-assert "if out:" in blk, "пустой ответ не отличается от нормального — страховка не сработает"
-assert "collector_fallback" in blk, "срабатывание страховки не считается (диагностики не будет)"
-print("OK 2/4: пустой ответ выделенного узла -> берём боевой, срабатывание считается")
+assert "on_fallback" in dblk, "срабатывание страховки не считается (диагностики не будет)"
+print("OK 2/4: ReceiptCollector <- _receipts_fn <- collect_receipts; решение одно и по ОТКАЗУ")
 
-# --- 3. ЛОГИКА страховки на моках: пустой словарь != {hash: None} ------------------------
+# --- 3. ЛОГИКА страховки на НАСТОЯЩЕЙ функции (не на пересказе) --------------------------
+DED, COMBAT = "https://ded.example/K", "https://combat.example/K"
+H = "0x" + "11" * 32
 calls = []
 
 
-def make_receipts(dedicated_url, dedicated_out, combat_out):
-    """Повторяет боевую ветку один-в-один, чтобы экзаменовать РЕШЕНИЕ, а не текст."""
-    stats = {}
+def batch(url, hs, timeout=5):
+    """Шов НИЖЕ дефекта: сам batch_receipts экзаменуется в test_collector_no_fallback.py,
+    здесь проверяется решение о страховке при каждом из трёх исходов контракта."""
+    calls.append(url)
+    if url == DED:
+        return DEDICATED() if callable(DEDICATED) else dict(DEDICATED)
+    return {H: {"status": "0x1"}}
 
-    def _batch(url, hs):
-        calls.append(url)
-        return dict(dedicated_out) if url == dedicated_url else dict(combat_out)
-
-    def _receipts(hs):
-        if not dedicated_url:
-            return _batch("combat", hs)
-        out = _batch(dedicated_url, hs)
-        if out:
-            return out
-        stats["collector_fallback"] = stats.get("collector_fallback", 0) + 1
-        return _batch("combat", hs)
-    return _receipts, stats
-
-
-H = "0xaaa"
 
 # 3a. выделенный ответил -> боевой НЕ трогаем (нагрузка ушла с боевого ключа)
 calls.clear()
-f, st = make_receipts("dedicated", {H: {"status": "0x1"}}, {H: {"status": "0x1"}})
-assert f([H]) == {H: {"status": "0x1"}}
-assert calls == ["dedicated"], "боевой ключ дёрнут зря — увод не состоялся: %s" % calls
-assert not st, "страховка засчитана на здоровом ответе"
+DEDICATED = {H: {"status": "0x1"}}
+fired = []
+assert sfl.collect_receipts([H], DED, COMBAT, batch, on_fallback=fired.append) == DEDICATED
+assert calls == [DED], "боевой ключ дёрнут зря — увод не состоялся: %s" % calls
+assert not fired, "страховка засчитана на здоровом ответе"
 
 # 3b. ЕЩЁ НЕ НАМАЙНЕНО ({hash: None}) — это НЕ отказ, страховку НЕ зовём
 calls.clear()
-f, st = make_receipts("dedicated", {H: None}, {H: {"status": "0x1"}})
-assert f([H]) == {H: None}, "«не намайнено» подменено ответом боевого"
-assert calls == ["dedicated"], "страховка сработала на нормальном ответе — лишний расход боевого"
-assert not st
+DEDICATED = {H: None}
+assert sfl.collect_receipts([H], DED, COMBAT, batch, on_fallback=fired.append) == {H: None}, \
+    "«не намайнено» подменено ответом боевого"
+assert calls == [DED], "страховка сработала на нормальном ответе — лишний расход боевого: %s" % calls
+assert not fired
 
-# 3c. ОТКАЗ ТРАНСПОРТА (пустой словарь) -> страховка боевым
+# 3c. ОТКАЗ УЗЛА (ReceiptsUnavailable) -> страховка боевым
+
+
+def DEDICATED():
+    raise ex.ReceiptsUnavailable("транспорт ConnectionError", "ded.example")
+
+
 calls.clear()
-f, st = make_receipts("dedicated", {}, {H: {"status": "0x1"}})
-assert f([H]) == {H: {"status": "0x1"}}, "выделенный молчит, а квитанции не добраны боевым"
-assert calls == ["dedicated", "combat"], calls
-assert st.get("collector_fallback") == 1, "срабатывание страховки не посчитано"
-print("OK 3/4: ответ -> только выделенный; «не намайнено» -> без страховки; отказ -> боевой")
+assert sfl.collect_receipts([H], DED, COMBAT, batch,
+                            on_fallback=fired.append) == {H: {"status": "0x1"}}, \
+    "выделенный молчит, а квитанции не добраны боевым"
+assert calls == [DED, COMBAT], calls
+assert len(fired) == 1 and "ded.example" in fired[0], "срабатывание страховки не названо: %s" % fired
+print("OK 3/4: ответ -> только выделенный; «не намайнено» -> без страховки; ОТКАЗ -> боевой")
 
 # --- 4. КОНТРОЛЬ: ручка пуста -> всё как раньше, выделенный не дёргается -----------------
 calls.clear()
-f, st = make_receipts("", {}, {H: {"status": "0x1"}})
-assert f([H]) == {H: {"status": "0x1"}}
-assert calls == ["combat"], "при пустой ручке тронут посторонний узел: %s" % calls
+DEDICATED = {}
+assert sfl.collect_receipts([H], "", COMBAT, batch) == {H: {"status": "0x1"}}
+assert calls == [COMBAT], "при пустой ручке тронут посторонний узел: %s" % calls
 print("OK 4/4: КОНТРОЛЬ — пустая ручка = прежнее поведение, весь трафик на боевом")
 print("=== #99 ЗАКРЫТ (увод не трогает готовность: брони снимаются в любом случае) ===")
