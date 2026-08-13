@@ -371,10 +371,44 @@ assert any("метод ПОДДЕРЖАН" in m for m in msgs_ok), msgs_ok
 assert seen_ok.count("eth_getBlockReceipts") == 1,     "способность выясняется ОДНИМ запросом, а не каждый оборот: %s" % seen_ok
 assert ix_ok.snapshot()["rcpt_probe"] == "поддержан"
 
+# -32601 — НЕ ПРИГОВОР С ПЕРВОГО ОТВЕТА (р-3, канон #52). За адресом узла стоит ПУЛ бэкендов;
+# один ответ «метода нет» — свойство ОТВЕТИВШЕГО, а утверждение печатается про УЗЕЛ и закрывает
+# приёмку (в) до конца жизни процесса. Гасим после K отказов на РАЗНЫХ блоках.
 ix_no, msgs_no, seen_no = _cap_drill("unsupported")
-assert ix_no._rcpt_probe == "не поддержан" and ix_no._receipts_ok is False
-assert any("НЕ ПОДДЕРЖАН" in m for m in msgs_no), msgs_no
+assert ix_no._receipts_ok is True and ix_no._rcpt_probe != "не поддержан", \
+    "ОДИН -32601 не имеет права объявлять свойство УЗЛА: %s" % ix_no._rcpt_probe
 assert seen_no.count("eth_getBlockReceipts") == 1, seen_no
+_hc2 = _C2 = None
+
+
+class _C2(logging.Handler):                                   # noqa: E303
+    def emit(self, rec):
+        msgs_no.append(rec.getMessage())
+
+
+_hc2 = _C2()
+logging.getLogger("liquidator").addHandler(_hc2)
+try:
+    for _i in range(1, ci.CHAIN_INDEX_RCPT_UNSUP_K):
+        _T[0] += ci.CHAIN_INDEX_RCPT_PROBE_RETRY_SEC + 1
+        ix_no._probe_receipts_cap(49890266 + _i)              # ДРУГОЙ блок, тот же -32601
+    assert ix_no._rcpt_probe == "не поддержан" and ix_no._receipts_ok is False, \
+        "после %d отказов на РАЗНЫХ блоках способность обязана погаснуть" % ci.CHAIN_INDEX_RCPT_UNSUP_K
+    assert seen_no.count("eth_getBlockReceipts") == ci.CHAIN_INDEX_RCPT_UNSUP_K, seen_no
+    _T[0] += ci.CHAIN_INDEX_RCPT_PROBE_RETRY_SEC + 1
+    ix_no._probe_receipts_cap(49890299)
+    assert seen_no.count("eth_getBlockReceipts") == ci.CHAIN_INDEX_RCPT_UNSUP_K, \
+        "погашенная способность не долбит узел: %s" % seen_no
+    # ...и ВО ВРЕМЕНИ переспрашивается: «не умеет» не имеет права быть вечным.
+    _T[0] += ci.CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC + 1
+    ix_no._probe_receipts_cap(49890300)
+    assert seen_no.count("eth_getBlockReceipts") == ci.CHAIN_INDEX_RCPT_UNSUP_K + 1, \
+        ("латч способности обязан иметь потолок по времени (канон #52), иначе приёмка (в) "
+         "недостижима до рестарта: %s" % seen_no)
+finally:
+    logging.getLogger("liquidator").removeHandler(_hc2)
+assert any("НЕ ПОДДЕРЖАН" in m for m in msgs_no), msgs_no
+assert any("переспрашиваю способность" in m for m in msgs_no), msgs_no[-3:]
 
 # ТРАНСПОРТ — НЕ ПРИГОВОР СПОСОБНОСТИ: «не смогли спросить» это не «не умеет».
 ix_tr, msgs_tr, seen_tr = _cap_drill("transport")
@@ -387,8 +421,9 @@ assert seen_tr.count("eth_getBlockReceipts") == 2, \
      "и неотличимым от «не умеет»: %s" % seen_tr.count("eth_getBlockReceipts"))
 assert ix_tr._rcpt_probe == "не выяснено" and ix_tr._receipts_ok is True
 print("UNIT_OK: способность узла к eth_getBlockReceipts выясняется ОДНИМ запросом и называется "
-      "вслух; -32601 гасит её навсегда, транспортный отказ — только откладывает (index_hits=0 "
-      "стал читаемым)")
+      "вслух; -32601 гасит её только после %d отказов на РАЗНЫХ блоках и переспрашивается через "
+      "%.0fч, транспортный отказ — просто откладывает (index_hits=0 стал читаемым)"
+      % (ci.CHAIN_INDEX_RCPT_UNSUP_K, ci.CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC / 3600.0))
 
 logging.getLogger("liquidator").removeHandler(_h)
 print("ПРОШЛИ: потолок головы — pending-подача больше не запирает индекс")

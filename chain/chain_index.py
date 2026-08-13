@@ -182,8 +182,16 @@ CHAIN_INDEX_ABSENT_BLOCKS = int(os.environ.get("CHAIN_INDEX_ABSENT_BLOCKS", "12"
 # eth_feeHistory (261 байт, ~0 CPU) — см. docs/FEED_CONTRACT_B1_TIPS.md.
 # =0 оставляет полное чтение ТОЛЬКО на блоки, где летят наши пробы: трафик падает до нуля в
 # штиль, но чужие гонки перестают измеряться.
+# ДЕФОЛТ '0' (ревью р-3, МАЙОР-1). Механика НОВАЯ — файла не было до этого пакета, — а новая
+# боевая механика не имеет права приезжать включённой: цена названа числом выше и платится
+# ровно в заторных блоках, где решаются деньги, значит включение — решение kelbic одной
+# переменной окружения, а не мой дефолт. ДЕНЕЖНЫЙ тракт от этого НЕ страдает: блоки с НАШИМИ
+# пробами читаются целиком через `_want_full()` независимо от этой ручки (проверено запуском:
+# при =0 остаются полных=1, state='mined', receipts_for=1 ключ). Выключается ровно и только
+# наблюдаемость ЧУЖИХ гонок — а вместе с ней и ПОЛНЫЕ чтения в штиль, поэтому приёмка «а» при
+# =0 в штиль законно печатает ЧАСТИЧНО (см. `_selfcheck`), а не ЖИВ.
 CHAIN_INDEX_FULL_ON_LOGS = os.environ.get(
-    "CHAIN_INDEX_FULL_ON_LOGS", "1").lower() not in ("0", "false", "no", "off")
+    "CHAIN_INDEX_FULL_ON_LOGS", "0").lower() not in ("0", "false", "no", "off")
 # Прореживание громких строк (отказ узла / протухание): без него лежащий узел даёт строку/сек.
 CHAIN_INDEX_LOUD_SEC = float(os.environ.get("CHAIN_INDEX_LOUD_SEC", "60"))
 # Призовое окно позиций (Ш10): наша tx считается «в полосе», если она в [T+1, T+PRIZE] за транзитом.
@@ -220,6 +228,17 @@ CHAIN_INDEX_HEALTH_SEC = float(os.environ.get("CHAIN_INDEX_HEALTH_SEC", "120"))
 # Как часто ПЕРЕСПРАШИВАТЬ способность узла отдавать квитанции блока, если проба не удалась по
 # транспорту. «Не смогли спросить» — это не «не умеет»: латч ставится ТОЛЬКО на -32601.
 CHAIN_INDEX_RCPT_PROBE_RETRY_SEC = float(os.environ.get("CHAIN_INDEX_RCPT_PROBE_RETRY_SEC", "300"))
+# СКОЛЬКО -32601 НА РАЗНЫХ БЛОКАХ гасят способность узла к квитанциям, и через сколько её
+# ПЕРЕСПРАШИВАТЬ. Прежде хватало ОДНОГО ответа: способность гасилась НАВСЕГДА, приёмка (в)
+# становилась недостижимой, а строка утверждала про УЗЕЛ «квитанции=не поддержан» по одному
+# ответу ПУЛА (за адресом вроде base-rpc.publicnode.com стоит пул бэкендов, и один из них
+# может ответить иначе). Канон #52: латч только на терминальной причине; «метод не существует»
+# терминален для БЭКЕНДА, но про пул это утверждение требует повторов на РАЗНЫХ блоках и
+# всё равно переспрашивается по времени. Частота триггера в бою не замерена — поэтому
+# ограничение стоит с обеих сторон: и K, и таймер.
+CHAIN_INDEX_RCPT_UNSUP_K = int(os.environ.get("CHAIN_INDEX_RCPT_UNSUP_K", "3"))
+CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC = float(
+    os.environ.get("CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC", "21600"))
 
 
 class IndexUnavailable(RuntimeError):
@@ -709,17 +728,29 @@ class ChainIndex:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thr = None
-        self._loud_ts = 0.0
+        self._loud_ts = {}      # {вид события: mono последней громкой строки} — см. _loud
         self._health_ts = self._t0
         # СПОСОБНОСТЬ УЗЛА, названная вслух: без неё index_hits=0 нечитаем (и «узел не умеет»,
         # и «мы не спрашивали» дают один и тот же ноль). Латч ставится только на -32601.
         self._rcpt_probe = "не проверено"
         self._rcpt_probe_ts = 0.0
+        self._rcpt_unsup = set()   # блоки, на которых узел ответил -32601 (нужны РАЗНЫЕ)
+        self._rcpt_unsup_ts = 0.0  # когда способность погашена (для переспроса по времени)
         self._fail_streak = 0
+        # УСТУПКА КЛЮЧА БОЮ — СОСТОЯНИЕ, а не сумма. `stats['shed']` считает ОБОРОТЫ петли, и
+        # после одной уступки он не обнуляется никогда: строка живости, читая его как «факт
+        # настоящего», больше не возвращалась к «ЧИТАЮ ЦЕПЬ», а сама уступка печаталась как
+        # ERROR «ЗАМОРОЖЕН» — ложный диагноз на ПРОЕКТНОЙ НОРМЕ (ревью р-3).
+        self._shed_active = False
+        self._shed_since = 0.0
+        # Приёмка «а» требует НЕ МЕНЕЕ ДВУХ подряд здоровых отчётов: одна строка «ЧИТАЮ ЦЕПЬ»
+        # это утверждение о МОМЕНТЕ. Счётчик обнуляется на любой оговорке.
+        self._alive_streak = 0
+        self._health_prev = None   # снимок stats на прошлом отчёте: числа в строке — ЗА ОКНО
         self._beyond_bn = None     # на каком номере залипли (см. CHAIN_INDEX_BEYOND_LOUD_N)
         self._beyond_n = 0
         self.stats = {"blocks": 0, "full": 0, "light": 0, "logs": 0, "receipts": 0,
-                      "gaps": 0, "fails": 0, "shed": 0, "ours": 0, "transit": 0,
+                      "gaps": 0, "fails": 0, "shed": 0, "shed_events": 0, "ours": 0, "transit": 0,
                       "winners": 0, "self_polls": 0, "stale_events": 0,
                       "beyond_head": 0, "head_polls": 0, "rpc_calls": 0, "cu": 0.0,
                       "reingest": 0, "foreign_liq": 0}
@@ -996,20 +1027,28 @@ class ChainIndex:
         st, tr = self.transit_report(bn, agg=agg)
         idxs = sorted(x["index"] for x in ours.values())
         tips = sorted({x["tip"] for x in ours.values()})
+        # РЕЖИМ СУДА — ВСЛУХ (ревью р-3). Слепой и зрячий отчёты выглядели БАЙТ В БАЙТ
+        # одинаково: в слепом случае `transit_report` выбирает транзит ЭВРИСТИКОЙ (скорее
+        # всего ЧУЖОЙ) и печатает его адрес тем же полем `agg=`. Читатель жирного окна не мог
+        # отличить «мы судили, зная владельца» от «мы судили против постороннего события» —
+        # а на этом стоит приёмка (б).
+        _own = agg_set(agg)
+        mode = ("владелец известен (%d ног)" % len(_own)) if _own else "ВСЛЕПУЮ (эвристика)"
         if st != "transit" or not tr:
             _why = {"uncovered": "БЛОК НЕ ПОКРЫТ индексом (судить не о чем)",
                     "no_transit": "транзита в блоке НЕТ",
                     "foreign": "транзиты есть, но НИ ОДНОЙ ноги нашего рынка (%s) среди них нет"
                                % (_agg_show(agg),)}.get(st, st)
-            return ("ПОЗИЦИИ blk=%d: наших %d (idx %d..%d), %s, tip %s"
-                    % (bn, len(ours), idxs[0], idxs[-1], _why, "/".join(str(t) for t in tips)))
+            return ("ПОЗИЦИИ blk=%d [суд: %s]: наших %d (idx %d..%d), %s, tip %s"
+                    % (bn, mode, len(ours), idxs[0], idxs[-1], _why,
+                       "/".join(str(t) for t in tips)))
         band = [i for i in idxs if 1 <= i - tr["index"] <= self._prize]
         match = [x for x in ours.values() if x["tip"] == tr["tip"]]
         win = [x for x in ours.values() if x.get("won")]
-        return ("ПОЗИЦИИ blk=%d: транзит idx=%d tip=%d agg=%s (полоса вперёд %d tx, вся полоса "
-                "%d); наших %d, в полосе [T+1,T+%d]=%d, tip-match=%d, побед=%d; наши idx "
-                "%d..%d tip %s"
-                % (bn, tr["index"], tr["tip"], str(tr.get("agg") or "?")[:10],
+        return ("ПОЗИЦИИ blk=%d [суд: %s]: транзит idx=%d tip=%d agg=%s (полоса вперёд %d tx, "
+                "вся полоса %d); наших %d, в полосе [T+1,T+%d]=%d, tip-match=%d, побед=%d; наши "
+                "idx %d..%d tip %s"
+                % (bn, mode, tr["index"], tr["tip"], str(tr.get("agg") or "?")[:10],
                    tr.get("band_ahead", 0), tr.get("band_full", 0), len(ours), self._prize,
                    len(band), len(match), len(win), idxs[0], idxs[-1],
                    "/".join(str(t) for t in tips)))
@@ -1093,18 +1132,21 @@ class ChainIndex:
                 # -32601 = метод не поддержан узлом. Это СВОЙСТВО УЗЛА, а не сбой: гасим
                 # способность навсегда и говорим об этом один раз, вместо вечных повторов.
                 if _is_unsupported(e):
-                    self._receipts_ok = False
-                    self._rcpt_probe = "не поддержан"
-                    self._log("CHAIN-INDEX: узел=%s не умеет eth_getBlockReceipts — статус и "
-                              "газ наших tx останутся за прежним трактом квитанций, позиции и "
-                              "победы индекс даёт по-прежнему" % _host(self.url))
+                    if self._note_unsupported(bn):
+                        self._log("CHAIN-INDEX: узел=%s не умеет eth_getBlockReceipts (%d "
+                                  "отказов -32601 на РАЗНЫХ блоках) — статус и газ наших tx "
+                                  "останутся за прежним трактом квитанций, позиции и победы "
+                                  "индекс даёт по-прежнему; переспрошу через %.0fч"
+                                  % (_host(self.url), CHAIN_INDEX_RCPT_UNSUP_K,
+                                     CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC / 3600.0))
                 else:
                     # Транзиентный отказ ИМЕННО квитанций не имеет права стоить нам блока:
                     # позиции и вердикт победы уже собраны из блока и логов. Считаем отказ,
                     # идём дальше без газа (у факта он останется None = «не знаю»).
                     self.stats["receipts_fail"] = self.stats.get("receipts_fail", 0) + 1
                     self._loud("CHAIN-INDEX: квитанции блока %d не прочитаны (%s) — позиции "
-                               "есть, газ пойдёт прежним трактом" % (bn, str(e)[:80]), err=False)
+                               "есть, газ пойдёт прежним трактом" % (bn, str(e)[:80]),
+                               err=False, key="квитанции-блока")
             if rcpts:
                 _merge_receipts(facts, rcpts)
         self.stats["full"] += 1
@@ -1180,12 +1222,20 @@ class ChainIndex:
         self._prune_wanted()       # раз в блок, а не на каждый вызов гейта прогрева
 
     # ---- петля ----
-    def _loud(self, msg, err=True):
-        """Громко, но не в каждый оборот: лежащий узел иначе даёт строку в секунду."""
+    def _loud(self, msg, err=True, key="общее"):
+        """Громко, но не в каждый оборот: лежащий узел иначе даёт строку в секунду.
+
+        ПРОРЕЖИВАНИЕ — ПО ВИДУ СОБЫТИЯ, а не одно на всех. Общий таймер значил, что одна
+        болтливая диагностика ГЛУШИТ другую: строка «способность не выяснена» (раз в 300с)
+        съедала окно и молчаливо отменяла тревогу «блок объявлен будущим N раз подряд». Это
+        тот же класс, что мёртвый сторож: сигнал пропадает не потому, что события нет.
+        """
         now = self._now()
-        if now - self._loud_ts < CHAIN_INDEX_LOUD_SEC:
+        ts = self._loud_ts if isinstance(self._loud_ts, dict) else {}
+        if now - ts.get(key, -1e18) < CHAIN_INDEX_LOUD_SEC:
             return
-        self._loud_ts = now
+        ts[key] = now
+        self._loud_ts = ts
         (log.error if err else log.warning)("%s", msg)
 
     def _shed(self) -> bool:
@@ -1238,8 +1288,13 @@ class ChainIndex:
                 if self._shed():
                     # Бой уехал на НАШ ключ: фон обязан уступить. Индекс при этом ПРОТУХАЕТ,
                     # и потребитель это увидит (state -> unknown), а не получит пустоту.
+                    if not self._shed_active:          # ФРОНТ: событие, а не оборот петли
+                        self._shed_active = True
+                        self._shed_since = self._now()
+                        self.stats["shed_events"] += 1
                     self.stats["shed"] += 1
                 else:
+                    self._shed_active = False
                     self._catch_up(self._head)
                 # ОТЧЁТЫ — ВНЕ ветки работы. Прежде уступка ключа делала `continue`, и вместе с
                 # чтением цепи замолкала САМА ДИАГНОСТИКА: индекс протухал молча ровно тогда,
@@ -1295,7 +1350,8 @@ class ChainIndex:
                 if self._beyond_n >= CHAIN_INDEX_BEYOND_LOUD_N:
                     self._loud("CHAIN-INDEX: блок %d объявлен будущим %d раз подряд (узел=%s, "
                                "%s) — индекс СТОИТ на этом номере, покрытие не растёт"
-                               % (bn, self._beyond_n, _host(self.url), str(e)[:80]), err=False)
+                               % (bn, self._beyond_n, _host(self.url), str(e)[:80]),
+                               err=False, key="выше-головы")
                     self._beyond_n = 0
                 return
             except Exception as e:
@@ -1319,15 +1375,34 @@ class ChainIndex:
             dead.append("индекс протух (%.1fс)" % s["age"])
         if s["gaps"] > 0:
             dead.append("дыр=%d" % s["gaps"])
+        # ОТКАЗЫ УЗЛА — тоже не «ЖИВ». Дословный критерий приёмки «а» (р-3): блоков>0 И дыр=0
+        # И отказов=0 И свежесть=True. Прежняя редакция печатала «ЖИВ» при отказах>0, то есть
+        # приёмка снималась с прибора, который часть окна не читал ничего. Но и «МЁРТВ» это не
+        # тот диагноз (тот же класс ложной тревоги, что уступка ключа в строке живости):
+        # транзиентный отказ при живом чтении — ЧАСТИЧНО.
+        caveat = []
+        if s["fails"] > 0:
+            caveat.append("отказов узла=%d (приёмка «а» требует нуля)" % s["fails"])
         # ПОЛНЫХ ЧТЕНИЙ НОЛЬ — это НЕ смерть, но и НЕ приёмка. Критерий приёмки «а» требует
         # M>0 намеренно: без полного чтения хоть одного блока не проверены ни разбор
         # транзакций, ни позиции, ни квитанции блока — а «блоков=30» при «полных=0» означает
         # ровно «мы читали только логи». Отдельный вердикт вместо тихого «ЖИВ».
+        # ПОЧЕМУ ЭТО ЗАКОННЫЙ ПРОХОД, А НЕ ПРОВАЛ (р-3, условие 2). С дефолтом
+        # CHAIN_INDEX_FULL_ON_LOGS=0 в ШТИЛЬ полных чтений и не будет: блок читается целиком
+        # только когда летят НАШИ пробы. Требовать «полных>0» в первую минуту — значит либо
+        # объявить провалом проектную норму, либо держать дорогой дефолт РАДИ СТРОКИ. Поэтому
+        # вердикт разведён: ЧАСТИЧНО = «цепь читаю, полных не было» (проход), а «полных>0»
+        # снимается ПОЗЖЕ — первой строкой окна, где летят наши пробы.
         if not dead and s["full"] <= 0:
-            verdict = ("ЧАСТИЧНО — цепь читаю, но ПОЛНЫХ чтений в окне не было (ни интересного "
-                       "лога, ни наших проб): разбор блока и квитанции этим окном НЕ проверены")
-        elif dead:
+            caveat.insert(0, "ПОЛНЫХ чтений в окне не было (ни интересного лога при "
+                             "FULL_ON_LOGS=%d, ни наших проб): разбор блока и квитанции этим "
+                             "окном НЕ проверены" % (1 if CHAIN_INDEX_FULL_ON_LOGS else 0,))
+        if dead:
             verdict = "МЁРТВ — " + "; ".join(dead)
+        elif caveat:
+            verdict = ("ЧАСТИЧНО — цепь читаю, но: " + "; ".join(caveat)
+                       + ". Это ЗАКОННЫЙ проход приёмки «а» в штиль, а не провал — «полных>0» "
+                         "снимается на первом окне, где летят наши пробы")
         else:
             verdict = "ЖИВ"
         msg = ("CHAIN-INDEX ПРИЁМКА(%.0fс): блоков=%d полных=%d лёгких=%d дыр=%d отказов=%d "
@@ -1359,30 +1434,103 @@ class ChainIndex:
             return
         self._health_ts = now
         s = self.snapshot()
+        # ЧИСЛА В СТРОКЕ — ЗА ОКНО, а не за жизнь процесса. Подпись «(120с)» при кумулятивных
+        # величинах врала дважды: «блоков=270» не давало понять, читаем ли МЫ СЕЙЧАС, а «дыр=1»
+        # висело часами после единственной дыры — читатель не отличал «дыры идут» от «дыра
+        # была час назад» (ревью р-3). Пожизненные итоги остаются отдельным хвостом строки.
+        prev = self._health_prev or {}
+        self._health_prev = dict(s)
+
+        def _d(k):
+            return int(s.get(k, 0) or 0) - int(prev.get(k, 0) or 0)
+
         why = []
-        if s["blocks"] > 0 and not s["fresh"]:
+        shed_now = self._shed_active
+        shed_win = _d("shed_events") > 0 or _d("shed") > 0
+        frozen = False
+        if s["blocks"] > 0 and not s["fresh"] and not shed_now and not shed_win:
             # ГЛАВНЫЙ СЛУЧАЙ: читали и перестали. Именно он молчал.
+            frozen = True
             self.stats["stale_events"] = self.stats.get("stale_events", 0) + 1
             why.append("ЗАМОРОЖЕН: читали блоки (%d), последний %d, но свежего скана нет %.0fс "
                        "(порог %.0fс); подтверждённая голова узла %d"
                        % (s["blocks"], s["last"], s["age"], CHAIN_INDEX_STALE_SEC, s["conf"]))
+        elif shed_now:
+            # ПРОЕКТНАЯ НОРМА, А НЕ ПОЛОМКА: бой сел на наш ключ, узел жив, голова растёт, и
+            # мы ОБЯЗАНЫ не читать. Диагноз «ЗАМОРОЖЕН» здесь ложен, а ERROR на норме учит
+            # читателя игнорировать ровно ту строку, ради которой закрывался блокер №5.
+            why.append("УСТУПКА КЛЮЧА БОЮ активна %.0fс (узел жив, читать не имеем права — это "
+                       "НОРМА, не заморозка); уступок ключа бою за окно=%d, всего=%d"
+                       % (now - self._shed_since, _d("shed_events"), self.stats["shed_events"]))
+        elif shed_win and s["blocks"] > 0 and not s["fresh"]:
+            # Уступка кончилась внутри окна и догон ещё не случился: причина протухания
+            # НАЗВАНА, но заморозку не объявляем — решит следующее окно (в нём уступок уже нет).
+            why.append("свежести нет (возраст %.0fс), но в окне была уступка ключа бою "
+                       "(%d) — заморозку НЕ объявляю, решит следующее окно"
+                       % (s["age"], _d("shed_events")))
         if s["blocks"] <= 0:
             why.append("НИ ОДНОГО блока не прочитано за %.0fс аптайма" % (now - self._t0))
-        if self.stats.get("shed"):
-            why.append("уступок ключа бою=%d" % self.stats["shed"])
-        msg = ("CHAIN-INDEX ЖИВОСТЬ(%.0fс): блоков=%d полных=%d лёгких=%d дыр=%d отказов=%d "
-               "beyond=%d свежесть=%s возраст=%.1fс голова=%s потолок=%d квитанции=%s узел=%s "
-               "— %s"
-               % (CHAIN_INDEX_HEALTH_SEC, s["blocks"], s["full"], s["light"], s["gaps"],
-                  s["fails"], s["beyond_head"], s["fresh"], s["age"], s["last"], s["conf"],
-                  s["rcpt_probe"], _host(self.url),
+        elif _d("blocks") <= 0 and not shed_now and not shed_win:
+            why.append("за ОКНО не прочитано НИ ОДНОГО блока (всего %d) — прибор стоит"
+                       % s["blocks"])
+        # ПОДРЯД — потому что одна строка это утверждение о МОМЕНТЕ. Приёмка «а» требует не
+        # менее ДВУХ подряд здоровых отчётов, и читателю не надо считать их глазами.
+        self._alive_streak = (self._alive_streak + 1) if not why else 0
+        msg = ("CHAIN-INDEX ЖИВОСТЬ(%.0fс): ЗА ОКНО блоков=%d полных=%d лёгких=%d дыр=%d "
+               "отказов=%d beyond=%d | свежесть=%s возраст=%.1fс голова=%s потолок=%d "
+               "квитанции=%s узел=%s | подряд здоровых=%d | всего: блоков=%d дыр=%d отказов=%d "
+               "уступок=%d — %s"
+               % (CHAIN_INDEX_HEALTH_SEC, _d("blocks"), _d("full"), _d("light"), _d("gaps"),
+                  _d("fails"), _d("beyond_head"), s["fresh"], s["age"], s["last"], s["conf"],
+                  s["rcpt_probe"], _host(self.url), self._alive_streak,
+                  s["blocks"], s["gaps"], s["fails"], self.stats["shed_events"],
                   "ЧИТАЮ ЦЕПЬ" if not why else "; ".join(why)))
-        if s["blocks"] > 0 and not s["fresh"]:
+        if frozen:
             log.error("%s", msg)
         elif why:
             log.warning("%s", msg)
         else:
             log.info("%s", msg)
+
+    def _note_unsupported(self, bn):
+        """-32601 на квитанциях блока. Гасим способность ТОЛЬКО после K отказов на РАЗНЫХ
+        блоках; True — способность погашена этим вызовом."""
+        try:
+            self._rcpt_unsup.add(int(bn or 0))
+        except Exception:
+            self._rcpt_unsup.add(0)
+        if len(self._rcpt_unsup) < CHAIN_INDEX_RCPT_UNSUP_K:
+            self._loud("CHAIN-INDEX: узел=%s ответил -32601 на eth_getBlockReceipts (блок %s, "
+                       "%d/%d на РАЗНЫХ блоках) — способность НЕ гашу: один ответ пула не есть "
+                       "свойство узла" % (_host(self.url), bn, len(self._rcpt_unsup),
+                                          CHAIN_INDEX_RCPT_UNSUP_K),
+                       err=False, key="квитанции-32601")
+            return False
+        self._receipts_ok = False
+        self._rcpt_probe = "не поддержан"
+        self._rcpt_unsup_ts = self._now()
+        return True
+
+    def _rcpt_unlatch(self):
+        """ПЕРЕСПРОС способности после латча: «не умеет» с потолком по времени, а не навсегда.
+
+        Канон #52 (латч только на терминальной причине) плюс «в МОМЕНТЕ, а не во ВРЕМЕНИ»:
+        отказ, снятый один раз, не имеет права закрывать приёмку (в) на всю жизнь процесса.
+        """
+        if self._receipts_ok or not self._rcpt_unsup_ts:
+            return
+        if (self._now() - self._rcpt_unsup_ts) < CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC:
+            return
+        self._receipts_ok = True
+        self._rcpt_probe = "не проверено"
+        self._rcpt_probe_ts = 0.0
+        self._rcpt_unsup.clear()
+        self._rcpt_unsup_ts = 0.0
+        log.warning("CHAIN-INDEX КВИТАНЦИИ: переспрашиваю способность узла=%s спустя %.1fч — "
+                    "«не поддержан» держался на %d отказах и не имеет права быть вечным "
+                    "(канон #52: латч только на терминальной причине)",
+                    _host(self.url), CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC / 3600.0,
+                    CHAIN_INDEX_RCPT_UNSUP_K)
 
     def _probe_receipts_cap(self, bn):
         """ОДИН eth_getBlockReceipts на ЗАПЕЧАТАННОМ блоке — способность узла НАЗВАНА вслух.
@@ -1395,6 +1543,7 @@ class ChainIndex:
         на -32601 (свойство узла). Транспортный отказ оставляет способность НЕВЫЯСНЕННОЙ и
         переспрашивается — «не смогли спросить» это не «не умеет».
         """
+        self._rcpt_unlatch()
         if not self._receipts_ok or self._rcpt_probe in ("поддержан", "не поддержан"):
             return
         now = self._now()
@@ -1405,17 +1554,21 @@ class ChainIndex:
             r = self._rpc("eth_getBlockReceipts", [hex(int(bn))])
         except Exception as e:
             if _is_unsupported(e):
-                self._receipts_ok = False
-                self._rcpt_probe = "не поддержан"
-                log.warning("CHAIN-INDEX КВИТАНЦИИ БЛОКА: метод НЕ ПОДДЕРЖАН узлом=%s (%s). "
-                            "Статус и газ наших проб останутся за прежним поштучным трактом; "
-                            "index_hits будет нулевым ЗАКОННО, а не от слепоты",
-                            _host(self.url), str(e)[:60])
+                if self._note_unsupported(bn):
+                    log.warning("CHAIN-INDEX КВИТАНЦИИ БЛОКА: метод НЕ ПОДДЕРЖАН узлом=%s (%d "
+                                "отказов -32601 на РАЗНЫХ блоках, последний: %s). Статус и газ "
+                                "наших проб останутся за прежним поштучным трактом; index_hits "
+                                "будет нулевым ЗАКОННО, а не от слепоты; переспрошу через %.0fч",
+                                _host(self.url), CHAIN_INDEX_RCPT_UNSUP_K, str(e)[:60],
+                                CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC / 3600.0)
             else:
                 self._rcpt_probe = "не выяснено"
-                log.warning("CHAIN-INDEX КВИТАНЦИИ БЛОКА: способность НЕ ВЫЯСНЕНА (%s) — это не "
-                            "«не умеет», переспросим через %.0fс",
-                            str(e)[:60], CHAIN_INDEX_RCPT_PROBE_RETRY_SEC)
+                # ЧЕРЕЗ ПРОРЕЖИВАНИЕ: узел, отвечающий на getBlockReceipts не списком, иначе
+                # даёт 288 одинаковых WARNING в сутки (300с × вечно) — шум учит не читать.
+                self._loud("CHAIN-INDEX КВИТАНЦИИ БЛОКА: способность НЕ ВЫЯСНЕНА (%s) — это не "
+                           "«не умеет», переспросим через %.0fс"
+                           % (str(e)[:60], CHAIN_INDEX_RCPT_PROBE_RETRY_SEC),
+                           err=False, key="квитанции-проба")
             return
         if isinstance(r, list):
             self._rcpt_probe = "поддержан"
@@ -1424,15 +1577,17 @@ class ChainIndex:
                         "отсутствие наших tx, а не слепоту прибора", _host(self.url), bn, len(r))
         else:
             self._rcpt_probe = "не выяснено"
-            log.warning("CHAIN-INDEX КВИТАНЦИИ БЛОКА: узел=%s ответил %s вместо списка — "
-                        "способность не выяснена", _host(self.url), type(r).__name__)
+            self._loud("CHAIN-INDEX КВИТАНЦИИ БЛОКА: узел=%s ответил %s вместо списка — "
+                       "способность не выяснена" % (_host(self.url), type(r).__name__),
+                       err=False, key="квитанции-проба")
 
     def _note_fail(self, e, bn=None):
         self.stats["fails"] += 1
         self._fail_streak += 1
         self._loud("CHAIN-INDEX ОТКАЗ: узел=%s блок=%s (%s: %s) — подряд %d; индекс "
                    "ПРОТУХАЕТ, потребители обязаны видеть 'unknown', а не пустоту"
-                   % (_host(self.url), bn, type(e).__name__, str(e)[:120], self._fail_streak))
+                   % (_host(self.url), bn, type(e).__name__, str(e)[:120], self._fail_streak),
+                   key="отказ-узла")
 
 
 # ---------------------------------------------------------------- синглтон

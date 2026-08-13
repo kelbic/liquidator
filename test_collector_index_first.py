@@ -254,9 +254,12 @@ def _http(url, payload, timeout):
 
 real_idx = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD], http=_http,
                          now=Clock(), log_fn=lambda m: None)
-real_idx.scan_block(49890266)
 _have = [rc["transactionHash"].lower() for rc in RCPTS
          if rc["to"].lower() == BOARD]                          # две наши пробы с квитанцией
+# БОЕВАЯ ФОРМА (р-3): блок греет НАША заявка, а не чужой лог — CHAIN_INDEX_FULL_ON_LOGS с этого
+# раунда выключен по умолчанию. Хэш кладём в форме отправщика (64 hex без '0x').
+real_idx.note_hash(_have[0][2:], head=49890265)
+real_idx.scan_block(49890266)
 _miss = [h for h in real_idx.block_facts(49890266)["ours"] if h not in _have][:2]
 assert len(_have) == 2 and len(_miss) == 2
 

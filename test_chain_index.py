@@ -36,6 +36,20 @@ BLOCK = json.loads(gzip.open(FIX / "block_49890266.json.gz", "rt").read())
 LOGS = json.loads((FIX / "logs_49890266.json").read_text())["result"]
 RECEIPTS = json.loads((FIX / "receipts_49890266.json").read_text())
 
+# БОЕВАЯ ФОРМА ПРОГРЕВА (р-3): полное чтение блока включает НАША ПРОБА В ПОЛЁТЕ (`note_hash`
+# зовётся из боевого отправщика), а не чужой лог — `CHAIN_INDEX_FULL_ON_LOGS` с этого раунда
+# ВЫКЛЮЧЕН по умолчанию (новая механика не приезжает включённой). Хэш берём в той форме, в
+# какой его отдаёт `send_presigned_probe`: 64 hex БЕЗ префикса '0x'.
+H_FIRE = next(rc["transactionHash"] for rc in RECEIPTS
+              if rc["to"].lower() == BOARD)[2:]
+assert len(H_FIRE) == 64 and not H_FIRE.startswith("0x")
+
+
+def _arm_full(idx, head=BN - 1):
+    """Заявка на НАШ хэш — единственный путь к полному чтению при дефолтных ручках."""
+    idx.note_hash(H_FIRE, head=head)
+    return idx
+
 
 def make_http(calls, *, receipts=True, fail=None, head=BN):
     """Сокет-двойник: отдаёт ЗАПИСАННЫЕ ответы узла. Ничего не разбирает и не решает."""
@@ -82,6 +96,7 @@ calls = []
 clk = Clock()
 idx = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD], http=make_http(calls),
                     now=clk, log_fn=lambda m: None)
+_arm_full(idx)
 facts = idx.scan_block(BN)
 
 assert len(facts["ours"]) == 33, "ЗНАЛИ ЗАРАНЕЕ: в блоке 33 наши пробы к доске, найдено %d" % len(facts["ours"])
@@ -153,6 +168,7 @@ print("UNIT_OK: владелец транзита — НАБОР ног рынк
 calls2 = []
 idx2 = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD, WINNER_CONTRACT],
                      http=make_http(calls2), now=Clock(), log_fn=lambda m: None)
+_arm_full(idx2)
 f2 = idx2.scan_block(BN)
 won = [h for h, f in f2["ours"].items() if f["won"]]
 assert len(won) == 1, "чужая победа в этом блоке ровно одна, найдено %d" % len(won)
@@ -202,19 +218,48 @@ assert calls == ["eth_getLogs", "eth_getBlockByNumber", "eth_getBlockReceipts"],
 print("UNIT_OK: цена блока — ТРИ запроса (логи, блок, квитанции блока) против 33 поштучных")
 
 # ---------------------------------------------------------------- 5. узел не умеет getBlockReceipts
+# ЛАТЧ НА K ОТКАЗОВ, НЕ НА ОДИН (р-3, канон #52). За адресом узла стоит ПУЛ бэкендов: один
+# ответ «-32601» — свойство ОТВЕТИВШЕГО, а утверждение печатается про УЗЕЛ и закрывает
+# приёмку (в) на всю жизнь процесса. Требуем K отказов на РАЗНЫХ блоках И переспрос по времени.
 calls3 = []
+clk3 = Clock()
 idx3 = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD],
-                     http=make_http(calls3, receipts=False), now=Clock(), log_fn=lambda m: None)
+                     http=make_http(calls3, receipts=False), now=clk3, log_fn=lambda m: None)
+_arm_full(idx3)
 idx3.scan_block(BN)
-idx3.scan_block(BN + 1)
-assert calls3.count("eth_getBlockReceipts") == 1, \
-    "способность узла выясняется ОДИН раз, повторов быть не должно: %s" % calls3
-assert idx3._receipts_ok is False
+assert idx3._receipts_ok is True and idx3._rcpt_probe != "не поддержан", \
+    ("ОДИН -32601 не имеет права гасить способность узла навсегда: rcpt_probe=%s"
+     % idx3._rcpt_probe)
+for i in range(1, ci.CHAIN_INDEX_RCPT_UNSUP_K):
+    clk3.t += ci.CHAIN_INDEX_RCPT_PROBE_RETRY_SEC + 1.0   # штатный переспрос способности
+    idx3._probe_receipts_cap(BN + i)                      # ДРУГОЙ блок, тот же ответ -32601
+assert idx3._receipts_ok is False and idx3._rcpt_probe == "не поддержан", \
+    ("после %d отказов на РАЗНЫХ блоках способность обязана погаснуть: %s"
+     % (ci.CHAIN_INDEX_RCPT_UNSUP_K, idx3._rcpt_probe))
+assert calls3.count("eth_getBlockReceipts") == ci.CHAIN_INDEX_RCPT_UNSUP_K, \
+    "лишних попыток после латча быть не должно: %s" % calls3
+_n0 = calls3.count("eth_getBlockReceipts")
+clk3.t += ci.CHAIN_INDEX_RCPT_PROBE_RETRY_SEC + 1.0
+idx3._probe_receipts_cap(BN + ci.CHAIN_INDEX_RCPT_UNSUP_K + 1)
+_arm_full(idx3)                                           # пробы снова в полёте => полное чтение
+idx3.scan_block(BN)                                       # блок с НАШИМИ tx, ветка квитанций
+assert calls3.count("eth_getBlockReceipts") == _n0, \
+    "погашенная способность не переспрашивается СРАЗУ: %s" % calls3
 assert len(idx3.receipts_for(list(facts["ours"]))) == 0, \
     "без gasUsed квитанцию выдавать НЕЛЬЗЯ — денежный учёт по выдуманному числу это вторая ложь"
 assert idx3.lookup(list(facts["ours"])[0]) is not None, "позиции при этом остаются известны"
-print("UNIT_OK: узел без eth_getBlockReceipts — способность гасится навсегда, позиции живут, "
-      "газ НЕ выдумывается")
+# ...А ЧЕРЕЗ ОКНО ПЕРЕСПРАШИВАЕТСЯ. «Не умеет» — утверждение о МОМЕНТЕ, если его не проверять
+# ВО ВРЕМЕНИ: приёмка (в) иначе недостижима до рестарта процесса.
+clk3.t += ci.CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC + 1.0
+idx3._rcpt_unlatch()
+assert idx3._receipts_ok is True and idx3._rcpt_probe == "не проверено", \
+    "латч способности обязан иметь потолок по времени (канон #52): %s" % idx3._rcpt_probe
+idx3._probe_receipts_cap(BN + ci.CHAIN_INDEX_RCPT_UNSUP_K + 2)
+assert calls3.count("eth_getBlockReceipts") == _n0 + 1, \
+    "после переспроса узел обязан быть спрошен СНОВА: %s" % calls3
+print("UNIT_OK: способность к квитанциям гасится только после %d отказов -32601 на РАЗНЫХ "
+      "блоках и переспрашивается через %.0fч; позиции живут, газ НЕ выдумывается"
+      % (ci.CHAIN_INDEX_RCPT_UNSUP_K, ci.CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC / 3600.0))
 
 # ---------------------------------------------------------------- 6. три исхода state()
 h_known = list(facts["ours"])[0]
@@ -342,6 +387,7 @@ print("UNIT_OK: отказ узла — громкая строка с хост�
 clk8 = Clock()
 idx8 = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD], http=make_http([]),
                      now=clk8, log_fn=lambda m: None)
+_arm_full(idx8)
 idx8.scan_block(BN)
 assert len(idx8.corpses()) == 1
 idx8._ingest(BN + ci.CHAIN_INDEX_CORPSE_BLOCKS + 1, {}, full=True)
@@ -352,6 +398,7 @@ print("UNIT_OK: список трупов ограничен окном в %d б
 clk9 = Clock()
 idx9 = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD], http=make_http([]),
                      now=clk9, keep_blocks=4, log_fn=lambda m: None)
+_arm_full(idx9)
 idx9.scan_block(BN)
 assert len(idx9._by_hash) == 33
 for i in range(1, 8):
@@ -438,5 +485,80 @@ finally:
     idx11.stop()
 print("UNIT_OK: четыре блока подряд обслужены ОДНИМ долгоживущим тредом (+1 к процессу), "
       "подача блока в петлю сети не трогает")
+
+# ---------------------------------------------------------------- 14. ДЕФОЛТ ВЫКЛЮЧЕН (р-3)
+# Проверяем НЕ значение константы, а ПОВЕДЕНИЕ при ЧИСТОМ окружении: новая механика (полное
+# чтение блока по ЧУЖОМУ логу) не имеет права приезжать включённой — это решение kelbic, и оно
+# стоит 40-46 мс ядра на заторном блоке. Прогон в ОТДЕЛЬНОМ процессе с вычищенной переменной:
+# модуль читает окружение на импорте, поэтому в текущем процессе дефолт уже «сгорел».
+# ВТОРАЯ ПОЛОВИНА — та, ради которой дефолт можно двигать: ДЕНЕЖНЫЙ путь от ручки НЕ зависит.
+# Наша проба в полёте (`note_hash`) греет блок целиком и при выключенной ручке, значит ours,
+# квитанции блока и lookup остаются на месте. Обе половины меряются В ОДНОМ прогоне.
+import os                                                      # noqa: E402
+import subprocess                                              # noqa: E402
+
+_CHILD = r'''
+import gzip, json, pathlib, sys
+R = %r
+sys.path.insert(0, R)
+import chain.chain_index as ci
+FIX = pathlib.Path(R) / "fixtures"
+BN = %d
+BOARD = %r
+BLOCK = json.loads(gzip.open(FIX / "block_49890266.json.gz", "rt").read())
+LOGS = json.loads((FIX / "logs_49890266.json").read_text())["result"]
+RCPTS = json.loads((FIX / "receipts_49890266.json").read_text())
+H_FIRE = next(rc["transactionHash"] for rc in RCPTS if rc["to"].lower() == BOARD)[2:]
+
+
+def mk(calls):
+    def _http(url, payload, timeout):
+        m = payload["method"]
+        calls.append(m)
+        if m == "eth_getLogs":
+            return {"result": LOGS}
+        if m == "eth_getBlockByNumber":
+            return BLOCK
+        if m == "eth_getBlockReceipts":
+            return {"result": RCPTS}
+        if m == "eth_blockNumber":
+            return {"result": hex(BN)}
+        raise AssertionError(m)
+    return _http
+
+
+c1 = []
+i1 = ci.ChainIndex("https://node.example/K", watch_to=[BOARD], http=mk(c1),
+                   now=lambda: 1000.0, log_fn=lambda m: None)
+i1.scan_block(BN)                    # ЧУЖАЯ гонка: интересные логи есть, наших проб НЕТ
+c2 = []
+i2 = ci.ChainIndex("https://node.example/K", watch_to=[BOARD], http=mk(c2),
+                   now=lambda: 1000.0, log_fn=lambda m: None)
+i2.note_hash(H_FIRE, head=BN - 1)    # НАША проба в полёте — боевой путь прогрева
+i2.scan_block(BN)
+f = i2.block_facts(BN) or {}
+print("DEFAULT=%%s CALLS_FOREIGN=%%s FULL_FOREIGN=%%d CALLS_OURS=%%s OURS=%%d RCPT=%%d LOOKUP=%%s"
+      %% (ci.CHAIN_INDEX_FULL_ON_LOGS, ",".join(c1), i1.stats["full"], ",".join(c2),
+         len(f.get("ours") or {}), len(i2.receipts_for([H_FIRE])),
+         (i2.lookup(H_FIRE) or {}).get("index")))
+''' % (str(pathlib.Path(__file__).parent), BN, BOARD)
+
+_env = {k: v for k, v in os.environ.items() if k != "CHAIN_INDEX_FULL_ON_LOGS"}
+_r = subprocess.run([sys.executable, "-c", _CHILD], env=_env, capture_output=True, text=True)
+assert _r.returncode == 0, _r.stderr[-2000:]
+_out = _r.stdout.strip().splitlines()[-1]
+_kv = dict(p.split("=", 1) for p in _out.split(" "))
+assert _kv["DEFAULT"] == "False", \
+    ("новая механика приезжает ВКЛЮЧЁННОЙ: CHAIN_INDEX_FULL_ON_LOGS=%s при пустом окружении"
+     % _kv["DEFAULT"])
+assert _kv["CALLS_FOREIGN"] == "eth_getLogs" and _kv["FULL_FOREIGN"] == "0", \
+    ("ЧУЖАЯ гонка при дефолтных ручках обязана стоить ОДИН getLogs (40-46 мс ядра на заторном "
+     "блоке — не наш дефолт): %s" % _out)
+assert _kv["CALLS_OURS"] == "eth_getLogs,eth_getBlockByNumber,eth_getBlockReceipts", \
+    "НАША проба в полёте обязана греть блок целиком и при ВЫКЛЮЧЕННОЙ ручке: %s" % _out
+assert _kv["OURS"] == "33" and _kv["RCPT"] == "1" and _kv["LOOKUP"] != "None", \
+    "денежный конец (#109/#110) не имеет права зависеть от ручки наблюдаемости чужих гонок: %s" % _out
+print("UNIT_OK: дефолт ВЫКЛЮЧЕН (чужая гонка = 1 getLogs, полных 0), а денежный путь от ручки "
+      "НЕ зависит: наших tx 33, квитанция 1, lookup idx=%s" % _kv["LOOKUP"])
 
 print("ПРОШЛИ: фоновый индекс цепи (#110) — позитивный контроль на блоке %d" % BN)
