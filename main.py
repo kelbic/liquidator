@@ -996,8 +996,9 @@ def main():
 
     store = Store(cfg.db_path)
     alerter = Alerter(cfg.tg_bot_token, cfg.tg_admin_id, cfg.alert_antiflood_sec, tag=cfg.bot_tag)
-    from chain.execute import check_gas_budget_sane
+    from chain.execute import check_gas_budget_sane, sign_backend_probe
     check_gas_budget_sane(cfg.max_daily_gas_usd, log)   # #53: несогласованность — громко на старте
+    sign_backend_probe(log=log)   # #COIN: чем и почём подписываем — фактом из журнала, не верой
     guard = KillSwitch(cfg.max_daily_loss_usd, cfg.max_daily_gas_usd, cfg.max_inflight)
     markets = load_covered_markets(cfg.covered_markets_path)
     rpc = BaseRpc(cfg.rpc_url, cfg.chain_id) if cfg.rpc_url else None

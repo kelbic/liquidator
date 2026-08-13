@@ -585,6 +585,92 @@ def check_gas_budget_sane(max_daily_gas_usd: float, log=None) -> bool:
     return ok
 
 
+def sign_backend_probe(warmup: int = 32, log=None) -> dict:
+    """СТАРТОВАЯ ПРОБА ПОДПИСИ: какой ECC-бэкенд РЕАЛЬНО подписывает и почём (#COIN).
+
+    Зачем строка в журнале. Бот подписывает лестницы проб чистым Python, если в venv нет
+    coincurve: eth_keys молча берёт NativeECCBackend. Разница замерена — x6.6 по всему
+    sign_transaction на боевой форме пробы. «coincurve добавлен в requirements.txt» НЕ значит
+    «coincurve стоит на Шарлотте»: пакет доезжает только пересборкой venv, а её легко забыть
+    (класс «живой источник против копии в репо»). Поэтому факт обязан быть В ЖУРНАЛЕ БОТА.
+
+    Почему не читаем import coincurve. Наличие модуля не доказывает, что подписывает он:
+    ECC_BACKEND_CLASS может пинить native, а eth_account берёт бэкенд не из объекта ключа
+    (проверено запуском: acct._key_obj.backend — ДРУГОЙ экземпляр, туда вызов не идёт).
+    Поэтому позитивный контроль: на время прогрева оборачиваем ecdsa_sign НА КЛАССЕ и считаем
+    вызовы. Ноль вызовов = бэкенд НЕ подтверждён, и строка обязана это сказать («хэш tx — не
+    эффект»: имя класса — это хэш, счётчик вызовов — эффект). Обёртка снимается в finally.
+
+    Ключ СЛУЧАЙНЫЙ, одноразовый: боевой .env для замера не нужен и не читается.
+    Форма tx — ровно боевая проба доски (V2_PROBE_CALLDATA, EIP-1559, chainId цепи).
+
+    ЦЕНА (замерена, а не оценена): вся проба стоит 348мс на native и 241мс с coincurve —
+    один раз на старте, ДО арма. Львиная доля не подписи, а вывод публичного ключа в
+    Account.from_key и импорт бэкенда, которые всё равно будут оплачены первой боевой
+    подписью. Рестарт вооружённого бота и так стоит секунды простоя."""
+    import statistics
+    out = {"backend": "?", "p50_ms": None, "n": 0, "confirmed": False, "fast": False,
+           "coincurve": None}
+    try:
+        from eth_keys import keys as _keys
+        from eth_account import Account as _Account
+        cls = type(_keys.backend)
+        out["backend"] = cls.__module__ + "." + cls.__name__
+        out["fast"] = "coincurve" in cls.__module__.lower() or "coincurve" in cls.__name__.lower()
+        try:
+            import coincurve as _cc                     # noqa: F401  (нужен сам факт импорта)
+            # ВЕРСИЮ БЕРЁМ ИЗ МЕТАДАННЫХ, А НЕ ИЗ АТРИБУТА: у coincurve 20.0.0 — той самой,
+            # что собрана на Шарлотте под Python 3.14 — атрибута __version__ НЕТ вовсе
+            # (у 21.0.0 есть). getattr(..., "?") молча печатал бы «coincurve=?» ровно на
+            # боевой версии: диагност, врущий именно там, где его читают.
+            import importlib.metadata as _md
+            try:
+                out["coincurve"] = _md.version("coincurve")
+            except Exception:
+                out["coincurve"] = getattr(_cc, "__version__", "установлен, версия неизвестна")
+        except Exception as e:
+            out["coincurve"] = "НЕТ (%s)" % type(e).__name__
+        acct = _Account.from_key(os.urandom(32))
+        tx = {"from": acct.address, "to": acct.address, "data": V2_PROBE_CALLDATA,
+              "nonce": 0, "gas": 1_000_000, "chainId": 8453,
+              "maxFeePerGas": 100_000_000, "maxPriorityFeePerGas": 1_000_000}
+        hits = [0]
+        _orig = cls.ecdsa_sign
+
+        def _counting(self, msg_hash, private_key):
+            hits[0] += 1
+            return _orig(self, msg_hash, private_key)
+
+        cls.ecdsa_sign = _counting
+        try:
+            samples = []
+            for i in range(max(4, int(warmup))):
+                tx["nonce"] = i
+                _t = time.perf_counter()
+                acct.sign_transaction(tx)
+                samples.append((time.perf_counter() - _t) * 1e3)
+        finally:
+            cls.ecdsa_sign = _orig
+        out["n"] = len(samples)
+        out["p50_ms"] = statistics.median(samples)
+        out["confirmed"] = hits[0] >= len(samples)
+    except Exception as e:                      # проба ДИАГНОСТИЧЕСКАЯ: не имеет права ронять старт
+        out["error"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+    if log:
+        _p = "%.3f" % out["p50_ms"] if out["p50_ms"] is not None else "?"
+        _line = ("SIGN бэкенд=%s p50=%sмс (%d подписей прогрева) coincurve=%s подтверждён=%s"
+                 % (out["backend"], _p, out["n"], out["coincurve"],
+                    "да" if out["confirmed"] else "НЕТ"))
+        if out["fast"] and out["confirmed"]:
+            log.info(_line)
+        else:
+            # МОЛЧАЛИВАЯ ДЕГРАДАЦИЯ ЗАПРЕЩЕНА. Не собрался coincurve — бот работает (это
+            # допустимо), но чистый Python в подписи обязан быть виден с первой строки журнала.
+            log.warning("%s — МЕДЛЕННЫЙ ПУТЬ (чистый Python). Лечится пересборкой venv: "
+                        "venv/bin/pip install -r requirements.txt", _line)
+    return out
+
+
 def specfire_stats():
     with _INFLIGHT_LOCK:
         _specfire_roll_day_locked()
@@ -1170,7 +1256,10 @@ def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, lo
 
 
 # --- ПРЕД-ПОДПИСАННАЯ ЛЕСТНИЦА ПРОБ (#32) --------------------------------------------------
-# Замер боевого send-пути: подпись p50=4мс/p99=36мс + вызов держит тред 60мс (p50). При 8
+# Замер боевого send-пути (07.08, НА NativeECCBackend — coincurve в venv не было, вскрыто
+# 13.08): подпись p50=4мс/p99=36мс + вызов держит тред 60мс (p50). Подпись с coincurve стоит
+# 0.557мс (замер на этой же форме), поэтому вклад ПОДПИСИ в 60мс удержания треда — шум; сами
+# 60мс это сеть, их пакет COIN не трогает. При 8
 # тредах это потолок ~133 отправки/с, то есть эквивалент ~20 стволов — лестница «×22» упиралась
 # в НАШ процесс, а не в сеть. Проба доски всегда одна и та же (ровно байт 0x01, план живёт в
 # контракте), поэтому её можно подписать ЗАРАНЕЕ и в момент огня только разослать готовые байты.
@@ -1347,8 +1436,9 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
 
         if compat and start_nonce is None:
             # ДОТОЧКА СКЛАДА, а не пересборка. Две причины, и вторая важнее первой:
-            #  1) уже подписанное не переподписываем — подпись это 4мс CPU на пробу, а фоновое
-            #     пополнение обязано уступать огню;
+            #  1) уже подписанное не переподписываем — подпись это 4мс CPU на пробу (native;
+            #     0.557мс с coincurve, пакет COIN — экономия перестала быть решающей, но
+            #     причина №2 от неё не зависела никогда), а фоновое пополнение уступает огню;
             #  2) продолжать надо с ХВОСТА очереди (или с локального счётчика, если склад
             #     выбран досуха). Пересборка от pending-nonce здесь была бы прямой ДЫРОЙ:
             #     pending отстаёт от уже разосланных проб, и новая лестница начиналась бы
