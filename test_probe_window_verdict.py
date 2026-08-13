@@ -93,6 +93,11 @@ def make_sf():
     sf.cfg = _Cfg()
     sf.rpc = None
     sf.stats = {}
+    # ПОФИДОВЫЙ учёт позиций (р-5, майор C): в бою эти поля заводит __init__, здесь объект
+    # собран через __new__ — заводим ровно те же, иначе стенд проверял бы объект, которого в
+    # бою не бывает.
+    sf._probe_by_feed = {}
+    sf._probe_feed_lock = threading.Lock()
     sf._log = LOG.append
     sf._now = lambda: 0.0
     return sf
@@ -167,16 +172,17 @@ try:
                             dev_by={"BTC": 0.001}, build_fn=lambda m, b, d: None,
                             send_fn=lambda c, g: None, receipt_fn=lambda h: (0, 0.0),
                             log_fn=LOG2.append)
-    # ЛАТЧ ДО ОКНА: законный слепой суд в РАННЕМ окне того же процесса. Без него снимок и
-    # кумулятив совпадают, и мутация «снимок на арме не берётся» прошла бы зелёной — стенд
-    # обязан отличать «дельта» от «итог», а не только уметь их складывать.
-    live._note_probe_position(h, r, meta=("0xleg", ("LBTC", MID_BLIND, "0xb", 1.0)))
+    # ЛАТЧ ДО ОКНА: законный слепой суд в РАННЕМ окне ТОГО ЖЕ ФИДА. Фид здесь именно «BTC»
+    # (после р-5 счётчики пофидовые): возьми мы чужой фид — слепой суд не попал бы в дельту и
+    # без снимка, и мутация «снимок на арме не берётся» прошла бы зелёной. Стенд обязан
+    # отличать «дельта» от «итог», а не только уметь их складывать.
+    live._note_probe_position(h, r, meta=("0xleg", ("BTC", MID_BLIND, "0xb", 1.0)))
     assert live.stats["probe_no_agg"] == 1, live.stats
     stop = threading.Event()
     t = threading.Thread(target=live._window_loop, args=("BTC", "down", stop), daemon=True)
     t.start()
     time.sleep(0.15)                          # окно живёт; снимок уже взят на арме
-    live._note_probe_position(h, r, meta=("0xleg", ("CBBTC", MID_SEEN, "0xb", 1.0)))
+    live._note_probe_position(h, r, meta=("0xleg", ("BTC", MID_SEEN, "0xb", 1.0)))
     time.sleep(0.05)
     stop.set()
     t.join(timeout=5)

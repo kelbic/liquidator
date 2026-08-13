@@ -20,6 +20,7 @@ import json
 import logging
 import pathlib
 import sys
+import threading
 import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -81,6 +82,7 @@ class _Cfg:
 def make_sf():
     sf = sfl.SpecFireLive.__new__(sfl.SpecFireLive)
     sf.cfg, sf.rpc, sf.stats = _Cfg(), None, {}
+    sf._probe_by_feed, sf._probe_feed_lock = {}, threading.Lock()      # р-5, майор C
     sf._log = lambda m: None
     sf._now = lambda: 0.0
     return sf
