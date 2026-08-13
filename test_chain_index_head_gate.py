@@ -404,12 +404,15 @@ try:
     assert ix_no._rcpt_probe == "не поддержан" and ix_no._receipts_ok is False, \
         "после %d отказов на РАЗНЫХ блоках способность обязана погаснуть" % ci.CHAIN_INDEX_RCPT_UNSUP_K
     assert seen_no.count("eth_getBlockReceipts") == ci.CHAIN_INDEX_RCPT_UNSUP_K, seen_no
-    _T[0] += ci.CHAIN_INDEX_RCPT_PROBE_RETRY_SEC + 1
+    # ЛЕСЕНКА ПЕРЕСПРОСА (майор М2, р-6): внутри ступени — ни одной попытки, сколько её ни
+    # зови; «не долбит узел» проверяется именно так, а не привязкой к одному сроку 6ч.
+    _rung = ci.CHAIN_INDEX_RCPT_UNSUP_LADDER[0]
+    _T[0] += _rung / 3.0
     ix_no._probe_receipts_cap(49890299)
     assert seen_no.count("eth_getBlockReceipts") == ci.CHAIN_INDEX_RCPT_UNSUP_K, \
-        "погашенная способность не долбит узел: %s" % seen_no
+        "погашенная способность не долбит узел внутри ступени: %s" % seen_no
     # ...и ВО ВРЕМЕНИ переспрашивается: «не умеет» не имеет права быть вечным.
-    _T[0] += ci.CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC + 1
+    _T[0] += _rung + 1
     ix_no._probe_receipts_cap(49890300)
     assert seen_no.count("eth_getBlockReceipts") == ci.CHAIN_INDEX_RCPT_UNSUP_K + 1, \
         ("латч способности обязан иметь потолок по времени (канон #52), иначе приёмка (в) "

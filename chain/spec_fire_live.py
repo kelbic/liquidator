@@ -1255,7 +1255,7 @@ class SpecFireLive:
                 if _c is not None:
                     self.probe_board[feed] = (mid, b, _c[0], _c[1], _c[2], self._now())
                     # ЧЕЙ ЭТО ПЛАН (блокер C р-6): по этому ключу окно и судит свою приёмку (б).
-                    self._win_key[feed] = self.plan_key(mid, b)
+                    self._note_win_key(feed, mid, b)
                     self._engine()          # склад и прогрев патрона нужны и здесь
                     return
                 # кэша нет (рестарт под живым планом) — НЕ выходим: собираем пробу ради
@@ -1289,7 +1289,7 @@ class SpecFireLive:
                 # Прогрев строит ровно тот же probe-dict — публикация здесь открывает оба
                 # детект-пути, не трогая порог огня.
                 self.probe_board[feed] = (mid, b, d, probe["calldata"], probe["gas"], self._now())
-                self._win_key[feed] = self.plan_key(mid, b)     # ключ приёмки (б), блокер C р-6
+                self._note_win_key(feed, mid, b)          # ключ приёмки (б), блокер C р-6
                 # кэш пробы под живой план: из него публикуются окна 2..N, не платя за сборку
                 self._board_probe_cache = {(mid, b): (d, probe["calldata"], probe["gas"])}
                 # СКЛАД НАБИВАЕТСЯ ЗДЕСЬ, а не в первом огне. Движок поднимается лениво, и если
@@ -1619,6 +1619,21 @@ class SpecFireLive:
         if not mid or not b:
             return None
         return (str(mid).lower(), str(b).lower())
+
+    def _note_win_key(self, feed, mid, b):
+        """ЧЕЙ ПЛАН У ЭТОГО ОКНА — запомнить ключ, по которому окно судит свою приёмку (б).
+
+        ЧЕРЕЗ getattr, А НЕ ПРЯМЫМ ПРИСВАИВАНИЕМ, И ЭТО НЕ МЕЛОЧЬ. Точки записи стоят внутри
+        `_prearm_board` — ДЕНЕЖНОГО пути, обёрнутого широким `except Exception`. Объект,
+        собранный в стенде через `__new__` (или любой будущий путь, где поле не заведено), дал
+        бы здесь AttributeError, тот молча ушёл бы в `_arm_retry`, и УЧЁТНАЯ правка убила бы
+        публикацию доски. Ровно этот класс («измерительный код уронил боевой») стенд и поймал:
+        три теста прогрева покраснели на прямом присваивании. Учёт не имеет права ронять огонь.
+        """
+        d = getattr(self, "_win_key", None)
+        if d is None:
+            d = self._win_key = {}
+        d[feed] = self.plan_key(mid, b)
 
     def _probe_keys(self):
         """Учёт ПО КЛЮЧУ ПЛАНА, заводя его при первом обращении.
@@ -2262,7 +2277,7 @@ class SpecFireLive:
                                     # ЭТОЙ пробы по формируемому блоку — та же семантика
                                     self.probe_board[feed] = (mid, b, d, probe["calldata"],
                                                               probe["gas"], self._now())
-                                    self._win_key[feed] = self.plan_key(mid, b)   # блокер C р-6
+                                    self._note_win_key(feed, mid, b)   # блокер C р-6
                             if probe is not None:
                                 h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
                                 if h is not None:
@@ -2346,7 +2361,7 @@ class SpecFireLive:
             # `stats=` (там пожизненный итог, который умеет только расти). КЛЮЧ — план,
             # который опубликовало ЭТО окно (блокер C р-6): ярлык фида в бою ставит последний
             # тикнувший keepalive, и по нему приёмка (б) меряла чужие пробы.
-            _wkey = self._win_key.pop(feed, None)
+            _wkey = (getattr(self, "_win_key", None) or {}).pop(feed, None)
             _pw = self._probe_delta(_probe0, _wkey)
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "

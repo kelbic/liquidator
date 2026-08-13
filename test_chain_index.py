@@ -239,18 +239,22 @@ assert idx3._receipts_ok is False and idx3._rcpt_probe == "не поддержа
 assert calls3.count("eth_getBlockReceipts") == ci.CHAIN_INDEX_RCPT_UNSUP_K, \
     "лишних попыток после латча быть не должно: %s" % calls3
 _n0 = calls3.count("eth_getBlockReceipts")
-clk3.t += ci.CHAIN_INDEX_RCPT_PROBE_RETRY_SEC + 1.0
+# ЛЕСЕНКА ПЕРЕСПРОСА (майор М2, р-6): латч держится СТУПЕНЬЮ, а не единственным сроком 6ч.
+# Инвариант, который здесь и проверяется, прежний: погашенная способность НЕ ДОЛБИТ узел —
+# внутри ступени нет ни одной попытки, сколько её ни зови и сколько блоков ни читай.
+_rung = ci.CHAIN_INDEX_RCPT_UNSUP_LADDER[0]
+clk3.t += _rung / 3.0
 idx3._probe_receipts_cap(BN + ci.CHAIN_INDEX_RCPT_UNSUP_K + 1)
 _arm_full(idx3)                                           # пробы снова в полёте => полное чтение
 idx3.scan_block(BN)                                       # блок с НАШИМИ tx, ветка квитанций
 assert calls3.count("eth_getBlockReceipts") == _n0, \
-    "погашенная способность не переспрашивается СРАЗУ: %s" % calls3
+    "погашенная способность не переспрашивается ВНУТРИ ступени: %s" % calls3
 assert len(idx3.receipts_for(list(facts["ours"]))) == 0, \
     "без gasUsed квитанцию выдавать НЕЛЬЗЯ — денежный учёт по выдуманному числу это вторая ложь"
 assert idx3.lookup(list(facts["ours"])[0]) is not None, "позиции при этом остаются известны"
 # ...А ЧЕРЕЗ ОКНО ПЕРЕСПРАШИВАЕТСЯ. «Не умеет» — утверждение о МОМЕНТЕ, если его не проверять
 # ВО ВРЕМЕНИ: приёмка (в) иначе недостижима до рестарта процесса.
-clk3.t += ci.CHAIN_INDEX_RCPT_UNSUP_RETRY_SEC + 1.0
+clk3.t += _rung + 1.0                                     # ...а ПОСЛЕ ступени — обязана
 idx3._rcpt_unlatch()
 assert idx3._receipts_ok is True and idx3._rcpt_probe == "не проверено", \
     "латч способности обязан иметь потолок по времени (канон #52): %s" % idx3._rcpt_probe
