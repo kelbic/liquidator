@@ -1538,6 +1538,19 @@ class SpecFireLive:
         if _receipt_has_win(r, self.cfg.liquidator_address) is not True:
             self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
             return
+        self._probe_win(tgt, h, addr, gas_usd, src="движок")
+
+    def _probe_win(self, tgt, h, addr, gas_usd=0.0, src="движок"):
+        """ПОБЕДА ПРОБЫ: приз взят — гасим огонь, ставим паузу, закрываем окно, считаем.
+
+        ОДНА ТОЧКА НА ВСЕ ИСТОЧНИКИ ВЕРДИКТА (хвост #110-х1). Прежде эти шесть действий жили
+        ТОЛЬКО в ветке квитанции `_engine_result`, а путь NO-RECEIPT (`_engine_timeout` ->
+        индекс сказал 'mined') `fact['won']` не читал ВОВСЕ. Значит первая в истории бота
+        победа, о которой узел квитанций промолчал, прошла бы НЕВИДИМОЙ: ни wins, ни disarm,
+        ни кулдауна — и движок продолжал бы жечь газ по УЖЕ ВЗЯТОЙ цели, пока не истечёт TTL
+        окна. Это денежный дефект, и лечится он тем, что вердикт победы у нас один, откуда бы
+        ни пришёл ФАКТ.
+        """
         feed, mid, b, dbt = (tgt if tgt else ("", "?", "?", 0.0))
         from chain.execute import mark_recent_send
         self.stats["wins"] += 1
@@ -1551,9 +1564,9 @@ class SpecFireLive:
                 stop = self._windows.pop(feed, None)
             if stop is not None:
                 stop.set()
-        log.warning("SPECFIRE WIN!!! [движок %s] %s/%s debt=$%.0fk tx=%s gas=$%.2f — "
+        log.warning("SPECFIRE WIN!!! [%s %s] %s/%s debt=$%.0fk tx=%s gas=$%.2f — "
                     "план доски исполнен (окна на паузе %.0fс)",
-                    (addr or "?")[:10], str(mid)[:10], str(b)[:10], (dbt or 0) / 1e3, h,
+                    src, (addr or "?")[:10], str(mid)[:10], str(b)[:10], (dbt or 0) / 1e3, h,
                     gas_usd, SPEC_FIRE_WIN_COOLDOWN_SEC)
 
     def _agg_of_market(self, mid):
@@ -1848,6 +1861,26 @@ class SpecFireLive:
             self._note_probe_position(h, {"blockNumber": (fact or {}).get("block"),
                                           "transactionIndex": (fact or {}).get("index")},
                                       meta=meta)
+            # ХВОСТ #110-х1 (ДЕНЬГИ): tx села — А ВЗЯЛА ЛИ ОНА ПРИЗ? Здесь этого не спрашивали
+            # ВОВСЕ, и первая победа, о которой узел квитанций промолчал, была бы НЕВИДИМА: ни
+            # wins, ни disarm, ни кулдауна — движок жёг бы газ по УЖЕ ВЗЯТОЙ цели до конца TTL
+            # окна, а суточный учёт победы не увидел бы. Факт индекса несёт `won` ТРЕМЯ
+            # значениями: True (наш хэш среди логов Liquidate у Morpho — это и есть захват),
+            # False (логи прочитаны, нас там нет — ФАКТ, а не молчание) и None (логи блока не
+            # читаны, судить не о чем).
+            _won = (fact or {}).get("won")
+            if _won is True:
+                self.stats["noreceipt_win"] = self.stats.get("noreceipt_win", 0) + 1
+                self._probe_win((meta or (None, None))[1], h, addr, 0.0, src="NO-RECEIPT")
+            elif _won is None:
+                # НЕЗНАНИЕ ЗАКРЫВАЕТ ГАРД В СТОРОНУ «НЕ ПОБЕДА»: объявить победу по неизвестности
+                # значило бы погасить собственный огонь посреди живой возможности. Но и тихо
+                # это оставлять нельзя — счётчик показывает, как часто вердикт недоступен.
+                self.stats["noreceipt_win_unknown"] = self.stats.get(
+                    "noreceipt_win_unknown", 0) + 1
+                self._log("SPECFIRE движок NO-RECEIPT tx=%s — tx СЕЛА, но логи блока %s не "
+                          "прочитаны: победа НЕ доказана и НЕ опровергнута (won=None), огонь "
+                          "не гашу" % (h, (fact or {}).get("block")))
             return
         if addr:
             # #102: СПЕРВА спрашиваем цепь. Сброс склада стоит 40 пред-подписанных проб и
