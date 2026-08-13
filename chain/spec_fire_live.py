@@ -1556,6 +1556,33 @@ class SpecFireLive:
             return None
         return legs or None
 
+    # СЧЁТЧИКИ ПОЗИЦИЙ — ОКОННЫЕ, а не пожизненные (ревью р-3, условие 3). Критерий приёмки
+    # (б) «probe_no_agg==0» стоял на кумулятиве процесса: ОДИН законный слепой суд (рынок с
+    # watch-паттерном длины !=42, напр. LBTC_FUNDAMENTAL — agg_set его отбрасывает) защёлкивал
+    # приёмку ПРОВАЛЕННОЙ на всю жизнь процесса, а 200 последующих ЗРЯЧИХ окон не могли это
+    # снять ничем. Репро ревьюера: probe_judged=201, in_band=200, tip_match=200, probe_no_agg=1.
+    # Поэтому снимок берётся на АРМЕ окна, а в закрывающую строку идёт ДЕЛЬТА.
+    _PROBE_KEYS = ("probe_landed", "probe_idx_off", "probe_uncovered", "probe_no_transit",
+                   "probe_foreign_transit", "probe_judged", "probe_judged_blind",
+                   "probe_no_agg", "probe_in_band", "probe_tip_match",
+                   "probe_in_band_blind", "probe_tip_match_blind")
+    # Эти три печатаются ВСЕГДА, даже нулями: приёмка (б) читается по НУЛЮ probe_no_agg, а
+    # отсутствие ключа в словаре нулём не является — «не мерили» и «ноль» неразличимы.
+    _PROBE_ALWAYS = ("probe_judged", "probe_no_agg", "probe_judged_blind")
+
+    def _probe_snap(self):
+        return {k: int(self.stats.get(k, 0) or 0) for k in self._PROBE_KEYS}
+
+    def _probe_delta(self, snap):
+        """Дельта счётчиков позиций ЗА ОКНО. snap — снимок на арме."""
+        cur = self._probe_snap()
+        out = {}
+        for k in self._PROBE_KEYS:
+            v = cur[k] - int((snap or {}).get(k, 0))
+            if v or k in self._PROBE_ALWAYS:
+                out[k] = v
+        return out
+
     def _note_probe_position(self, h, r, meta=None):
         """#110: позиция нашей пробы в блоке против транзита — метрика №1 плана.
 
@@ -1624,13 +1651,16 @@ class SpecFireLive:
             fact = ci.lookup(h)
             if fact is not None and fact.get("tip") == t_tip:
                 self.stats[_tipm] = self.stats.get(_tipm, 0) + 1
-            # Строка — одна на БЛОК, а не на пробу: при 200 отправках/с иначе журнал станет
-            # вторым источником нагрузки на одном ядре.
+            # Строка — одна на БЛОК И РЕЖИМ СУДА, а не на пробу: при 200 отправках/с строка
+            # на пробу сделала бы журнал вторым источником нагрузки на одном ядре. Но ключ
+            # именно ПАРА: дедуп по одному номеру блока прятал ЗРЯЧИЙ суд за напечатанным
+            # раньше слепым — то есть ровно ту строку, по которой снимается приёмка (б).
             seen = getattr(self, "_pos_logged", None)
             if seen is None:
                 seen = self._pos_logged = {}
-            if bn not in seen:
-                seen[bn] = True
+            _key = (bn, bool(blind))
+            if _key not in seen:
+                seen[_key] = True
                 if len(seen) > 64:
                     for k in sorted(seen)[:32]:
                         seen.pop(k, None)
@@ -1863,6 +1893,8 @@ class SpecFireLive:
         last_yield_log = 0.0
         fat_mode = False     # EV-плотность (06.08): жир в досягаемости -> каденс 0.12с, кап 600
         next_board_try = 0.0  # v5 доска: когда снова пробовать положить/переложить план
+        # СНИМОК НА АРМЕ ОКНА: приёмка (б) судится ЗДЕСЬ И СЕЙЧАС, а не за жизнь процесса.
+        _probe0 = self._probe_snap()
         try:
             while not stop.is_set() and probes < _window_cap(fat_mode):
                 pf = self.pending_fire.pop(feed, None)
@@ -2150,12 +2182,15 @@ class SpecFireLive:
                 _is = _ix.snapshot() if _ix is not None else "НЕ ПОДНЯТ"
             except Exception:
                 _is = "?"
+            # ПОЗИЦИИ ЗА ЭТО ОКНО (р-3): критерий (б) читается из `окно_позиции=`, а не из
+            # `stats=` (там пожизненный итог, который умеет только расти).
+            _pw = self._probe_delta(_probe0)
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
-                      "engine=%s collector=%s index=%s stats=%s" % (
+                      "engine=%s collector=%s index=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _fs, _us, _mm, _es or "—", _cs or "—", _is, self.stats))
+                          _fs, _us, _mm, _es or "—", _cs or "—", _is, _pw, self.stats))
 
     def handle_event(self, ev: dict):
         try:
