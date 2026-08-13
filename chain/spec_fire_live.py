@@ -600,14 +600,24 @@ class SpecFireLive:
         self._board_probe_cache: dict = {}        # (mid,b) -> (debt, calldata, gas): проба под
                                                   # живым планом, чтобы окна 2..N публиковали
                                                   # доску без пересборки (HIGH N1)
-        # СЧЁТЧИКИ ПОЗИЦИЙ — ПО ФИДУ (ревью р-4, майор C). Общий self.stats годился, пока
-        # окна шли ПОДРЯД; в каскаде окна разных фидов живут ОДНОВРЕМЕННО по построению, а
-        # `_note_probe_position` зовётся из треда КОЛЛЕКТОРА, не из треда окна. Дельта общих
-        # счётчиков поэтому вбирала пробы ЧУЖОГО окна: зрячее окно BTC несло probe_no_agg=1 от
-        # законно-слепого ETH и приёмка (б) читалась ПРОВАЛЕННОЙ ровно на жирном окне, ради
-        # которого пакет и делался. Ключ — фид цели (meta[1][0]); None-бакет для проб, чьего
-        # окна мы не знаем: они не имеют права молча раствориться (незнание закрывает гард).
-        self._probe_by_feed: dict = {}            # feed|None -> {ключ счётчика: значение}
+        # СЧЁТЧИКИ ПОЗИЦИЙ — ПО КЛЮЧУ ДОСКИ (mid, borrower), ревью р-6, БЛОКЕР C.
+        #
+        # Общий self.stats годился, пока окна шли ПОДРЯД; в каскаде окна разных фидов живут
+        # ОДНОВРЕМЕННО, а `_note_probe_position` зовётся из треда КОЛЛЕКТОРА. Правка р-5
+        # привязала счётчики к ЯРЛЫКУ ФИДА — и на БОЕВОМ тракте это не работает: ярлык в
+        # meta берётся из `FireEngine._target`, а это ОДНО перезаписываемое поле, куда пишет
+        # ПОСЛЕДНИЙ тикнувший keepalive любого окна каскада. Дрель L3 (настоящие `_worker` и
+        # `_engine_fat_keepalive`, доска армлена соседом под слепой рынок) показала ровно
+        # прежнюю картину: окно BTC — no_agg=428 при judged=428.
+        #
+        # ПРАВИЛЬНЫЙ КЛЮЧ — ЦЕЛЬ ПЛАНА, под которым проба реально ушла: mid+borrower из того же
+        # `_target`. Он не «последний тикнувший», а тот, чью калдату несёт проба, и потому
+        # атрибуция перестаёт зависеть от порядка keepalive. Окно печатает дельту по ключу
+        # СВОЕГО живого плана, пробы под ЧУЖИМ планом — отдельным бакетом, безключевые
+        # (движок армлен без цели) — своим: незнание обязано быть НАЗВАНО, а не растворено.
+        self._probe_by_key: dict = {}             # (mid,b)|None -> {ключ счётчика: значение}
+        self._win_key: dict = {}                  # feed -> (mid,b): план, который ЭТО окно
+                                                  # опубликовало; по нему судится приёмка (б)
         self._board_next_try: dict = {}           # feed -> ts следующей попытки арма (#57): осечка
                                                   # арма обязана перепробовать БЫСТРО, а не через
                                                   # каденс переарма — окно короче ретрая иначе
@@ -1244,6 +1254,8 @@ class SpecFireLive:
                 _c = self._board_probe_cache.get((mid, b))
                 if _c is not None:
                     self.probe_board[feed] = (mid, b, _c[0], _c[1], _c[2], self._now())
+                    # ЧЕЙ ЭТО ПЛАН (блокер C р-6): по этому ключу окно и судит свою приёмку (б).
+                    self._win_key[feed] = self.plan_key(mid, b)
                     self._engine()          # склад и прогрев патрона нужны и здесь
                     return
                 # кэша нет (рестарт под живым планом) — НЕ выходим: собираем пробу ради
@@ -1277,6 +1289,7 @@ class SpecFireLive:
                 # Прогрев строит ровно тот же probe-dict — публикация здесь открывает оба
                 # детект-пути, не трогая порог огня.
                 self.probe_board[feed] = (mid, b, d, probe["calldata"], probe["gas"], self._now())
+                self._win_key[feed] = self.plan_key(mid, b)     # ключ приёмки (б), блокер C р-6
                 # кэш пробы под живой план: из него публикуются окна 2..N, не платя за сборку
                 self._board_probe_cache = {(mid, b): (d, probe["calldata"], probe["gas"])}
                 # СКЛАД НАБИВАЕТСЯ ЗДЕСЬ, а не в первом огне. Движок поднимается лениво, и если
@@ -1582,66 +1595,104 @@ class SpecFireLive:
     # отсутствие ключа в словаре нулём не является — «не мерили» и «ноль» неразличимы.
     _PROBE_ALWAYS = ("probe_judged", "probe_no_agg", "probe_judged_blind")
 
-    def _probe_feeds(self):
-        """Пофидовый учёт, заводя его при первом обращении.
+    @staticmethod
+    def plan_key(mid, b):
+        """КЛЮЧ ПЛАНА (mid, borrower) в каноне нижнего регистра, либо None.
+
+        Один ключ на всю проводку: под ним ходит доска (`self._board['key']`), под ним же
+        считаются пробы. Пустая половина = ключа НЕТ (незнание закрывает гард): такая проба
+        уйдёт в None-бакет и будет НАЗВАНА, а не приписана чужому плану.
+        """
+        if not mid or not b:
+            return None
+        return (str(mid).lower(), str(b).lower())
+
+    def _probe_keys(self):
+        """Учёт ПО КЛЮЧУ ПЛАНА, заводя его при первом обращении.
 
         Лок МОДУЛЬНЫЙ, а не свой на объект, и словарь заводится лениво НАМЕРЕННО: путь
         `_note_probe_position` — ИЗМЕРИТЕЛЬНЫЙ, он идёт из треда коллектора по денежному
         исходу пробы, и уронить его AttributeError'ом ради учёта нельзя. Цена общего лока —
         одно обновление словаря на пробу (сотни в секунду в пике), контенции здесь нет.
         """
-        d = getattr(self, "_probe_by_feed", None)
+        d = getattr(self, "_probe_by_key", None)
         if d is None:
-            d = self._probe_by_feed = {}
+            d = self._probe_by_key = {}
         return d
 
-    def _probe_bump(self, feed, key, n=1):
-        """+1 в ОБА учёта: пожизненный self.stats и пофидовый (окно судит только СВОЙ фид)."""
-        self.stats[key] = self.stats.get(key, 0) + n
+    def _probe_bump(self, key, name, n=1):
+        """+1 в ОБА учёта: пожизненный self.stats и по КЛЮЧУ ПЛАНА (окно судит только свой)."""
+        self.stats[name] = self.stats.get(name, 0) + n
         with _PROBE_FEED_LOCK:
-            m = self._probe_feeds()
-            d = m.get(feed)
+            m = self._probe_keys()
+            d = m.get(key)
             if d is None:
-                d = m[feed] = {}
-            d[key] = d.get(key, 0) + n
+                if len(m) > 64:
+                    # Ключей столько же, сколько целей, под которые мы клали план. Кольцо на
+                    # 64 держит память постоянной; окно судится по СВЕЖЕМУ ключу, а вытесняются
+                    # самые старые — те, чьи окна давно закрыты.
+                    for _k in list(m)[:32]:
+                        if _k is not None:
+                            m.pop(_k, None)
+                d = m[key] = {}
+            d[name] = d.get(name, 0) + n
 
-    def _probe_snap(self, feed=None):
-        """Снимок счётчиков позиций СВОЕГО фида (+ None-бакет неатрибутированных).
+    def _probe_snap(self, key=None):
+        """Снимок счётчиков позиций: ПОЛНАЯ карта по ключам + кумулятив процесса.
 
-        feed=None означает «весь процесс» и оставлен для читателей, которым нужен кумулятив.
+        Снимок берётся на АРМЕ окна, когда ключ плана ещё может быть неизвестен (доску кладёт
+        отдельный тред прогрева), поэтому он не привязан к ключу: дельта выберет нужный ключ
+        ПОТОМ. Аргумент `key` оставлен для совместимости вызовов и на снимок не влияет.
         """
         with _PROBE_FEED_LOCK:
-            if feed is None:
-                return {k: int(self.stats.get(k, 0) or 0) for k in self._PROBE_KEYS}
-            m = self._probe_feeds()
-            d = m.get(feed) or {}
-            u = m.get(None) or {}
-            out = {k: int(d.get(k, 0) or 0) for k in self._PROBE_KEYS}
-            # ЧИСЛО ПРОБ, а не сумма их исходов: probe_landed растёт ровно один раз на пробу,
-            # поэтому «probe_no_feed=2» читается как две пробы без окна, а не как одна с двумя
-            # засчитанными признаками.
-            out["_noattr"] = int(u.get("probe_landed", 0) or 0)
-            return out
+            m = self._probe_keys()
+            return {"by_key": {k: dict(v) for k, v in m.items()},
+                    "all": {k: int(self.stats.get(k, 0) or 0) for k in self._PROBE_KEYS}}
 
-    def _probe_delta(self, snap, feed=None):
-        """Дельта счётчиков позиций ЗА ОКНО И ПО СВОЕМУ ФИДУ. snap — снимок на арме.
+    def _probe_delta(self, snap, key=None):
+        """Дельта счётчиков позиций ЗА ОКНО И ПО КЛЮЧУ СВОЕГО ПЛАНА. snap — снимок на арме.
 
-        Приёмка (б) читается ИМЕННО отсюда, поэтому дельта обязана принадлежать своему окну:
-        параллельное окно другого фида не имеет права ни провалить, ни вытянуть чужую.
-        Неатрибутированные пробы (фид цели неизвестен) не выбрасываются молча — они выходят
-        отдельным ключом `probe_no_feed`, общим на процесс, чтобы ноль в probe_no_agg нельзя
-        было прочитать как «всё сужено зряче», когда часть судов вообще не привязана к окну.
+        key=None — кумулятив ПРОЦЕССА за окно (для читателей, которым нужен весь тракт).
+
+        Приёмка (б) читается ИМЕННО отсюда и ТОЛЬКО ПАРОЙ (ревью р-6): зрячее окно обязано
+        показать `probe_no_agg==0` ПРИ `probe_judged>=1`, а слепой сосед того же каскада —
+        свой законный `probe_no_agg>=1`. Односторонний ноль зеленеет вакуумно: если пробы
+        вообще перестанут учитываться, ноль будет тем же нулём.
+
+        Поэтому рядом печатаются два бакета, которые не дают прочитать ноль как «всё сужено
+        зряче»: `probe_foreign_plan` — пробы, ушедшие под ЧУЖИМ планом (доску перехватило
+        соседнее окно каскада), и `probe_no_key_proc` — пробы, у которых цели плана не было
+        вовсе (движок армлен без цели). Второй ОБЩИЙ НА ПРОЦЕСС и назван суффиксом `_proc`
+        именно поэтому: подмешивать его в дельту окна значило бы, что одна такая проба будет
+        прочитана КАЖДЫМ окном каскада как своя (минор р-6).
         """
-        cur = self._probe_snap(feed)
+        snap = snap or {}
+        s_by, s_all = (snap.get("by_key") or {}), (snap.get("all") or {})
+        with _PROBE_FEED_LOCK:
+            m = self._probe_keys()
+            cur_by = {k: dict(v) for k, v in m.items()}
+        cur_all = {k: int(self.stats.get(k, 0) or 0) for k in self._PROBE_KEYS}
+        if key is None:
+            out = {}
+            for k in self._PROBE_KEYS:
+                v = cur_all[k] - int(s_all.get(k, 0) or 0)
+                if v or k in self._PROBE_ALWAYS:
+                    out[k] = v
+            return out
+        own_c, own_s = (cur_by.get(key) or {}), (s_by.get(key) or {})
         out = {}
         for k in self._PROBE_KEYS:
-            v = cur[k] - int((snap or {}).get(k, 0))
+            v = int(own_c.get(k, 0) or 0) - int(own_s.get(k, 0) or 0)
             if v or k in self._PROBE_ALWAYS:
                 out[k] = v
-        if feed is not None:
-            na = int(cur.get("_noattr", 0)) - int((snap or {}).get("_noattr", 0))
-            if na:
-                out["probe_no_feed"] = na
+        own_landed = int(own_c.get("probe_landed", 0) or 0) - int(own_s.get("probe_landed", 0) or 0)
+        none_landed = (int((cur_by.get(None) or {}).get("probe_landed", 0) or 0)
+                       - int((s_by.get(None) or {}).get("probe_landed", 0) or 0))
+        all_landed = cur_all["probe_landed"] - int(s_all.get("probe_landed", 0) or 0)
+        # ПЕЧАТАЕМ ВСЕГДА, включая нули: отсутствие ключа нулём не является, а по этой паре
+        # читатель понимает, куда делись пробы, которых нет в дельте окна.
+        out["probe_foreign_plan"] = max(0, all_landed - own_landed - none_landed)
+        out["probe_no_key_proc"] = none_landed
         return out
 
     def _note_probe_position(self, h, r, meta=None):
@@ -1677,30 +1728,36 @@ class SpecFireLive:
         except Exception:
             return                        # квитанция без позиции — считать нечего, молча выходим
         _tgt0 = (meta or (None, None))[1]
-        # ФИД ЦЕЛИ = ОКНО, которому принадлежит эта проба (tgt = (feed, mid, borrower, debt)).
-        # Пустая строка фидом не является: она попадёт в None-бакет и будет НАЗВАНА в строке
-        # окна, а не растворится в чужой дельте.
-        _feed = (_tgt0[0] if (_tgt0 and len(_tgt0) > 0 and _tgt0[0]) else None)
-        self._probe_bump(_feed, "probe_landed")
+        # КЛЮЧ ПЛАНА = ЦЕЛЬ, ПОД КОТОРОЙ ПРОБА УШЛА (tgt = (feed, mid, borrower, debt)).
+        #
+        # ЯРЛЫК ФИДА (tgt[0]) для этого НЕ ГОДИТСЯ, и это блокер C р-6: `FireEngine._target` —
+        # ОДНО перезаписываемое поле, в него пишет ПОСЛЕДНИЙ тикнувший keepalive любого окна
+        # каскада, а сама доска в этот момент держит план ОДНОЙ цели. Поэтому в бою ярлык
+        # говорил «BTC» про пробы, летевшие под планом соседнего окна, и приёмка (б) читалась
+        # ПРОВАЛЕННОЙ ровно на жирном окне (дрель L3: no_agg=428 при judged=428).
+        # Ключ (mid, borrower) берётся из ТОГО ЖЕ кортежа, но он описывает КАЛДАТУ пробы, а не
+        # порядок тиков, — и потому от гонки keepalive не зависит.
+        _mid0 = _tgt0[1] if (_tgt0 and len(_tgt0) > 1) else None
+        _bor0 = _tgt0[2] if (_tgt0 and len(_tgt0) > 2) else None
+        _pkey = self.plan_key(_mid0, _bor0)
+        self._probe_bump(_pkey, "probe_landed")
         try:
             from chain import chain_index as _ci
             ci = _ci.get_index()
             if ci is None:
-                self._probe_bump(_feed, "probe_idx_off")
+                self._probe_bump(_pkey, "probe_idx_off")
                 return
-            _tgt = _tgt0
-            _mid = _tgt[1] if (_tgt and len(_tgt) > 1) else None
-            agg = self._agg_of_market(_mid) if _mid else None
+            agg = self._agg_of_market(_mid0) if _mid0 else None
             blind = agg is None
             if blind:
-                self._probe_bump(_feed, "probe_no_agg")
+                self._probe_bump(_pkey, "probe_no_agg")
             st, tr = ci.transit_report(bn, agg=agg)
             if st != "transit" or not tr:
                 _k = {"uncovered": "probe_uncovered", "no_transit": "probe_no_transit",
                       "foreign": "probe_foreign_transit"}.get(st, "probe_uncovered")
-                self._probe_bump(_feed, _k)
+                self._probe_bump(_pkey, _k)
                 return
-            self._probe_bump(_feed, "probe_judged")
+            self._probe_bump(_pkey, "probe_judged")
             t_idx, t_tip = tr["index"], tr["tip"]
             # ВСЛЕПУЮ — ОТДЕЛЬНЫМИ СЧЁТЧИКАМИ. Владельца транзита мы не знаем (рынок не
             # резолвился / фид не Chainlink), значит `transit_report` выбрал транзит
@@ -1711,12 +1768,12 @@ class SpecFireLive:
             _band = "probe_in_band_blind" if blind else "probe_in_band"
             _tipm = "probe_tip_match_blind" if blind else "probe_tip_match"
             if blind:
-                self._probe_bump(_feed, "probe_judged_blind")
+                self._probe_bump(_pkey, "probe_judged_blind")
             if 1 <= idx - t_idx <= _ci.CHAIN_INDEX_PRIZE_WINDOW:
-                self._probe_bump(_feed, _band)
+                self._probe_bump(_pkey, _band)
             fact = ci.lookup(h)
             if fact is not None and fact.get("tip") == t_tip:
-                self._probe_bump(_feed, _tipm)
+                self._probe_bump(_pkey, _tipm)
             # Строка — одна на БЛОК И РЕЖИМ СУДА, а не на пробу: при 200 отправках/с строка
             # на пробу сделала бы журнал вторым источником нагрузки на одном ядре. Но ключ
             # именно ПАРА: дедуп по одному номеру блока прятал ЗРЯЧИЙ суд за напечатанным
@@ -1959,9 +2016,11 @@ class SpecFireLive:
         last_yield_log = 0.0
         fat_mode = False     # EV-плотность (06.08): жир в досягаемости -> каденс 0.12с, кап 600
         next_board_try = 0.0  # v5 доска: когда снова пробовать положить/переложить план
-        # СНИМОК НА АРМЕ ОКНА И ПО СВОЕМУ ФИДУ: приёмка (б) судится ЗДЕСЬ И СЕЙЧАС, и она
-        # принадлежит ЭТОМУ окну — параллельное окно каскада не имеет права её загрязнить.
-        _probe0 = self._probe_snap(feed)
+        # СНИМОК НА АРМЕ ОКНА: приёмка (б) судится ЗДЕСЬ И СЕЙЧАС, и она принадлежит ЭТОМУ
+        # окну — параллельное окно каскада не имеет права её загрязнить. Ключ плана на арме
+        # ещё неизвестен (доску кладёт тред прогрева), поэтому снимок берётся ПОЛНЫЙ, а ключ
+        # выбирается на закрытии — из плана, который опубликовало это самое окно.
+        _probe0 = self._probe_snap()
         try:
             while not stop.is_set() and probes < _window_cap(fat_mode):
                 pf = self.pending_fire.pop(feed, None)
@@ -2170,6 +2229,7 @@ class SpecFireLive:
                                     # ЭТОЙ пробы по формируемому блоку — та же семантика
                                     self.probe_board[feed] = (mid, b, d, probe["calldata"],
                                                               probe["gas"], self._now())
+                                    self._win_key[feed] = self.plan_key(mid, b)   # блокер C р-6
                             if probe is not None:
                                 h = (self._send_fn or self._send)(probe["calldata"], probe["gas"])
                                 if h is not None:
@@ -2250,14 +2310,19 @@ class SpecFireLive:
             except Exception:
                 _is = "?"
             # ПОЗИЦИИ ЗА ЭТО ОКНО (р-3): критерий (б) читается из `окно_позиции=`, а не из
-            # `stats=` (там пожизненный итог, который умеет только расти).
-            _pw = self._probe_delta(_probe0, feed)
+            # `stats=` (там пожизненный итог, который умеет только расти). КЛЮЧ — план,
+            # который опубликовало ЭТО окно (блокер C р-6): ярлык фида в бою ставит последний
+            # тикнувший keepalive, и по нему приёмка (б) меряла чужие пробы.
+            _wkey = self._win_key.pop(feed, None)
+            _pw = self._probe_delta(_probe0, _wkey)
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
-                      "engine=%s collector=%s index=%s окно_позиции=%s stats=%s" % (
+                      "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _fs, _us, _mm, _es or "—", _cs or "—", _is, _pw, self.stats))
+                          _fs, _us, _mm, _es or "—", _cs or "—", _is,
+                          ("%s/%s" % (_wkey[0][:10], _wkey[1][:10])) if _wkey else "НЕТ",
+                          _pw, self.stats))
 
     def handle_event(self, ev: dict):
         try:
