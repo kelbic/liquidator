@@ -905,9 +905,13 @@ def start_index(cfg=None, watch_to=(), url=None, log_fn=None):
                       "tx и tip транзита остаются неизмеримыми")
             return None
         watch = set(str(a).lower() for a in (watch_to or ()) if a)
-        for a in (getattr(cfg, "liquidator_address", ""), os.environ.get("SPEC_FIRE_BOARD_ADDR", "")):
-            if a:
-                watch.add(str(a).lower())
+        if getattr(cfg, "liquidator_address", ""):
+            watch.add(str(cfg.liquidator_address).lower())    # пробы идут ИМЕННО туда (v5-доска)
+        # Доп. адреса через запятую — на случай, если доска когда-нибудь переедет в отдельный
+        # контракт: тогда позиции проб не пропадут из виду до следующего релиза.
+        for a in os.environ.get("CHAIN_INDEX_WATCH", "").split(","):
+            if a.strip():
+                watch.add(a.strip().lower())
         idx = ChainIndex(u, watch_to=watch, log_fn=log_fn)
         idx.start()
         _INDEX = idx
