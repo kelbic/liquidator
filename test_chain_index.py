@@ -61,7 +61,10 @@ def make_http(calls, *, receipts=True, fail=None, head=BN):
                 return {"error": {"code": -32601, "message": "rpc method is unsupported"}}
             return {"result": RECEIPTS}
         if m == "eth_blockNumber":
-            return {"result": hex(head)}
+            # ГОЛОВА УЗЛА — АВТОРИТЕТ. Двойник умеет отдавать её динамически (head может быть
+            # вызываемым): подача из flashblocks несёт pending-номер, и индекс обязан
+            # сканировать только до того, что узел ПРИЗНАЁТ.
+            return {"result": hex(head() if callable(head) else head)}
         raise AssertionError("индекс не имеет права звать %s" % m)
     return _http
 
@@ -110,6 +113,20 @@ rep = idx.our_position_report(BN)
 assert "tip-match=0" in rep and "в полосе [T+1,T+20]=0" in rep, rep
 print("UNIT_OK: отчёт позиций — %s" % rep)
 
+# ПРИЁМКА (б): строка позиции с транзитом СВОЕГО фида. Без agg строка считалась бы против
+# транзита кого угодно — в блоке без Liquidate это и происходило.
+_our_agg = idx.transits_of(BN)[1]["agg"]
+rep_agg = idx.our_position_report(BN, agg=_our_agg)
+assert "транзит idx=1083" in rep_agg and "agg=%s" % _our_agg[:10] in rep_agg, rep_agg
+assert "полоса вперёд 37" in rep_agg and "вся полоса 85" in rep_agg, \
+    ("полоса ВПЕРЁД (приз) и ВСЯ полоса — разные величины и обязаны быть разведены: %s" % rep_agg)
+rep_alien = idx.our_position_report(BN, agg="0x" + "de" * 20)
+assert "НАШЕГО фида" in rep_alien, ("транзит ЧУЖОГО фида не имеет права выдаваться за наш: %s"
+                                    % rep_alien)
+assert idx.transit_report(BN, agg="0x" + "de" * 20)[0] == "foreign"
+print("UNIT_OK: строка позиции считается против транзита СВОЕГО фида (agg), чужой транзит даёт "
+      "исход 'foreign', а не подменяет собой наш")
+
 # ---------------------------------------------------------------- 2. вердикт победы
 calls2 = []
 idx2 = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD, WINNER_CONTRACT],
@@ -141,8 +158,11 @@ ours_h = [h for h in facts["ours"]]
 r = idx.receipts_for(ours_h)
 assert len(r) == 2, "квитанции пришли на 2 хэша из 33 — столько их в фикстуре, %d" % len(r)
 one = r[[h for h in ours_h if h in r][0]]
-assert one["status"] == 1 and one["gasUsed"] == 54710 and one["logs"] == []
-assert one["transactionIndex"] in (17, 163) and one["blockNumber"] == BN
+# ФОРМА КВИТАНЦИИ ОДНА НА ОБА ИСТОЧНИКА: hex-строки, как отдаёт узел. Прежде индекс отдавал
+# числа, сеть — hex, и денежный путь молча падал на одном из двух (см. test_engine_result_fmt).
+assert one["status"] == "0x1" and one["gasUsed"] == hex(54710) and one["logs"] == []
+assert ci.rcpt_int(one["status"]) == 1 and ci.rcpt_int(one["gasUsed"]) == 54710
+assert ci.rcpt_int(one["transactionIndex"]) in (17, 163) and ci.rcpt_int(one["blockNumber"]) == BN
 # effectiveGasPrice БЕЗ квитанции: base + min(tip, maxFee-base). Сверяем с НАСТОЯЩИМ полем узла.
 for rc in RECEIPTS:
     h = rc["transactionHash"].lower()
@@ -218,13 +238,33 @@ idx5 = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD], http=make_htt
 idx5.scan_block(BN + 5)                           # логов нет, хэшей не ждём => блок не читаем
 assert calls5 == ["eth_getLogs"], "тихий блок обязан стоить ОДИН запрос: %s" % calls5
 idx5.note_hash(h_ghost, head=BN + 5)
+# ОКНО НАЧИНАЕТСЯ С from_bn+1. Блок BN+5 был ЗАПЕЧАТАН на момент отправки (и прочитан легко
+# ДО регистрации хэша) — наша tx в нём оказаться не могла, и требовать его покрытия значило бы
+# не выдать «absent» НИКОГДА (счётчик noreceipt_dropped_confirmed был структурно нулевым).
 for i in range(6, 6 + ci.CHAIN_INDEX_ABSENT_BLOCKS + 1):
     idx5.scan_block(BN + i)
 assert "eth_getBlockByNumber" in calls5, "ждём свой хэш => блоки читаются ПОЛНОСТЬЮ"
 st, why = idx5.state(h_ghost)
-assert st == "unknown" and str(BN + 5) in why, (st, why)
-print("UNIT_OK: тихий блок стоит 1 запрос; но блок, прочитанный НЕ полностью, лишает права на "
-      "приговор — «мы туда не смотрели» != «нашей tx там не было»")
+assert st == "absent", ("окно [from_bn+1 .. from_bn+N] покрыто целиком — приговор обязан "
+                        "выноситься, иначе «мы правда теряем ноги» недоказуемо: %s" % (why,))
+print("UNIT_OK: тихий блок стоит 1 запрос; окно приговора считается с from_bn+1 (блок отправки "
+      "запечатан ДО неё), поэтому «absent» вообще достижим")
+
+# ...а вот лёгкое чтение ВНУТРИ окна право на приговор отнимает. Сценарий боевой: прогрев
+# гаснет через WANT_TTL, и хвост окна дочитывается легко.
+calls5b = []
+clk5b = Clock()
+idx5b = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD], http=make_http(calls5b),
+                      now=clk5b, log_fn=lambda m: None)
+idx5b.note_hash(h_ghost, head=BN + 5)
+for i in range(6, 6 + ci.CHAIN_INDEX_ABSENT_BLOCKS + 1):
+    if i == 9:
+        clk5b.t += ci.CHAIN_INDEX_WANT_TTL_SEC + 1.0     # прогрев погас посреди окна
+    idx5b.scan_block(BN + i)
+st, why = idx5b.state(h_ghost)
+assert st == "unknown" and str(BN + 9) in why, (st, why)
+print("UNIT_OK: блок ВНУТРИ окна, прочитанный НЕ полностью, лишает права на приговор — "
+      "«мы туда не смотрели» != «нашей tx там не было»")
 
 # ---------------------------------------------------------------- 9. неделя штиля -> старт окна
 clk6 = Clock()
@@ -352,7 +392,9 @@ import time as _time                                          # noqa: E402
 
 before = threading.active_count()
 clk11 = Clock()
-idx11 = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD], http=make_http([]),
+_h11 = {"n": BN + 3}
+idx11 = ci.ChainIndex("https://node.example/KEY", watch_to=[BOARD],
+                      http=make_http([], head=lambda: _h11["n"]),
                       now=clk11, log_fn=lambda m: None)
 idx11.start()
 try:

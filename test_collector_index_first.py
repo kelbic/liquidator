@@ -101,10 +101,13 @@ col4 = fe.ReceiptCollector(receipts_fn=_net, index_fn=None,           # ручк
 for h in H[:3]:
     col4.track(h, ("0xleg", None))
 col4.tick()
-assert sorted(net[0]) == sorted(H[:3]) and "index_hits" not in col4.stats, \
+# Счётчики механизма ЗАВЕДЕНЫ ВСЕГДА и стоят на нуле: приёмка обязана отличать «механизм снят»
+# от «механизм есть и молчит», а отсутствующий ключ читается и так, и так (блокер приёмки #3).
+assert sorted(net[0]) == sorted(H[:3]), net
+assert col4.stats["index_hits"] == 0 and col4.stats["polls_saved"] == 0 and col4.stats["polls"] == 1, \
     "index_fn=None обязан давать путь БИТ-В-БИТ прежний: %s / %s" % (net, col4.stats)
-print("UNIT_OK: SPEC_FIRE_COLLECTOR_INDEX=0 (index_fn=None) — прежний путь без единого следа "
-      "механизма")
+print("UNIT_OK: SPEC_FIRE_COLLECTOR_INDEX=0 (index_fn=None) — прежний путь, а счётчики "
+      "механизма честно стоят на нуле (снят, а не «молчит»)")
 
 # ---------------------------------------------------------------- 5. NO-RECEIPT против индекса
 class _Idx:
@@ -272,8 +275,11 @@ try:
     for h in _have + _miss:
         col7.track(h, ("0xleg", None))
     col7.tick()
-    assert len(seen) == 2 and all(g == 54710 for _h, g, _i in seen), seen
-    assert sorted(i for _h, _g, i in seen) == [17, 163], seen
+    # Форма квитанции — ТА ЖЕ, что у сети (hex): различие форматов уже стоило нам молчаливого
+    # ValueError в денежном пути, поэтому проверяем именно её, а не «числа».
+    assert len(seen) == 2 and all(g == "0xd5b6" for _h, g, _i in seen), seen
+    assert all(ci.rcpt_int(g) == 54710 for _h, g, _i in seen), seen
+    assert sorted(ci.rcpt_int(i) for _h, _g, i in seen) == [17, 163], seen
     assert sorted(net[0]) == sorted(_miss), \
         "в сеть ушли ровно те, кого индекс не знает: %s" % net
     assert sf6.stats.get("index_receipts") == 2, sf6.stats

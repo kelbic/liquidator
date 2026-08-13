@@ -103,6 +103,27 @@ COLLECT_MIN_AGE_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_MIN_AGE_SEC
 CU_PER_RECEIPT = float(os.environ.get("SPEC_FIRE_ENGINE_CU_PER_RECEIPT", "15"))
 
 
+_COLLECTORS = []                    # живые коллекторы процесса (в бою он один)
+
+
+def collector_stats():
+    """Сводные счётчики коллекторов процесса — для суточной приёмки #109.
+
+    Отдаёт polls (СЕТЕВЫЕ поллы), polls_saved (партии, закрытые индексом целиком) и
+    index_hits (исходы, взятые из индекса). Без этой тройки «экономия запросов» остаётся
+    утверждением, а не замером.
+    """
+    out = {"polls": 0, "polls_saved": 0, "index_hits": 0, "tracked": 0, "resolved": 0,
+           "timeouts": 0, "batch_fail": 0, "index_fail": 0, "cu": 0.0}
+    for c in list(_COLLECTORS):
+        for k in out:
+            try:
+                out[k] += (c.stats.get(k, 0) or 0)
+            except Exception:
+                pass
+    return out
+
+
 class ReceiptCollector:
     """ОДИН тред на все квитанции движка: партиями спрашивает исходы и раздаёт их обработчику.
 
@@ -139,7 +160,10 @@ class ReceiptCollector:
         self._pending = {}          # hash -> (meta, deadline)
         self._stop = threading.Event()
         self._thr = None
-        self.stats = {"tracked": 0, "resolved": 0, "timeouts": 0, "polls": 0, "cu": 0.0}
+        self.stats = {"tracked": 0, "resolved": 0, "timeouts": 0, "polls": 0, "cu": 0.0,
+                      "index_hits": 0, "polls_saved": 0}
+        _COLLECTORS.append(self)    # приёмка «за сутки» (#109) читается из hot-stats, а не
+        #                             только из close-строки окна, которого может и не быть
 
     def track(self, h, meta):
         with self._lock:

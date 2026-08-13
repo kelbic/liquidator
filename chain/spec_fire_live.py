@@ -1492,9 +1492,14 @@ class SpecFireLive:
         """Исход пробы движка. Вердикт победы — ТОЛЬКО по событию Liquidated (см. LIQUIDATED_TOPIC0):
         у пробы доски status=1 бывает и у холостой, и у неудачной попытки."""
         from chain.execute import volley_bal_charge
+        from chain.chain_index import rcpt_int
         addr, tgt = (meta or (None, None))
         try:
-            _wei = int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
+            # ОДИН разбор на ОБА источника. Сеть отдаёт '0x...', индекс — тоже (см.
+            # chain_index.receipt_like): прежде здесь стоял голый int(), сетевая квитанция
+            # падала ValueError, ветка глоталась общим except и газ МОЛЧА книжился нулём —
+            # то есть само включение индекса меняло поведение суточного kill-switch.
+            _wei = rcpt_int(r.get("gasUsed"), 0) * rcpt_int(r.get("effectiveGasPrice"), 0)
             gas_usd = _wei * float(self.cfg.eth_price_usd) / 1e18
         except Exception:
             _wei, gas_usd = 0, 0.0
@@ -1504,7 +1509,7 @@ class SpecFireLive:
         from chain.execute import volley_gas_settle
         volley_gas_settle(h, gas_usd)
         volley_bal_charge(addr, _wei)     # #45: патрон списывается по ФАКТУ, не по эстимейту
-        self._note_probe_position(h, r)   # #110: метрика №1 — ГДЕ мы встали относительно транзита
+        self._note_probe_position(h, r, meta=meta)   # #110: метрика №1 — ГДЕ мы встали
         if _receipt_has_win(r, self.cfg.liquidator_address) is not True:
             self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
             return
@@ -1526,7 +1531,23 @@ class SpecFireLive:
                     (addr or "?")[:10], str(mid)[:10], str(b)[:10], (dbt or 0) / 1e3, h,
                     gas_usd, SPEC_FIRE_WIN_COOLDOWN_SEC)
 
-    def _note_probe_position(self, h, r):
+    def _agg_of_market(self, mid):
+        """Агрегатор ФИДА нашей цели (mid -> BF1 watch-key последнего резолва) либо None.
+
+        Без него метрика №1 считалась против ЧУЖОГО транзита: `transit_of` без agg берёт
+        «предшествующий победе, иначе первый», а в блоке без Liquidate (это подавляющее
+        большинство блоков) первый транзит — чей угодно. Watch-паттерны (композиты, длина не
+        42) сюда не годятся: с адресом лога они не сравнимы, и лучше честный None.
+        """
+        try:
+            from chain.feeds import primary_map
+            a = primary_map().get(mid)
+        except Exception:
+            return None
+        a = str(a or "").lower()
+        return a if (len(a) == 42 and a.startswith("0x")) else None
+
+    def _note_probe_position(self, h, r, meta=None):
         """#110: позиция нашей пробы в блоке против транзита — метрика №1 плана.
 
         Раньше её взять было НЕОТКУДА: квитанция несёт `transactionIndex`, но не несёт ни tip
@@ -1534,19 +1555,22 @@ class SpecFireLive:
         (позиции 48/49/51 и 4745 при победителе на 2267) делался офлайн, руками, через сутки
         после гонки — то есть в бою мы были слепы к единственной величине, которая решает.
 
-        Счётчики раздельные и по РАЗНЫМ единицам: landed — сколько проб вообще сели;
-        in_band — сколько попало в призовое окно [T+1, T+N]; tip_match — сколько встало на tip
-        транзита (условие ничьей). Ноль в in_band при ненулевом landed — это ФАКТ проигрыша
-        позицией, а не отсутствие данных.
+        СЧЁТЧИКИ ЧИТАЮТСЯ КАК РАЗБИЕНИЕ, а не как набор. Инвариант держится тождеством:
+
+            probe_landed = probe_idx_off + probe_uncovered + probe_no_transit
+                           + probe_foreign_transit + probe_judged
+
+        и по нему ВИДНО, работает механизм или снят: probe_landed==probe_idx_off означает
+        «индекса нет» (прежде landed рос и при снятом механизме, и ноль в in_band читался как
+        проигрыш позицией). in_band/tip_match — подмножества probe_judged, то есть считаются
+        ТОЛЬКО против транзита НАШЕГО фида в блоке, прочитанном ЦЕЛИКОМ.
         """
-        def _num(v):
-            if isinstance(v, int):
-                return v
-            s = str(v)
-            return int(s, 16) if s.startswith("0x") else int(s)
+        from chain.chain_index import rcpt_int
         try:
-            bn = _num(r.get("blockNumber"))
-            idx = _num(r.get("transactionIndex"))
+            bn = rcpt_int(r.get("blockNumber"), None)
+            idx = rcpt_int(r.get("transactionIndex"), None)
+            if bn is None or idx is None:
+                return
         except Exception:
             return                        # квитанция без позиции — считать нечего, молча выходим
         self.stats["probe_landed"] = self.stats.get("probe_landed", 0) + 1
@@ -1554,12 +1578,21 @@ class SpecFireLive:
             from chain import chain_index as _ci
             ci = _ci.get_index()
             if ci is None:
+                self.stats["probe_idx_off"] = self.stats.get("probe_idx_off", 0) + 1
                 return
-            tr = ci.transit_of(bn)
-            if tr is None:
-                self.stats["probe_no_transit"] = self.stats.get("probe_no_transit", 0) + 1
+            _tgt = (meta or (None, None))[1]
+            _mid = _tgt[1] if (_tgt and len(_tgt) > 1) else None
+            agg = self._agg_of_market(_mid) if _mid else None
+            if agg is None:
+                self.stats["probe_no_agg"] = self.stats.get("probe_no_agg", 0) + 1
+            st, tr = ci.transit_report(bn, agg=agg)
+            if st != "transit" or not tr:
+                _k = {"uncovered": "probe_uncovered", "no_transit": "probe_no_transit",
+                      "foreign": "probe_foreign_transit"}.get(st, "probe_uncovered")
+                self.stats[_k] = self.stats.get(_k, 0) + 1
                 return
-            t_idx, t_tip, tie = tr
+            self.stats["probe_judged"] = self.stats.get("probe_judged", 0) + 1
+            t_idx, t_tip = tr["index"], tr["tip"]
             if 1 <= idx - t_idx <= _ci.CHAIN_INDEX_PRIZE_WINDOW:
                 self.stats["probe_in_band"] = self.stats.get("probe_in_band", 0) + 1
             fact = ci.lookup(h)
@@ -1575,7 +1608,7 @@ class SpecFireLive:
                 if len(seen) > 64:
                     for k in sorted(seen)[:32]:
                         seen.pop(k, None)
-                rep = ci.our_position_report(bn)
+                rep = ci.our_position_report(bn, agg=agg)
                 if rep:
                     self._log("SPECFIRE %s" % rep)
         except Exception:
@@ -1595,12 +1628,21 @@ class SpecFireLive:
         # ЗАМАЙНЕНА (j2 — в 49820480, j1 — в 49805074). Ценой той лжи был сброс склада живой
         # ноги (40 пред-подписанных проб + 28-32с пересборки флота) ровно в каскадные секунды.
         # Индекс различает три исхода, и приговор выносится ТОЛЬКО на "absent".
-        try:
+        ci = None                     # объявлено ДО try: иначе ветка except читала бы имя,
+        try:                          # которого нет (NameError вместо диагноза)
             from chain import chain_index as _ci
             ci = _ci.get_index()
             st, fact = ci.state(h) if ci is not None else ("unknown", None)
         except Exception:
             st, fact = ("unknown", None)
+        # ЧТО СКАЗАЛ ИНДЕКС — отдельным счётчиком на каждый исход. Без него приёмка нечитаема:
+        # noreceipt_false при ИСПРАВНОМ пакете стремится к нулю по построению (коллектор
+        # спрашивает индекс ПЕРВЫМ, и знакомая ему проба с газом до таймаута просто не
+        # доживает), то есть ноль там означает и «всё хорошо», и «индекса нет». Разбиение
+        # ниже отвечает на этот вопрос прямо.
+        _sk = {"mined": "noreceipt_idx_mined", "absent": "noreceipt_idx_absent"}.get(
+            st, "noreceipt_idx_off" if ci is None else "noreceipt_idx_unknown")
+        self.stats[_sk] = self.stats.get(_sk, 0) + 1
         if st == "mined":
             self.stats["noreceipt_false"] = self.stats.get("noreceipt_false", 0) + 1
             # Раз tx СЕЛА, газ по ней потрачен. Прежний путь снимал бронь и записывал ноль —
@@ -1625,7 +1667,8 @@ class SpecFireLive:
                       % (h, (fact or {}).get("block"), (fact or {}).get("index"),
                          (addr or "?")[:10]))
             self._note_probe_position(h, {"blockNumber": (fact or {}).get("block"),
-                                          "transactionIndex": (fact or {}).get("index")})
+                                          "transactionIndex": (fact or {}).get("index")},
+                                      meta=meta)
             return
         if addr:
             # #102: СПЕРВА спрашиваем цепь. Сброс склада стоит 40 пред-подписанных проб и

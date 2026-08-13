@@ -2083,15 +2083,39 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             else:
                                 _s = _ci.snapshot()
                                 log.info("CHAIN-INDEX: блоков=%d (полных %d / лёгких %d) дыр=%d "
-                                         "отказов=%d shed=%d | наших tx=%d транзитов=%d побед=%d "
-                                         "трупов=%d | голова=%s возраст=%.1fс свежесть=%s тред=%s",
+                                         "отказов=%d beyond=%d shed=%d | наших tx=%d транзитов=%d "
+                                         "побед=%d трупов=%d | голова=%s потолок=%s возраст=%.1fс "
+                                         "свежесть=%s тред=%s | ЗАМЕР: %.2f зап/с ~%d CU/сут",
                                          _s["blocks"], _s["full"], _s["light"], _s["gaps"],
-                                         _s["fails"], _s["shed"], _s["ours"], _s["transit"],
-                                         _s["winners"], _s["pairs"], _s["last"], _s["age"],
-                                         _s["fresh"], _ci.alive())
+                                         _s["fails"], _s["beyond_head"], _s["shed"], _s["ours"],
+                                         _s["transit"], _s["winners"], _s["pairs"], _s["last"],
+                                         _s["conf"], _s["age"], _s["fresh"], _ci.alive(),
+                                         _s["rps"], _s["cu_day"])
                                 if not _ci.alive():
                                     log.error("CHAIN-INDEX: ТРЕД МЁРТВ — источник правды об "
                                               "исходах проб потерян, счётчики приёмки лгут")
+                                if _s["blocks"] <= 0:
+                                    log.error("CHAIN-INDEX: блоков=0 при живом треде — цепь НЕ "
+                                              "читается (потолок=%s, отказов=%d, beyond=%d). "
+                                              "Все счётчики позиций и исходов ничего не значат",
+                                              _s["conf"], _s["fails"], _s["beyond_head"])
+                        except Exception:
+                            pass
+                        # #109 ЗА СУТКИ: экономия поштучных квитанций. polls — СЕТЕВЫЕ поллы,
+                        # polls_saved — партии, закрытые индексом целиком, index_hits — исходы,
+                        # взятые из индекса. Это и есть приёмка пакета в деньгах запросов.
+                        try:
+                            from chain.fire_engine import collector_stats as _cst
+                            _c9 = _cst()
+                            if _c9["polls"] or _c9["polls_saved"] or _c9["tracked"]:
+                                _tot = max(1, _c9["polls"] + _c9["polls_saved"])
+                                log.info("#109 квитанции: polls=%d polls_saved=%d (%.0f%% партий "
+                                         "закрыл индекс) index_hits=%d из resolved=%d | "
+                                         "batch_fail=%d index_fail=%d cu=%.0f",
+                                         _c9["polls"], _c9["polls_saved"],
+                                         100.0 * _c9["polls_saved"] / _tot, _c9["index_hits"],
+                                         _c9["resolved"], _c9["batch_fail"], _c9["index_fail"],
+                                         _c9["cu"])
                         except Exception:
                             pass
                         _stg = stage_report()
