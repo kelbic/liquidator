@@ -146,7 +146,9 @@ SPEC_FIRE_RECEIPT_POLL_SEC = float(os.environ.get("SPEC_FIRE_RECEIPT_POLL_SEC", 
 # реактивный дубль и рвёт паттерн кулдауном — как главная. Откат: SPEC_FIRE_VOLLEY=0 (execute).
 SPEC_FIRE_VOLLEY_PHASE_SEC = float(os.environ.get("SPEC_FIRE_VOLLEY_PHASE_MS", "50")) / 1000.0
 # ПАРАЛЛЕЛЬНЫЕ НОГИ (07.08, замер боевого send-пути: 1717 отправок за 7д, journalctl DIAG
-# send-stages). Разложение: sign p50=4мс/p99=36, relay_spawn p50=0 (SEND-3 отдаёт raw в
+# send-stages; снято на NativeECCBackend — coincurve в venv не было, вскрыто 13.08, пакет COIN
+# опускает sign до 0.557мс, остальные стадии сетевые и не меняются).
+# Разложение: sign p50=4мс/p99=36, relay_spawn p50=0 (SEND-3 отдаёт raw в
 # секвенсер daemon-тредами ДО синхронной ноги), alch p50=55мс/p90=69/max=222. Итог: до
 # СЕКВЕНСЕРА (= гонка) нога доезжает за ~5мс, но вызов send_tx ДЕРЖИТ тред 60мс (p50), и
 # последовательный цикл прибавлял их к сдвигу: шаг ног был 50+60=110мс вместо 50 — расписание
