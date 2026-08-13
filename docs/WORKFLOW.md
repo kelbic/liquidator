@@ -183,10 +183,12 @@ git add <files>
 git commit -m "<императив: что и зачем>"
 git push
 # ⚠ ЗАВИСИМОСТИ. Правка requirements.txt на боевую машину САМА НЕ ДОЕЗЖАЕТ: бот запускается
-# из venv, а venv собран когда-то. Класс «живой источник против копии в репо». Если в диффе
-# тронут requirements.txt — ПЕРЕСОБРАТЬ ДО рестарта:
-git diff --name-only HEAD~1 | grep -q '^requirements.txt$' && \
-  /root/liquidator/venv/bin/pip install -r /root/liquidator/requirements.txt
+# из venv, а venv собран когда-то. Класс «живой источник против копии в репо».
+# БЕЗУСЛОВНО перед КАЖДЫМ рестартом (идемпотентно: на удовлетворённых пинах — no-op за секунды).
+# Условный гейт `git diff HEAD~1 | grep requirements` УБРАН вердиктом р-5: он молча пропускал
+# правку, приехавшую не последним коммитом (мерж, несколько коммитов за раз, откат-накат) —
+# то есть сам был док-правкой С ЛОГИКОЙ и умирал ровно в тех случаях, ради которых написан.
+/root/liquidator/venv/bin/pip install -r /root/liquidator/requirements.txt
 # ⚠ coincurve на Шарлотте СОБИРАЕТСЯ ИЗ ИСХОДНИКОВ (Python 3.14, колёс нет). Уже стоящий
 # 20.0.0 команда выше просто засчитает. Но при СОЗДАНИИ venv с нуля обычный pip упадёт —
 # рецепт (проверен на машине): apt install cmake pkg-config build-essential libsecp256k1-dev;
@@ -198,9 +200,14 @@ git diff --name-only HEAD~1 | grep -q '^requirements.txt$' && \
 systemctl restart liquidator-bot && sleep 8 && systemctl is-active liquidator-bot
 journalctl -u liquidator-bot --since "-2 min" --no-pager | grep -cE "ERROR|Traceback"
 # ПРИЁМКА ЗАВИСИМОСТЕЙ ФАКТОМ, А НЕ ВЕРОЙ: бот печатает на старте, чем реально подписывает.
-# «SIGN бэкенд=...CoinCurveECCBackend ... подтверждён=да» = быстрый путь;
-# «...NativeECCBackend ... МЕДЛЕННЫЙ ПУТЬ» (WARNING) = venv не пересобран.
-journalctl -u liquidator-bot --since "-2 min" --no-pager | grep "SIGN бэкенд="
+# Строка САМОВЕРДИКТНА: голый `grep "SIGN бэкенд="` ловит И провал тоже (NativeECCBackend +
+# МЕДЛЕННЫЙ ПУТЬ) и читается глазом как «строка есть — значит порядок». Требовать ИМЕННО быстрый
+# путь, а пустой вывод объявлять провалом вслух:
+journalctl -u liquidator-bot --since "-2 min" --no-pager \
+  | grep -E 'SIGN бэкенд=.*CoinCurveECCBackend.*подтверждён=да' \
+  || echo 'ДЕПЛОЙ НЕ ДОЕХАЛ: venv не пересобран либо подпись идёт чистым Python'
+# В самой строке сверить p50 <= 1.5мс (на Шарлотте native даёт 2.756мс — p50 это независимый
+# физический свидетель бэкенда, помимо его имени).
 systemd-cgtop -b -n1 | grep -E "liquidator-bot|twidgest-bot"
 rm -f <bak-файлы>
 ```
