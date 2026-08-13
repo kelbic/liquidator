@@ -1532,20 +1532,29 @@ class SpecFireLive:
                     gas_usd, SPEC_FIRE_WIN_COOLDOWN_SEC)
 
     def _agg_of_market(self, mid):
-        """Агрегатор ФИДА нашей цели (mid -> BF1 watch-key последнего резолва) либо None.
+        """ВЛАДЕЛЬЦЫ транзита нашей цели: НАБОР watch-ног рынка (не одна BF1) либо None.
 
-        Без него метрика №1 считалась против ЧУЖОГО транзита: `transit_of` без agg берёт
-        «предшествующий победе, иначе первый», а в блоке без Liquidate (это подавляющее
-        большинство блоков) первый транзит — чей угодно. Watch-паттерны (композиты, длина не
-        42) сюда не годятся: с адресом лога они не сравнимы, и лучше честный None.
+        Без владельца метрика №1 считалась против ЧУЖОГО транзита: `transit_of` без agg берёт
+        «предшествующий победе, иначе первый», а в блоке без Liquidate (подавляющее
+        большинство блоков) первый транзит — чей угодно.
+
+        Но и ОДНОЙ BF1-ноги мало, и это не мелочь: цену композита двигает ЛЮБАЯ живая нога
+        рынка (ради этого 07-23 и вводился multi-leg watch), поэтому в up-окне, которое армит
+        ETH/USD-нога рынка cbBTC/WETH, собственный транзит по BF1-ключу опознавался как
+        `foreign` — строка ПОЗИЦИИ не печаталась вовсе, и жирное окно уходило без замера.
+        Ключ владения теперь по НАБОРУ ног (`feeds.legs_map()`), BF1 остаётся запасным
+        источником для до-multi-leg резолвов. Watch-паттерны (композиты, длина != 42)
+        отсеивает `chain_index.agg_set` — с адресом лога они не сравнимы.
         """
         try:
-            from chain.feeds import primary_map
-            a = primary_map().get(mid)
+            from chain.feeds import legs_map, primary_map
+            from chain.chain_index import agg_set
+            legs = agg_set(legs_map().get(mid) or ())
+            if not legs:
+                legs = agg_set(primary_map().get(mid))
         except Exception:
             return None
-        a = str(a or "").lower()
-        return a if (len(a) == 42 and a.startswith("0x")) else None
+        return legs or None
 
     def _note_probe_position(self, h, r, meta=None):
         """#110: позиция нашей пробы в блоке против транзита — метрика №1 плана.
@@ -1563,7 +1572,13 @@ class SpecFireLive:
         и по нему ВИДНО, работает механизм или снят: probe_landed==probe_idx_off означает
         «индекса нет» (прежде landed рос и при снятом механизме, и ноль в in_band читался как
         проигрыш позицией). in_band/tip_match — подмножества probe_judged, то есть считаются
-        ТОЛЬКО против транзита НАШЕГО фида в блоке, прочитанном ЦЕЛИКОМ.
+        ТОЛЬКО против транзита НАШЕГО рынка в блоке, прочитанном ЦЕЛИКОМ.
+
+        ОТДЕЛЬНО probe_judged_blind (+ in_band_blind / tip_match_blind): владелец транзита
+        неизвестен, судили эвристикой «транзит перед первой ликвидацией, иначе первый». Такие
+        замеры в денежные счётчики НЕ идут — иначе приёмка (б) проходится против ЧУЖОГО
+        транзита, а это ровно тот класс, из-за которого метрика №1 три недели была нечитаема.
+        Критерий приёмки (б) требует probe_no_agg==0: судить обязаны ЗНАЯ, чей транзит.
         """
         from chain.chain_index import rcpt_int
         try:
@@ -1583,7 +1598,8 @@ class SpecFireLive:
             _tgt = (meta or (None, None))[1]
             _mid = _tgt[1] if (_tgt and len(_tgt) > 1) else None
             agg = self._agg_of_market(_mid) if _mid else None
-            if agg is None:
+            blind = agg is None
+            if blind:
                 self.stats["probe_no_agg"] = self.stats.get("probe_no_agg", 0) + 1
             st, tr = ci.transit_report(bn, agg=agg)
             if st != "transit" or not tr:
@@ -1593,11 +1609,21 @@ class SpecFireLive:
                 return
             self.stats["probe_judged"] = self.stats.get("probe_judged", 0) + 1
             t_idx, t_tip = tr["index"], tr["tip"]
+            # ВСЛЕПУЮ — ОТДЕЛЬНЫМИ СЧЁТЧИКАМИ. Владельца транзита мы не знаем (рынок не
+            # резолвился / фид не Chainlink), значит `transit_report` выбрал транзит
+            # ЭВРИСТИКОЙ — он с высокой вероятностью ЧУЖОЙ. Класть такие замеры в
+            # in_band/tip_match означало бы «пройти приёмку (б) против чужого транзита»: числа
+            # растут, а измеряют они постороннее событие. Разбиение probe_landed при этом не
+            # ломается — judged остаётся пятым классом, blind это его ПОДМНОЖЕСТВО-МАРКЕР.
+            _band = "probe_in_band_blind" if blind else "probe_in_band"
+            _tipm = "probe_tip_match_blind" if blind else "probe_tip_match"
+            if blind:
+                self.stats["probe_judged_blind"] = self.stats.get("probe_judged_blind", 0) + 1
             if 1 <= idx - t_idx <= _ci.CHAIN_INDEX_PRIZE_WINDOW:
-                self.stats["probe_in_band"] = self.stats.get("probe_in_band", 0) + 1
+                self.stats[_band] = self.stats.get(_band, 0) + 1
             fact = ci.lookup(h)
             if fact is not None and fact.get("tip") == t_tip:
-                self.stats["probe_tip_match"] = self.stats.get("probe_tip_match", 0) + 1
+                self.stats[_tipm] = self.stats.get(_tipm, 0) + 1
             # Строка — одна на БЛОК, а не на пробу: при 200 отправках/с иначе журнал станет
             # вторым источником нагрузки на одном ядре.
             seen = getattr(self, "_pos_logged", None)

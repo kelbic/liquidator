@@ -98,6 +98,19 @@ EXTRA_LEG_GETTERS = ("BASE_FEED_2", "QUOTE_FEED_1", "QUOTE_FEED_2")
 EXTRA_LEG_MAX_AGE_SEC = 3 * 3600.0   # market-ноги (ETH/USD hb 20мин) всегда моложе; стейблы (hb 24ч) — старше
 
 _PRIMARY_AGG: dict = {}   # {market_id: BF1 watch-key} последнего resolve_feeds (см. primary_map)
+_LEGS_AGG: dict = {}      # {market_id: [все watch-ключи рынка]} последнего resolve_feeds
+
+
+def legs_map():
+    """{market_id: [ВСЕ watch-ноги рынка]} последнего resolve_feeds (primary первой).
+
+    Зачем отдельно от primary_map. Владение транзитом — свойство РЫНКА, а не одной его ноги:
+    композит цены двигает ЛЮБАЯ из ног (07-23 multi-leg именно поэтому и вводился), и в
+    up-окне рынка cbBTC/WETH транзит приезжает от ETH/USD-ноги, то есть НЕ от BF1. Судить по
+    одному BF1 значит объявлять собственный транзит ЧУЖИМ ровно в тех окнах, ради которых
+    метрика позиций и снимается.
+    """
+    return {k: list(v) for k, v in _LEGS_AGG.items()}
 
 
 def primary_map():
@@ -194,16 +207,21 @@ def resolve_feeds(rpc, markets, fallback_rpc=None):
     повторяем через запасной эндпоинт; легитимно пустые (не-Chainlink) просто пусты дважды."""
     aggs = defaultdict(list)
     prim = {}
+    legs_by_market = {}
     for m in markets:
         primary, legs = _resolve_legs(rpc, m.market_id, fallback_rpc)
         if not legs and fallback_rpc is not None:
             primary, legs = _resolve_legs(fallback_rpc, m.market_id)
         if primary:
             prim[m.market_id] = primary
+        if legs:
+            legs_by_market[m.market_id] = list(legs)
         for agg in legs:
             aggs[agg].append(m.market_id)
     _PRIMARY_AGG.clear()
     _PRIMARY_AGG.update(prim)
+    _LEGS_AGG.clear()
+    _LEGS_AGG.update(legs_by_market)
     return dict(aggs)
 
 

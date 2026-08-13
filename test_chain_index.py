@@ -121,11 +121,33 @@ assert "транзит idx=1083" in rep_agg and "agg=%s" % _our_agg[:10] in rep_
 assert "полоса вперёд 37" in rep_agg and "вся полоса 85" in rep_agg, \
     ("полоса ВПЕРЁД (приз) и ВСЯ полоса — разные величины и обязаны быть разведены: %s" % rep_agg)
 rep_alien = idx.our_position_report(BN, agg="0x" + "de" * 20)
-assert "НАШЕГО фида" in rep_alien, ("транзит ЧУЖОГО фида не имеет права выдаваться за наш: %s"
-                                    % rep_alien)
+assert "НИ ОДНОЙ ноги нашего рынка" in rep_alien, \
+    ("транзит ЧУЖОГО фида не имеет права выдаваться за наш: %s" % rep_alien)
 assert idx.transit_report(BN, agg="0x" + "de" * 20)[0] == "foreign"
-print("UNIT_OK: строка позиции считается против транзита СВОЕГО фида (agg), чужой транзит даёт "
+print("UNIT_OK: строка позиции считается против транзита СВОЕГО рынка, чужой транзит даёт "
       "исход 'foreign', а не подменяет собой наш")
+
+# БЛОКЕР Р2 №4: владение — по НАБОРУ ног рынка, а не по одной BF1. В эталонном блоке ДВА
+# транзита (406 и 1083) от РАЗНЫХ агрегаторов. Рынок, чей BF1 стоит на 406, а вторая нога —
+# на 1083, обязан узнать СВОЙ транзит по любой из них; прежний ключ по одной ноге объявлял
+# второй транзит чужим и строку позиций не печатал вовсе.
+_agg_a = idx.transits_of(BN)[0]["agg"]        # 406
+_agg_b = idx.transits_of(BN)[1]["agg"]        # 1083 (призовой)
+assert _agg_a != _agg_b, "в эталоне транзиты от РАЗНЫХ агрегаторов: %s / %s" % (_agg_a, _agg_b)
+_st_one, _tr_one = idx.transit_report(BN, agg=_agg_b)
+assert _st_one == "transit" and _tr_one["index"] == 1083
+_st_legs, _tr_legs = idx.transit_report(BN, agg=[_agg_a, _agg_b, "0x" + "de" * 20])
+assert _st_legs == "transit" and _tr_legs["index"] == 406, \
+    ("набор ног обязан признать СВОИМ самый ранний из своих транзитов (за ним и стоит приз): "
+     "%s" % (_tr_legs,))
+_st_none, _ = idx.transit_report(BN, agg=["0x" + "de" * 20, "0x" + "ad" * 20])
+assert _st_none == "foreign", "набор ЧУЖИХ ног обязан остаться foreign"
+_st_pat, _ = idx.transit_report(BN, agg=["composite:cbbtc-weth"])
+assert _st_pat == "transit" and _tr_legs is not None, "watch-паттерн не адрес: сравнивать нечем"
+_rep_legs = idx.our_position_report(BN, agg=[_agg_a, _agg_b])
+assert "транзит idx=406" in _rep_legs, _rep_legs
+print("UNIT_OK: владелец транзита — НАБОР ног рынка (multi-leg): свой транзит опознан по "
+      "не-BF1 ноге, чужой набор остаётся foreign")
 
 # ---------------------------------------------------------------- 2. вердикт победы
 calls2 = []
