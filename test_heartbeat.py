@@ -6,7 +6,8 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 from heartbeat import beat, age_sec
 from analysis.heartbeat_check import REGISTRY, REALERT_SEC, run_check
 

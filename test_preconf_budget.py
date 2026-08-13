@@ -1,7 +1,8 @@
 """Юниты preconf-бюджета (24.07, инцидент «degraded 18x windows»): полл уступает канал
 реактиву, но форы не теряет вне тени. Без сети."""
 import sys
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 import chain.hotpath as hp
 
 # 1) чистый штиль: полл идёт на preconf (фора сохранена — главное требование)

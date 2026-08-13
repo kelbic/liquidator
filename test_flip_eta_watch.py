@@ -5,7 +5,8 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 from analysis.flip_eta import margin_changes, ETA_ALERT_DAYS
 
 

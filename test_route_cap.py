@@ -1,6 +1,7 @@
 """Юниты пер-роутного капа + weETH-роут. Без сети."""
 import sys
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 from chain.execute import (direct_swap, _SWAP_ROUTES, ROUTE_COLLATERALS,
                            _WEETH, _WSTETH, _UNIV3_WETH)
 

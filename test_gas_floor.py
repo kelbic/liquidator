@@ -2,7 +2,8 @@
 preconf-estimate не ответил — иначе приз уходит в out-of-gas. Стоимость по-прежнему
 считается по gas_limit_est (net-гейт мелких призов в каскаде не должен задохнуться)."""
 import sys, types
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 from config import Config
 import chain.hotpath as hp
 

@@ -3,7 +3,8 @@
 import os
 import sys
 import tempfile
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 from store import Store
 
 tmp = tempfile.mkdtemp()
@@ -38,7 +39,7 @@ print("UNIT_OK: synchronous=NORMAL на соединениях Store (fsync то
 
 # 5) порядок в process_candidates: деньги -> потом телеметрия (стрёмная регрессия для гонки)
 import re
-src = open("/home/claude-agent/work/liquidator/.claude/worktrees/latency-race/main.py").read()
+src = open(str(__import__("pathlib").Path(__file__).resolve().parent / "main.py")).read()
 i_exec = src.index("_execute_actionable(rpc, cfg, actionable")
 i_ups = src.index("store.upsert_positions(_pos_rows)")
 i_sim = src.index("for _kw in _sim_rows")

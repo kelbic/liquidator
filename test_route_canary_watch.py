@@ -13,7 +13,8 @@ import json
 import sys
 import urllib.error
 
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 
 from analysis import route_canary as rc
 from analysis import route_canary_watch as w
