@@ -222,7 +222,13 @@ print("UNIT_OK: гард «URL индекса != боевой rpc_url» — фо
 # ручки) отдавал индексу ИМЕННО ЕЁ — «первый свободный от коллектора» — и сажал туда ~91k
 # запросов в сутки под надписью «разведён». Это повтор #33: 29 минут слепоты предиктора за
 # сутки стоили нам оси предвидения.
-_ENV_COMBAT = {"BG_RPC_URL": "https://trigger/k1", "BG_RPC_URL_2": "https://mass/k2"}
+# ПРЕДУСЛОВИЕ ДЕПЛОЯ = КОД (ревью р-4, майор D). Док утверждал «без явной CHAIN_INDEX_RPC_URL
+# индекс НЕ поднимется — намеренно», а код при ЭТОЙ самой .env поднимался сам на BG_RPC_URL_2.
+# Теперь авто-ветка живёт под CHAIN_INDEX_AUTO_URL=1, и это проверяется ОБОИМИ исходами.
+_ENV_TYPICAL = {"BG_RPC_URL": "https://trigger/k1", "BG_RPC_URL_2": "https://mass/k2"}
+_u0, _s0, _n0 = ci.index_url_choice(_ENV_TYPICAL)
+assert _u0 == "" and "ОТКАЗ" in _n0 and "CHAIN_INDEX_AUTO_URL" in _n0, (_u0, _s0, _n0)
+_ENV_COMBAT = dict(_ENV_TYPICAL, CHAIN_INDEX_AUTO_URL="1")
 
 
 def _old_choice(e):
@@ -243,15 +249,18 @@ assert u != "https://trigger/k1", "на триггерный ключ индек
 assert (u, src) == ("https://mass/k2", "BG_RPC_URL_2"), (u, src, note)
 
 # Массовой ноги нет — не «сядем на что осталось», а ОТКАЗ с названной причиной.
-u2, s2, n2 = ci.index_url_choice({"BG_RPC_URL": "https://trigger/k1"})
+u2, s2, n2 = ci.index_url_choice({"BG_RPC_URL": "https://trigger/k1",
+                                  "CHAIN_INDEX_AUTO_URL": "1"})
 assert u2 == "" and "ОТКАЗ" in n2 and "CHAIN_INDEX_RPC_URL" in n2, (u2, n2)
 u2b, _s, n2b = ci.index_url_choice({"BG_RPC_URL": "https://trigger/k1",
-                                    "BG_RPC_URL_2": "https://trigger/k1"})
+                                    "BG_RPC_URL_2": "https://trigger/k1",
+                                    "CHAIN_INDEX_AUTO_URL": "1"})
 assert u2b == "" and "ОТКАЗ" in n2b, (u2b, n2b)
 
 # PREDICT_RPC_URL — тоже триггерная нога (#33 её и вводил).
 u2c, _s, n2c = ci.index_url_choice({"PREDICT_RPC_URL": "https://pred/p",
-                                    "BG_RPC_URL_2": "https://pred/p"})
+                                    "BG_RPC_URL_2": "https://pred/p",
+                                    "CHAIN_INDEX_AUTO_URL": "1"})
 assert u2c == "" and "ОТКАЗ" in n2c, (u2c, n2c)
 
 # Явная ручка сильнее всех — включая осознанный выбор триггерного ключа, но ВСЛУХ.
@@ -277,9 +286,9 @@ logging.getLogger("liquidator").addHandler(_he)
 ci.stop_index()
 _sv_u, _sv_n = ci.CHAIN_INDEX_RPC_URL, ci.CHAIN_INDEX_URL_NOTE
 try:
-    ci.CHAIN_INDEX_RPC_URL, ci.CHAIN_INDEX_URL_NOTE = ci.index_url_choice(
-        {"BG_RPC_URL": "https://trigger/k1"})[0], ci.index_url_choice(
-        {"BG_RPC_URL": "https://trigger/k1"})[2]
+    _e_no_mass = {"BG_RPC_URL": "https://trigger/k1", "CHAIN_INDEX_AUTO_URL": "1"}
+    ci.CHAIN_INDEX_RPC_URL, ci.CHAIN_INDEX_URL_NOTE = (ci.index_url_choice(_e_no_mass)[0],
+                                                       ci.index_url_choice(_e_no_mass)[2])
     assert ci.start_index(cfg=_Cfg()) is None
 finally:
     ci.CHAIN_INDEX_RPC_URL, ci.CHAIN_INDEX_URL_NOTE = _sv_u, _sv_n
