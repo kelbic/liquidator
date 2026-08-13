@@ -233,8 +233,13 @@ _snap = ci.ChainIndex("https://n/K", watch_to=[], http=lambda *a: {}, now=lambda
 _src = pathlib.Path("chain/hotpath.py").read_text()
 _blk = _src[_src.index("CHAIN-INDEX: блоков=%d"):]
 _blk = _blk[:_blk.index("except Exception")]
-for _k in set(_re.findall(r'_s\["(\w+)"\]', _blk)):
+# ОГРАНИЧЕНИЕ НАЗЫВАЮ ПРЯМО: это проверка ПО ИСХОДНИКУ, а не исполнение боевой строки —
+# она ловит только те обращения к snapshot(), которые видит регексп. Поэтому регексп покрывает
+# ОБЕ формы (_s["k"] и _s.get("k")): вторая безопасна в бою (даёт дефолт вместо KeyError), но
+# именно поэтому опечатка в ней МОЛЧА напечатала бы «?» вместо числа приёмки.
+for _k in set(_re.findall(r'_s(?:\["|\.get\(")(\w+)', _blk)):
     assert _k in _snap, ("hot-stats читает ключ snapshot(), которого нет: %s" % _k)
+assert "rcpt_probe" in _blk, "строка приёмки обязана называть способность узла к квитанциям"
 _c9 = _fe.collector_stats()
 _src9 = _src[_src.index("#109 квитанции:"):]
 _src9 = _src9[:_src9.index("except Exception")]

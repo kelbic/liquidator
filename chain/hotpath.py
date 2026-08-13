@@ -2082,15 +2082,20 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                          "квитанции; позиции и tip транзита не измеряются)")
                             else:
                                 _s = _ci.snapshot()
+                                # квитанции=... — СПОСОБНОСТЬ УЗЛА, названная вслух. Без неё
+                                # index_hits=0 в строке #109 ниже нечитаем: «узел не умеет
+                                # eth_getBlockReceipts», «мы не спрашивали» и «наших tx в
+                                # блоках не было» дают ОДИН И ТОТ ЖЕ ноль.
                                 log.info("CHAIN-INDEX: блоков=%d (полных %d / лёгких %d) дыр=%d "
                                          "отказов=%d beyond=%d shed=%d | наших tx=%d транзитов=%d "
                                          "побед=%d трупов=%d | голова=%s потолок=%s возраст=%.1fс "
-                                         "свежесть=%s тред=%s | ЗАМЕР: %.2f зап/с ~%d CU/сут",
+                                         "свежесть=%s тред=%s квитанции=%s | ЗАМЕР: %.2f зап/с "
+                                         "~%d CU/сут",
                                          _s["blocks"], _s["full"], _s["light"], _s["gaps"],
                                          _s["fails"], _s["beyond_head"], _s["shed"], _s["ours"],
                                          _s["transit"], _s["winners"], _s["pairs"], _s["last"],
                                          _s["conf"], _s["age"], _s["fresh"], _ci.alive(),
-                                         _s["rps"], _s["cu_day"])
+                                         _s.get("rcpt_probe", "?"), _s["rps"], _s["cu_day"])
                                 if not _ci.alive():
                                     log.error("CHAIN-INDEX: ТРЕД МЁРТВ — источник правды об "
                                               "исходах проб потерян, счётчики приёмки лгут")
