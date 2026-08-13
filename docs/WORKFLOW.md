@@ -182,8 +182,25 @@ sqlite3 liquidator.db "ALTER TABLE ...;"
 git add <files>
 git commit -m "<императив: что и зачем>"
 git push
+# ⚠ ЗАВИСИМОСТИ. Правка requirements.txt на боевую машину САМА НЕ ДОЕЗЖАЕТ: бот запускается
+# из venv, а venv собран когда-то. Класс «живой источник против копии в репо». Если в диффе
+# тронут requirements.txt — ПЕРЕСОБРАТЬ ДО рестарта:
+git diff --name-only HEAD~1 | grep -q '^requirements.txt$' && \
+  /root/liquidator/venv/bin/pip install -r /root/liquidator/requirements.txt
+# ⚠ coincurve на Шарлотте СОБИРАЕТСЯ ИЗ ИСХОДНИКОВ (Python 3.14, колёс нет). Уже стоящий
+# 20.0.0 команда выше просто засчитает. Но при СОЗДАНИИ venv с нуля обычный pip упадёт —
+# рецепт (проверен на машине): apt install cmake pkg-config build-essential libsecp256k1-dev;
+# pip install "scikit-build-core<0.10"; COINCURVE_IGNORE_SYSTEM_LIB=0 pip install \
+#   --no-build-isolation "coincurve==20.0.0"
+# ⚠ ЮНИТ. liquidator-bot.service в репо — ФАЙЛ, а не то, что применено. Если тронут он:
+#   cp liquidator-bot.service /etc/systemd/system/ && systemctl daemon-reload
+# и СРАЗУ сверить применённое с ожидаемым (см. «Ресурс-чек» — эти значения уже расходились).
 systemctl restart liquidator-bot && sleep 8 && systemctl is-active liquidator-bot
 journalctl -u liquidator-bot --since "-2 min" --no-pager | grep -cE "ERROR|Traceback"
+# ПРИЁМКА ЗАВИСИМОСТЕЙ ФАКТОМ, А НЕ ВЕРОЙ: бот печатает на старте, чем реально подписывает.
+# «SIGN бэкенд=...CoinCurveECCBackend ... подтверждён=да» = быстрый путь;
+# «...NativeECCBackend ... МЕДЛЕННЫЙ ПУТЬ» (WARNING) = venv не пересобран.
+journalctl -u liquidator-bot --since "-2 min" --no-pager | grep "SIGN бэкенд="
 systemd-cgtop -b -n1 | grep -E "liquidator-bot|twidgest-bot"
 rm -f <bak-файлы>
 ```

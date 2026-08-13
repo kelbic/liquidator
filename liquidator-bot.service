@@ -1,6 +1,15 @@
 # /etc/systemd/system/liquidator-bot.service
 # cgroup-лимиты не дают всплеску/утечке задеть twidgest. От root в /root.
 # ВАЖНО: НЕТ inline-комментариев после директив — только на своих строках.
+#
+# ⚠ ЭТОТ ФАЙЛ — КОПИЯ, А НЕ ИСТИНА. Он копируется на боевую машину (cp + daemon-reload),
+# поэтому РАСХОЖДЕНИЕ С ЖИВЫМ = МИНА: копирование молча ОТКАТИТ живые лимиты.
+# 13.08 такое расхождение и было найдено (аудит ядер): в файле лежали реликтовые
+# MemoryHigh=384M/MemoryMax=512M (те самые, что душили бота в июле) и CPUQuota=150%,
+# тогда как живьём стояли 1536M/2048M и 350% (квота поднята live set-property'ом, без
+# рестарта). Файл приведён к ЖИВЫМ значениям — ниже они и есть.
+# ПРАВИЛО: после cp+daemon-reload СВЕРЯТЬ применённое, а не верить cp:
+#   systemctl show liquidator-bot -p CPUQuotaPerSecUSec,CPUWeight,MemoryHigh,MemoryMax,TasksMax
 [Unit]
 Description=Base liquidation monitor/bot (Morpho Blue)
 After=network-online.target
@@ -15,10 +24,21 @@ EnvironmentFile=/root/liquidator/.env
 ExecStart=/root/liquidator/venv/bin/python -u main.py
 Restart=on-failure
 RestartSec=10
+# ВЕС CPU = 30 — это ЖИВОЕ значение, и файл держит его НАРОЧНО: инвариант «файл == живое»
+# дороже улучшения, иначе cp во время инцидента молча поменяет планировщик.
+# ОТКРЫТЫЙ ВОПРОС ВЛАДЕЛЬЦУ (не менять молча): 30 = «отдавать время соседям при конкуренции»,
+# реликт одноядерной Шарлотты, где twidgest мог задохнуться. Машина теперь 4 ядра, load ~0.46
+# (≈3 свободных), а мы гоночный процесс. Предложение: 30 -> 100 (дефолтный вес наравне).
+# Применять ОДНОВРЕМЕННО в файле и живьём:
+#   systemctl set-property liquidator-bot CPUWeight=100   (+ правка этой строки)
 CPUWeight=30
-CPUQuota=150%
-MemoryHigh=384M
-MemoryMax=512M
+# КВОТА CPU. 150% = кап 1.5 ядра из 4 — реликт; против него насчитано 442 троттла
+# (~51мс каждый) в пиковые моменты. Живьём поднята до 350% (оставляем ядро системе
+# и соседям). Откат: CPUQuota=150%.
+CPUQuota=350%
+# ПАМЯТЬ. 384M/512M душили бота в июле; живьём 1536M/2048M из 8GB. Откат: 384M/512M.
+MemoryHigh=1536M
+MemoryMax=2048M
 IOWeight=30
 TasksMax=256
 NoNewPrivileges=true
