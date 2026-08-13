@@ -332,6 +332,12 @@ SPEC_FIRE_COLLECTOR_FALLBACK_LOG_SEC = float(
 # 0 = не резать (так ходим в боевой Alchemy: он держит большие батчи и тарифицирует поштучно).
 SPEC_FIRE_COLLECTOR_BATCH_CHUNK = int(
     os.environ.get("SPEC_FIRE_COLLECTOR_BATCH_CHUNK", "3"))
+# #110 ИНДЕКС ЦЕПИ ПЕРЕД КВИТАНЦИЯМИ. =0 снимает МЕХАНИЗМ: коллектор не спрашивает индекс
+# вовсе, исход пробы снова добывается только поштучными квитанциями, а «NO-RECEIPT» снова
+# читается как приговор (то есть возвращается ровно та ложь, ради которой пакет и делался).
+# Параметров тут нет намеренно — либо второй источник правды есть, либо его нет.
+SPEC_FIRE_COLLECTOR_INDEX = os.environ.get(
+    "SPEC_FIRE_COLLECTOR_INDEX", "1").lower() not in ("0", "false", "no", "off")
 
 
 def collect_receipts(hs, dedicated_url, combat_url, batch_fn, on_fallback=None,
@@ -1363,6 +1369,26 @@ class SpecFireLive:
                                            on_fallback=self._note_collector_fallback,
                                            dedicated_chunk=SPEC_FIRE_COLLECTOR_BATCH_CHUNK)
 
+    def _index_fn(self):
+        """Шов ИНДЕКСА ЦЕПИ для коллектора (#110) либо None.
+
+        None — это и есть ручка отката: механизм снимается целиком (индекса не спрашивают
+        вовсе), а не подкручивается параметром. Индекс не поднялся / выключен — то же самое.
+        """
+        if not SPEC_FIRE_COLLECTOR_INDEX:
+            return None
+        from chain import chain_index as _ci
+
+        def _ask(hs):
+            idx = _ci.get_index()
+            if idx is None:
+                return {}
+            got = idx.receipts_for(hs)
+            if got:
+                self.stats["index_receipts"] = self.stats.get("index_receipts", 0) + len(got)
+            return got
+        return _ask
+
     # ---- движок огня (#32, 07.08): постоянный пул вместо порождения залпа на тик ----
     def _engine(self):
         """Ленивый подъём движка. Выключен -> None, и путь залпа идёт как прежде бит-в-бит."""
@@ -1393,6 +1419,14 @@ class SpecFireLive:
                     # ПО ПОСТРОЕНИЮ. Считаем там же, где приёмка их ищет.
                     self.stats["board_probes"] = self.stats.get("board_probes", 0) + 1
                     self.stats["engine_probes"] = self.stats.get("engine_probes", 0) + 1
+                    # #110: заявляем хэш индексу СРАЗУ при отправке. С этого момента индекс
+                    # читает блоки ЦЕЛИКОМ (иначе позицию нашей пробы взять неоткуда) и
+                    # запоминает голову цепи — от неё считается право сказать «tx не села».
+                    try:
+                        from chain import chain_index as _ci
+                        _ci.note_hash(h)
+                    except Exception:
+                        pass
                 return h
 
             def _refill(addr, base_fee=None):
@@ -1442,6 +1476,7 @@ class SpecFireLive:
                       % _collector_node_kind())
             col = _fe.ReceiptCollector(
                 receipts_fn=self._receipts_fn(_combat_url),
+                index_fn=self._index_fn(),
                 on_result=self._engine_result, on_timeout=self._engine_timeout,
                 log=self._log)
             eng = _fe.FireEngine(legs_fn=_legs, send_fn=_send, collector=col,
@@ -1469,6 +1504,7 @@ class SpecFireLive:
         from chain.execute import volley_gas_settle
         volley_gas_settle(h, gas_usd)
         volley_bal_charge(addr, _wei)     # #45: патрон списывается по ФАКТУ, не по эстимейту
+        self._note_probe_position(h, r)   # #110: метрика №1 — ГДЕ мы встали относительно транзита
         if _receipt_has_win(r, self.cfg.liquidator_address) is not True:
             self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
             return
@@ -1490,6 +1526,61 @@ class SpecFireLive:
                     (addr or "?")[:10], str(mid)[:10], str(b)[:10], (dbt or 0) / 1e3, h,
                     gas_usd, SPEC_FIRE_WIN_COOLDOWN_SEC)
 
+    def _note_probe_position(self, h, r):
+        """#110: позиция нашей пробы в блоке против транзита — метрика №1 плана.
+
+        Раньше её взять было НЕОТКУДА: квитанция несёт `transactionIndex`, но не несёт ни tip
+        транзита, ни ширины полосы ничьей, а полный блок в бою никто не читал. Разбор 13.08
+        (позиции 48/49/51 и 4745 при победителе на 2267) делался офлайн, руками, через сутки
+        после гонки — то есть в бою мы были слепы к единственной величине, которая решает.
+
+        Счётчики раздельные и по РАЗНЫМ единицам: landed — сколько проб вообще сели;
+        in_band — сколько попало в призовое окно [T+1, T+N]; tip_match — сколько встало на tip
+        транзита (условие ничьей). Ноль в in_band при ненулевом landed — это ФАКТ проигрыша
+        позицией, а не отсутствие данных.
+        """
+        def _num(v):
+            if isinstance(v, int):
+                return v
+            s = str(v)
+            return int(s, 16) if s.startswith("0x") else int(s)
+        try:
+            bn = _num(r.get("blockNumber"))
+            idx = _num(r.get("transactionIndex"))
+        except Exception:
+            return                        # квитанция без позиции — считать нечего, молча выходим
+        self.stats["probe_landed"] = self.stats.get("probe_landed", 0) + 1
+        try:
+            from chain import chain_index as _ci
+            ci = _ci.get_index()
+            if ci is None:
+                return
+            tr = ci.transit_of(bn)
+            if tr is None:
+                self.stats["probe_no_transit"] = self.stats.get("probe_no_transit", 0) + 1
+                return
+            t_idx, t_tip, tie = tr
+            if 1 <= idx - t_idx <= _ci.CHAIN_INDEX_PRIZE_WINDOW:
+                self.stats["probe_in_band"] = self.stats.get("probe_in_band", 0) + 1
+            fact = ci.lookup(h)
+            if fact is not None and fact.get("tip") == t_tip:
+                self.stats["probe_tip_match"] = self.stats.get("probe_tip_match", 0) + 1
+            # Строка — одна на БЛОК, а не на пробу: при 200 отправках/с иначе журнал станет
+            # вторым источником нагрузки на одном ядре.
+            seen = getattr(self, "_pos_logged", None)
+            if seen is None:
+                seen = self._pos_logged = {}
+            if bn not in seen:
+                seen[bn] = True
+                if len(seen) > 64:
+                    for k in sorted(seen)[:32]:
+                        seen.pop(k, None)
+                rep = ci.our_position_report(bn)
+                if rep:
+                    self._log("SPECFIRE %s" % rep)
+        except Exception:
+            pass
+
     def _engine_timeout(self, meta, h):
         """Квитанции нет за таймаут: nonce ноги под вопросом — склад этой ноги сбрасываем,
         иначе вся её лестница висит за возможной дырой."""
@@ -1499,6 +1590,43 @@ class SpecFireLive:
         # навсегда и гейт огня самозапирается. Факт при этом НЕ пишем: расход неизвестен.
         volley_gas_settle(h, 0.0)
         addr = (meta or (None, None))[0]
+        # #110: ПЕРВЫМ спрашиваем индекс — он видел сами блоки. Это прямая заплата на ложь
+        # 12-13.08: КАЖДАЯ проверенная проба с меткой «NO-RECEIPT (nonce инвалидирован)» была
+        # ЗАМАЙНЕНА (j2 — в 49820480, j1 — в 49805074). Ценой той лжи был сброс склада живой
+        # ноги (40 пред-подписанных проб + 28-32с пересборки флота) ровно в каскадные секунды.
+        # Индекс различает три исхода, и приговор выносится ТОЛЬКО на "absent".
+        try:
+            from chain import chain_index as _ci
+            ci = _ci.get_index()
+            st, fact = ci.state(h) if ci is not None else ("unknown", None)
+        except Exception:
+            st, fact = ("unknown", None)
+        if st == "mined":
+            self.stats["noreceipt_false"] = self.stats.get("noreceipt_false", 0) + 1
+            # Раз tx СЕЛА, газ по ней потрачен. Прежний путь снимал бронь и записывал ноль —
+            # дневной счётчик недосчитывал ровно те пробы, о которых узел молчал. Если индекс
+            # принёс gasUsed (узел умеет getBlockReceipts) — книжим ФАКТ, не оценку; не принёс
+            # — оставляем ноль и не выдумываем.
+            _g = (fact or {}).get("gas_used")
+            _p = (fact or {}).get("eff_gas_price")
+            if _g and _p:
+                try:
+                    from chain.execute import volley_gas_add, volley_bal_charge
+                    _wei = int(_g) * int(_p)
+                    volley_gas_add(_wei * float(self.cfg.eth_price_usd) / 1e18)
+                    if addr:
+                        volley_bal_charge(addr, _wei)
+                    self.stats["noreceipt_gas_booked"] = self.stats.get(
+                        "noreceipt_gas_booked", 0) + 1
+                except Exception:
+                    pass
+            self._log("SPECFIRE движок NO-RECEIPT tx=%s — ИНДЕКС ОПРОВЕРГ: tx в блоке %s поз %s "
+                      "(квитанция не пришла, но проба СЕЛА). Склад ноги %s СОХРАНЁН"
+                      % (h, (fact or {}).get("block"), (fact or {}).get("index"),
+                         (addr or "?")[:10]))
+            self._note_probe_position(h, {"blockNumber": (fact or {}).get("block"),
+                                          "transactionIndex": (fact or {}).get("index")})
+            return
         if addr:
             # #102: СПЕРВА спрашиваем цепь. Сброс склада стоит 40 пред-подписанных проб и
             # 28-32с пересборки всего флота, поэтому «не знаю» не имеет права его запускать.
@@ -1508,6 +1636,12 @@ class SpecFireLive:
                           "tx села, склад СОХРАНЁН" % (addr[:10], h))
                 return
             self.stats["noreceipt_dropped"] = self.stats.get("noreceipt_dropped", 0) + 1
+            if st == "absent":
+                # Индекс сплошь прочитал все блоки с момента отправки — сброс склада обоснован
+                # ФАКТОМ, а не молчанием узла квитанций. Разделяем счётчики: доля
+                # dropped_confirmed в dropped и есть честный знаменатель «мы правда теряем ноги».
+                self.stats["noreceipt_dropped_confirmed"] = self.stats.get(
+                    "noreceipt_dropped_confirmed", 0) + 1
             volley_invalidate_nonce(addr)
             invalidate_ladder(addr)
             self._log("SPECFIRE движок NO-RECEIPT eoa=%s tx=%s — nonce на цепи ОТСТАЁТ, "
@@ -1938,12 +2072,21 @@ class SpecFireLive:
             _eng = getattr(self, "_fire_engine", None)
             _es = dict(getattr(_eng, "stats", {}) or {}) if _eng is not None else {}
             _cs = dict(getattr(getattr(_eng, "_collector", None), "stats", {}) or {}) if _eng else {}
+            # #110: индекс — В ЗАКРЫВАЮЩЕЙ СТРОКЕ ОКНА. Приёмка окна читается вместе с
+            # состоянием источника правды: протухший индекс делает «probes=N, wins=0»
+            # непроверяемым утверждением, и это обязано быть видно в той же строке.
+            try:
+                from chain import chain_index as _ci
+                _ix = _ci.get_index()
+                _is = _ix.snapshot() if _ix is not None else "НЕ ПОДНЯТ"
+            except Exception:
+                _is = "?"
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
-                      "engine=%s collector=%s stats=%s" % (
+                      "engine=%s collector=%s index=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _fs, _us, _mm, _es or "—", _cs or "—", self.stats))
+                          _fs, _us, _mm, _es or "—", _cs or "—", _is, self.stats))
 
     def handle_event(self, ev: dict):
         try:

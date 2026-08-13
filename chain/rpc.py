@@ -173,6 +173,11 @@ CU_COST = {"eth_call": 26, "eth_getBalance": 19, "eth_blockNumber": 10, "eth_cha
            "eth_getBlockByNumber": 16, "eth_getBlockByHash": 21, "eth_getTransactionReceipt": 15,
            "eth_getTransactionByHash": 17, "eth_getTransactionCount": 26, "eth_estimateGas": 87,
            "eth_getLogs": 75, "eth_sendRawTransaction": 250, "eth_feeHistory": 10,
+           # #110: точной цены eth_getBlockReceipts в прайсе нет. Ставим ОЦЕНКУ СВЕРХУ, а не
+           # дефолтную двадцатку: недосчёт прячет дыру, а ради этого счётчик и заводится
+           # (12.08: расход коллектора не считался вовсе, и по нулю был вынесен вердикт
+           # «трафик не наш»). Один вызов на блок вместо N поштучных всё равно дешевле.
+           "eth_getBlockReceipts": 250,
            "eth_maxPriorityFeePerGas": 10, "eth_getCode": 19, "eth_getStorageAt": 17,
            "eth_gasPrice": 19, "eth_syncing": 10, "net_version": 0, "web3_clientVersion": 0}
 _USAGE: dict = {}

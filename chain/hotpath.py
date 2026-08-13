@@ -24,6 +24,10 @@ import time
 # тестом test_unresolved_names.py, #35 — ровно тот случай, ради которого он писался).
 # Цикла нет: chain/rpc.py ничего из chain/hotpath.py не импортирует.
 from chain.rpc import redact_clip
+# #110: модульный импорт по той же причине — вызовов два (подача блока и печать счётчиков),
+# и локальный импорт в одном оставил бы второй с NameError. Цикла нет: chain/chain_index.py
+# из chain/hotpath.py ничего не берёт.
+from chain import chain_index as _chain_index
 
 log = logging.getLogger(__name__)
 
@@ -2066,6 +2070,30 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                         " ".join("%s×%d" % (m, n) for m, n in _top[:3]))
                         except Exception:
                             pass
+                        # #110: индекс цепи — ЕДИНИЦЫ РАЗНЫЕ и разделены намеренно. blocks —
+                        # покрытые блоки; full/light — из них прочитанные целиком и по логам;
+                        # gaps — потерянные окна (каждое отнимает право сказать «tx не села»);
+                        # fails — отказы узла; age/fresh — протухание. Индекса нет — строка
+                        # тоже есть: молчание не должно быть неотличимо от «всё хорошо».
+                        try:
+                            _ci = _chain_index.get_index()
+                            if _ci is None:
+                                log.info("CHAIN-INDEX: НЕ ПОДНЯТ (исходы проб — только поштучные "
+                                         "квитанции; позиции и tip транзита не измеряются)")
+                            else:
+                                _s = _ci.snapshot()
+                                log.info("CHAIN-INDEX: блоков=%d (полных %d / лёгких %d) дыр=%d "
+                                         "отказов=%d shed=%d | наших tx=%d транзитов=%d побед=%d "
+                                         "трупов=%d | голова=%s возраст=%.1fс свежесть=%s тред=%s",
+                                         _s["blocks"], _s["full"], _s["light"], _s["gaps"],
+                                         _s["fails"], _s["shed"], _s["ours"], _s["transit"],
+                                         _s["winners"], _s["pairs"], _s["last"], _s["age"],
+                                         _s["fresh"], _ci.alive())
+                                if not _ci.alive():
+                                    log.error("CHAIN-INDEX: ТРЕД МЁРТВ — источник правды об "
+                                              "исходах проб потерян, счётчики приёмки лгут")
+                        except Exception:
+                            pass
                         _stg = stage_report()
                         if _stg:
                             log.info("STAGE p50/p95 мс (окно %.0fч): %s", STAGE_WINDOW_SEC / 3600.0, _stg)
@@ -2118,6 +2146,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         continue
                     if bn != last_poll_block:                 # one preconf-price poll per block (money markets)
                         last_poll_block = bn
+                        # #110: подача блока индексу. Тут же, где уже стоит per-block драйвер,
+                        # и ровно тем же способом — БЕЗ работы в recv-петле: индекс только
+                        # запоминает номер и будит свой единственный тред.
+                        _chain_index.offer_block(bn)
                         feed_handled.clear()                  # Layer1: dedup set is per-block -> clear on block change
                         _bf = basefee_of(d)                   # 5a: index-0 кадр несёт base-хедер
                         if _bf is not None:

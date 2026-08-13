@@ -111,12 +111,21 @@ class ReceiptCollector:
     задокументированные инциденты. Партия из одного запроса стоит столько же, сколько один
     полл, а покрывает сотни проб.
 
-    Швы: receipts_fn(hashes) -> {hash: receipt|None}; on_result(meta, receipt); on_timeout(meta).
+    Швы: receipts_fn(hashes) -> {hash: receipt|None}; on_result(meta, receipt); on_timeout(meta);
+    index_fn(hashes) -> {hash: receipt} — ИНДЕКС ЦЕПИ (#110), спрашивается ПЕРВЫМ.
+
+    Почему индекс первым (#109). Поштучная квитанция — самый дорогой способ узнать то, что уже
+    лежит в блоке: 63k подзапросов за 2 часа, 889 отказов за сутки и — главное — ЛОЖЬ под 429
+    («NO-RECEIPT» у замайненных проб). Индекс читает блок ОДИН раз на всех, поэтому у него
+    исход бесплатен, а у сети спрашивается только остаток. index_fn=None (ручка отката) делает
+    путь бит-в-бит прежним.
     """
 
     def __init__(self, receipts_fn, on_result, on_timeout=None, log=None,
-                 poll_sec=None, timeout_sec=None, batch=None, now=None, sleep=None, min_age_sec=None):
+                 poll_sec=None, timeout_sec=None, batch=None, now=None, sleep=None,
+                 min_age_sec=None, index_fn=None):
         self._receipts_fn = receipts_fn
+        self._index_fn = index_fn
         self._on_result = on_result
         self._on_timeout = on_timeout
         self._log = log
@@ -167,10 +176,32 @@ class ReceiptCollector:
                       if _now - (e[2] if len(e) > 2 else 0.0) >= self._min_age][:self._batch]
             if not hashes:
                 return 0
-        self.stats["cu"] = self.stats.get("cu", 0.0) + len(hashes) * CU_PER_RECEIPT
         got = {}
+        ask = hashes
+        if self._index_fn is not None:
+            # #110: сперва ИНДЕКС. Он читает блок раз на всех, поэтому исход отсюда стоит ноль
+            # запросов и ноль CU. Ключей в ответе меньше запрошенного — это «остальных не
+            # знаю», и остаток честно уходит в сеть: индекс не имеет права никого хоронить.
+            try:
+                _idx = self._index_fn(hashes) or {}
+            except Exception as e:                    # индекс лёг -> работаем как до него
+                _idx = {}
+                self.stats["index_fail"] = self.stats.get("index_fail", 0) + 1
+                if self._log:
+                    self._log("FIRE collect index fail: %s %s (спрашиваем сеть как прежде)"
+                              % (type(e).__name__, str(e)[:120]))
+            if _idx:
+                got.update({h: r for h, r in _idx.items() if r is not None})
+                self.stats["index_hits"] = self.stats.get("index_hits", 0) + len(got)
+                ask = [h for h in hashes if h not in got]
+        if not ask:
+            # Партия закрыта индексом целиком: сети не касаемся вовсе. Ровно это и есть #109 —
+            # 63k подзапросов за два часа превращаются в один общий разбор блока.
+            self.stats["polls_saved"] = self.stats.get("polls_saved", 0) + 1
+        self.stats["cu"] = self.stats.get("cu", 0.0) + len(ask) * CU_PER_RECEIPT
         try:
-            got = self._receipts_fn(hashes) or {}
+            if ask:
+                got.update(self._receipts_fn(ask) or {})
         except Exception as e:
             # РАННИЙ ВЫХОД ЗДЕСЬ БЫЛ РЕГРЕССИЕЙ (#101, поймано ревью 12.08). Снятие брони #93
             # живёт в цикле НИЖЕ (_on_timeout -> volley_gas_settle), поэтому `return 0` на
@@ -189,7 +220,9 @@ class ReceiptCollector:
                 self._log("FIRE collect batch fail: %s %s (таймауты обрабатываются)"
                           % (type(e).__name__, str(e)[:140]))
         else:
-            self.stats["polls"] += 1
+            if ask:
+                self.stats["polls"] += 1   # СЕТЕВОЙ полл, а не проход тика: партию, закрытую
+                #                            индексом, считать поллом = завысить свой же расход
         done = 0
         now = self._now()
         for h in hashes:
