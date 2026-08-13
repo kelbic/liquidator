@@ -382,7 +382,10 @@ assert ix_tr._rcpt_probe == "не выяснено" and ix_tr._receipts_ok is Tr
 assert seen_tr.count("eth_getBlockReceipts") == 1, "и не имеет права долбить узел каждый оборот"
 _T[0] += ci.CHAIN_INDEX_RCPT_PROBE_RETRY_SEC + 1        # ВО ВРЕМЕНИ: окно переспроса прошло
 ix_tr._catch_up(49890267)
-assert ix_tr._rcpt_probe == "не выяснено"
+assert seen_tr.count("eth_getBlockReceipts") == 2, \
+    ("после окна переспроса проба обязана ПОВТОРИТЬСЯ — иначе «не выяснено» становится вечным "
+     "и неотличимым от «не умеет»: %s" % seen_tr.count("eth_getBlockReceipts"))
+assert ix_tr._rcpt_probe == "не выяснено" and ix_tr._receipts_ok is True
 print("UNIT_OK: способность узла к eth_getBlockReceipts выясняется ОДНИМ запросом и называется "
       "вслух; -32601 гасит её навсегда, транспортный отказ — только откладывает (index_hits=0 "
       "стал читаемым)")

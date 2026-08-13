@@ -114,10 +114,15 @@ def index_url_choice(env=None):
         if mass != col:
             return (mass, "BG_RPC_URL_2", "массовая нога bg-страйпа, разведён с коллектором")
         return (mass, "BG_RPC_URL_2", "массовая нога bg-страйпа, ДЕЛИТ КЛЮЧ С КОЛЛЕКТОРОМ")
+    _hint = ("Задайте CHAIN_INDEX_RPC_URL — годится и бесплатный публичный узел "
+             "(base-rpc.publicnode.com умеет eth_getBlockReceipts, проверено запросом 13.08)")
+    if not trig and not mass:
+        # Диагноз обязан различать «нечего брать» и «брать нельзя»: одинаковый текст на разные
+        # причины — это тот же класс, что одинаковый ноль на слепоту и на пустоту.
+        return ("", "", "своего узла нет вовсе (CHAIN_INDEX_RPC_URL / BG_RPC_URL_2 / "
+                        "BG_RPC_URL пусты). " + _hint)
     return ("", "", "ОТКАЗ: свободен только ТРИГГЕРНЫЙ ключ (BG_RPC_URL/PREDICT_RPC_URL), а "
-                    "садиться на него молча запрещено (#33). Задайте CHAIN_INDEX_RPC_URL — "
-                    "годится и бесплатный публичный узел (base-rpc.publicnode.com умеет "
-                    "eth_getBlockReceipts, проверено запросом 13.08)")
+                    "садиться на него молча запрещено (#33). " + _hint)
 
 
 CHAIN_INDEX_RPC_URL, CHAIN_INDEX_URL_SRC, CHAIN_INDEX_URL_NOTE = index_url_choice()
@@ -1307,19 +1312,30 @@ class ChainIndex:
             return
         self._selfchecked = True
         s = self.snapshot()
-        why = []
+        dead = []
         if s["blocks"] <= 0:
-            why.append("НИ ОДНОГО блока не прочитано")
+            dead.append("НИ ОДНОГО блока не прочитано")
         if not s["fresh"]:
-            why.append("индекс протух (%.1fс)" % s["age"])
+            dead.append("индекс протух (%.1fс)" % s["age"])
         if s["gaps"] > 0:
-            why.append("дыр=%d" % s["gaps"])
+            dead.append("дыр=%d" % s["gaps"])
+        # ПОЛНЫХ ЧТЕНИЙ НОЛЬ — это НЕ смерть, но и НЕ приёмка. Критерий приёмки «а» требует
+        # M>0 намеренно: без полного чтения хоть одного блока не проверены ни разбор
+        # транзакций, ни позиции, ни квитанции блока — а «блоков=30» при «полных=0» означает
+        # ровно «мы читали только логи». Отдельный вердикт вместо тихого «ЖИВ».
+        if not dead and s["full"] <= 0:
+            verdict = ("ЧАСТИЧНО — цепь читаю, но ПОЛНЫХ чтений в окне не было (ни интересного "
+                       "лога, ни наших проб): разбор блока и квитанции этим окном НЕ проверены")
+        elif dead:
+            verdict = "МЁРТВ — " + "; ".join(dead)
+        else:
+            verdict = "ЖИВ"
         msg = ("CHAIN-INDEX ПРИЁМКА(%.0fс): блоков=%d полных=%d лёгких=%d дыр=%d отказов=%d "
-               "beyond=%d свежесть=%s голова=%s потолок=%d узел=%s (%s) — ВЕРДИКТ: %s"
+               "beyond=%d свежесть=%s голова=%s потолок=%d квитанции=%s узел=%s (%s) — ВЕРДИКТ: %s"
                % (CHAIN_INDEX_SELFCHECK_SEC, s["blocks"], s["full"], s["light"], s["gaps"],
                   s["fails"], s["beyond_head"], s["fresh"], s["last"], s["conf"],
-                  _host(self.url), CHAIN_INDEX_URL_SRC, "ЖИВ" if not why else "МЁРТВ — " + "; ".join(why)))
-        if why:
+                  s["rcpt_probe"], _host(self.url), CHAIN_INDEX_URL_SRC, verdict))
+        if dead:
             log.error("%s", msg)
         else:
             log.warning("%s", msg)
