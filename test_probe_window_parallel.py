@@ -108,9 +108,9 @@ def run_pair():
         tB = threading.Thread(target=live._window_loop, args=("ETH", "down", stopB), daemon=True)
         tB.start()
         time.sleep(0.15)
-        assert live._win_key.get("BTC") and live._win_key.get("ETH"), \
+        assert live._plan_key_by_feed.get("BTC") and live._plan_key_by_feed.get("ETH"), \
             ("окно обязано опубликовать СВОЙ план боевым путём (_prearm_board) — иначе "
-             "приёмке (б) не по чему судить: %s" % live._win_key)
+             "приёмке (б) не по чему судить: %s" % live._plan_key_by_feed)
         # В ОКНЕ BTC села НАША проба ПОД ПЛАНОМ BTC (владелец транзита известен),
         # в окне ETH — под планом ETH, законный слепой суд.
         live._note_probe_position(H, RCPT, meta=("0xleg", ("BTC", MID_SEEN, B_SEEN, 1.0)))

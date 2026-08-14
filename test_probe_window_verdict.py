@@ -97,7 +97,7 @@ def make_sf():
     # объект собран через __new__ — заводим ровно те же, иначе стенд проверял бы объект,
     # которого в бою не бывает.
     sf._probe_by_key = {}
-    sf._win_key = {}
+    sf._plan_key_by_feed = {}
     sf._log = LOG.append
     sf._now = lambda: 0.0
     return sf
@@ -186,7 +186,7 @@ try:
     # ПЛАН ЭТОГО ОКНА (блокер C р-6 / B2 р-7): без ключа окно не смеет печатать число вовсе.
     # В бою ключ кладёт _prearm_board; здесь доска выключена нарочно (V2_BOARD=False), поэтому
     # ставим его руками — иначе стенд мерил бы объект, которого в бою не бывает.
-    live._win_key["BTC"] = live.plan_key(MID_SEEN, "0xb")
+    live._plan_key_by_feed["BTC"] = live.plan_key(MID_SEEN, "0xb")
     t = threading.Thread(target=live._window_loop, args=("BTC", "down", stop), daemon=True)
     t.start()
     time.sleep(0.15)                          # окно живёт; снимок уже взят на арме
@@ -214,7 +214,7 @@ try:
     LOG2.clear()
     live.dev_by["ETH"] = 0.001
     stop2 = threading.Event()
-    live._win_key.pop("ETH", None)
+    live._plan_key_by_feed.pop("ETH", None)
     t2 = threading.Thread(target=live._window_loop, args=("ETH", "down", stop2), daemon=True)
     t2.start()
     time.sleep(0.10)

@@ -29,7 +29,7 @@ def mk():
     s.stats = {}
     s._probe_by_key = {}
     s._probe_claim = {}
-    s._win_key = {}
+    s._plan_key_by_feed = {}
     s._board = {}
     return s
 

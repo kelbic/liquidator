@@ -82,7 +82,7 @@ class _Cfg:
 def make_sf():
     sf = sfl.SpecFireLive.__new__(sfl.SpecFireLive)
     sf.cfg, sf.rpc, sf.stats = _Cfg(), None, {}
-    sf._probe_by_key, sf._win_key = {}, {}          # учёт ПО КЛЮЧУ ПЛАНА (р-6, блокер C)
+    sf._probe_by_key, sf._plan_key_by_feed = {}, {}          # учёт ПО КЛЮЧУ ПЛАНА (р-6, блокер C)
     sf._log = lambda m: None
     sf._now = lambda: 0.0
     return sf
