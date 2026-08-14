@@ -105,6 +105,44 @@ def _tgts_fat(tgts, bonus_of=None) -> bool:
     return any(t[2] >= SPEC_FIRE_FAT_DEBT_USD for t in tgts)
 
 
+# ---- EV цели = долг × близость к флипу (пакет B1) ----
+# Селектор владельца ОДНОГО слота доски и ценностной гард #88 ранжируют не по долгу,
+# а по EV. Близость считается из HF: down — залог должен упасть на (1-1/HF); up — долг
+# вырасти на (HF-1). closeness = 1/max(dist, eps) — монотонно растёт к флипу, никогда не
+# отрицательна (1-dist уходила в минус на далёких up-целях), и сильно вознаграждает
+# цель у самой кромки (proximity). Незнание HF -> None: цель НЕ тащится по одному долгу
+# (канон «незнание закрывает гард») — в ранжировании падает в нижний бакет, в гарде #88
+# не вытесняет живого владельца. HF из Morpho API (main.py:86) — по канону врёт на
+# экзотике; это НАСЛЕДУЕМЫЙ предел входа EV, не чинится в B1 (см. named_limits).
+_EV_CLOSE_EPS = float(os.environ.get("SPEC_FIRE_V2_EV_CLOSE_EPS", "0.0001"))
+
+
+def _flip_dist(hf, direction):
+    """Дистанция до флипа из HF; None = HF нечитаем (нет ключа / <=0)."""
+    if hf is None:
+        return None
+    try:
+        hf = float(hf)
+    except (TypeError, ValueError):
+        return None
+    if hf <= 0.0:
+        return None
+    if hf <= 1.0:
+        return 0.0                       # уже за кромкой — ближе не бывает
+    return (hf - 1.0) if direction == "up" else (1.0 - 1.0 / hf)
+
+
+def _plan_ev_val(debt, hf, direction):
+    """EV = долг × близость. None = HF нечитаем ИЛИ долга нет (нижний бакет / не вытесняет)."""
+    d = _flip_dist(hf, direction)
+    if d is None:
+        return None
+    dd = float(debt or 0.0)
+    if dd <= 0.0:
+        return None
+    return dd * (1.0 / max(d, _EV_CLOSE_EPS))
+
+
 def _window_cap(fat_mode: bool) -> int:
     return SPEC_FIRE_FAT_CAP if (SPEC_FIRE_EV_DENSITY and fat_mode) else SPEC_FIRE_MAX_PROBES_WINDOW
 
@@ -195,6 +233,10 @@ SPEC_FIRE_LATTICE_MIN_FRAC = float(os.environ.get("SPEC_FIRE_LATTICE_MIN_FRAC", 
 SPEC_FIRE_V2_BOARD = os.environ.get("SPEC_FIRE_V2_BOARD", "0").lower() not in ("0", "false", "no")
 SPEC_FIRE_V2_PLAN_TTL_SEC = int(os.environ.get("SPEC_FIRE_V2_PLAN_TTL_SEC", "900"))
 SPEC_FIRE_V2_REARM_SEC = float(os.environ.get("SPEC_FIRE_V2_REARM_SEC", "240"))
+# гистерезис переарма (B1): читаемый кандидат вытесняет живого инкумбента, только
+# если его EV выше на эту долю — демпфер против флапа близких EV. Откат без кода:
+# SPEC_FIRE_V2_EV_MARGIN=0 ⇒ вытесняет любое строгое превосходство.
+SPEC_FIRE_V2_EV_MARGIN = float(os.environ.get("SPEC_FIRE_V2_EV_MARGIN", "0.2"))
 # #57 (ревью 08.08): арм доски — ЕДИНСТВЕННАЯ точка входа флота в бой (право огня движку даёт
 # только живой севший план; V1-деградация сидит за тир-гейтом, ложным в решающий блок). Осечка
 # ОДНОГО setPlan при каденсе переарма 240с оставляла окно короче ретрая вовсе без доски: движок
@@ -878,6 +920,11 @@ class SpecFireLive:
                 elig.append((mid, b, d))
                 if dist is not None and (edge_d is None or dist < edge_d):
                     edge_d, edge_t = dist, (mid, b, d)
+        # top-1 по ДОЛГУ. Контракт edge-слота (test_spec_fire_edge_slot): кромка-по-dist
+        # отдаётся ОТДЕЛЬНО через edge_t и НЕ ранжирует top-K; незнание HF fail-open — цель
+        # остаётся eligible (1c: без hf_by len(tgts)==1). Владельца ОДНОГО слота доски по EV
+        # (долг × близость) выбирает арбитр в _prearm_board ПОСЛЕ этого ранга (R2 разрешает
+        # post-selection), а ценностной гард #88 — в _arm_board. Здесь ранг чист по долгу.
         elig.sort(key=lambda t: -t[2])
         return elig[:k], hold_dist, edge_t
 
@@ -1022,7 +1069,12 @@ class SpecFireLive:
         return bool(st and st.get("key") == (mid, b)
                     and self._now() < st.get("until", 0.0))
 
-    def _arm_board(self, probe, mid, b, feed, debt=0.0) -> bool:
+    def _hf_of(self, mid, b):
+        """HF цели из shared (Morpho API). None = ключа нет. Одиночный get под GIL — без лока
+        (порядок shared.lock->_board_lock в файле не встречается, обратной вложенности нет)."""
+        return (getattr(self.shared, "hf_by", {}) or {}).get((mid, b))
+
+    def _arm_board(self, probe, mid, b, feed, debt=0.0, direction=None) -> bool:
         """Записать armed-план в контракт (owner-tx с главного кошелька). Возврат: доска готова?
 
         Вызывается ЗАРАНЕЕ (пока окно взведено, но горячая фаза не началась) — плану надо сесть
@@ -1041,6 +1093,27 @@ class SpecFireLive:
                 st = self._board
                 if self._now() - st.get("armed_ts", 0.0) < SPEC_FIRE_V2_REARM_SEC:
                     return True                   # свежая и та же цель — переписывать нечего
+            # --- ЦЕННОСТНОЙ ГАРД #88 + ГИСТЕРЕЗИС (пакет B1) ---
+            # Один слот доски арбитрируется по EV (долг × близость к флипу), а не «кто последний».
+            # Живого владельца НЕ вытесняет: (а) план с нечитаемым HF (незнание не вытесняет);
+            # (б) читаемый план, не превосходящий инкумбента на порог SPEC_FIRE_V2_EV_MARGIN
+            # (демпфер флапа: 0.1%-качели EV не молотят setPlan). Порог — доля EV ИНКУМБЕНТА
+            # (subject-scaled, канон gate-input-from-subject). Протухшего (за until) вытесняет
+            # любой свежий — иначе труп заклинил бы слот навечно (A1). Штатные смены слота
+            # (_clear_board/_verify_board/_arm_retry) идут мимо этой ветки. Учёта/Thread здесь
+            # нет — EV читается одним getattr сбоку от денежного пути. direction сюда НЕ
+            # прокидывается (сигнатуру _arm_board пинят юнит-стабы prearm — down по умолчанию);
+            # ранг EV по HF инвариантен к направлению, разъезжается лишь МАСШТАБ при сравнении
+            # down-цели с up-целью на одном слоте — редкий кейс, назван в named_limits.
+            plan_ev = _plan_ev_val(debt, self._hf_of(mid, b), direction)
+            _st = self._board
+            if (_st and _st.get("key") and _st.get("key") != (mid, b)
+                    and self._now() < _st.get("until", 0.0)):
+                if plan_ev is None:
+                    return True               # незнание близости не вытесняет живого владельца
+                _inc_ev = _st.get("ev")
+                if _inc_ev is not None and plan_ev < _inc_ev * (1.0 + SPEC_FIRE_V2_EV_MARGIN):
+                    return True               # не лучше живого инкумбента на порог — держим слот
             import chain.execute as _ex
             dl = int(time.time()) + SPEC_FIRE_V2_PLAN_TTL_SEC
             cd = _ex.encode_set_plan(
@@ -1065,6 +1138,7 @@ class SpecFireLive:
                 self.stats["board_fails"] += 1
                 return False
             self._board = {"key": (mid, b), "armed_ts": self._now(), "debt": float(debt),
+                           "ev": plan_ev,
                            # доска считается годной только ПОСЛЕ того, как tx могла сесть;
                            # до этого 1-байт пробы ушли бы в пустоту (плана в сторадже нет)
                            "until": self._now() + SPEC_FIRE_V2_PLAN_TTL_SEC - 30.0,
@@ -1258,6 +1332,21 @@ class SpecFireLive:
                 self._arm_retry(feed, "жир вне досягаемости (reach %.2f%%)" % (reach * 100.0))
                 return
             mid, b, d = tgts[0]
+            # --- ПЕР-ФИДНЫЙ ВЫБОР ВЛАДЕЛЬЦА СЛОТА ПО EV (пакет B1) ---
+            # _top_fat отдаёт top-1 по ДОЛГУ и, ОТДЕЛЬНО, кромку-по-dist (_edge). Владельца
+            # ОДНОГО слота доски выбираем по EV = долг × близость к флипу: близкая к кромке цель
+            # с меньшим долгом бьёт далёкий жир (гонка №2 cbXRP: 119 проб ушли в top-по-долгу,
+            # флипнулась ближайшая мелочь с 0 проб). Арбитр POST-selection — _top_fat и контракт
+            # edge-слота не тронуты. Кромку берём ТОЛЬКО если её EV читаем и СТРОГО выше EV
+            # жир-топа: незнание близости (ev=None) в нижний бакет, обе неизвестны → держим жир.
+            # `_edge is not None` первым в условии — при пустой кромке (юнит-стабы _top_fat без
+            # shared) HF не читаем и AttributeError не возникает. Один getattr HF сбоку от
+            # денежного пути: без Thread, без учёта под широким except.
+            if _edge is not None and _edge[:2] != (mid, b):
+                ev_top = _plan_ev_val(d, self._hf_of(mid, b), direction)
+                ev_edge = _plan_ev_val(_edge[2], self._hf_of(_edge[0], _edge[1]), direction)
+                if ev_edge is not None and (ev_top is None or ev_edge > ev_top):
+                    mid, b, d = _edge
             if self._board_ready(mid, b):
                 # HIGH N1 (ревью 09.08): ранний выход стоял ДО публикации probe_board, и после
                 # фикса #57 он стал ЖИВЫМ путём — окна 2..N каскада доходят сюда гарантированно
