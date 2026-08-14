@@ -1519,35 +1519,38 @@ class SpecFireLive:
     def _engine_result(self, meta, h, r):
         """Исход пробы движка. Вердикт победы — ТОЛЬКО по событию Liquidated (см. LIQUIDATED_TOPIC0):
         у пробы доски status=1 бывает и у холостой, и у неудачной попытки."""
-        from chain.execute import volley_bal_charge
-        from chain.chain_index import rcpt_int
         addr, tgt = (meta or (None, None))
+        # ВЕРДИКТ — ПЕРВОЙ СТРОКОЙ, ДО ЕДИНОГО ИМПОРТА (структурное правило р-7). Прежде выше
+        # стояли два импорта, разбор газа и ТРИ учётных вызова, и вопрос «если это БРОСИТ —
+        # что перестанет стрелять?» имел ответ «ВСЁ»: исключение измерителя уносило вердикт,
+        # disarm, закрытие окна и wins, а коллектор глотал его до имени типа («FIRE collect
+        # handler fail: RuntimeError»). Второй за сутки случай «учёт уронил огонь», и лечится
+        # он ПОРЯДКОМ, а не ещё одним except. `_receipt_has_win` — функция этого же модуля,
+        # импорта не требует.
+        _won = _receipt_has_win(r, self.cfg.liquidator_address) is True
+        _wei, gas_usd = 0, 0.0
         try:
             # ОДИН разбор на ОБА источника. Сеть отдаёт '0x...', индекс — тоже (см.
             # chain_index.receipt_like): прежде здесь стоял голый int(), сетевая квитанция
             # падала ValueError, ветка глоталась общим except и газ МОЛЧА книжился нулём —
             # то есть само включение индекса меняло поведение суточного kill-switch.
+            from chain.chain_index import rcpt_int
             _wei = rcpt_int(r.get("gasUsed"), 0) * rcpt_int(r.get("effectiveGasPrice"), 0)
             gas_usd = _wei * float(self.cfg.eth_price_usd) / 1e18
         except Exception:
-            _wei, gas_usd = 0, 0.0
-        from chain.execute import volley_gas_settle
-        # ДЕНЬГИ ПЕРВЫМИ, УЧЁТ ПОСЛЕ (структурное правило р-7). Прежде три учётных вызова
-        # стояли подряд ДО вердикта победы, и вопрос «если счётчик БРОСИТ — что перестанет
-        # стрелять?» имел ответ «ВСЁ»: исключение измерителя уносило вердикт, disarm, закрытие
-        # окна и wins, а коллектор глотал его до имени типа («FIRE collect handler fail:
-        # RuntimeError»). Это второй за сутки случай «учёт уронил огонь», и лечится он
-        # ПОРЯДКОМ, а не ещё одним except.
-        if _receipt_has_win(r, self.cfg.liquidator_address) is True:
+            _wei, gas_usd = 0, 0.0        # цена неизвестна — но она НЕ решает, победа ли это
+        if _won:
             self._probe_win(tgt, h, addr, gas_usd, src="движок")
         else:
             self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
         # #93: записываем ФАКТ и освобождаем бронь, поставленную при отправке этой же пробы.
         # Бронь покрывает только окно «в полёте» (учёт отставал от отправок вшестеро), поэтому
         # суточный факт от неё не растёт — она ограничивает мгновенную экспозицию.
-        self._accounted("бронь газа", h, volley_gas_settle, h, gas_usd)
-        # #45: патрон списывается по ФАКТУ, не по эстимейту
-        self._accounted("патрон ноги", h, volley_bal_charge, addr, _wei)
+        def _book():
+            from chain.execute import volley_bal_charge, volley_gas_settle
+            volley_gas_settle(h, gas_usd)
+            volley_bal_charge(addr, _wei)   # #45: патрон списывается по ФАКТУ, не по эстимейту
+        self._accounted("бронь газа и патрон ноги", h, _book)
         # #110: метрика №1 — ГДЕ мы встали
         self._accounted("позиция пробы", h, self._note_probe_position, h, r, meta=meta)
 
