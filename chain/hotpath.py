@@ -115,6 +115,182 @@ HOT_SIM_CONFIRMED_RETRY = os.environ.get("HOT_SIM_CONFIRMED_RETRY", "1").lower()
 # нонсами) — латентность дороже ордеринга (наш промах = +785мс). Откат HOT_DISPATCH_INCREMENTAL=0
 # = прежний батч бит-в-бит.
 HOT_DISPATCH_INCREMENTAL = os.environ.get("HOT_DISPATCH_INCREMENTAL", "1").lower() not in ("0", "false", "no")
+# Р1: ПАРАЛЛЕЛЬНАЯ ПОДГОТОВКА ЦЕЛЕЙ ХВОСТА КАСКАДА.
+#
+# ЗАМЕР. Каскад 11.08 06:38 — 30 ликвидаций в двух блоках (49820471/49820472). Голову забирает
+# «стена» (пул >=1133 EOA, 712-796 tx в блок на tip транзита), с ней не конкурируем; ХВОСТ
+# (2-я..N-я цель) берёт «объёмщик» мелкими деньгами — 43 события за 10 дней, ниша без стены.
+# Цена подготовки ОДНОЙ цели — 632мс, и она СЕТЕВАЯ (eth_call + Kyber-квота; STATE §12.08
+# ночь-3), не CPU. Каскад живёт 2-4с => последовательный цикл успевал 6 целей из 26 (замерено
+# дрелью test_cascade_tail_parallel.py на этом самом коде), то есть хвост был недостижим.
+#
+# ПОЧЕМУ ТРЕДЫ, А НЕ ПРОЦЕССЫ: ждём сокет, GIL при этом отпущен. Пул ОДИН на процесс и
+# переиспользуется — Thread() на вызов уже пробивал cgroup-кап и ронял hot_loop.
+# Откат REACTIVE_PREP_THREADS=1 снимает МЕХАНИЗМ (цели готовятся в вызывающем треде тем же
+# циклом), а не сжимает параметр.
+REACTIVE_PREP_THREADS = int(os.environ.get("REACTIVE_PREP_THREADS", "8") or 8)
+_PREP_THREADS_MAX = 32          # защита от опечатки в env: 500 тредов положат 1-ядерную машину
+_PREP_POOL = None
+_PREP_POOL_N = 0
+_PREP_POOL_LOCK = threading.Lock()
+
+
+def _prep_threads():
+    try:
+        return max(1, min(int(REACTIVE_PREP_THREADS), _PREP_THREADS_MAX))
+    except Exception:                                        # noqa: BLE001
+        return 1                                             # мусор в ручке = прежнее поведение
+
+
+def _prep_pool(n):
+    """Общий пул на процесс; None = пул не поднялся (вызывающий идёт прежним последовательным путём)."""
+    global _PREP_POOL, _PREP_POOL_N
+    with _PREP_POOL_LOCK:
+        if _PREP_POOL is not None and _PREP_POOL_N >= n:
+            return _PREP_POOL
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            _old, _PREP_POOL = _PREP_POOL, ThreadPoolExecutor(max_workers=n,
+                                                              thread_name_prefix="hot-prep")
+            _PREP_POOL_N = n
+            if _old is not None:
+                _old.shutdown(wait=False)
+        except Exception:                                    # noqa: BLE001
+            _PREP_POOL, _PREP_POOL_N = None, 0
+        return _PREP_POOL
+
+
+def run_prep_batch(cand, fn, log=None):
+    """Подготовить цели пулом тредов. fn обязана сама ловить свои исключения (см. _prep_one).
+
+    len(cand)==1 или ручка=1 -> ровно прежний последовательный вызов в ТОМ ЖЕ треде: никакого
+    пула, никакого фьючерса, поведение бит-в-бит. Отказ пула тоже падает в этот путь — огонь
+    не гасим ни при какой поломке параллелизма."""
+    if not cand:
+        return
+    n = _prep_threads()
+    pool = _prep_pool(n) if (n > 1 and len(cand) > 1) else None
+    if pool is None:
+        for c in cand:
+            fn(*c)
+        return
+    futs = []
+    try:
+        for c in cand:
+            futs.append(pool.submit(fn, *c))
+    except Exception as e:                                   # noqa: BLE001
+        if log is not None:
+            log.error("HOT prep-pool submit failed (%s) — хвост готовим последовательно",
+                      type(e).__name__)
+        for c in cand[len(futs):]:
+            fn(*c)
+    for f in futs:
+        try:
+            f.result()
+        except Exception:                                    # noqa: BLE001
+            pass                                             # fn всё ловит; это страховка от смерти воркера
+
+
+# Р1: ЗАЯВКА «ОДНА ЦЕЛЬ — ОДНА ПОДГОТОВКА».
+#
+# Рынок может висеть под ДВУМЯ агрегаторами (multi-leg, 07-23: `agg=` в DIAG — это атрибуция
+# ноги-триггера). Обе ноги, транслируя в одном блоке, спавнят по своему _process_transmit и
+# видят один и тот же (mid, borrower). Последовательная подготовка держала окно перекрытия
+# узким; параллельная растягивает его на весь каскад. Цена дубля названа в коде ниже прямо:
+# «2-я tx сожгла бы nonce+газ», плюс 632мс сети на уже оплаченную цель.
+# TTL: тред, умерший не сняв заявку, не имеет права запереть заёмщика до перезапуска процесса.
+# ВТОРАЯ ЛИНИЯ ОСТАЁТСЯ ПРЕЖНЕЙ и заявку НЕ дублирует: дубль ОТПРАВКИ ловит `_RECENT_SENDS`
+# под `_SEND_LOCK` в dispatch_liquidations. Заявка снимается сразу после подготовки (держать её
+# до квитанции нельзя — добой той же позиции в следующем блоке законен и обычен).
+_PREP_CLAIM = {}
+_PREP_CLAIM_LOCK = threading.Lock()
+_PREP_CLAIM_TTL = float(os.environ.get("REACTIVE_PREP_CLAIM_TTL_SEC", "20"))
+
+
+def claim_prep(key, now=None):
+    """True = заявка НАША (мы и платим за подготовку). False = цель уже готовит кто-то другой."""
+    t = float(now if now is not None else time.monotonic())
+    with _PREP_CLAIM_LOCK:
+        for k in [k for k, ts in _PREP_CLAIM.items() if t - ts > _PREP_CLAIM_TTL]:
+            _PREP_CLAIM.pop(k, None)
+        if key in _PREP_CLAIM:
+            return False
+        _PREP_CLAIM[key] = t
+        return True
+
+
+def release_prep(key):
+    with _PREP_CLAIM_LOCK:
+        _PREP_CLAIM.pop(key, None)
+
+
+# Р1/#108: ФИЛЬТР ТРУПОВ ПЕРЕД ДОРОГОЙ ПОДГОТОВКОЙ.
+#
+# ЗАМЕР #108: 30 из 43 «healthy-race» были ТРУПАМИ — цель ликвидировали до того, как наш сим
+# досчитал (fast-lane: 47% ревертов при 0 побед). В каскаде это дороже вдвойне: каждая мёртвая
+# цель съедает 632мс из 4-секундного бюджета, то есть отнимает ЖИВУЮ цель хвоста.
+#
+# Источник — фоновый индекс цепи (#110, в бою с 14.08): он уже прочитал блоки и знает события
+# Liquidate Morpho. Горячий путь только ЧИТАЕТ его память — НИ ОДНОГО сетевого вызова.
+#
+# ВЕРДИКТ ВЫНОСИМ ТОЛЬКО ДОКАЗУЕМЫЙ. 88.7% ликвидаций частичные, и частичная HF не чинит
+# (repaid r со сейзом r*(1+lif) оставляет HF<1 — потому добой в два блока и обычен), поэтому
+# «видели Liquidate» трупом НЕ является. Труп — два случая:
+#   (1) списан безнадёжный долг (bad_debt_shares > 0): позиция в Morpho обнуляется целиком;
+#   (2) погашено не меньше, чем ВЕСЬ borrow_shares нашего снапшота.
+# ЧЕСТНЫЙ ПРЕДЕЛ правила (2): если наш снапшот СВЕЖЕЕ индекса (уже после добоя), remainder
+# меньше repaid и мы пропустим ещё живую цель. Промах требует одновременно свежего снапшота И
+# погашения >=50% — то есть цели, которую конкурент жуёт ПРЯМО СЕЙЧАС; это ровно та гонка,
+# которую #108 замерил как 30 проигрышей из 43. Промах направлен в сторону замера, не против.
+# Незнание (индекса нет / протух / пары нет) НЕ блокирует: незнание как ЗАПРЕТ гасило бы огонь.
+REACTIVE_CORPSE_FILTER = os.environ.get("REACTIVE_CORPSE_FILTER", "1").lower() not in ("0", "false", "no")
+_CORPSE_UNKNOWN_LOG_TS = 0.0
+_CORPSE_UNKNOWN_LOG_GAP = 60.0
+
+
+def corpse_pairs(stats=None, log=None):
+    """{(mid, borrower): (repaid_shares, bad_debt_shares)} из ПАМЯТИ индекса, либо None = НЕ ЗНАЮ.
+
+    Зовём ОДИН раз на рынок, а не на цель: в каскаде это одна копия словаря пар вместо 26."""
+    global _CORPSE_UNKNOWN_LOG_TS
+    if not REACTIVE_CORPSE_FILTER:
+        return None
+    why = ""
+    try:
+        idx = _chain_index.get_index()
+        if idx is None:
+            why = "индекса нет (CHAIN_INDEX=0 либо узел не задан)"
+        else:
+            p = idx.corpses()
+            if p is None:
+                why = "индекс протух (fresh=False)"
+            else:
+                return p
+    except Exception as e:                                   # noqa: BLE001
+        why = "%s: %s" % (type(e).__name__, redact_clip(e, 60))
+    if stats is not None:
+        stats["f_corpse_unk"] = stats.get("f_corpse_unk", 0) + 1
+    _n = time.monotonic()
+    if log is not None and _n - _CORPSE_UNKNOWN_LOG_TS > _CORPSE_UNKNOWN_LOG_GAP:
+        _CORPSE_UNKNOWN_LOG_TS = _n
+        log.info("HOT corpse-filter: НЕ ЗНАЮ (%s) — фильтр пропущен, цели готовим как раньше", why)
+    return None
+
+
+def corpse_verdict(row, borrow_shares):
+    """PURE. True = ДОКАЗАННЫЙ труп. row = (repaid_shares, bad_debt_shares) из индекса либо None."""
+    if not row:
+        return False
+    try:
+        repaid, bad = int(row[0]), int(row[1])
+        bs = int(borrow_shares) if borrow_shares is not None else 0
+    except Exception:                                        # noqa: BLE001
+        return False
+    if bad > 0:
+        return True
+    return bs > 0 and repaid >= bs
+
+
 _SIM_TRANSPORT_MARKS = ("429", "Too Many Requests", "timed out", "timeout", "Connection",
                         "Max retries", "502", "503", "504")
 
@@ -1639,9 +1815,12 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
 
     ready, meta_by = [], {}
     _canary_fired = False                        # ранний выстрел на hint-рынке (см. ниже) — один на транзит
-    _t_read_total = 0.0; _t_prep_total = 0.0; _t_flips_total = 0.0   # DIAG latency: read=340-call, sim=prepare_hot
+    _t_read_total = 0.0; _t_flips_total = 0.0   # DIAG latency: read=340-call, sim=prepare_hot
+    _prep_acc = {"ms": 0.0}                      # Р1: сумма ПО ТРЕДАМ подготовки (может превышать wall)
+    _rdy_lock = threading.Lock()                 # ready/meta_by/учёт — из нескольких prep-тредов
     _incr_results = []                           # инкрементальный dispatch (HOT_DISPATCH_INCREMENTAL)
-    _incr_state = {"blocked": None, "t_send": 0.0, "threads": [], "rlock": threading.Lock()}
+    _incr_state = {"blocked": None, "t_send": 0.0, "threads": [], "rlock": threading.Lock(),
+                   "glock": threading.Lock()}    # Р1: kill-switch спрашивают N тредов разом
 
     def _dispatch_ready_now(item):
         """Готовая цель уходит немедленно; kill-switch перед КАЖДЫМ сендом (та же GuardState,
@@ -1657,6 +1836,9 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                                                   gas_spent_today=today["gas"] + specfire_gas_today(),
                                                   inflight=current_inflight()))
         if blocked:
+            # Р1: защёлку и пейдж ставит ПЕРВЫЙ увидевший — N параллельных prep-тредов
+            # спрашивают гард одновременно, и без этого лока один kill-switch дал бы N
+            # одинаковых тревог (алерт — учёт, он обязан висеть сбоку и не множиться).
             # #52: ТРАНЗИЕНТНУЮ причину (нет свободных слотов inflight) НЕ защёлкиваем — слоты
             # освобождаются на квитанции за секунды, а латч выключал хвост каскада на ТОМ САМОМ
             # транзите, который и есть FCFS-гонка. Защёлкиваются только терминальные причины
@@ -1667,7 +1849,10 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                     log.info("HOT incr: слот занят (%s) — цель пропущена, латч НЕ ставим "
                              "(пропусков %d)", blocked, _incr_state["skipped_transient"])
                 return
-            _incr_state["blocked"] = blocked
+            with _incr_state["glock"]:
+                if _incr_state["blocked"]:
+                    return
+                _incr_state["blocked"] = blocked
             log.error("HOT kill switch engaged: %s — инкрементальный dispatch остановлен", blocked)
             alerter.send_async("\U0001F6D1 hot path halted: %s" % blocked, key="hot-killswitch")
             return
@@ -1686,6 +1871,30 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         _th = threading.Thread(target=_run, daemon=True)
         _incr_state["threads"].append(_th)
         _th.start()
+
+    def _prep_ms(sec):
+        """УЧЁТ СБОКУ: собственный try — счётчик не имеет права уронить или задержать огонь
+        (13.08: счётчик атрибуции внутри _prearm_board под широким except молча гасил арм)."""
+        try:
+            with _rdy_lock:
+                _prep_acc["ms"] += sec * 1000.0
+        except Exception:                                    # noqa: BLE001
+            pass
+
+    def _ready_now(_mid, b, prep, hr, du, fast=False):
+        """Готовая цель: сперва ОТПРАВКА, журнал ПОСЛЕ. Порядок не косметический — учёт,
+        стоящий ПЕРЕД сендом, у нас уже гасил арм."""
+        with _rdy_lock:
+            ready.append((_mid, b, prep)); meta_by[(_mid, b)] = (hr, du)
+        if HOT_DISPATCH_INCREMENTAL:
+            _dispatch_ready_now((_mid, b, prep))
+        try:
+            log.info("HOT ready%s %s/%s hf=%.4f repaid~$%.0f net%s$%.2f block=%d subidx=%s",
+                     " FAST" if fast else "", _mid[:10], b[:10], hr.hf, du,
+                     ">=" if fast else "=", prep.get("net_usd", 0.0), block, subidx)
+        except Exception:                                    # noqa: BLE001
+            pass
+
     for mid in feeds.get(agg, []):
         om = meta.get(mid)
         borrowers = groups.get(mid, [])
@@ -1760,42 +1969,73 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                 log.info("DIAG noflip %s/%s minHF=%.4f bshares=%d px=%d n=%d src=%s trig=%s price=%.0fms read=%.0fms flips=%.1fms e2e=%.0fms",
                          mid[:10], _bb[:10], _hv, _bs, int(price), len(_c), _rsrc, subidx, _t_price_last, _t_read_last,
                          _t_flips_last, (time.time() - t) * 1000.0)
+        # Р1: ОТБОР ЦЕЛЕЙ (дёшево, последовательно) -> ПОДГОТОВКА (632мс сети, параллельно).
+        # Порог floor и фильтр трупов стоят ДО дорогой работы: 632мс, потраченные на пыль или
+        # на труп, отнимают из 4-секундного бюджета каскада ровно одну ЖИВУЮ цель хвоста.
+        _cand, _corpses, _asked = [], None, False
         for (b, hr, du) in flipped:
             if du < floor:                                   # reaction filter: $2k+ only
                 if stats is not None: stats["f_floor"] += 1
                 continue
-            if stats is not None: stats["f_prep"] += 1
             _bc = pos_by.get(b)
-            if (getattr(cfg, "fast_lane", False) and not fast_lane_disabled()   # II.6: breaker -> фолбэк sim
-                    and _bc and du >= getattr(cfg, "fast_lane_min_repaid_usd", 1000.0)
-                    and du <= getattr(cfg, "fast_lane_max_repaid_usd", 500000.0)):  # мега-сайз -> sim
-                _fs = time.perf_counter()                    # P1-9: fast-lane БЕЗ sim; при ok обычный
-                fprep = prepare_fast(rpc, preconf_rpc, cfg, mid, b, du,   # prepare НЕ дублируем (2-я tx
-                                     debt_assets_by.get((mid, b), 0), price,   # сожгла бы nonce+газ)
-                                     (tba, tbs, _bc[0], _bc[1]))
-                _t_prep_total += (time.perf_counter() - _fs) * 1000.0
-                if fprep.get("ok"):
-                    ready.append((mid, b, fprep)); meta_by[(mid, b)] = (hr, du)
-                    log.info("HOT ready FAST %s/%s hf=%.4f repaid~$%.0f net>=$%.2f block=%d subidx=%s",
-                             mid[:10], b[:10], hr.hf, du, fprep["net_usd"], block, subidx)
-                    if HOT_DISPATCH_INCREMENTAL:
-                        _dispatch_ready_now((mid, b, fprep))
-                    continue
-                log.info("DIAG fast-lane fallback %s/%s: %s", mid[:10], b[:10], str(fprep.get("reason"))[:60])
-            _ps = time.perf_counter()
-            # P0-4: (tba,tbs,bs,col) из read_positions этого же
-            prep = prepare_fn(rpc, preconf_rpc, cfg, mid, b, du,   # триггера (мс назад, тот же preconf) -> prepare_hot
-                              debt_assets_by.get((mid, b), 0), price,   # не перечитывает market/position (~-350мс)
-                              state=((tba, tbs, _bc[0], _bc[1]) if _bc else None))
-            _t_prep_total += (time.perf_counter() - _ps) * 1000.0
-            if prep.get("ok"):
-                ready.append((mid, b, prep)); meta_by[(mid, b)] = (hr, du)
-                log.info("HOT ready %s/%s hf=%.4f repaid~$%.0f net=$%.2f block=%d subidx=%s",
-                         mid[:10], b[:10], hr.hf, du, prep["net_usd"], block, subidx)
-                if HOT_DISPATCH_INCREMENTAL:
-                    _dispatch_ready_now((mid, b, prep))
-            else:
-                log.info("HOT skip %s/%s: %s", mid[:10], b[:10], str(prep.get("reason"))[:80])
+            if not _asked:                                   # #110: снимок пар из ПАМЯТИ индекса,
+                _asked = True                                # без сети, и только когда есть ЗА ЧТО
+                _corpses = corpse_pairs(stats=stats, log=log)   # платить (транзит без флипов не платит)
+            _row = _corpses.get((mid, b)) if _corpses is not None else None
+            if _row is not None and corpse_verdict(_row, _bc[0] if _bc else None):
+                if stats is not None:
+                    stats["f_corpse"] = stats.get("f_corpse", 0) + 1
+                log.info("HOT corpse-skip %s/%s: индекс видел добой (repaid=%s bad_debt=%s, "
+                         "наш borrow_shares=%s) — 632мс подготовки не платим",
+                         mid[:10], b[:10], _row[0], _row[1], _bc[0] if _bc else "?")
+                continue
+            if stats is not None: stats["f_prep"] += 1
+            _cand.append((b, hr, du, _bc))
+
+        def _prep_one(b, hr, du, _bc, _mid=mid, _price=price, _tba=tba, _tbs=tbs):
+            """Подготовка ОДНОЙ цели — прежнее тело цикла, плюс заявка и свой try/finally.
+
+            Заявка: рынок бывает под ДВУМЯ агрегаторами (multi-leg), обе ноги спавнят свой
+            транзит и видят одну цель; prepare НЕ дублируем (2-я tx сожгла бы nonce+газ).
+            try: одна упавшая цель не имеет права унести ВЕСЬ хвост каскада — раньше исключение
+            из подготовки выходило наружу и убивало остальные цели транзита."""
+            _key = (_mid, b)
+            if not claim_prep(_key):
+                if stats is not None:
+                    stats["f_claim"] = stats.get("f_claim", 0) + 1
+                log.info("HOT prep-claim %s/%s: цель уже готовит другая нога — дубль не платим",
+                         _mid[:10], b[:10])
+                return
+            try:
+                if (getattr(cfg, "fast_lane", False) and not fast_lane_disabled()   # II.6: breaker -> фолбэк sim
+                        and _bc and du >= getattr(cfg, "fast_lane_min_repaid_usd", 1000.0)
+                        and du <= getattr(cfg, "fast_lane_max_repaid_usd", 500000.0)):  # мега-сайз -> sim
+                    _fs = time.perf_counter()                # P1-9: fast-lane БЕЗ sim; при ok обычный
+                    fprep = prepare_fast(rpc, preconf_rpc, cfg, _mid, b, du,
+                                         debt_assets_by.get((_mid, b), 0), _price,
+                                         (_tba, _tbs, _bc[0], _bc[1]))
+                    _prep_ms(time.perf_counter() - _fs)
+                    if fprep.get("ok"):
+                        _ready_now(_mid, b, fprep, hr, du, fast=True)
+                        return
+                    log.info("DIAG fast-lane fallback %s/%s: %s", _mid[:10], b[:10], str(fprep.get("reason"))[:60])
+                _ps = time.perf_counter()
+                # P0-4: (tba,tbs,bs,col) из read_positions этого же
+                prep = prepare_fn(rpc, preconf_rpc, cfg, _mid, b, du,   # триггера (мс назад, тот же preconf) -> prepare_hot
+                                  debt_assets_by.get((_mid, b), 0), _price,   # не перечитывает market/position (~-350мс)
+                                  state=((_tba, _tbs, _bc[0], _bc[1]) if _bc else None))
+                _prep_ms(time.perf_counter() - _ps)
+                if prep.get("ok"):
+                    _ready_now(_mid, b, prep, hr, du)
+                else:
+                    log.info("HOT skip %s/%s: %s", _mid[:10], b[:10], str(prep.get("reason"))[:80])
+            except Exception as e:                           # noqa: BLE001
+                log.error("HOT prep error %s/%s: %s: %s", _mid[:10], b[:10],
+                          type(e).__name__, redact_clip(e, 80))
+            finally:
+                release_prep(_key)                           # упавшая подготовка НЕ запирает заёмщика
+
+        run_prep_batch(_cand, _prep_one, log=log)
 
         if hint_oracle is not None and oracle == hint_oracle and not ready and not _canary_fired:
             # 07-17: канарейка стреляет В ТОЧКЕ, где fast-lane отправил бы hint-рынок, а не после
@@ -1838,6 +2078,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
     _be_trip = pop_batch_empty_trip()              # мультибатч: серия пустых батчей (nOk=0) -> TG-пейдж
     if _be_trip:
         alerter.send_async(_be_trip, key="batch-empty")
+    _t_prep_total = _prep_acc["ms"]              # Р1: СУММА по prep-тредам (не wall-clock)
     stage_note("prep", _t_prep_total); stage_note("e2e", (time.time() - t) * 1000.0)
     if _t_send:
         stage_note("send", _t_send)
@@ -2127,13 +2368,18 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         if _stg:
                             log.info("STAGE p50/p95 мс (окно %.0fч): %s", STAGE_WINDOW_SEC / 3600.0, _stg)
                         _px_ok, _px_fail = px_preconf_take()
-                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d poll_lat=%d px_free=%d/%d px_pre=%d/%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d prep=%d",
+                        log.info("hot stats %ds: spawn=%d pspawn=%d poll=%d poll_lat=%d px_free=%d/%d px_pre=%d/%d | gate proceed=%d skip=%d none=%d poll_none=%d poll_fb=%d | funnel nocand=%d noprice=%d norp=%d noflip=%d floor=%d corpse=%d/unk%d claim=%d prep=%d",
                                  int(time.monotonic() - last_stats), stats["spawn"], stats["pspawn"], stats["poll"],
                                  stats.get("poll_lat", 0),
                                  stats.get("px_free", 0), stats.get("px_free", 0) + stats.get("px_rpc", 0),
                                  _px_ok, _px_ok + _px_fail,
                                  stats["proceed"], stats["skip"], stats["none"], stats["poll_none"], stats["poll_fb"],
-                                 stats["f_nocand"], stats["f_noprice"], stats["f_norp"], stats["f_noflip"], stats["f_floor"], stats["f_prep"])
+                                 stats["f_nocand"], stats["f_noprice"], stats["f_norp"], stats["f_noflip"], stats["f_floor"],
+                                 # Р1: corpse= срезано фильтром трупов, unk= окон, где индекс НЕ ЗНАЛ
+                                 # (unk высокий при corpse=0 = фильтр мёртв, а не «трупов нет»),
+                                 # claim= дублей подготовки, снятых заявкой multi-leg.
+                                 stats.get("f_corpse", 0), stats.get("f_corpse_unk", 0),
+                                 stats.get("f_claim", 0), stats["f_prep"])
                         # порог: >3 фолбэка/поллинг ≈ >8% чтений цены потеряли фору = РЕАЛЬНАЯ cap-деградация
                         # (исходный preconf-кап был 1457/окно=67%); микро-остаток спайков фида (≤2%, ~48/окно)
                         # НЕ будит — иначе ложно «мелькает» в норме (07-22, poll_fb калибр. на катастрофу, не на 1-2 оракула)

@@ -82,6 +82,12 @@ _orig_flag = hp.HOT_DISPATCH_INCREMENTAL
 _real_threading = hp.threading
 hp.threading = types.SimpleNamespace(Thread=SyncThread, Lock=_real_threading.Lock,
                                      Event=_real_threading.Event)
+# Р1: СТРОГОЕ ЧЕРЕДОВАНИЕ prep->dispatch->prep — контракт ПОСЛЕДОВАТЕЛЬНОЙ подготовки, и с
+# 14.08 он живёт за ручкой отката REACTIVE_PREP_THREADS=1. При дефолтных 8 тредах порядок двух
+# мгновенных preps не определён вовсе, и утверждать его = ловить флейк. Пункты 1-3 проверяют
+# ровно прежний тракт (ручка на 1); параллельный контракт — в пункте 1b и в дрелях Р1.
+_orig_prep_n = hp.REACTIVE_PREP_THREADS
+hp.REACTIVE_PREP_THREADS = 1
 try:
     # 1. ON (дефолт кода): каждая готовая цель уходит ДО prepare следующей
     assert _orig_flag is True, "дефолт HOT_DISPATCH_INCREMENTAL должен быть ON"
@@ -116,6 +122,48 @@ finally:
     hp._flips = _orig_flips
     hp.HOT_DISPATCH_INCREMENTAL = _orig_flag
     hp.threading = _real_threading
+    hp.REACTIVE_PREP_THREADS = _orig_prep_n
+
+# 1b. Р1, ПАРАЛЛЕЛЬНАЯ подготовка (дефолт 8 тредов): чередование больше не утверждаем — но
+# БАРЬЕРА БЫТЬ НЕ ДОЛЖНО. Первый dispatch обязан уйти РАНЬШЕ, чем закончится последняя
+# подготовка: ровно это и было дефектом №3 вскрытия каскада 06.08 (first-ready ждал хвост 7.8с).
+hp._flips = lambda price, lltv, tba, tbs, positions: [
+    (b, types.SimpleNamespace(hf=0.98), du) for (b, bs, col, du) in positions]
+try:
+    import time as _time
+    _marks = {"lock": threading.Lock(), "first_disp": None, "last_prep": 0.0}
+    ev = []
+    kw = _mk_env(ev)
+    kw["log"] = _log()
+    _t0 = _time.perf_counter()
+
+    def _slow_prep(rpc, preconf_rpc, cfg, mid, b, du, debt_assets, price, state=None):
+        # РАЗНАЯ цена подготовки: равные сны финишируют в одну миллисекунду и делают
+        # утверждение о порядке подбрасыванием монеты (свой стенд — тоже подозреваемый).
+        _time.sleep(0.05 if b == "0xb1" else 0.60)
+        with _marks["lock"]:
+            _marks["last_prep"] = max(_marks["last_prep"], _time.perf_counter() - _t0)
+        return {"ok": True, "calldata": "0x", "net_usd": 5.0}
+
+    _base_disp = kw["dispatch_fn"]
+
+    def _mark_disp(rpc, cfg, ready, log=None, max_inflight=None):
+        with _marks["lock"]:
+            if _marks["first_disp"] is None:
+                _marks["first_disp"] = _time.perf_counter() - _t0
+        return _base_disp(rpc, cfg, ready, log=log, max_inflight=max_inflight)
+
+    kw["prepare_fn"] = _slow_prep
+    kw["dispatch_fn"] = _mark_disp
+    res = hp._process_transmit(AGG, 104, 0, _time.time(), **kw)
+    assert len(res) == 2 and all(r["sent"] for r in res), res
+    assert _marks["first_disp"] is not None and _marks["first_disp"] < _marks["last_prep"] - 0.3, \
+        "барьер вернулся: первый dispatch %.3fс, последняя подготовка %.3fс" % (
+            _marks["first_disp"] if _marks["first_disp"] is not None else -1, _marks["last_prep"])
+    print("UNIT_OK: параллельная подготовка — первый dispatch (%.2fс) до конца подготовок (%.2fс)"
+          % (_marks["first_disp"], _marks["last_prep"]))
+finally:
+    hp._flips = _orig_flips
 
 # 4. ЖИВЫЕ треды: receipt-ожидание внутри dispatch (боевой замер 07.08: ~4с/tx) не должно
 # сериализовать цели — два dispatch по 0.5с обязаны идти внахлёст (e2e ~0.5с, не ~1.0с)
