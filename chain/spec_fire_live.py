@@ -1109,10 +1109,18 @@ class SpecFireLive:
             _st = self._board
             if (_st and _st.get("key") and _st.get("key") != (mid, b)
                     and self._now() < _st.get("until", 0.0)):
-                if plan_ev is None:
-                    return True               # незнание близости не вытесняет живого владельца
                 _inc_ev = _st.get("ev")
-                if _inc_ev is not None and plan_ev < _inc_ev * (1.0 + SPEC_FIRE_V2_EV_MARGIN):
+                if plan_ev is None:
+                    # Незнание близости не вытесняет ИЗВЕСТНО-ценного владельца (канон
+                    # «незнание закрывает гард»). НО если EV инкумбента ТОЖЕ None
+                    # (напр. shared.hf_by пуст — легальное состояние, тот же защитный
+                    # getattr, что и на base), ценностной основы предпочесть застоявшийся
+                    # слот НЕТ: держать его весь until (~870с) против свежего top-1 — регресс
+                    # против base, который трекает fattest каждые 240с (LWW). Оба EV неизвестны
+                    # → проваливаемся в перезапись (base-трекинг), а не морозим слот на until.
+                    if _inc_ev is not None:
+                        return True
+                elif _inc_ev is not None and plan_ev < _inc_ev * (1.0 + SPEC_FIRE_V2_EV_MARGIN):
                     return True               # не лучше живого инкумбента на порог — держим слот
             import chain.execute as _ex
             dl = int(time.time()) + SPEC_FIRE_V2_PLAN_TTL_SEC
