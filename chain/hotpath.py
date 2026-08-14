@@ -785,6 +785,48 @@ def _net_gate(profit_wei, debt_usd, debt_assets, cfg):
     return profit_usd, cost_usd, profit_usd - cost_usd
 
 
+# ============ Р1б/#120: TIP ХВОСТА — ОТДЕЛЬНЫЙ РЕЖИМ ============
+#
+# Замер суб-блоков 49965023 (14.08): flashblocks публикует суб-блок ПОСЛЕ закрытия ⇒ весь
+# реактивный конвейер (detect -> prepare 632мс -> dispatch) прибывает в ПОЗДНИЕ суб-блоки,
+# где новая цена уже действует. Опасность Ш28 («переплата телепортирует в голову суб-блока
+# со старой ценой») к этому пути НЕ применима по построению — она про суб-блок ТРАНЗИТА,
+# в который реакция физически не входит. А класс 0.001-0.02 gwei проигрывает сортировку
+# хвоста реактору (~4 gwei, 35% событий) ВСЕГДА: внутри суб-блока прибытия tip покупает ранг.
+#
+# Tip хвоста платим ОТ ЭКОНОМИКИ ЦЕЛИ (канон «вход гейта — от субъекта»): не выше
+# REACTIVE_TAIL_TIP_GWEI (класс реактора), не выше доли REACTIVE_TAIL_TIP_FRAC от gross-приза
+# (мелкий хвост не переплачивает за гонку, которую при живом реакторе всё равно проиграет),
+# не ниже измеренного класса рынка (пол). Гейт net считает cost ТЕМ ЖЕ tip — гейт и tx не
+# расходятся. Откат REACTIVE_TAIL_TIP_GWEI=0 — прежнее поведение бит-в-бит.
+_TAIL_TIP_GWEI = float(os.environ.get("REACTIVE_TAIL_TIP_GWEI", "4.0") or 0.0)
+_TAIL_TIP_FRAC = float(os.environ.get("REACTIVE_TAIL_TIP_FRAC", "0.25"))
+
+
+def tail_tip_gwei(cfg, profit_usd, debt_usd, now=None):
+    """Tip реактивного (хвостового) выстрела. PURE-ish. Ручка =0 -> dynamic бит-в-бит."""
+    base = dynamic_tip_gwei(cfg, debt_usd) if now is None else dynamic_tip_gwei(cfg, debt_usd, now)
+    if _TAIL_TIP_GWEI <= 0:
+        return base
+    try:
+        gas = float(getattr(cfg, "gas_limit_est", 0) or 0)
+        eth = float(getattr(cfg, "eth_price_usd", 0) or 0)
+        afford = ((_TAIL_TIP_FRAC * max(0.0, float(profit_usd or 0.0)) * 1e9 / (gas * eth))
+                  if gas > 0 and eth > 0 else 0.0)
+    except Exception:                                        # noqa: BLE001
+        afford = 0.0                                         # незнание НЕ повышает ставку
+    return max(base, min(_TAIL_TIP_GWEI, afford))
+
+
+def _net_gate_tail(profit_wei, debt_usd, debt_assets, cfg):
+    """(profit, cost, net, tip_gwei) для реактивного пути: cost по tip ХВОСТА, и наружу
+    отдаётся ТО ЖЕ число tip, которым будет подписан выстрел."""
+    profit_usd = profit_wei * debt_usd / debt_assets if debt_assets else 0.0
+    tip = tail_tip_gwei(cfg, profit_usd, debt_usd)
+    cost_usd = cfg.gas_limit_est * tip * cfg.eth_price_usd / 1e9
+    return profit_usd, cost_usd, profit_usd - cost_usd, tip
+
+
 # ---- on-chain reads ----
 
 def read_preconf_price(preconf_rpc, oracle):
@@ -1645,7 +1687,8 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
                      collateral_dbg, tba, tbs, int(price), lltv_wad, lif_from_lltv(lltv_wad / 10**18), _diag_blk, cd0.hex() if isinstance(cd0, (bytes, bytearray)) else str(cd0))
             return {"ok": False, "reason": f"preconf sim revert: {sim['error']}"}
         profit_wei = sim["profit"]
-        profit_usd, cost_usd, net_usd = _net_gate(profit_wei, debt_usd, debt_assets, cfg)
+        # Р1б/#120: гейт и tip хвоста — ОДНО число (cost посчитан тем tip, которым стреляем)
+        profit_usd, cost_usd, net_usd, _tail_tip = _net_gate_tail(profit_wei, debt_usd, debt_assets, cfg)
         if net_usd < cfg.min_profit_usd:
             _note_refusal(market_id, borrower, "net-below-min", debt_usd)   # #123: отказ в регистр
             return {"ok": False, "net_usd": net_usd,
@@ -1676,7 +1719,7 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
                  "debt_assets": debt_assets, "unwrap_target": unwrap, "swap_meta": _swap_meta}
         _fb = _fresh_basefee()
         if _fb is not None:                                   # SEND-2: fee из fb-хедера (0 Alchemy-RTT в send)
-            _tip = int(dynamic_tip_gwei(cfg, debt_usd) * 1e9)   # каскадная страховка по призу
+            _tip = int(_tail_tip * 1e9)                       # Р1б/#120: тот же tip, которым считался гейт
             _prep["max_fee"] = _fb * 2 + _tip                 # та же формула base*2+tip, но base = pending-блок из фида
             _prep["tip"] = _tip
         return _prep
@@ -1739,13 +1782,14 @@ def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asse
         min_profit = repaid_assets * (_lif_wad - WAD) // WAD // 2
         if min_profit <= 0:
             return {"ok": False, "reason": "fast: zero bonus"}
-        profit_usd, cost_usd, net_usd = _net_gate(min_profit, debt_usd, debt_assets, cfg)
+        # Р1б/#120: гейт и tip хвоста — одно число
+        profit_usd, cost_usd, net_usd, _tail_tip = _net_gate_tail(min_profit, debt_usd, debt_assets, cfg)
         if net_usd < cfg.min_profit_usd:
             _note_refusal(market_id, borrower, "fast-net-below-min", debt_usd)   # #123: отказ в регистр
             return {"ok": False, "reason": f"fast: net ${net_usd:.2f} < min (analytic floor)"}
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
         cd = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit)
-        _tip = int(dynamic_tip_gwei(cfg, debt_usd) * 1e9)     # каскадная страховка по призу
+        _tip = int(_tail_tip * 1e9)                           # Р1б/#120: тот же tip, которым считался гейт
         return {"ok": True, "calldata": cd,
                 "gas": max(_GAS_CACHE.get(market_id, 0),
                            int(getattr(cfg, "gas_limit_floor", 3_000_000) or 3_000_000)),

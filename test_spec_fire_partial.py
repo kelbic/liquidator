@@ -119,7 +119,8 @@ import chain.hotpath as hp
 
 cap2 = {}
 _orig2 = (hp._fresh_basefee, hp._net_gate, hp.dynamic_tip_gwei, dict(hp._FULL_PARAMS_CACHE),
-          ex.direct_swap, ex.encode_liquidate, ex.route_max_in, hp.REACTIVE_PARTIAL)
+          ex.direct_swap, ex.encode_liquidate, ex.route_max_in, hp.REACTIVE_PARTIAL,
+          hp._net_gate_tail)
 
 
 def fake_direct2(coll, loan, seized, s, r, *, repaid_assets, **kw):
@@ -134,6 +135,7 @@ def fake_encode2(mp, borrower, repaid_shares, router, cdata, min_profit):
 
 hp._fresh_basefee = lambda: 10**7
 hp._net_gate = lambda mp_, du, da, c: (100.0, 1.0, 99.0)
+hp._net_gate_tail = lambda mp_, du, da, c: (100.0, 1.0, 99.0, 0.05)   # Р1б/#120: боевой шов fast
 hp.dynamic_tip_gwei = lambda c, d: 0.05
 hp._FULL_PARAMS_CACHE["0xM"] = ("0xLOAN", "0xCOLL", "0xORCL", "0xIRM", 625 * 10**15)
 ex.direct_swap = fake_direct2
@@ -158,7 +160,8 @@ try:
     assert "shares" not in cap2
 finally:
     (hp._fresh_basefee, hp._net_gate, hp.dynamic_tip_gwei, _pc,
-     ex.direct_swap, ex.encode_liquidate, ex.route_max_in, hp.REACTIVE_PARTIAL) = _orig2
+     ex.direct_swap, ex.encode_liquidate, ex.route_max_in, hp.REACTIVE_PARTIAL,
+     hp._net_gate_tail) = _orig2
     hp._FULL_PARAMS_CACHE.clear()
     hp._FULL_PARAMS_CACHE.update(_pc)
 print("UNIT_OK: prepare_fast — частичка вместо отказа, откат REACTIVE_PARTIAL=0")
