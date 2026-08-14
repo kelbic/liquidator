@@ -1806,6 +1806,7 @@ class SpecFireLive:
                     # записывало в probe_foreign_plan (120 при истине 70). Ключи ЖИВЫХ окон
                     # (`_win_key`) и ключ доски щадим — их владельцы ещё будут судиться.
                     _live = self._live_plan_keys()
+                    _claim = getattr(self, "_probe_claim", None)
                     _n = 0
                     for _k in list(m):
                         if _n >= 32:
@@ -1813,6 +1814,15 @@ class SpecFireLive:
                         if _k is None or _k in _live:
                             continue
                         m.pop(_k, None)
+                        # L2 р-8: КЛЕЙМО УХОДИТ ВМЕСТЕ СО СЧЁТЧИКАМИ, НА КОТОРЫЕ ССЫЛАЕТСЯ.
+                        # Пол отсчёта соседа имеет смысл только пока в кольце лежат те самые
+                        # числа, от которых он отсчитан. Пережив их, он превращал ШТАТНОЕ
+                        # второе окно той же цели (каскад) в probe_landed=-41: отрицательные
+                        # счётчики, ради устранения которых кольцо и чинили в р-7, вернулись
+                        # через новый механизм. Срок жизни клейма обязан быть КОГЕРЕНТЕН
+                        # кольцу, и единственная точка выхода ключа из кольца — вот эта.
+                        if _claim is not None:
+                            _claim.pop(_k, None)
                         _n += 1
                 d = m[key] = {}
             d[name] = d.get(name, 0) + n
@@ -1855,16 +1865,20 @@ class SpecFireLive:
         if key is None:
             return "не измерено (окно не публиковало плана — приёмке (б) не по чему судить)"
         with _PROBE_FEED_LOCK:
-            own_c = dict((self._probe_keys().get(key) or {}))
+            m = self._probe_keys()
+            own_c = dict((m.get(key) or {}))
             claim = getattr(self, "_probe_claim", None)
             if claim is None:
                 claim = self._probe_claim = {}
+            # ЧИСТКА ПО ФАКТУ КОЛЬЦА, А НЕ ПО СВОЕМУ СЧЁТУ (L2 р-8). Прежнее «если клейм >64,
+            # выбросить первые 32» жило своей жизнью: оно и держало клеймо ключа, которого в
+            # кольце давно нет (тогда пол отсчёта врёт), и могло выбросить клеймо ключа,
+            # который в кольце ЕСТЬ (тогда сосед считается дважды). Клеймо теперь —
+            # подмножество кольца по построению, и его размер ограничен размером кольца.
+            for _k in [_k for _k in claim if _k not in m and _k != key]:
+                claim.pop(_k, None)
             base = dict(claim.get(key) or {})
             claim[key] = dict(own_c)          # клеймим ровно то, что засчитываем ниже
-            if len(claim) > 64:               # кольцо клейм: та же память, что у карты проб
-                for _k in list(claim)[:32]:
-                    if _k != key:
-                        claim.pop(_k, None)
         out = self._probe_delta(snap, key, floor=base)
         _s0 = int(((snap or {}).get("by_key") or {}).get(key, {}).get("probe_landed", 0) or 0)
         taken = max(0, int(base.get("probe_landed", 0) or 0) - _s0)
@@ -1919,11 +1933,17 @@ class SpecFireLive:
         # же планом. Без него два окна одного плана печатают одну дельту дважды (сумма 82 при
         # 41 факте). Ниже в `own_landed` он НЕ участвует нарочно: чужой бакет считается от
         # СЫРОЙ дельты, иначе пробы, ушедшие под НАШИМ планом, назывались бы чужими.
+        #
+        # ОТРИЦАТЕЛЬНАЯ ДЕЛЬТА НЕВОЗМОЖНА ПО ПОСТРОЕНИЮ (L2 р-8), а не «маловероятна»: пол
+        # отсчёта зажат текущим значением счётчика. Оба вычитаемых — и снимок на арме, и
+        # клеймо соседа — сняты с карты, которая умеет ОБНУЛЯТЬСЯ (вытеснение ключа кольцом),
+        # поэтому «пол больше факта» есть штатное состояние, а не авария. Зажим читается
+        # честно: «всё, что у нас есть по этому ключу, уже кем-то засчитано» = 0.
         _fl = floor or {}
         out = {}
         for k in self._PROBE_KEYS:
-            v = int(own_c.get(k, 0) or 0) - max(int(own_s.get(k, 0) or 0),
-                                                int(_fl.get(k, 0) or 0))
+            _cur = int(own_c.get(k, 0) or 0)
+            v = _cur - min(_cur, max(int(own_s.get(k, 0) or 0), int(_fl.get(k, 0) or 0)))
             if v or k in self._PROBE_ALWAYS:
                 out[k] = v
         own_landed = int(own_c.get("probe_landed", 0) or 0) - int(own_s.get("probe_landed", 0) or 0)
