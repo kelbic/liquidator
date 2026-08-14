@@ -288,8 +288,21 @@ class ReceiptCollector:
             try:
                 self._on_result(ent[0], h, r)
             except Exception as e:
+                # ХВОСТ L1 р-8, ВТОРОЙ БРАТ. По образцу пути таймаута (c2fdc92): отказ
+                # обработчика ИСХОДА — того самого, что выносит вердикт победы по квитанции и
+                # снимает бронь #93, — печатался БЕЗ ХЭША и без текста, одним именем типа.
+                # Разобрать по такой строке нечего: какая проба легла и почему — неизвестно, а
+                # хэш уже снят с `_pending`, то есть другого следа не будет ни от кого.
+                # Глотать бросок мы обязаны (одна битая квитанция не имеет права уронить тред
+                # коллектора), молчать о нём — нет.
+                self.stats["result_handler_fail"] = self.stats.get(
+                    "result_handler_fail", 0) + 1
                 if self._log:
-                    self._log("FIRE collect handler fail: %s" % type(e).__name__)
+                    try:
+                        self._log("FIRE collect handler fail tx=%s: %s: %s"
+                                  % (h, type(e).__name__, str(e)[:140]))
+                    except Exception:
+                        pass
         return done
 
     def _loop(self):
