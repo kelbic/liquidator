@@ -353,6 +353,35 @@ SPEC_FIRE_V2_BOARD_SETTLE_SEC = float(os.environ.get("SPEC_FIRE_V2_BOARD_SETTLE_
 # приз УЖЕ у владельца (контракт сметает прибыль сам), план одноразовый (delete _plan), а лишние
 # пробы по нему — дешёвые no-op'ы. Значит на доске fail-closed: нет события — нет победы.
 LIQUIDATED_TOPIC0 = "0xde0aa27286f5cb3a4ed853dc4823ead62d63e92cdf13de09d6aece56970721a4"
+
+# #54: КНИЖКА ВЫРУЧКИ ПОБЕД ПРОБ. Kill-switch суммирует actions со status LIKE 'submitted:%'
+# — их пишет только диспатч-путь; победа ПРОБЫ (движок/доска) не писала ничего, а её газ
+# учитывался (specfire_gas_today) ⇒ выигрышный день выглядел чистым расходом и мог заглушить
+# боевой путь. Шов модульный, арм ЯВНЫЙ из main.py (канон notify_fn: забыли армировать —
+# молчание, не выстрел); вызов — СБОКУ от денег через _accounted (правило р-7).
+_REVENUE_BOOK = None            # fn(market_label, borrower, net_usd, tx_hash) | None = выключено
+
+
+def set_revenue_book(fn):
+    """#54: явный арм книжки выручки (main.py). None = снять."""
+    global _REVENUE_BOOK
+    _REVENUE_BOOK = fn
+
+
+# Незнание НЕ приписывает выручку: неизвестный займ -> 0 с громкой строкой (недосчёт для
+# kill-switch безопасен — он консервативнее; приписка фантома открыла бы газ-кап).
+_LOAN_USD = {"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": (6, 1.0)}     # USDC
+
+
+def _loan_profit_usd(loan, profit_raw, cfg):
+    lt = str(loan or "").lower()
+    if lt == "0x4200000000000000000000000000000000000006":              # WETH — цена из cfg
+        return float(profit_raw) / 1e18 * float(getattr(cfg, "eth_price_usd", 0) or 0)
+    d = _LOAN_USD.get(lt)
+    if d is None:
+        return None
+    dec, px = d
+    return float(profit_raw) / 10**dec * px
 # Флот (07.08): ног может быть десятки. Тред-на-ногу при 70 ногах на ДВУХЪЯДЕРНОЙ машине —
 # это ровно тот эффект наблюдателя, на который у нас есть задокументированные инциденты.
 # Поэтому ноги режутся на пачки: не больше N тредов на залп, каждый ведёт свою долю ног.
@@ -1797,10 +1826,32 @@ class SpecFireLive:
         _won = _receipt_has_win(r, self.cfg.liquidator_address) is True
         if _won:
             self._probe_win(tgt, h, addr, gas_usd, src="движок")
+            # #54: выручка победы — СБОКУ, ПОСЛЕ денег (правило р-7); бросок не трогает огонь
+            self._accounted("выручка победы", h, self._book_probe_revenue, h, r)
         else:
             self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
         # #110: метрика №1 — ГДЕ мы встали
         self._accounted("позиция пробы", h, self._note_probe_position, h, r, meta=meta)
+
+    def _book_probe_revenue(self, h, r):
+        """#54: провести выручку победы пробы в store (виден kill-switch'у). Профит — из
+        события Liquidated(borrower, loan, profit) нашего контракта (parse_batch_receipt:
+        фантомная прибыль запрещена, только СВОИ события). Газ пробы уже в specfire_gas_today
+        — здесь gas_usd=0, двойного счёта нет."""
+        if _REVENUE_BOOK is None:
+            return                                            # канал не армирован (канон)
+        from chain.execute import parse_batch_receipt
+        wins, _fails = parse_batch_receipt(r, self.cfg.liquidator_address)
+        for (borrower, loan), profit_raw in (wins or {}).items():
+            usd = _loan_profit_usd(loan, profit_raw, self.cfg)
+            if usd is None:
+                log.warning("#54 выручка НЕ книжится: неизвестный займ %s (profit_raw=%d tx=%s)"
+                            " — незнание не приписывает", str(loan)[:12], int(profit_raw), h)
+                continue
+            _REVENUE_BOOK(borrower, float(usd), h)
+            self.stats["revenue_booked_usd"] = self.stats.get("revenue_booked_usd", 0.0) + float(usd)
+            log.info("#54 ВЫРУЧКА ПОБЕДЫ: $%.2f borrower=%s tx=%s — проведена в kill-switch",
+                     usd, str(borrower)[:12], h)
 
     def _accounted(self, what, h, fn, *a, **kw):
         """ИЗМЕРЕНИЕ В СВОЕЙ ВЕТКЕ, с ГРОМКИМ следом. Возврат: измерение прошло?

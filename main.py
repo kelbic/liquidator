@@ -765,6 +765,18 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                         _sfl._alert = lambda _t, _k: alerter.send_async(_t, key=_k)
                         from chain.execute import set_combat_win_hook
                         set_combat_win_hook(_sfl.note_combat_win_by_market)   # #58
+                        # #54: выручка побед проб — в kill-switch. Арм ЯВНЫЙ и только здесь;
+                        # строка actions: status 'submitted:1 probe-win' попадает в фильтр
+                        # realized_today (LIKE 'submitted:%'), газ пробы уже в specfire_gas_today.
+                        try:
+                            from chain.spec_fire_live import set_revenue_book
+                            set_revenue_book(lambda borrower, usd, h: store.log_action(
+                                market_id="spec-fire-win", borrower=str(borrower), mode="execute",
+                                tx_hash=str(h), net_usd=float(usd), gas_usd=0.0,
+                                status="submitted:1 probe-win"))
+                            log.info("#54 книжка выручки проб АРМИРОВАНА (kill-switch видит победы)")
+                        except Exception:
+                            log.exception("#54 книжка выручки: арм не удался — выручка невидима, огонь не тронут")
                         _handlers.append(_sfl.handle_event)
                         from chain.failover import set_windows_probe
                         set_windows_probe(lambda: len(_sfl._windows))   # назад-свитч не посреди окна
