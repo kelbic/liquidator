@@ -2812,7 +2812,8 @@ def prepare_liquidation(rpc, cfg, market_id: str, borrower: str, debt_usd: float
             return {"ok": False, "reason": "no debt (cleared)"}
         price = decode_price(aggregate3(rpc, [(oracle, encode_price_call())])[0][1])
 
-        repaid_shares = int(borrow_shares)
+        from chain.hotpath import _shave_ask      # #121: заявка строго меньше долга
+        repaid_shares = _shave_ask(int(borrow_shares))
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)
         seized = expected_seized(repaid_assets, lif_from_lltv(lltv_wad / 10**18), price)
         if seized == 0:

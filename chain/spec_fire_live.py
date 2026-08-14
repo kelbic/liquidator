@@ -783,9 +783,10 @@ class SpecFireLive:
         # заставлял роутер тянуть больше, чем есть -> revert -> SwapFailed(). Именно это и
         # ловила форк-репетиция: одинаковый газ при minOut=долг и minOut=1, живая квота
         # канарейки. Плюс без капа шер глубокая позиция даёт Panic 0x11 внутри Morpho.
-        from chain.hotpath import _seized_exact, _cap_repaid_shares
+        from chain.hotpath import _seized_exact, _cap_repaid_shares, _shave_ask
         _lif_wad = int(round(lif_from_lltv(lltv_wad / 10**18) * 10**18))
-        repaid_shares = _cap_repaid_shares(int(bs), int(coll_amt), int(price), _lif_wad, tba, tbs)
+        # #121: запас вниз ДО капа — заявка строго меньше долга (граница underflow Morpho)
+        repaid_shares = _cap_repaid_shares(_shave_ask(int(bs)), int(coll_amt), int(price), _lif_wad, tba, tbs)
         if repaid_shares <= 0:
             return None
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)   # репэй-сторона: вверх, как и было
