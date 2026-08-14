@@ -265,7 +265,12 @@ def corpse_pairs(stats=None, log=None):
             if p is None:
                 why = "индекс протух (fresh=False)"
             else:
-                return p
+                # ФОРМА КЛЮЧА (канон hx() в индексе): у заёмщика ДВА источника и ДВЕ формы —
+                # Morpho API отдаёт checksum-адрес (он и лежит в shared.groups), лог цепи —
+                # нижний регистр. Несимметричная нормализация даёт множества, которые НЕ
+                # ПЕРЕСЕКАЮТСЯ НИКОГДА: фильтр был бы структурным нулём, а «corpse=0» читалось
+                # бы как «трупов не было». Нормализуем ОБЕ стороны, а не одну.
+                return {(str(k[0]).lower(), str(k[1]).lower()): v for k, v in p.items()}
     except Exception as e:                                   # noqa: BLE001
         why = "%s: %s" % (type(e).__name__, redact_clip(e, 60))
     if stats is not None:
@@ -1981,7 +1986,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             if not _asked:                                   # #110: снимок пар из ПАМЯТИ индекса,
                 _asked = True                                # без сети, и только когда есть ЗА ЧТО
                 _corpses = corpse_pairs(stats=stats, log=log)   # платить (транзит без флипов не платит)
-            _row = _corpses.get((mid, b)) if _corpses is not None else None
+            _row = _corpses.get((str(mid).lower(), str(b).lower())) if _corpses is not None else None
             if _row is not None and corpse_verdict(_row, _bc[0] if _bc else None):
                 if stats is not None:
                     stats["f_corpse"] = stats.get("f_corpse", 0) + 1
