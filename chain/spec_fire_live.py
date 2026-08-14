@@ -1528,17 +1528,47 @@ class SpecFireLive:
             gas_usd = _wei * float(self.cfg.eth_price_usd) / 1e18
         except Exception:
             _wei, gas_usd = 0, 0.0
+        from chain.execute import volley_gas_settle
+        # ДЕНЬГИ ПЕРВЫМИ, УЧЁТ ПОСЛЕ (структурное правило р-7). Прежде три учётных вызова
+        # стояли подряд ДО вердикта победы, и вопрос «если счётчик БРОСИТ — что перестанет
+        # стрелять?» имел ответ «ВСЁ»: исключение измерителя уносило вердикт, disarm, закрытие
+        # окна и wins, а коллектор глотал его до имени типа («FIRE collect handler fail:
+        # RuntimeError»). Это второй за сутки случай «учёт уронил огонь», и лечится он
+        # ПОРЯДКОМ, а не ещё одним except.
+        if _receipt_has_win(r, self.cfg.liquidator_address) is True:
+            self._probe_win(tgt, h, addr, gas_usd, src="движок")
+        else:
+            self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
         # #93: записываем ФАКТ и освобождаем бронь, поставленную при отправке этой же пробы.
         # Бронь покрывает только окно «в полёте» (учёт отставал от отправок вшестеро), поэтому
         # суточный факт от неё не растёт — она ограничивает мгновенную экспозицию.
-        from chain.execute import volley_gas_settle
-        volley_gas_settle(h, gas_usd)
-        volley_bal_charge(addr, _wei)     # #45: патрон списывается по ФАКТУ, не по эстимейту
-        self._note_probe_position(h, r, meta=meta)   # #110: метрика №1 — ГДЕ мы встали
-        if _receipt_has_win(r, self.cfg.liquidator_address) is not True:
-            self.stats["board_noop"] = self.stats.get("board_noop", 0) + 1
-            return
-        self._probe_win(tgt, h, addr, gas_usd, src="движок")
+        self._accounted("бронь газа", h, volley_gas_settle, h, gas_usd)
+        # #45: патрон списывается по ФАКТУ, не по эстимейту
+        self._accounted("патрон ноги", h, volley_bal_charge, addr, _wei)
+        # #110: метрика №1 — ГДЕ мы встали
+        self._accounted("позиция пробы", h, self._note_probe_position, h, r, meta=meta)
+
+    def _accounted(self, what, h, fn, *a, **kw):
+        """ИЗМЕРЕНИЕ В СВОЕЙ ВЕТКЕ, с ГРОМКИМ следом. Возврат: измерение прошло?
+
+        Правило раунда-7: учёт никогда не стоит перед деньгами и не оборачивает их. У каждого
+        учётного вызова на денежном пути обязан быть ответ на вопрос «если он БРОСИТ — что
+        перестанет стрелять?», и ответ обязан быть «ничего». Отсюда две вещи разом: вызов идёт
+        ПОСЛЕ вердикта и в своём try, а бросок печатается С ХЭШЕМ И ТИПОМ — невидимый отказ
+        есть отказ, который никто никогда не починит (за сутки два таких: голый `except: pass`
+        в `_engine_timeout` и общий except коллектора в `_engine_result`).
+        """
+        try:
+            fn(*a, **kw)
+            return True
+        except Exception as e:
+            try:
+                log.warning("SPECFIRE УЧЁТ УПАЛ (%s) tx=%s: %s: %s — ДЕНЬГИ НЕ ТРОНУТЫ "
+                            "(вердикт, разоружение и окно отработали до этого места)",
+                            what, h, type(e).__name__, e)
+            except Exception:
+                pass
+            return False
 
     def _probe_win(self, tgt, h, addr, gas_usd=0.0, src="движок"):
         """ПОБЕДА ПРОБЫ: приз взят — гасим огонь, ставим паузу, закрываем окно, считаем.
@@ -1550,24 +1580,72 @@ class SpecFireLive:
         ни кулдауна — и движок продолжал бы жечь газ по УЖЕ ВЗЯТОЙ цели, пока не истечёт TTL
         окна. Это денежный дефект, и лечится он тем, что вердикт победы у нас один, откуда бы
         ни пришёл ФАКТ.
+
+        БЛОКЕР B1 р-7: ОКНО И ПАУЗА — ПО КЛЮЧУ ПЛАНА, А НЕ ПО ЯРЛЫКУ ФИДА. `tgt[0]` ставит
+        ПОСЛЕДНИЙ тикнувший keepalive любого окна каскада (`FireEngine._target` — одно
+        перезаписываемое поле), а приз берётся под планом ОДНОЙ цели. Прежняя редакция гасила
+        окно СЛУЧАЙНОГО фида: окно взятой цели оставалось жить и жечь газ по уже забранному
+        призу, а живому соседу, чью цель никто не брал, ставилась WIN-пауза на 900с. Ту же
+        ложность ярлыка (59% проб несут чужой) раунд-6 доказал для УЧЁТА и оставил в ДЕНЬГАХ.
+        Ключ (mid,borrower) лежит в том же кортеже и описывает калдату пробы, поэтому от
+        гонки тиков не зависит; запасной источник — ключ самой доски.
         """
-        feed, mid, b, dbt = (tgt if tgt else ("", "?", "?", 0.0))
-        from chain.execute import mark_recent_send
-        self.stats["wins"] += 1
-        mark_recent_send(mid, b)
-        self._set_cooldown(feed, "probe", proven=True)       # #46: победа пробы не гасит флот
+        feed_label, mid, b, dbt = (tgt if tgt else ("", "?", "?", 0.0))
+        # ДЕНЬГИ ПЕРВЫМИ (структурное правило р-7): вердикт, разоружение и закрытие окна не
+        # имеют права стоять за учётом — бросок счётчика их не отменяет.
+        self.stats["wins"] = self.stats.get("wins", 0) + 1
         eng = getattr(self, "_fire_engine", None)
         if eng is not None:
             eng.disarm()                 # приз взят — огонь гасим немедленно, не ждём TTL
-        if feed:
+        _pk = self.plan_key(mid, b) or self._board_key()
+        _feeds = self._feeds_of_plan(_pk)
+        for _f in _feeds:
             with self._lock:
-                stop = self._windows.pop(feed, None)
+                stop = self._windows.pop(_f, None)
             if stop is not None:
                 stop.set()
+            self._set_cooldown(_f, "probe", proven=True)     # #46: победа пробы не гасит флот
+        if not _feeds:
+            # НЕЗНАНИЕ ЗАКРЫВАЕТ ГАРД: чьё это окно, мы не знаем. Гасить по ярлыку — значит
+            # выключить живую возможность соседа (ровно дефект B1), поэтому не гасим ничего и
+            # говорим об этом громко. Огонь движка уже снят disarm'ом выше, а окно со снятой
+            # целью само упрётся в loss-stop на следующем проходе.
+            log.warning("SPECFIRE WIN [%s] tx=%s план=%s: НИ ОДНО окно не заявляло этот план "
+                        "(ярлык последнего тика=%s, окна=%s) — окно НЕ гашу и паузу НЕ ставлю",
+                        src, h, _pk, feed_label, sorted(self._windows))
+
+        def _mark():
+            from chain.execute import mark_recent_send
+            mark_recent_send(mid, b)
+        self._accounted("метка «недавно отправляли»", h, _mark)
         log.warning("SPECFIRE WIN!!! [%s %s] %s/%s debt=$%.0fk tx=%s gas=$%.2f — "
-                    "план доски исполнен (окна на паузе %.0fс)",
+                    "план доски исполнен (окна плана %s на паузе %.0fс; ярлык тика=%s)",
                     src, (addr or "?")[:10], str(mid)[:10], str(b)[:10], (dbt or 0) / 1e3, h,
-                    gas_usd, SPEC_FIRE_WIN_COOLDOWN_SEC)
+                    gas_usd, _feeds or "НЕТ", SPEC_FIRE_WIN_COOLDOWN_SEC, feed_label)
+
+    def _board_key(self):
+        """Ключ плана, лежащего на доске, в каноне `plan_key` — либо None."""
+        try:
+            k = (getattr(self, "_board", None) or {}).get("key")
+            return self.plan_key(k[0], k[1]) if k and len(k) >= 2 else None
+        except Exception:
+            return None
+
+    def _feeds_of_plan(self, key):
+        """КАКИЕ ОКНА ЗАЯВИЛИ ЭТОТ ПЛАН. Пусто = мы не знаем, чей приз (см. _probe_win).
+
+        Источник — `_win_key`, тот же словарь, по которому окно судит свою приёмку (б):
+        одна запись на окно, кладётся в момент публикации плана. Совпасть может и НЕСКОЛЬКО
+        окон (два окна каскада на одной вершине _top_fat) — тогда гасить надо оба, иначе
+        второе продолжит жечь газ по взятой цели.
+        """
+        if key is None:
+            return []
+        try:
+            return [f for f, k in list((getattr(self, "_win_key", None) or {}).items())
+                    if k == key]
+        except Exception:
+            return []
 
     def _agg_of_market(self, mid):
         """ВЛАДЕЛЬЦЫ транзита нашей цели: НАБОР watch-ног рынка (не одна BF1) либо None.
@@ -1856,10 +1934,36 @@ class SpecFireLive:
             # дневной счётчик недосчитывал ровно те пробы, о которых узел молчал. Если индекс
             # принёс gasUsed (узел умеет getBlockReceipts) — книжим ФАКТ, не оценку; не принёс
             # — оставляем ноль и не выдумываем.
+            self._log("SPECFIRE движок NO-RECEIPT tx=%s — ИНДЕКС ОПРОВЕРГ: tx в блоке %s поз %s "
+                      "(квитанция не пришла, но проба СЕЛА, вердикт победы=%s). Склад ноги %s "
+                      "СОХРАНЁН"
+                      % (h, (fact or {}).get("block"), (fact or {}).get("index"),
+                         (fact or {}).get("won"), (addr or "?")[:10]))
+            # ХВОСТ #110-х1 (ДЕНЬГИ): tx села — А ВЗЯЛА ЛИ ОНА ПРИЗ? Здесь этого не спрашивали
+            # ВОВСЕ, и первая победа, о которой узел квитанций промолчал, была бы НЕВИДИМА: ни
+            # wins, ни disarm, ни кулдауна — движок жёг бы газ по УЖЕ ВЗЯТОЙ цели до конца TTL
+            # окна, а суточный учёт победы не увидел бы. Победой считается ТОЛЬКО `won is True`
+            # (наш хэш среди логов Liquidate у Morpho): всё остальное — «не победа», незнание
+            # гасить собственный огонь права не даёт.
+            #
+            # СЧЁТЧИК «ВЕРДИКТ НЕИЗВЕСТЕН» СНЯТ (р-7): он был структурно нулевым. `won` остаётся
+            # None только если `build_facts` получил logs=None, а `scan_block` читает логи
+            # ПЕРВЫМ вызовом и на отказе бросает IndexUnavailable — logs=[] подставляется
+            # всегда. Ноль в таком счётчике одинаково читается и как «вердикт всегда есть», и
+            # как «ветка мертва», то есть измерять он не умеет ничем. Вместо него вердикт
+            # ПЕЧАТАЕТСЯ в строке выше (`вердикт победы=...`): если won когда-нибудь придёт
+            # None, это будет видно в журнале, а не в счётчике, который умеет только ноль.
+            if (fact or {}).get("won") is True:
+                self.stats["noreceipt_win"] = self.stats.get("noreceipt_win", 0) + 1
+                self._probe_win((meta or (None, None))[1], h, addr, 0.0, src="NO-RECEIPT")
+            # УЧЁТ — ПОСЛЕ ДЕНЕГ И В СВОЕЙ ВЕТКЕ (структурное правило р-7). Прежде обе учётные
+            # записи (газ по факту индекса и позиция пробы) стояли ДО вердикта, причём газ — под
+            # голым `except: pass`: бросок в измерении съедал победу ЦЕЛИКОМ и не оставлял в
+            # журнале ни строки.
             _g = (fact or {}).get("gas_used")
             _p = (fact or {}).get("eff_gas_price")
             if _g and _p:
-                try:
+                def _book():
                     from chain.execute import volley_gas_add, volley_bal_charge
                     _wei = int(_g) * int(_p)
                     volley_gas_add(_wei * float(self.cfg.eth_price_usd) / 1e18)
@@ -1867,35 +1971,10 @@ class SpecFireLive:
                         volley_bal_charge(addr, _wei)
                     self.stats["noreceipt_gas_booked"] = self.stats.get(
                         "noreceipt_gas_booked", 0) + 1
-                except Exception:
-                    pass
-            self._log("SPECFIRE движок NO-RECEIPT tx=%s — ИНДЕКС ОПРОВЕРГ: tx в блоке %s поз %s "
-                      "(квитанция не пришла, но проба СЕЛА). Склад ноги %s СОХРАНЁН"
-                      % (h, (fact or {}).get("block"), (fact or {}).get("index"),
-                         (addr or "?")[:10]))
-            self._note_probe_position(h, {"blockNumber": (fact or {}).get("block"),
-                                          "transactionIndex": (fact or {}).get("index")},
-                                      meta=meta)
-            # ХВОСТ #110-х1 (ДЕНЬГИ): tx села — А ВЗЯЛА ЛИ ОНА ПРИЗ? Здесь этого не спрашивали
-            # ВОВСЕ, и первая победа, о которой узел квитанций промолчал, была бы НЕВИДИМА: ни
-            # wins, ни disarm, ни кулдауна — движок жёг бы газ по УЖЕ ВЗЯТОЙ цели до конца TTL
-            # окна, а суточный учёт победы не увидел бы. Факт индекса несёт `won` ТРЕМЯ
-            # значениями: True (наш хэш среди логов Liquidate у Morpho — это и есть захват),
-            # False (логи прочитаны, нас там нет — ФАКТ, а не молчание) и None (логи блока не
-            # читаны, судить не о чем).
-            _won = (fact or {}).get("won")
-            if _won is True:
-                self.stats["noreceipt_win"] = self.stats.get("noreceipt_win", 0) + 1
-                self._probe_win((meta or (None, None))[1], h, addr, 0.0, src="NO-RECEIPT")
-            elif _won is None:
-                # НЕЗНАНИЕ ЗАКРЫВАЕТ ГАРД В СТОРОНУ «НЕ ПОБЕДА»: объявить победу по неизвестности
-                # значило бы погасить собственный огонь посреди живой возможности. Но и тихо
-                # это оставлять нельзя — счётчик показывает, как часто вердикт недоступен.
-                self.stats["noreceipt_win_unknown"] = self.stats.get(
-                    "noreceipt_win_unknown", 0) + 1
-                self._log("SPECFIRE движок NO-RECEIPT tx=%s — tx СЕЛА, но логи блока %s не "
-                          "прочитаны: победа НЕ доказана и НЕ опровергнута (won=None), огонь "
-                          "не гашу" % (h, (fact or {}).get("block")))
+                self._accounted("газ по факту индекса", h, _book)
+            self._accounted("позиция пробы", h, self._note_probe_position, h,
+                            {"blockNumber": (fact or {}).get("block"),
+                             "transactionIndex": (fact or {}).get("index")}, meta=meta)
             return
         if addr:
             # #102: СПЕРВА спрашиваем цепь. Сброс склада стоит 40 пред-подписанных проб и
