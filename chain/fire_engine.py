@@ -263,8 +263,21 @@ class ReceiptCollector:
                     if self._on_timeout:
                         try:
                             self._on_timeout(ent[0], h)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # L1 р-8: МОЛЧАЛИВЫЙ except НА ДЕНЕЖНОМ ПУТИ — ДЕФЕКТ САМ ПО СЕБЕ.
+                            # Обработчик таймаута выносит вердикт победы NO-RECEIPT и защищает
+                            # nonce отставшей ноги; голый `pass` делал невидимым и его отказ, и
+                            # его причину — ровно поэтому «учёт перед деньгами» прожил здесь
+                            # три раунда. Глотать бросок мы обязаны (один битый хэш не имеет
+                            # права уронить тред коллектора), а молчать о нём — нет.
+                            self.stats["timeout_handler_fail"] = self.stats.get(
+                                "timeout_handler_fail", 0) + 1
+                            if self._log:
+                                try:
+                                    self._log("FIRE collect timeout handler fail tx=%s: %s: %s"
+                                              % (h, type(e).__name__, str(e)[:140]))
+                                except Exception:
+                                    pass
                 continue
             with self._lock:
                 ent = self._pending.pop(h, None)
