@@ -787,6 +787,9 @@ class ChainIndex:
         self._watch = {str(a).lower() for a in (watch_to or ()) if a}
         self._receipts_ok = (CHAIN_INDEX_RECEIPTS if receipts is None else bool(receipts))
         self._lock = threading.RLock()
+        # #123: подписчик Liquidate-событий. Арм ТОЛЬКО явный (set_on_liquidate из боевой точки
+        # входа) — по умолчанию канал закрыт; забытый арм = молчание, не выстрел (канон notify_fn).
+        self._on_liquidate = None
         self._blocks = {}          # bn -> facts
         self._by_hash = {}         # tx hash -> fact
         self._seen = {}            # bn -> full?(bool) — покрытие, включая «пустые» блоки
@@ -1102,6 +1105,11 @@ class ChainIndex:
         f = self.block_facts(bn)
         return list((f or {}).get("winners") or [])
 
+    def set_on_liquidate(self, fn):
+        """#123: явный арм подписчика Liquidate-событий (fn(bn, liquidate_list) | None = снять).
+        Зовётся ТОЛЬКО из боевой точки входа (main.py) — см. канон notify_fn в __init__."""
+        self._on_liquidate = fn
+
     def corpses(self, max_age_blocks=None):
         """{(mid, borrower): (repaid_shares, bad_debt_shares)} за последние N блоков.
 
@@ -1366,6 +1374,16 @@ class ChainIndex:
             self._shed_ok_acc = 0.0
             self.stats["blocks"] += 1
             self._trim()
+        # #123: подписчик Liquidate — СНАРУЖИ лока (прибор не имеет права держать индекс) и под
+        # except (не имеет права его ронять). Только полные сканы: на лёгких логи не разобраны.
+        _cb = self._on_liquidate
+        if _cb is not None and full and facts:
+            _liq = facts.get("liquidate") or []
+            if _liq:
+                try:
+                    _cb(bn, _liq)
+                except Exception:
+                    log.exception("CHAIN-INDEX on_liquidate: колбэк упал (индекс жив)")
 
     def _trim(self):
         """Кольцо: держим последние KEEP блоков. Под локом вызывающего."""

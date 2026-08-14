@@ -1017,6 +1017,19 @@ def main():
     # наших проб, их ПОЗИЦИИ, tip транзита и свежих трупов. Без него приёмка любого пакета
     # читается счётчиком, который под 429 лжёт (см. docs/ROLLBACKS.md, CHAIN_INDEX=0).
     chain_index.start_index(cfg=cfg, watch_to=[cfg.liquidator_address])
+    # #123: «отказ при чужой победе» — арм ЯВНЫЙ и только здесь (боевая точка входа, канон
+    # notify_fn: забытый арм = молчание, не выстрел). Прибор сбоку: осечка арма не роняет старт.
+    try:
+        from chain import hotpath as _hp123
+        _idx123 = chain_index.get_index()
+        if _idx123 is not None and _hp123.REFUSAL_LOSS_ALERT:
+            _idx123.set_on_liquidate(_hp123.make_refusal_loss_watcher(alerter, cfg))
+            log.info("#123 refusal-loss АРМИРОВАН: отказ+чужая победа в TTL-окне -> TG")
+        else:
+            log.info("#123 refusal-loss ВЫКЛЮЧЕН (%s)",
+                     "REFUSAL_LOSS_ALERT=0" if _idx123 is not None else "индекса нет")
+    except Exception:
+        log.exception("#123 refusal-loss: арм не удался — канал закрыт, огонь не затронут")
 
     log.info("liquidator start: mode=%s chain=%s markets=%d rpc=%s",
              cfg.mode, cfg.chain, len(markets), "set" if rpc else "MISSING")

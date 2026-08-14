@@ -125,6 +125,18 @@ ASK_SHAVE_BPS = int(os.environ.get("HOT_ASK_SHAVE_BPS", "10") or 0)
 # самом деле ЗДОРОВА). Зонд дочитывает confirmed-состояние в ОТДЕЛЬНОМ треде — решение о skip
 # уже принято, денежный путь не трогается — и называет источник поимённо. Откат HOT_PANIC_PROBE=0.
 HOT_PANIC_PROBE = os.environ.get("HOT_PANIC_PROBE", "1").lower() not in ("0", "false", "no")
+# «ОТКАЗ ПРИ ЧУЖОЙ ПОБЕДЕ» (#123, 14.08; вопрос kelbic «почему о cbADA не пришёл отчёт в TG»).
+# Уведомитель Ш16 подключён к рентгену ОТПРАВЛЕННЫХ tx — отказы (sim-revert -> HOT skip)
+# невидимы ему ПО ПОСТРОЕНИЮ: 10 отказов за 7 дней прошли молча, все в денежные моменты.
+# Здесь: лёгкий регистр отказов (сбоку от денежного пути, всё под except) + сверка с
+# Liquidate-событиями фонового индекса (#110). Совпадение в TTL-окне = «мы отказались, а
+# конкурент цель забрал» — редкое (~1.4/день) и самое ценное для вскрытия событие; после #121
+# каждое такое = либо отданный приз, либо проигранный бэкран (различит panic-probe).
+# Канал АРМИРУЕТСЯ ЯВНО в main.py (set_on_liquidate) — по умолчанию закрыт (канон notify_fn).
+# Откат REFUSAL_LOSS_ALERT=0 (регистр не пишется, арм в main сам отключается).
+REFUSAL_LOSS_ALERT = os.environ.get("REFUSAL_LOSS_ALERT", "1").lower() not in ("0", "false", "no")
+REFUSAL_TTL_SEC = float(os.environ.get("REFUSAL_LOSS_TTL_SEC", "600"))
+_REFUSAL_REG: dict = {}          # (mid_lower, borrower_lower) -> (ts, bucket, debt_usd)
 # ИНКРЕМЕНТАЛЬНЫЙ HOT-DISPATCH («го» kelbic 07.08, дефект №3 вскрытия каскада 06.08): 11 preps
 # по ~0.6с СЕРИЕЙ + один батч-dispatch после всех = first-ready ждал хвост 7.8с. Окно победы
 # замерено 0.5-2.2мс — батч-барьер это структурная сдача гонки. ON: готовая цель уходит в
@@ -1329,6 +1341,64 @@ def resolve_meta(rpc, markets):
 
 # ---- preconf-sourced prepare (mirror of execute.prepare_liquidation; 2 diffs only) ----
 
+def _note_refusal(market_id, borrower, bucket, debt_usd):
+    """#123: запомнить наш отказ от цели. Прибор СБОКУ от денежного пути: любая ошибка глотается,
+    запись — одна операция словаря. Нормализация обеих сторон в lower — канон corpse_pairs
+    (несимметричная нормализация = множества, которые не пересекаются никогда)."""
+    if not REFUSAL_LOSS_ALERT:
+        return
+    try:
+        _REFUSAL_REG[(str(market_id).lower(), str(borrower).lower())] = (
+            time.time(), str(bucket)[:32], float(debt_usd or 0.0))
+        if len(_REFUSAL_REG) > 512:                     # регистр не растёт бесконечно
+            _cut = time.time() - REFUSAL_TTL_SEC
+            for _k in [k for k, v in _REFUSAL_REG.items() if v[0] < _cut]:
+                _REFUSAL_REG.pop(_k, None)
+    except Exception:
+        pass
+
+
+def make_refusal_loss_watcher(alerter, cfg):
+    """#123: фабрика колбэка для chain_index.set_on_liquidate — ЕДИНСТВЕННАЯ точка, где регистр
+    отказов встречается с Liquidate-событиями цепи. Зовётся из треда индекса; всё под except —
+    прибор не имеет права ронять ни индекс, ни огонь. Своя победа (контракт/флот/кошелёк,
+    _is_ours) сообщением не считается. Один алерт на отказ (запись выбывает при совпадении);
+    антифлуд ключа refusal-loss остаётся в Alerter."""
+    def _cb(bn, liq_events):
+        try:
+            if not _REFUSAL_REG:
+                return
+            from chain.execute import _is_ours
+            now = time.time()
+            hits = []
+            for ev in (liq_events or []):
+                if not isinstance(ev, dict):                # мусор не обрывает соседние события
+                    continue
+                k = (str(ev.get("mid") or "").lower(), str(ev.get("borrower") or "").lower())
+                v = _REFUSAL_REG.get(k)
+                if v is None:
+                    continue
+                ts, bucket, debt = v
+                if now - ts > REFUSAL_TTL_SEC:
+                    _REFUSAL_REG.pop(k, None)
+                    continue
+                caller = str(ev.get("caller") or "")
+                _REFUSAL_REG.pop(k, None)               # один алерт (или своя победа) на отказ
+                if _is_ours(caller, caller, cfg):
+                    continue                            # взяли сами — не «чужая победа»
+                hits.append("рынок %s заёмщик %s долг $%.0f | наш отказ %.0fс назад (%s) | "
+                            "победитель %s tx %s" % (k[0][:10], k[1][:10], float(debt or 0.0),
+                                                     now - ts, bucket, caller[:12],
+                                                     str(ev.get("tx") or "")[:14]))
+            if hits:
+                alerter.send_async("\U0001FA78 ОТКАЗАЛИСЬ — ЗАБРАЛ КОНКУРЕНТ (блок %d):\n%s"
+                                   % (bn, "\n".join(hits[:4])), key="refusal-loss")
+                log.info("REFUSAL-LOSS блок %d: %d совпадений отказ->чужая победа", bn, len(hits))
+        except Exception:
+            log.exception("refusal-loss: прибор упал (индекс и огонь не затронуты)")
+    return _cb
+
+
 def _panic_probe(rpc, market_id, borrower, mid, ask_shares, ask_seized):
     """#121: назвать источник Panic 0x11 поимённо. Тред-демон, СБОКУ от денежного пути (skip уже
     решён), всё под except — прибор не имеет права влиять на огонь. Печатает confirmed-позицию
@@ -1569,6 +1639,7 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
             _diag_bucket = _diag_revert_bucket(str(sim.get("error", "")))
             if _diag_bucket == "panic-underflow" and HOT_PANIC_PROBE:
                 _panic_probe(rpc, market_id, borrower, mid, repaid_shares, seized)
+            _note_refusal(market_id, borrower, _diag_bucket, debt_usd)   # #123: отказ в регистр
             log.info("DIAG sim-revert %s/%s bucket=%s err=%s | repaid_shares=%d repaid_assets=%d seized=%d collateral=%d tba=%d tbs=%d price=%d lltv=%d lif=%.4f block=%d cd=%s",
                      market_id[:10], borrower[:10], _diag_bucket, str(sim["error"])[:40], repaid_shares, repaid_assets, seized,
                      collateral_dbg, tba, tbs, int(price), lltv_wad, lif_from_lltv(lltv_wad / 10**18), _diag_blk, cd0.hex() if isinstance(cd0, (bytes, bytearray)) else str(cd0))
@@ -1576,6 +1647,7 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         profit_wei = sim["profit"]
         profit_usd, cost_usd, net_usd = _net_gate(profit_wei, debt_usd, debt_assets, cfg)
         if net_usd < cfg.min_profit_usd:
+            _note_refusal(market_id, borrower, "net-below-min", debt_usd)   # #123: отказ в регистр
             return {"ok": False, "net_usd": net_usd,
                     "reason": f"net ${net_usd:.2f} (profit ${profit_usd:.2f} - cost ${cost_usd:.2f}) < min ${cfg.min_profit_usd:.2f}"}
 
@@ -1669,6 +1741,7 @@ def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asse
             return {"ok": False, "reason": "fast: zero bonus"}
         profit_usd, cost_usd, net_usd = _net_gate(min_profit, debt_usd, debt_assets, cfg)
         if net_usd < cfg.min_profit_usd:
+            _note_refusal(market_id, borrower, "fast-net-below-min", debt_usd)   # #123: отказ в регистр
             return {"ok": False, "reason": f"fast: net ${net_usd:.2f} < min (analytic floor)"}
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle, "irm": irm, "lltv": lltv_wad}
         cd = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], min_profit)

@@ -1,9 +1,17 @@
 """Telegram admin alerts with antiflood (mirrors essayist's infra_error alerting)."""
 from __future__ import annotations
+import logging
 import threading
 import time
 import urllib.parse
 import urllib.request
+
+# #123: «дошло ли в TG» было недоказуемо из журнала — send глотал сбои молча (return False).
+# Канон «канал тревоги проверять самому»: каждый ФАКТИЧЕСКИЙ пост и его исход — строкой в
+# журнал (антифлуд-подавления не логируем — шум). Текст сообщения НЕ пишем (гигиена журнала),
+# только ключ/исход/длину; при сбое — только ТИП исключения (str(e) сетевого слоя носил ключ
+# в пути URL — урок 07.08).
+log = logging.getLogger("liq.alerts")
 
 
 class Alerter:
@@ -29,10 +37,13 @@ class Alerter:
             return False
         self._last[key] = now
         if not self.token or not self.admin_id:
+            log.info("TG-отправка key=%s НЕ настроена (нет токена/адресата)", key)
             return False
         if self.tag:
             text = f"[{self.tag}] {text}"
-        return self._post(self.admin_id, text)
+        ok = self._post(self.admin_id, text)
+        log.info("TG-отправка key=%s ok=%s len=%d", key, ok, len(text))
+        return ok
 
     def _post(self, chat_id, text: str) -> bool:
         if not self.token or not chat_id:
@@ -42,5 +53,6 @@ class Alerter:
             url = f"https://api.telegram.org/bot{self.token}/sendMessage"
             with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10) as r:
                 return r.status == 200
-        except Exception:
+        except Exception as e:                      # только ТИП: str(e) может нести токен в URL
+            log.info("TG-пост не прошёл: %s", type(e).__name__)
             return False
