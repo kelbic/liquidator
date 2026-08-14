@@ -1389,6 +1389,19 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
 
     Здесь же греется кэш патрона (#45): путь холодный, RTT допустим, и нога выходит в окно
     с ИЗВЕСТНЫМ балансом — иначе первый же выстрел уткнулся бы в fail-closed гейт.
+
+    ПОДПИСЬ ВНЕ ЛОКА НОГИ (#112, 14.08 — ПРАВКА-4 REVIEW_ROUND3). Раньше ВЕСЬ проход (чтение
+    базы, подпись `depth−d` проб, установка) шёл под `with lk`. Подпись — единственная дорогая
+    часть: на native 4.27мс/проба × (40−12) = ~120мс немоты ноги за долив, и всё это время
+    огонь ЭТОЙ ноги (send_presigned_probe берёт тот же lk на pop) заблокирован. Теперь три фазы:
+      1) под локом — снять снимок и решить план (compat/пересборка, старт nonce, сколько
+         подписать). Сети под локом НЕТ;
+      2) ВНЕ лока — собственно подпись (CPU). Огонь ноги в это время идёт;
+      3) под локом — сверить, что снимок не устарел за время подписи, и установить. При любом
+         расхождении подписанное отбрасывается, лог, следующий проход пересоберёт (незнание
+         закрывает гард — не ставим сомнительное, чтобы не открыть дыру в nonce).
+    Дисциплина порядка (пополнение не лезет в лестницу, из которой стреляют) СОХРАНЕНА: установка
+    под локом и валидируется; фаза подписи чужой лестницы не трогает.
     """
     if volley_bal_stale(addr):
         volley_bal_warm(rpc, addr, log=log)
@@ -1400,10 +1413,26 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
     # Ш24: у каждой ноги СВОЙ тир (см. probe_tip_for). Раньше здесь стояла одна константа на
     # весь флот, и мы были ниже класса в 56% блоков — то есть в хвосте за всем полем.
     tip_wei = int(tip) if tip else probe_tip_for(addr)
+    acct = account_for(w3, key)          # чистая крипта (from_key, кэш) — вне лока
+    # СЕТЬ ВНЕ ЛОКА (#112): держать lk на RTT get_block значило бы немоту огня ноги на RTT.
+    if base_fee is None:
+        base_fee = int(w3.eth.get_block("latest").get("baseFeePerGas") or 0)
+    max_fee = base_fee * _VOLLEY_PRESIGN_MAXFEE_MULT + tip_wei
+
+    def _sign_run(n0, count):
+        out = []
+        for i in range(count):
+            t = {"from": addr, "to": cfg.liquidator_address, "data": V2_PROBE_CALLDATA,
+                 "nonce": n0 + i, "gas": int(gas), "chainId": rpc.chain_id,
+                 "maxFeePerGas": max_fee, "maxPriorityFeePerGas": tip_wei}
+            signed = acct.sign_transaction(t)
+            raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+            h = getattr(signed, "hash", None)
+            out.append((n0 + i, "0x" + bytes(raw).hex(), h.hex() if h is not None else None))
+        return out
+
+    # ---- ФАЗА 1: снимок + решение (под локом, без сети, без подписи) ----
     with lk:
-        if base_fee is None:
-            base_fee = int(w3.eth.get_block("latest").get("baseFeePerGas") or 0)
-        max_fee = base_fee * _VOLLEY_PRESIGN_MAXFEE_MULT + tip_wei
         st = _VOLLEY_LADDER.get(addr)
         # ЗАЩЁЛКА max_fee (ревью 08.08, CONFIRMED). Лестница, переподписанная на всплеске
         # basefee, несёт вздутый max_fee НАВСЕГДА: гейт по худшему случаю (gas x max_fee) при
@@ -1420,46 +1449,89 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
                      addr[:10], int(st["max_fee"]) / 1e9, max_fee / 1e9)
         if compat and len(st["q"]) >= depth:
             return len(st["q"])          # годная лестница уже есть — подпись не жжём
-        acct = account_for(w3, key)
-
-        def _sign_run(n0, count):
-            out = []
-            for i in range(count):
-                t = {"from": addr, "to": cfg.liquidator_address, "data": V2_PROBE_CALLDATA,
-                     "nonce": n0 + i, "gas": int(gas), "chainId": rpc.chain_id,
-                     "maxFeePerGas": max_fee, "maxPriorityFeePerGas": tip_wei}
-                signed = acct.sign_transaction(t)
-                raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-                h = getattr(signed, "hash", None)
-                out.append((n0 + i, "0x" + bytes(raw).hex(), h.hex() if h is not None else None))
-            return out
-
+        _n_snap = int(_VOLLEY_NONCE.get(addr, 0))   # для ловли выстрела во время подписи
         if compat and start_nonce is None:
             # ДОТОЧКА СКЛАДА, а не пересборка. Две причины, и вторая важнее первой:
-            #  1) уже подписанное не переподписываем — подпись это 4мс CPU на пробу (native;
-            #     0.557мс с coincurve, пакет COIN — экономия перестала быть решающей, но
-            #     причина №2 от неё не зависела никогда), а фоновое пополнение уступает огню;
+            #  1) уже подписанное не переподписываем — подпись это CPU на пробу (0.473мс COIN),
+            #     а фоновое пополнение уступает огню;
             #  2) продолжать надо с ХВОСТА очереди (или с локального счётчика, если склад
             #     выбран досуха). Пересборка от pending-nonce здесь была бы прямой ДЫРОЙ:
             #     pending отстаёт от уже разосланных проб, и новая лестница начиналась бы
             #     с занятых номеров — вся нога повисла бы до закрытия дыры.
-            nxt = (st["q"][-1][0] + 1) if st["q"] else max(int(_VOLLEY_NONCE.get(addr, 0)),
-                                                           _pending_nonce(w3, addr))
-            st["q"].extend(_sign_run(nxt, depth - len(st["q"])))
+            _mode = "topup"
+            _st_id = id(st)
+            _snap_gas = st["gas"]
+            _snap_max_fee = st["max_fee"]
+            _tail = st["q"][-1][0] if st["q"] else None
+            nxt = (_tail + 1) if _tail is not None else None   # пустой склад: pending вне лока
+            count = depth - len(st["q"])
+        else:
+            _mode = "rebuild"
+            nxt = int(start_nonce) if start_nonce is not None else None
+            count = depth
+
+    if count <= 0:
+        return ladder_depth(addr)
+    # pending читаем ВНЕ лока — только если план его требует (пустая доточка / пересборка)
+    if nxt is None:
+        # доточка досуха продолжает с ХВОСТА (локальный счётчик), пересборка — с ЦЕПИ
+        # (локальный мог уехать после NO-RECEIPT). Прежнее поведение сохранено.
+        if _mode == "topup":
+            nxt = max(int(_VOLLEY_NONCE.get(addr, 0)), _pending_nonce(w3, addr))
+        else:
+            nxt = _pending_nonce(w3, addr)
+
+    # ---- ФАЗА 2: ПОДПИСЬ ВНЕ ЛОКА (весь CPU; огонь ноги НЕ заблокирован) ----
+    signed = _sign_run(nxt, count)
+
+    # ---- ФАЗА 3: сверить снимок и установить (под локом) ----
+    with lk:
+        st = _VOLLEY_LADDER.get(addr)
+        if _mode == "topup":
+            if (st is None or id(st) != _st_id or st["gas"] != _snap_gas
+                    or int(st["max_fee"]) != int(_snap_max_fee)):
+                if log:
+                    log.info("VOLLEY доточка %s отменена: лестница пересобрана параллельно",
+                             addr[:10])
+                return ladder_depth(addr)
+            if st["q"]:
+                if st["q"][-1][0] + 1 != nxt:      # хвост уехал (чужая доточка) — сброс
+                    if log:
+                        log.info("VOLLEY доточка %s отменена: хвост уехал (ждали nonce %d)",
+                                 addr[:10], nxt)
+                    return len(st["q"])
+                st["q"].extend(signed)
+            else:
+                # склад слили ДОСУХА, пока подписывали. nxt = old_tail+1: номера этой лестницы
+                # кончались на old_tail, поэтому _VOLLEY_NONCE не мог обогнать nxt из НЕЁ; если
+                # обогнал — была иная пересборка, сброс.
+                if int(_VOLLEY_NONCE.get(addr, 0)) > nxt:
+                    if log:
+                        log.info("VOLLEY доточка %s отменена: счётчик обогнал (nonce %d)",
+                                 addr[:10], nxt)
+                    return 0
+                st["q"] = list(signed)
             st["ts"] = time.monotonic()
             if log:
                 log.info("VOLLEY склад %s доточен до %d проб (с nonce %d)",
                          addr[:10], len(st["q"]), nxt)
             return len(st["q"])
-        # полная сборка: nonce берём с ЦЕПИ — локальный счётчик мог уехать после NO-RECEIPT
-        nonce = int(start_nonce) if start_nonce is not None else _pending_nonce(w3, addr)
-        q = _sign_run(nonce, depth)
-        _VOLLEY_LADDER[addr] = {"q": q, "gas": int(gas), "max_fee": max_fee, "ts": time.monotonic()}
-        _VOLLEY_NONCE[addr] = nonce      # локальный счётчик и лестница выходят из одной точки
+        # пересборка. Выстрел, прошедший за время подписи ВНЕ лока, поднял бы _VOLLEY_NONCE —
+        # и установка с нашего (уже занятого) старта дала бы «replacement underpriced» (серия
+        # 85 за 10 мин, инцидент 11.08). Явный start_nonce задаёт вызывающий — ему и решать.
+        if start_nonce is None and int(_VOLLEY_NONCE.get(addr, 0)) != _n_snap:
+            if log:
+                log.info("VOLLEY пересборка %s отменена: выстрел во время подписи сдвинул "
+                         "счётчик (%d -> %d), старт %d занят",
+                         addr[:10], _n_snap, int(_VOLLEY_NONCE.get(addr, 0)), nxt)
+            return ladder_depth(addr)
+        _VOLLEY_LADDER[addr] = {"q": list(signed), "gas": int(gas), "max_fee": max_fee,
+                                "ts": time.monotonic()}
+        _VOLLEY_NONCE[addr] = nxt     # локальный счётчик и лестница выходят из одной точки
         if log:
             log.info("VOLLEY лестница %s: %d проб с nonce %d, maxFee %.4f gwei",
-                     addr[:10], depth, nonce, max_fee / 1e9)
-        return len(q)
+                     addr[:10], depth, nxt, max_fee / 1e9)
+        return len(signed)
 
 
 def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None):
