@@ -107,6 +107,24 @@ REACTIVE_PARTIAL = os.environ.get("REACTIVE_PARTIAL", "1").lower() not in ("0", 
 # хеджирован дочиткой с 23.07 — сим получает тот же паттерн: одиночный ретрай через
 # confirmed-rpc (block=latest; после транзита confirmed уже видит флип). Откат HOT_SIM_CONFIRMED_RETRY=0.
 HOT_SIM_CONFIRMED_RETRY = os.environ.get("HOT_SIM_CONFIRMED_RETRY", "1").lower() not in ("0", "false", "no")
+# ЗАПАС ВНИЗ НА ЗАЯВКЕ (#121, 14.08; доказано форк-репро блока 49965022 + транзит idx853):
+# заявка строилась как repaidShares == borrowShares — РОВНО граница underflow'а Morpho
+# (`position[id][b].borrowShares -= repaidShares`). Замер на форке НАШЕЙ боевой калдатой:
+# ask == bs -> OK, профит $17.55; ask == bs+1 -> Panic 0x11. Значит ЛЮБОЕ уменьшение долга
+# между снимком позиции и симом — хоть на 1 wei (repay заёмщика, частичная ликвидация
+# конкурента) — переводило ВЫИГРЫШНЫЙ приз в `bucket=panic-underflow` -> `HOT skip`.
+# Окно, где позиция ещё ликвидируема, шириной (1-HF)*shares (на цели 14.08 — 0.51%), то
+# есть ВЕСЬ полезный диапазон дрейфа попадал в панику. Канон «незнание обязано УМЕНЬШАТЬ
+# заявку»: просим строго меньше долга. Цена — тот же процент от бонуса (10bps = $0.02 на
+# призе $17.55, замерено форком), польза — приз вместо отказа. Откат HOT_ASK_SHAVE_BPS=0.
+ASK_SHAVE_BPS = int(os.environ.get("HOT_ASK_SHAVE_BPS", "10") or 0)
+# ЗОНД ПАНИКИ (#121): у имени «Panic 0x11» в этом проекте УЖЕ ТРИ разных источника, и бакет
+# `panic-underflow` их СЛИВАЕТ — форк-репро 14.08 показал, что одну и ту же панику дают (1) долг
+# заёмщика ниже заявки, (2) залог ниже сейза, (3) `lastUpdate > block.timestamp` у рассинхронного
+# preconf-состояния (тогда паника летит из _accrueInterest ДО проверки здоровья, и позиция на
+# самом деле ЗДОРОВА). Зонд дочитывает confirmed-состояние в ОТДЕЛЬНОМ треде — решение о skip
+# уже принято, денежный путь не трогается — и называет источник поимённо. Откат HOT_PANIC_PROBE=0.
+HOT_PANIC_PROBE = os.environ.get("HOT_PANIC_PROBE", "1").lower() not in ("0", "false", "no")
 # ИНКРЕМЕНТАЛЬНЫЙ HOT-DISPATCH («го» kelbic 07.08, дефект №3 вскрытия каскада 06.08): 11 preps
 # по ~0.6с СЕРИЕЙ + один батч-dispatch после всех = first-ready ждал хвост 7.8с. Окно победы
 # замерено 0.5-2.2мс — батч-барьер это структурная сдача гонки. ON: готовая цель уходит в
@@ -1311,6 +1329,38 @@ def resolve_meta(rpc, markets):
 
 # ---- preconf-sourced prepare (mirror of execute.prepare_liquidation; 2 diffs only) ----
 
+def _panic_probe(rpc, market_id, borrower, mid, ask_shares, ask_seized):
+    """#121: назвать источник Panic 0x11 поимённо. Тред-демон, СБОКУ от денежного пути (skip уже
+    решён), всё под except — прибор не имеет права влиять на огонь. Печатает confirmed-позицию
+    против нашей заявки: `debt<ask` (долг упал ниже заявки), `coll<seize` (залог ниже сейза),
+    `gone` (долга нет), `neither` (ни то ни другое ⇒ паника НЕ из вычитаний Morpho — смотреть
+    рассинхрон preconf: lastUpdate против block.timestamp)."""
+    def _run():
+        try:
+            from chain.multicall import aggregate3, encode_position_call, decode_position, encode_market_call, decode_market
+            rp = aggregate3(rpc, [(MORPHO_BLUE, encode_position_call(mid, borrower)),
+                                  (MORPHO_BLUE, encode_market_call(mid))])
+            bs_now, coll_now = decode_position(rp[0][1])
+            m_now = decode_market(rp[1][1])
+            if int(bs_now) == 0:
+                why = "gone"
+            elif int(bs_now) < int(ask_shares):
+                why = "debt<ask"
+            elif int(coll_now) < int(ask_seized):
+                why = "coll<seize"
+            else:
+                why = "neither(preconf-desync?)"
+            log.info("DIAG panic-probe %s/%s why=%s ask_shares=%d bs_now=%d (delta=%d) ask_seized=%d coll_now=%d lastUpdate=%d",
+                     market_id[:10], borrower[:10], why, int(ask_shares), int(bs_now),
+                     int(ask_shares) - int(bs_now), int(ask_seized), int(coll_now), int(m_now[4]))
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception:
+        pass
+
+
 def _diag_revert_bucket(err: str) -> str:
     """Классифицирует sim-revert в бакет для DIAG. Чистая (под юнит)."""
     e = (err or "").lower()
@@ -1335,6 +1385,20 @@ def _seized_exact(repaid_shares, lif_wad, price, tba, tbs):
     from chain.execute import ORACLE_PRICE_SCALE, WAD
     assets_down = to_assets_down(repaid_shares, tba, tbs)
     return (assets_down * lif_wad // WAD) * ORACLE_PRICE_SCALE // price
+
+
+def _shave_ask(borrow_shares, bps=None):
+    """#121: заявка ОБЯЗАНА быть строго меньше долга заёмщика. Morpho вычитает
+    `position.borrowShares -= repaidShares` БЕЗ zeroFloorSub — равенство есть граница, и любое
+    уменьшение долга между снимком и исполнением даёт Panic 0x11 (проверено на форке: bs -> OK,
+    bs+1 -> Panic 0x11). Просить полный кэшированный borrowShares значит ставить заявку ровно на
+    эту границу. Чистая (юнит), запас в bps, откат HOT_ASK_SHAVE_BPS=0 -> прежнее поведение.
+    Пыль (bs<=1) не режем: 0 shares Morpho отвергает как INCONSISTENT_INPUT."""
+    bs = int(borrow_shares)
+    b = ASK_SHAVE_BPS if bps is None else int(bps)
+    if bs <= 1 or b <= 0:
+        return bs
+    return max(1, bs - max(1, bs * b // 10_000))
 
 
 def _cap_repaid_shares(borrow_shares, collateral, price, lif_wad, tba, tbs):
@@ -1445,7 +1509,7 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         _lif_wad = int(round(_lif * 10**18))
         # P1-7: кап на глубокой позиции (seized>collateral был Panic 0x11 -> skip); seized ТОЧНО
         # по канону (toAssetsDown), а не оценкой сверху — amount_in свопа = реальный приход залога.
-        repaid_shares = _cap_repaid_shares(int(borrow_shares), int(collateral_dbg), int(price),
+        repaid_shares = _cap_repaid_shares(_shave_ask(int(borrow_shares)), int(collateral_dbg), int(price),
                                            _lif_wad, tba, tbs)
         if repaid_shares <= 0:
             return {"ok": False, "reason": "cap: no repayable shares (collateral~0)"}
@@ -1503,6 +1567,8 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
             except Exception:
                 _diag_blk = 0
             _diag_bucket = _diag_revert_bucket(str(sim.get("error", "")))
+            if _diag_bucket == "panic-underflow" and HOT_PANIC_PROBE:
+                _panic_probe(rpc, market_id, borrower, mid, repaid_shares, seized)
             log.info("DIAG sim-revert %s/%s bucket=%s err=%s | repaid_shares=%d repaid_assets=%d seized=%d collateral=%d tba=%d tbs=%d price=%d lltv=%d lif=%.4f block=%d cd=%s",
                      market_id[:10], borrower[:10], _diag_bucket, str(sim["error"])[:40], repaid_shares, repaid_assets, seized,
                      collateral_dbg, tba, tbs, int(price), lltv_wad, lif_from_lltv(lltv_wad / 10**18), _diag_blk, cd0.hex() if isinstance(cd0, (bytes, bytearray)) else str(cd0))
@@ -1575,7 +1641,7 @@ def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asse
             return {"ok": False, "reason": "fast: no debt"}
         _lif = lif_from_lltv(lltv_wad / 10**18)
         _lif_wad = int(round(_lif * 10**18))
-        repaid_shares = _cap_repaid_shares(int(borrow_shares), int(collateral), int(price),
+        repaid_shares = _cap_repaid_shares(_shave_ask(int(borrow_shares)), int(collateral), int(price),
                                            _lif_wad, tba, tbs)
         if repaid_shares <= 0:
             return {"ok": False, "reason": "fast: cap=0"}
