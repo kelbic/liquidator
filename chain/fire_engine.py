@@ -76,6 +76,23 @@ ENGINE_HOLD_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_SEC", "180"))
 # Потолок приёма (замер: отказы начались при ~115/с) не задевается с семикратным запасом.
 ENGINE_HOLD_RATE = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_RATE", "16"))
 ENGINE_HOLD_BURST = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_BURST", "2"))
+# Э1б (14.08): ДИСТ-ГЕЙТ HOLD ВО ВРЕМЕНИ. Э1a срезал hold 16->1 ($142->$9/день), но #118
+# показал: burst опаздывает на >=1 суб-блок ПО ПОСТРОЕНИЮ (триггер = публикация суб-блока),
+# в окно транзита встаёт только СТОЯЧАЯ плотность — а деньги Ш26 приходили через ~16с ПОСЛЕ
+# смерти окна, ровно в утончённом хвосте. Возврат: первые NEAR_SEC после угасания горячей
+# фазы hold держит боевой темп NEAR_RATE, остаток хвоста — тонкий ENGINE_HOLD_RATE.
+# Сигнал близости — ТОЛЬКО собственный таймстамп движка (_until): дистанция во времени от
+# последнего тика окна. Никаких чужих фактов (урок 8ea97ca: гейт по чужому подтверждённому
+# факту в игре одного блока ложен по построению). ЦЕНА (честная арифметика 14.08, а не «доли
+# доллара» — та оценка ОТОЗВАНА): hold-фаза жила ~713с за 1.2ч ⇒ ≤80 хвостов/сутки;
+# дефолты КОНСЕРВАТИВНЫ по Правилу денег (kelbic дважды отклонял дорогие ручки):
+# NEAR_SEC=15 × 8/с × ≤80 = ≤9.6k проб/сутки ≈ ВЕРХНЯЯ ОЦЕНКА ~$7/день сверх $9 базы;
+# ~4 пробы в tip-классе на блок (диапазон победителей 3-8). Подъём до 16/с×20с (≈$19/день,
+# ~8 в классе) — одна строка .env ПОСЛЕ замера фактической цены счётчиком sent_hold_near.
+# NEAR_SEC=15 покрывает замер Ш26 («деньги через ~16с» — впритык, это осознанный компромисс).
+# Откат SPEC_FIRE_ENGINE_HOLD_NEAR_RATE=0 — Э1a бит-в-бит.
+ENGINE_HOLD_NEAR_RATE = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_NEAR_RATE", "8"))
+ENGINE_HOLD_NEAR_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_NEAR_SEC", "15"))
 # Ш29: ЗАЛП ПО ФАКТУ ТРАНЗИТА.
 #
 # ВСКРЫТИЕ блока 49834406 (11.08). Призовое окно [436..455] заняли ДВАДЦАТЬ транзакций ОДНОГО
@@ -477,6 +494,13 @@ class FireEngine:
         with self._lock:
             return self._now() < self._until
 
+    def in_hold_near(self) -> bool:
+        """Э1б: ближний хвост удержания — боевой темп в первые NEAR_SEC после угасания
+        горячей фазы (деньги Ш26 приходили через ~16с после смерти окна)."""
+        with self._lock:
+            n = self._now()
+            return (not n < self._until) and ENGINE_HOLD_NEAR_RATE > 0 and n < self._until + ENGINE_HOLD_NEAR_SEC
+
     # ---- внутреннее ----
     def transit_burst(self, n=None):
         """Ш29: одноразовый ЗАЛП по подтверждённому транзиту.
@@ -513,7 +537,15 @@ class FireEngine:
                 return True
             n = self._now()
             hot = n < self._until
-            rate = self._rate if hot else ENGINE_HOLD_RATE
+            if hot:
+                rate = self._rate
+            elif ENGINE_HOLD_NEAR_RATE > 0 and n < self._until + ENGINE_HOLD_NEAR_SEC:
+                # Э1б: ближний хвост (дистанция во времени от последнего тика окна) — боевой
+                # темп; деньги Ш26 живут здесь (~16с после смерти окна). Бурст остаётся
+                # HOLD_BURST=2: поток обязан быть РОВНЫМ, вспышка = пауза = дыра на транзите.
+                rate = ENGINE_HOLD_NEAR_RATE
+            else:
+                rate = ENGINE_HOLD_RATE
             burst = ENGINE_BURST if hot else ENGINE_HOLD_BURST
             self._tokens = min(burst, self._tokens + (n - self._tok_ts) * rate)
             self._tok_ts = n
@@ -563,6 +595,8 @@ class FireEngine:
             self.stats["sent"] += 1
             if not hot_at_send:
                 self.stats["sent_hold"] = self.stats.get("sent_hold", 0) + 1
+                if self.in_hold_near():                       # Э1б: приёмка ближнего хвоста
+                    self.stats["sent_hold_near"] = self.stats.get("sent_hold_near", 0) + 1
             if self._collector is not None:
                 self._collector.track(h, (addr, tgt))
 
