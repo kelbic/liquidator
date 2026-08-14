@@ -97,19 +97,42 @@ def drill(freeze_after_sec=60.0, seconds=300, shed=False, kill_health=False,
     _sv_lvl = LOGGER.level
     LOGGER.setLevel(logging.INFO)
     _sv_poll = ci.CHAIN_INDEX_SELF_POLL_SEC
-    ci.CHAIN_INDEX_SELF_POLL_SEC = 0.001      # шаг ожидания петли — единственный «ускоритель»
+    ci.CHAIN_INDEX_SELF_POLL_SEC = 1.0
+    class _Wake(object):
+        """ЧАСЫ ПЕТЛИ ДВИГАЕТ САМ ТРЕД ИНДЕКСА (B4 р-7): модельное время идёт РОВНО внутри
+        собственного ожидания петли, а не по реальным часам главного треда. Прежняя редакция
+        (`T += шаг; _wake.set(); time.sleep(0.0015)`) надеялась, что настоящий тред успеет
+        отработать оборот за 1.5мс: под нагрузкой не успевал, и прибор давал ложный диагноз на
+        проектной норме. Показания прибора не имеют права зависеть от загрузки машины."""
+
+        def __init__(self, step, stop_at, on_tick=None):
+            self.step, self.stop_at, self.on_tick = step, stop_at, on_tick
+
+        def wait(self, timeout=None):
+            T[0] += self.step
+            if self.on_tick is not None:
+                self.on_tick()
+            if (T[0] - 1000.0) >= self.stop_at:
+                idx._stop.set()
+            return False
+
+        def set(self):
+            pass
+
+        def clear(self):
+            pass
+
+        def is_set(self):
+            return False
+
+    idx._wake = _Wake(1.0, seconds)
     try:
-        idx.start()
-        for _ in range(seconds):
-            T[0] += 1.0
-            idx._wake.set()
-            time.sleep(0.0015)                # дать НАСТОЯЩЕМУ треду отработать оборот
+        idx._stop.clear()
+        idx._loop()
     finally:
-        idx.stop()
         ci.CHAIN_INDEX_SELF_POLL_SEC = _sv_poll
         LOGGER.setLevel(_sv_lvl)
         LOGGER.removeHandler(cap)
-        idx._thr.join(timeout=2)
     return idx, cap
 
 

@@ -180,7 +180,7 @@ try:
     def _snap_global(self, key=None):
         return {"all": {k: int(self.stats.get(k, 0) or 0) for k in self._PROBE_KEYS}}
 
-    def _delta_global(self, snap, key=None):
+    def _delta_global(self, snap, key=None, floor=None):
         cur = {k: int(self.stats.get(k, 0) or 0) for k in self._PROBE_KEYS}
         out = {}
         for k in self._PROBE_KEYS:

@@ -1789,42 +1789,21 @@ class SpecFireLive:
            позже, свои собственные пробы (те, что пришли после клейма соседа) увидит.
         """
         if key is None:
-            return ("не измерено (окно не публиковало плана — приёмке (б) не по чему судить)")
-        snap = snap or {}
-        s_by, s_all = (snap.get("by_key") or {}), (snap.get("all") or {})
+            return "не измерено (окно не публиковало плана — приёмке (б) не по чему судить)"
         with _PROBE_FEED_LOCK:
-            m = self._probe_keys()
-            own_c = dict(m.get(key) or {})
-            none_c = dict(m.get(None) or {})
+            own_c = dict((self._probe_keys().get(key) or {}))
             claim = getattr(self, "_probe_claim", None)
             if claim is None:
                 claim = self._probe_claim = {}
             base = dict(claim.get(key) or {})
-            claim[key] = dict(own_c)          # клеймим ровно то, что засчитали ниже
+            claim[key] = dict(own_c)          # клеймим ровно то, что засчитываем ниже
             if len(claim) > 64:               # кольцо клейм: та же память, что у карты проб
                 for _k in list(claim)[:32]:
                     if _k != key:
                         claim.pop(_k, None)
-        cur_all = {k: int(self.stats.get(k, 0) or 0) for k in self._PROBE_KEYS}
-        own_s = (s_by.get(key) or {})
-        out, taken = {}, 0
-        for k in self._PROBE_KEYS:
-            cur = int(own_c.get(k, 0) or 0)
-            floor = max(int(own_s.get(k, 0) or 0), int(base.get(k, 0) or 0))
-            v = cur - floor
-            if k == "probe_landed":
-                taken = max(0, floor - int(own_s.get(k, 0) or 0))
-            if v or k in self._PROBE_ALWAYS:
-                out[k] = v
-        # ЧУЖОЕ СЧИТАЕТСЯ ОТ СЫРОЙ дельты своего ключа, а не от засчитанной: пробы, которые
-        # успел заклеймить сосед, ушли под НАШИМ планом — называть их «чужим планом» значило
-        # бы починить двойной счёт ценой новой лжи в соседнем бакете.
-        own_raw = int(own_c.get("probe_landed", 0) or 0) - int(own_s.get("probe_landed", 0) or 0)
-        none_landed = (int(none_c.get("probe_landed", 0) or 0)
-                       - int((s_by.get(None) or {}).get("probe_landed", 0) or 0))
-        all_landed = cur_all["probe_landed"] - int(s_all.get("probe_landed", 0) or 0)
-        out["probe_foreign_plan"] = max(0, all_landed - own_raw - none_landed)
-        out["probe_no_key_proc"] = none_landed
+        out = self._probe_delta(snap, key, floor=base)
+        _s0 = int(((snap or {}).get("by_key") or {}).get(key, {}).get("probe_landed", 0) or 0)
+        taken = max(0, int(base.get("probe_landed", 0) or 0) - _s0)
         if taken:
             out["учтено_соседом"] = taken
         return out
@@ -1841,7 +1820,7 @@ class SpecFireLive:
             return {"by_key": {k: dict(v) for k, v in m.items()},
                     "all": {k: int(self.stats.get(k, 0) or 0) for k in self._PROBE_KEYS}}
 
-    def _probe_delta(self, snap, key=None):
+    def _probe_delta(self, snap, key=None, floor=None):
         """Дельта счётчиков позиций ЗА ОКНО И ПО КЛЮЧУ СВОЕГО ПЛАНА. snap — снимок на арме.
 
         key=None — кумулятив ПРОЦЕССА за окно (для читателей, которым нужен весь тракт).
@@ -1872,9 +1851,15 @@ class SpecFireLive:
                     out[k] = v
             return out
         own_c, own_s = (cur_by.get(key) or {}), (s_by.get(key) or {})
+        # ПОЛ ОТСЧЁТА (`floor`) — то, что по этому ключу УЖЕ засчитал закрывшийся сосед с тем
+        # же планом. Без него два окна одного плана печатают одну дельту дважды (сумма 82 при
+        # 41 факте). Ниже в `own_landed` он НЕ участвует нарочно: чужой бакет считается от
+        # СЫРОЙ дельты, иначе пробы, ушедшие под НАШИМ планом, назывались бы чужими.
+        _fl = floor or {}
         out = {}
         for k in self._PROBE_KEYS:
-            v = int(own_c.get(k, 0) or 0) - int(own_s.get(k, 0) or 0)
+            v = int(own_c.get(k, 0) or 0) - max(int(own_s.get(k, 0) or 0),
+                                                int(_fl.get(k, 0) or 0))
             if v or k in self._PROBE_ALWAYS:
                 out[k] = v
         own_landed = int(own_c.get("probe_landed", 0) or 0) - int(own_s.get("probe_landed", 0) or 0)
@@ -2529,7 +2514,14 @@ class SpecFireLive:
             _wkey = (getattr(self, "_win_key", None) or {}).pop(feed, None)
             # НЕЗНАНИЕ ЗАКРЫВАЕТ ГАРД (блокер B2 р-7): без ключа плана окно не смеет печатать
             # ЧИСЛО — прежде оно печатало дельту кумулятива процесса как свою приёмку.
-            _pw = self._probe_window_report(_probe0, _wkey)
+            try:
+                _pw = self._probe_window_report(_probe0, _wkey)
+            except Exception as _e:
+                # УЧЁТ НЕ РОНЯЕТ ДАЖЕ СТРОКУ (правило р-7). Этот блок стоит в `finally` петли
+                # окна: бросок измерителя уносил бы ВСЮ закрывающую строку и убивал тред с
+                # трейсбеком — то есть отказ учёта делал бы невидимым и сам отказ, и приёмку
+                # окна разом. Печатаем причину В ПОЛЕ и идём дальше.
+                _pw = "УЧЁТ ПОЗИЦИЙ УПАЛ: %s: %s" % (type(_e).__name__, _e)
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (

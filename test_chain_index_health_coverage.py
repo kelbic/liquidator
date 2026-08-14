@@ -67,19 +67,42 @@ def drill(seconds=600, step=1.0, shed_fn=None, logs_fail_fn=None, freeze_after=N
     LOGGER.addHandler(cap)
     _lvl, _poll = LOGGER.level, ci.CHAIN_INDEX_SELF_POLL_SEC
     LOGGER.setLevel(logging.INFO)
-    ci.CHAIN_INDEX_SELF_POLL_SEC = 0.001
+    ci.CHAIN_INDEX_SELF_POLL_SEC = step
+    class _Wake(object):
+        """ЧАСЫ ПЕТЛИ ДВИГАЕТ САМ ТРЕД ИНДЕКСА (B4 р-7): модельное время идёт РОВНО внутри
+        собственного ожидания петли, а не по реальным часам главного треда. Прежняя редакция
+        (`T += шаг; _wake.set(); time.sleep(0.0015)`) надеялась, что настоящий тред успеет
+        отработать оборот за 1.5мс: под нагрузкой не успевал, и прибор давал ложный диагноз на
+        проектной норме. Показания прибора не имеют права зависеть от загрузки машины."""
+
+        def __init__(self, step, stop_at, on_tick=None):
+            self.step, self.stop_at, self.on_tick = step, stop_at, on_tick
+
+        def wait(self, timeout=None):
+            T[0] += self.step
+            if self.on_tick is not None:
+                self.on_tick()
+            if (T[0] - 1000.0) >= self.stop_at:
+                idx._stop.set()
+            return False
+
+        def set(self):
+            pass
+
+        def clear(self):
+            pass
+
+        def is_set(self):
+            return False
+
+    idx._wake = _Wake(step, seconds)
     try:
-        idx.start()
-        for _ in range(int(seconds / step)):
-            T[0] += step
-            idx._wake.set()
-            time.sleep(0.0015)
+        idx._stop.clear()
+        idx._loop()
     finally:
-        idx.stop()
         ci.CHAIN_INDEX_SELF_POLL_SEC = _poll
         LOGGER.setLevel(_lvl)
         LOGGER.removeHandler(cap)
-        idx._thr.join(timeout=2)
     live = [(lv, m) for lv, m in cap.rows if "CHAIN-INDEX ЖИВОСТЬ" in m]
     ok = [m for lv, m in live if "ЧИТАЮ ЦЕПЬ" in m]
     froze = [m for lv, m in live if lv >= logging.ERROR and "ЗАМОРОЖЕН" in m]

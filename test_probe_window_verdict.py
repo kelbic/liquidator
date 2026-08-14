@@ -178,7 +178,15 @@ try:
     # отличать «дельта» от «итог», а не только уметь их складывать.
     live._note_probe_position(h, r, meta=("0xleg", ("BTC", MID_BLIND, "0xb", 1.0)))
     assert live.stats["probe_no_agg"] == 1, live.stats
+    # ...И СУД ТОГО ЖЕ КЛЮЧА ДО ОКНА. Р-7: приёмка окна судится ПО КЛЮЧУ ПЛАНА, поэтому чужой
+    # ключ отсекается и без снимка — мутация «снимок не берётся» прошла бы зелёной. Ранний суд
+    # ПОД ТЕМ ЖЕ КЛЮЧОМ, что и план окна, оставляет снимок ЕДИНСТВЕННЫМ, что его отсекает.
+    live._note_probe_position(h, r, meta=("0xleg", ("BTC", MID_SEEN, "0xb", 1.0)))
     stop = threading.Event()
+    # ПЛАН ЭТОГО ОКНА (блокер C р-6 / B2 р-7): без ключа окно не смеет печатать число вовсе.
+    # В бою ключ кладёт _prearm_board; здесь доска выключена нарочно (V2_BOARD=False), поэтому
+    # ставим его руками — иначе стенд мерил бы объект, которого в бою не бывает.
+    live._win_key["BTC"] = live.plan_key(MID_SEEN, "0xb")
     t = threading.Thread(target=live._window_loop, args=("BTC", "down", stop), daemon=True)
     t.start()
     time.sleep(0.15)                          # окно живёт; снимок уже взят на арме
@@ -193,12 +201,35 @@ try:
          "по пожизненному итогу: %s" % close[0])
     _w = close[0].split("окно_позиции=")[1].split(" stats=")[0]
     assert "'probe_no_agg': 0" in _w and "'probe_judged': 1" in _w, \
-        ("снимок обязан браться НА АРМЕ окна: слепой суд ДО окна не имеет права попадать в "
-         "дельту этого окна — %s (кумулятив %s)" % (_w, live.stats))
-    assert live.stats["probe_no_agg"] == 1 and live.stats["probe_judged"] == 2, live.stats
+        ("снимок обязан браться НА АРМЕ окна: суд ДО окна не имеет права попадать в дельту "
+         "этого окна ДАЖЕ ПОД ТЕМ ЖЕ КЛЮЧОМ — %s (кумулятив %s)" % (_w, live.stats))
+    assert live.stats["probe_no_agg"] == 1 and live.stats["probe_judged"] == 3, live.stats
     print("UNIT_OK: НАСТОЯЩИЙ _window_loop берёт снимок на арме и печатает дельту в закрывающей "
           "строке: окно_позиции=%s при пожизненном probe_no_agg=%d"
           % (_w, live.stats["probe_no_agg"]))
+
+    # ---------------------------------------------- B2 р-7: ОКНО БЕЗ КЛЮЧА ПЛАНА НЕ ПЕЧАТАЕТ ЧИСЕЛ
+    # Прежде такое окно печатало дельту КУМУЛЯТИВА ПРОЦЕССА как свою приёмку: чужие пробы
+    # выдавались за измерение окна, которое не публиковало ничего. Незнание закрывает гард.
+    LOG2.clear()
+    live.dev_by["ETH"] = 0.001
+    stop2 = threading.Event()
+    live._win_key.pop("ETH", None)
+    t2 = threading.Thread(target=live._window_loop, args=("ETH", "down", stop2), daemon=True)
+    t2.start()
+    time.sleep(0.10)
+    live._note_probe_position(h, r, meta=("0xleg", ("ETH", MID_SEEN, "0xb", 1.0)))
+    time.sleep(0.05)
+    stop2.set()
+    t2.join(timeout=5)
+    _c2 = [m for m in LOG2 if "window close" in m and "feed=ETH" in m]
+    assert _c2, LOG2[-3:]
+    _w2 = _c2[0].split("окно_позиции=")[1].split(" stats=")[0]
+    assert "не измерено" in _w2 and not any(ch.isdigit() for ch in _w2), \
+        ("окно БЕЗ ключа плана обязано сказать «не измерено» и не печатать НИ ОДНОЙ цифры "
+         "(ноль — тоже число): %s" % _w2)
+    print("UNIT_OK: окно без ключа плана печатает «%s» — кумулятив процесса больше не выдаётся "
+          "за приёмку окна" % _w2)
 finally:
     sfl.SPEC_FIRE_V2_BOARD = _sv_board
     ci._INDEX = _saved_idx

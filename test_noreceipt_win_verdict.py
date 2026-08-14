@@ -96,6 +96,11 @@ def drill(won=True, logs_read=True, kill_verdict=False):
     live._fire_engine = eng
     stop = threading.Event()
     live._windows["BTC"] = stop
+    # ЧЕЙ ЭТО ПЛАН (блокер B1 р-7): окно гасится ПО КЛЮЧУ ПЛАНА, а не по ярлыку фида в meta.
+    # В бою ключ кладёт _prearm_board в момент публикации probe_board; здесь объект собран
+    # руками, и без этой строки стенд мерил бы состояние, которого в бою не бывает.
+    live._win_key["BTC"] = live.plan_key(MID, BORROWER)
+    live._idx_for_b1 = idx          # тот же индекс нужен клетке 4 (повторный прогон вердикта)
     # СПИОН НА КУЛДАУНЕ: ставится ли WIN-пауза ТЕМ ЖЕ вызовом, что и на пути квитанции.
     # Взведётся ли она фактически — решает ручка #46 (SPEC_FIRE_COOLDOWN_TRIGGER), и это
     # решение владельца; путь NO-RECEIPT обязан отличаться от пути квитанции НИЧЕМ.
@@ -153,12 +158,16 @@ live_u, eng_u, stop_u, cap_u, rows_u = drill(won=True, logs_read=False)
 assert not live_u.stats.get("wins"), \
     ("won=None — это «логи не читаны», а не победа: объявить её значило бы погасить свой "
      "огонь посреди живой возможности: %s" % live_u.stats)
-assert live_u.stats.get("noreceipt_win_unknown") == 1, \
-    ("...но и молчать нельзя: недоступность вердикта обязана быть СЧИТАНА: %s" % live_u.stats)
 assert eng_u.armed() is True and not stop_u.is_set(), "по незнанию огонь не гасим"
-assert any("НЕ доказана и НЕ опровергнута" in m for m in rows_u), rows_u[-2:]
-print("UNIT_OK: won=None (логи блока не читаны) победой НЕ считается, но названо и посчитано "
-      "(noreceipt_win_unknown=1) — незнание закрывает гард, а не открывает его")
+# СЧЁТЧИК «ВЕРДИКТ НЕИЗВЕСТЕН» СНЯТ В Р-7 как структурно нулевой: здесь он «достижим» только
+# потому, что дрель зовёт build_facts(logs=None) РУКАМИ, а боевой scan_block читает логи ПЕРВЫМ
+# вызовом и на отказе бросает IndexUnavailable. Ноль в таком счётчике одинаково значил «вердикт
+# всегда есть» и «ветка мертва». Требование осталось прежним — незнание обязано быть НАЗВАНО, —
+# но названо оно теперь там, где его прочтёт человек: в строке самого исхода.
+assert any("вердикт победы=None" in m for m in rows_u), \
+    ("недоступность вердикта обязана быть НАЗВАНА в строке исхода: %s" % rows_u[-2:])
+print("UNIT_OK: won=None (логи блока не читаны) победой НЕ считается и НАЗВАНО в строке исхода "
+      "(«вердикт победы=None») — незнание закрывает гард, а не открывает его")
 
 # ---------------------------------------------------------------- 3. МУТАЦИЯ: вернуть слепоту
 live_m, eng_m, stop_m, cap_m, _rm = drill(won=True, kill_verdict=True)
@@ -167,6 +176,36 @@ assert not live_m.stats.get("wins") and eng_m.armed() is True and not stop_m.is_
      "стенд — иначе тест не держит ничего: %s" % live_m.stats)
 print("UNIT_OK: мутация (ветка mined слепа к fact['won'], как было) краснит стенд: победа "
       "невидима, движок остаётся армленным по УЖЕ ВЗЯТОЙ цели")
+
+# ---------------------------------------------------------------- 4. B1: ЯРЛЫК != ПЛАН
+# `FireEngine._target` — ОДНО перезаписываемое поле: ярлык ставит ПОСЛЕДНИЙ тикнувший
+# keepalive любого окна каскада. Победа под планом окна BTC не имеет права гасить окно ETH.
+live_b, eng_b, stop_b, cap_b, rows_b = drill(won=True)
+_stop_eth = threading.Event()
+live_b._windows["ETH"] = _stop_eth
+live_b._win_key["ETH"] = live_b.plan_key("0x" + "ee" * 32, "0x" + "ef" * 20)
+live_b._windows["BTC"] = (_re_stop := threading.Event())
+live_b._win_key["BTC"] = live_b.plan_key(MID, BORROWER)
+live_b.stats["wins"] = 0
+live_b._cd_calls.clear()
+live_b._cooldown_feed.clear()
+_sv_i = ci._INDEX
+ci._INDEX = live_b._idx_for_b1
+try:
+    # ЯРЛЫК ЧУЖОЙ (ETH), а план в кортеже — тот, под которым проба ушла (BTC).
+    live_b._engine_timeout((LEG, ("ETH", MID, BORROWER, 90_000.0)), TXH)
+finally:
+    ci._INDEX = _sv_i
+assert live_b.stats.get("wins") == 1, live_b.stats
+assert _re_stop.is_set(), \
+    "окно ВЗЯТОЙ цели (его план == план пробы) обязано закрыться, даже если ярлык чужой"
+assert not _stop_eth.is_set(), \
+    ("окно СОСЕДА закрыто ЧУЖОЙ победой — его цель никто не брал, мы выключили живую "
+     "возможность: cd=%s" % live_b._cd_calls)
+assert live_b._cd_calls == [("BTC", "probe", True)], \
+    ("WIN-пауза обязана лечь на фид ВЗЯТОЙ цели, а не на ярлык последнего тика: %s"
+     % live_b._cd_calls)
+print("UNIT_OK: B1 — победа под чужим ярлыком гасит окно ПЛАНА (BTC) и не трогает соседа (ETH)")
 
 print("ПРОШЛИ: вердикт победы один на все источники факта — квитанция и индекс дают ОДНО И ТО "
       "ЖЕ действие, а незнание не выдаётся ни за победу, ни за её отсутствие")

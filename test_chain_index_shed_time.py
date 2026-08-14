@@ -79,27 +79,53 @@ def drill(seconds=600, shed_from=60.0, shed_to=None, freeze_after_sec=10 ** 6,
     LOGGER.setLevel(logging.INFO)
     _sv_poll = ci.CHAIN_INDEX_SELF_POLL_SEC
     _sv_loud = getattr(ci, "CHAIN_INDEX_SHED_LOUD_SEC", None)
-    ci.CHAIN_INDEX_SELF_POLL_SEC = 0.001      # шаг ожидания петли — единственный «ускоритель»
+    ci.CHAIN_INDEX_SELF_POLL_SEC = 1.0
     if loud_sec is not None and _sv_loud is not None:
         ci.CHAIN_INDEX_SHED_LOUD_SEC = float(loud_sec)
-    try:
-        idx.start()
-        for _ in range(seconds):
-            T[0] += 1.0
+
+    class _Wake(object):
+        """ЧАСЫ ПЕТЛИ ДВИГАЕТ САМ ТРЕД ИНДЕКСА (B4 р-7).
+
+        Прежняя редакция шла из главного треда: `T += 1; _wake.set(); time.sleep(0.0015)` —
+        то есть модельное время двигалось ПО РЕАЛЬНЫМ часам, в надежде, что настоящий тред
+        успеет отработать оборот за 1.5мс. Под нагрузкой не успевал: 2 падения из 4 и ЛОЖНЫЙ
+        «ЗАМОРОЖЕН» на проектной норме. Прибор, чьи показания зависят от загрузки машины,
+        приёмкой быть не может. Теперь `_loop` крутится ЗДЕСЬ ЖЕ, а время идёт РОВНО ВНУТРИ
+        его собственного ожидания: сколько бы ни длился реальный оборот, модель сдвинется на
+        CHAIN_INDEX_SELF_POLL_SEC и ни на секунду больше. Настоящими остаются `_loop`,
+        `_catch_up`, `scan_block`, `_ingest`, `_health`, `_selfcheck`, `offer_block`.
+        """
+
+        def wait(self, timeout=None):
+            dt = float(timeout or 1.0)
+            T[0] += dt
             if feed_head:
                 # РЕЦВ-ПЕТЛЯ: подача ФОРМИРУЕМОГО блока. Сети здесь нет — O(1) присвоение, и
                 # именно оно доказывает, что цепь жива, пока индекс уступает ключ бою.
                 idx.offer_block(BN0 + int((T[0] - 1000.0) // 2) + 1)
-            idx._wake.set()
-            time.sleep(0.0015)                # дать НАСТОЯЩЕМУ треду отработать оборот
+            if (T[0] - 1000.0) >= seconds:
+                idx._stop.set()
+            return False
+
+        def set(self):
+            pass
+
+        def clear(self):
+            pass
+
+        def is_set(self):
+            return False
+
+    idx._wake = _Wake()
+    try:
+        idx._stop.clear()
+        idx._loop()
     finally:
-        idx.stop()
         ci.CHAIN_INDEX_SELF_POLL_SEC = _sv_poll
         if _sv_loud is not None:
             ci.CHAIN_INDEX_SHED_LOUD_SEC = _sv_loud
         LOGGER.setLevel(_sv_lvl)
         LOGGER.removeHandler(cap)
-        idx._thr.join(timeout=2)
     return idx, cap
 
 
@@ -129,16 +155,27 @@ assert idx_c.stats["blocks"] > 0, "дрель бессмысленна, если
 assert idx_c.snapshot()["fresh"] is False, "уступая, индекс обязан быть протухшим: %s" % idx_c.snapshot()
 assert not _fr, ("НЕПРЕРЫВНАЯ уступка на ЖИВОЙ голове — проектная НОРМА, а не заморозка. "
                  "ERROR «ЗАМОРОЖЕН» за прогон: %d (%s)" % (len(_fr), _fr[:2]))
-assert not cap_c.errs, ("на проектной норме ERROR быть не должно вовсе: %s" % cap_c.errs[:2])
+# D5B (вердикт р-7): ERROR под непрерывной уступкой РАЗРЕШЁН РОВНО ОДИН — эскалация по
+# длительности. Уступка 100% дольше LOUD_SEC это состояние, в котором state()=unknown,
+# corpses()=None, index_hits=0: приёмки ВСЕХ пакетов в нём неизмеримы, и это авария, а не
+# норма. Блокер A р-6 (ложный «ЗАМОРОЖЕН» на проектной норме) проверяется строкой ВЫШЕ и
+# остаётся закрытым: ни одного ERROR с этим диагнозом.
+_not_esc = [m for m in cap_c.errs if "ЭСКАЛАЦИЯ" not in m]
+assert not _not_esc, ("на проектной норме единственный законный ERROR — эскалация d5b: %s"
+                      % _not_esc[:2])
+assert cap_c.errs, ("уступка 1140с БЕЗ единого скана обязана быть ERROR (d5b): приёмки всех "
+                    "пакетов в этом состоянии неизмерены, WARNING учит игнорировать строку")
 # ...и это не молчание: состояние обязано быть НАЗВАНО своим именем в каждом окне.
-_named = [m for m in cap_c.warns if "УСТУПКА КЛЮЧА БОЮ активна" in m]
+# ВСЕ строки, а не только warns: после LOUD_SEC та же строка уходит уровнем ERROR (d5b).
+_named = [m for m in cap_c.all() if "УСТУПКА КЛЮЧА БОЮ активна" in m]
 assert len(_named) >= 8, ("уступка обязана называться в КАЖДОМ окне (1200с / 120с = 10), "
                           "иначе мы просто заменили ложную тревогу молчанием: %d (%s)"
                           % (len(_named), cap_c.warns[-1:]))
 assert any("голова растёт" in m for m in _named), \
     ("у состояния «голова растёт, скан уступает» обязано быть СВОЁ имя — по нему читатель "
      "отличает уступку от заморозки: %s" % _named[-1])
-print("UNIT_OK: непрерывная уступка 1200с на ЖИВОЙ голове — ERROR=0 (на коде р-5 было 9), "
+print("UNIT_OK: непрерывная уступка 1200с на ЖИВОЙ голове — ложных «ЗАМОРОЖЕН» 0 (на коде "
+      "р-5 было 9), "
       "состояние названо в %d окнах подряд" % len(_named))
 
 # ---------------------------------------------------------------- 2. ПОЗИТИВНЫЙ КОНТРОЛЬ
@@ -162,7 +199,7 @@ assert _ages and max(_ages) > 4 * ci.CHAIN_INDEX_HEALTH_SEC, \
     ("возраст обязан УЙТИ далеко за длину окна — иначе режим отказа недостижим по построению "
      "(ровно этим и был слеп стенд р-5): max=%s" % (max(_ages) if _ages else None))
 print("UNIT_OK: 10 окон подряд под непрерывной уступкой, возраст дошёл до %.0fс (> 4 окон), "
-      "ERROR ноль — сравнение осей больше не даёт ложный диагноз" % max(_ages))
+      "ложных «ЗАМОРОЖЕН» ноль — сравнение осей больше не даёт ложный диагноз" % max(_ages))
 
 # ------------------- 4. УСТУПКА НЕ ЕСТЬ ВЕЧНЫЙ ОТКУП ЗА ПРОТУХАНИЕ, НАЧАВШЕЕСЯ ДО НЕЁ
 # Голова узла замерла на 60-й секунде, уступка началась на 300-й и дальше НЕПРЕРЫВНА. 240
@@ -186,7 +223,7 @@ print("UNIT_OK: протухание ДО уступки (240с) звучит ER
 # Прежняя эскалация стояла на ЧИСЛЕ ОКОН и была мертва дважды: `_shed_supp_streak` обнулялся
 # ДО печати (в журнале всегда «0 окон подряд»), а порог N=3 недостижим ни в одном режиме
 # (max streak=1). Теперь порог — ДЛИТЕЛЬНОСТЬ уступки БЕЗ СКАНА, и он проверяется мутацией.
-_esc = [m for m in cap_c.warns if "ЭСКАЛАЦИЯ" in m]
+_esc = [m for m in cap_c.all() if "ЭСКАЛАЦИЯ" in m]      # d5b: уровень ERROR, см. п.1
 assert _esc, ("непрерывная уступка 1140с обязана эскалироваться (порог %.0fс): %s"
               % (ci.CHAIN_INDEX_SHED_LOUD_SEC, cap_c.warns[-1:]))
 _num = re.search(r"ЭСКАЛАЦИЯ: уступка без единого скана уже (\d+)с", _esc[-1])
@@ -194,7 +231,7 @@ assert _num and int(_num.group(1)) >= int(ci.CHAIN_INDEX_SHED_LOUD_SEC), \
     ("эскалация обязана печатать НАСТОЯЩУЮ длительность, а не ноль (дефект М1: streak "
      "обнулялся ДО печати): %s" % _esc[-1])
 idx_e, cap_e = drill(seconds=1200, shed_from=60.0, loud_sec=10 ** 9)     # МУТАЦИЯ ПОРОГА
-assert not [m for m in cap_e.warns if "ЭСКАЛАЦИЯ" in m], \
+assert not [m for m in cap_e.all() if "ЭСКАЛАЦИЯ" in m], \
     ("мутация порога (LOUD_SEC=1e9) ОБЯЗАНА снять эскалацию — иначе строка печатается всегда "
      "и порога не держит: %s" % [m for m in cap_e.warns if "ЭСКАЛАЦИЯ" in m][:1])
 assert not cap_e.errs, "мутация порога не имеет права рождать ERROR: %s" % cap_e.errs[:2]
