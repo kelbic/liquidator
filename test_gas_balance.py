@@ -2,7 +2,8 @@
 не доливать ETH): батч-путь был третьим и падал на фолбэк 500k; тонкий кошелёк не должен
 отбивать залп 'insufficient funds'. Без сети."""
 import sys, types
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 from chain.execute import batch_gas_limit, clamp_fee_to_balance, gas_floor_of
 
 cfg = types.SimpleNamespace(gas_limit_est=500_000, gas_limit_floor=3_000_000)

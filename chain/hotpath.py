@@ -24,6 +24,10 @@ import time
 # тестом test_unresolved_names.py, #35 — ровно тот случай, ради которого он писался).
 # Цикла нет: chain/rpc.py ничего из chain/hotpath.py не импортирует.
 from chain.rpc import redact_clip
+# #110: модульный импорт по той же причине — вызовов два (подача блока и печать счётчиков),
+# и локальный импорт в одном оставил бы второй с NameError. Цикла нет: chain/chain_index.py
+# из chain/hotpath.py ничего не берёт.
+from chain import chain_index as _chain_index
 
 log = logging.getLogger(__name__)
 
@@ -2066,6 +2070,59 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                         " ".join("%s×%d" % (m, n) for m, n in _top[:3]))
                         except Exception:
                             pass
+                        # #110: индекс цепи — ЕДИНИЦЫ РАЗНЫЕ и разделены намеренно. blocks —
+                        # покрытые блоки; full/light — из них прочитанные целиком и по логам;
+                        # gaps — потерянные окна (каждое отнимает право сказать «tx не села»);
+                        # fails — отказы узла; age/fresh — протухание. Индекса нет — строка
+                        # тоже есть: молчание не должно быть неотличимо от «всё хорошо».
+                        try:
+                            _ci = _chain_index.get_index()
+                            if _ci is None:
+                                log.info("CHAIN-INDEX: НЕ ПОДНЯТ (исходы проб — только поштучные "
+                                         "квитанции; позиции и tip транзита не измеряются)")
+                            else:
+                                _s = _ci.snapshot()
+                                # квитанции=... — СПОСОБНОСТЬ УЗЛА, названная вслух. Без неё
+                                # index_hits=0 в строке #109 ниже нечитаем: «узел не умеет
+                                # eth_getBlockReceipts», «мы не спрашивали» и «наших tx в
+                                # блоках не было» дают ОДИН И ТОТ ЖЕ ноль.
+                                log.info("CHAIN-INDEX: блоков=%d (полных %d / лёгких %d) дыр=%d "
+                                         "отказов=%d beyond=%d shed=%d | наших tx=%d транзитов=%d "
+                                         "побед=%d трупов=%d | голова=%s потолок=%s возраст=%.1fс "
+                                         "свежесть=%s тред=%s квитанции=%s | ЗАМЕР: %.2f зап/с "
+                                         "~%d CU/сут",
+                                         _s["blocks"], _s["full"], _s["light"], _s["gaps"],
+                                         _s["fails"], _s["beyond_head"], _s["shed"], _s["ours"],
+                                         _s["transit"], _s["winners"], _s["pairs"], _s["last"],
+                                         _s["conf"], _s["age"], _s["fresh"], _ci.alive(),
+                                         _s.get("rcpt_probe", "?"), _s["rps"], _s["cu_day"])
+                                if not _ci.alive():
+                                    log.error("CHAIN-INDEX: ТРЕД МЁРТВ — источник правды об "
+                                              "исходах проб потерян, счётчики приёмки лгут")
+                                if _s["blocks"] <= 0:
+                                    log.error("CHAIN-INDEX: блоков=0 при живом треде — цепь НЕ "
+                                              "читается (потолок=%s, отказов=%d, beyond=%d). "
+                                              "Все счётчики позиций и исходов ничего не значат",
+                                              _s["conf"], _s["fails"], _s["beyond_head"])
+                        except Exception:
+                            pass
+                        # #109 ЗА СУТКИ: экономия поштучных квитанций. polls — СЕТЕВЫЕ поллы,
+                        # polls_saved — партии, закрытые индексом целиком, index_hits — исходы,
+                        # взятые из индекса. Это и есть приёмка пакета в деньгах запросов.
+                        try:
+                            from chain.fire_engine import collector_stats as _cst
+                            _c9 = _cst()
+                            if _c9["polls"] or _c9["polls_saved"] or _c9["tracked"]:
+                                _tot = max(1, _c9["polls"] + _c9["polls_saved"])
+                                log.info("#109 квитанции: polls=%d polls_saved=%d (%.0f%% партий "
+                                         "закрыл индекс) index_hits=%d из resolved=%d | "
+                                         "batch_fail=%d index_fail=%d cu=%.0f",
+                                         _c9["polls"], _c9["polls_saved"],
+                                         100.0 * _c9["polls_saved"] / _tot, _c9["index_hits"],
+                                         _c9["resolved"], _c9["batch_fail"], _c9["index_fail"],
+                                         _c9["cu"])
+                        except Exception:
+                            pass
                         _stg = stage_report()
                         if _stg:
                             log.info("STAGE p50/p95 мс (окно %.0fч): %s", STAGE_WINDOW_SEC / 3600.0, _stg)
@@ -2118,6 +2175,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         continue
                     if bn != last_poll_block:                 # one preconf-price poll per block (money markets)
                         last_poll_block = bn
+                        # #110: подача блока индексу. Тут же, где уже стоит per-block драйвер,
+                        # и ровно тем же способом — БЕЗ работы в recv-петле: индекс только
+                        # запоминает номер и будит свой единственный тред.
+                        _chain_index.offer_block(bn)
                         feed_handled.clear()                  # Layer1: dedup set is per-block -> clear on block change
                         _bf = basefee_of(d)                   # 5a: index-0 кадр несёт base-хедер
                         if _bf is not None:

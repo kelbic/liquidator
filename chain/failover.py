@@ -47,6 +47,19 @@ def bg_shed() -> bool:
     return a is not None and a._bg_collision()
 
 
+def active_url() -> str:
+    """ТЕКУЩИЙ боевой указатель чтений (пусто = failover не поднят).
+
+    Нужен потребителям, у которых СВОЙ узел: `bg_shed()` отвечает на вопрос «бой встал на
+    bg_url», а это ЧУЖОЙ адрес — для фона со своим ключом ответ не про него (#110).
+    """
+    a = _ACTIVE
+    try:
+        return str(getattr(a, "rpc_url", "") or "") if a is not None else ""
+    except Exception:
+        return ""
+
+
 def set_windows_probe(fn) -> None:
     a = _ACTIVE
     if a is not None:

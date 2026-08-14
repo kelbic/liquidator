@@ -111,6 +111,27 @@ COLLECT_MIN_AGE_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_COLLECT_MIN_AGE_SEC
 CU_PER_RECEIPT = float(os.environ.get("SPEC_FIRE_ENGINE_CU_PER_RECEIPT", "15"))
 
 
+_COLLECTORS = []                    # живые коллекторы процесса (в бою он один)
+
+
+def collector_stats():
+    """Сводные счётчики коллекторов процесса — для суточной приёмки #109.
+
+    Отдаёт polls (СЕТЕВЫЕ поллы), polls_saved (партии, закрытые индексом целиком) и
+    index_hits (исходы, взятые из индекса). Без этой тройки «экономия запросов» остаётся
+    утверждением, а не замером.
+    """
+    out = {"polls": 0, "polls_saved": 0, "index_hits": 0, "tracked": 0, "resolved": 0,
+           "timeouts": 0, "batch_fail": 0, "index_fail": 0, "cu": 0.0}
+    for c in list(_COLLECTORS):
+        for k in out:
+            try:
+                out[k] += (c.stats.get(k, 0) or 0)
+            except Exception:
+                pass
+    return out
+
+
 class ReceiptCollector:
     """ОДИН тред на все квитанции движка: партиями спрашивает исходы и раздаёт их обработчику.
 
@@ -119,12 +140,21 @@ class ReceiptCollector:
     задокументированные инциденты. Партия из одного запроса стоит столько же, сколько один
     полл, а покрывает сотни проб.
 
-    Швы: receipts_fn(hashes) -> {hash: receipt|None}; on_result(meta, receipt); on_timeout(meta).
+    Швы: receipts_fn(hashes) -> {hash: receipt|None}; on_result(meta, receipt); on_timeout(meta);
+    index_fn(hashes) -> {hash: receipt} — ИНДЕКС ЦЕПИ (#110), спрашивается ПЕРВЫМ.
+
+    Почему индекс первым (#109). Поштучная квитанция — самый дорогой способ узнать то, что уже
+    лежит в блоке: 63k подзапросов за 2 часа, 889 отказов за сутки и — главное — ЛОЖЬ под 429
+    («NO-RECEIPT» у замайненных проб). Индекс читает блок ОДИН раз на всех, поэтому у него
+    исход бесплатен, а у сети спрашивается только остаток. index_fn=None (ручка отката) делает
+    путь бит-в-бит прежним.
     """
 
     def __init__(self, receipts_fn, on_result, on_timeout=None, log=None,
-                 poll_sec=None, timeout_sec=None, batch=None, now=None, sleep=None, min_age_sec=None):
+                 poll_sec=None, timeout_sec=None, batch=None, now=None, sleep=None,
+                 min_age_sec=None, index_fn=None):
         self._receipts_fn = receipts_fn
+        self._index_fn = index_fn
         self._on_result = on_result
         self._on_timeout = on_timeout
         self._log = log
@@ -138,7 +168,10 @@ class ReceiptCollector:
         self._pending = {}          # hash -> (meta, deadline)
         self._stop = threading.Event()
         self._thr = None
-        self.stats = {"tracked": 0, "resolved": 0, "timeouts": 0, "polls": 0, "cu": 0.0}
+        self.stats = {"tracked": 0, "resolved": 0, "timeouts": 0, "polls": 0, "cu": 0.0,
+                      "index_hits": 0, "polls_saved": 0}
+        _COLLECTORS.append(self)    # приёмка «за сутки» (#109) читается из hot-stats, а не
+        #                             только из close-строки окна, которого может и не быть
 
     def track(self, h, meta):
         with self._lock:
@@ -175,10 +208,32 @@ class ReceiptCollector:
                       if _now - (e[2] if len(e) > 2 else 0.0) >= self._min_age][:self._batch]
             if not hashes:
                 return 0
-        self.stats["cu"] = self.stats.get("cu", 0.0) + len(hashes) * CU_PER_RECEIPT
         got = {}
+        ask = hashes
+        if self._index_fn is not None:
+            # #110: сперва ИНДЕКС. Он читает блок раз на всех, поэтому исход отсюда стоит ноль
+            # запросов и ноль CU. Ключей в ответе меньше запрошенного — это «остальных не
+            # знаю», и остаток честно уходит в сеть: индекс не имеет права никого хоронить.
+            try:
+                _idx = self._index_fn(hashes) or {}
+            except Exception as e:                    # индекс лёг -> работаем как до него
+                _idx = {}
+                self.stats["index_fail"] = self.stats.get("index_fail", 0) + 1
+                if self._log:
+                    self._log("FIRE collect index fail: %s %s (спрашиваем сеть как прежде)"
+                              % (type(e).__name__, str(e)[:120]))
+            if _idx:
+                got.update({h: r for h, r in _idx.items() if r is not None})
+                self.stats["index_hits"] = self.stats.get("index_hits", 0) + len(got)
+                ask = [h for h in hashes if h not in got]
+        if not ask:
+            # Партия закрыта индексом целиком: сети не касаемся вовсе. Ровно это и есть #109 —
+            # 63k подзапросов за два часа превращаются в один общий разбор блока.
+            self.stats["polls_saved"] = self.stats.get("polls_saved", 0) + 1
+        self.stats["cu"] = self.stats.get("cu", 0.0) + len(ask) * CU_PER_RECEIPT
         try:
-            got = self._receipts_fn(hashes) or {}
+            if ask:
+                got.update(self._receipts_fn(ask) or {})
         except Exception as e:
             # РАННИЙ ВЫХОД ЗДЕСЬ БЫЛ РЕГРЕССИЕЙ (#101, поймано ревью 12.08). Снятие брони #93
             # живёт в цикле НИЖЕ (_on_timeout -> volley_gas_settle), поэтому `return 0` на
@@ -197,7 +252,9 @@ class ReceiptCollector:
                 self._log("FIRE collect batch fail: %s %s (таймауты обрабатываются)"
                           % (type(e).__name__, str(e)[:140]))
         else:
-            self.stats["polls"] += 1
+            if ask:
+                self.stats["polls"] += 1   # СЕТЕВОЙ полл, а не проход тика: партию, закрытую
+                #                            индексом, считать поллом = завысить свой же расход
         done = 0
         now = self._now()
         for h in hashes:
@@ -214,8 +271,21 @@ class ReceiptCollector:
                     if self._on_timeout:
                         try:
                             self._on_timeout(ent[0], h)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # L1 р-8: МОЛЧАЛИВЫЙ except НА ДЕНЕЖНОМ ПУТИ — ДЕФЕКТ САМ ПО СЕБЕ.
+                            # Обработчик таймаута выносит вердикт победы NO-RECEIPT и защищает
+                            # nonce отставшей ноги; голый `pass` делал невидимым и его отказ, и
+                            # его причину — ровно поэтому «учёт перед деньгами» прожил здесь
+                            # три раунда. Глотать бросок мы обязаны (один битый хэш не имеет
+                            # права уронить тред коллектора), а молчать о нём — нет.
+                            self.stats["timeout_handler_fail"] = self.stats.get(
+                                "timeout_handler_fail", 0) + 1
+                            if self._log:
+                                try:
+                                    self._log("FIRE collect timeout handler fail tx=%s: %s: %s"
+                                              % (h, type(e).__name__, str(e)[:140]))
+                                except Exception:
+                                    pass
                 continue
             with self._lock:
                 ent = self._pending.pop(h, None)
@@ -226,8 +296,21 @@ class ReceiptCollector:
             try:
                 self._on_result(ent[0], h, r)
             except Exception as e:
+                # ХВОСТ L1 р-8, ВТОРОЙ БРАТ. По образцу пути таймаута (c2fdc92): отказ
+                # обработчика ИСХОДА — того самого, что выносит вердикт победы по квитанции и
+                # снимает бронь #93, — печатался БЕЗ ХЭША и без текста, одним именем типа.
+                # Разобрать по такой строке нечего: какая проба легла и почему — неизвестно, а
+                # хэш уже снят с `_pending`, то есть другого следа не будет ни от кого.
+                # Глотать бросок мы обязаны (одна битая квитанция не имеет права уронить тред
+                # коллектора), молчать о нём — нет.
+                self.stats["result_handler_fail"] = self.stats.get(
+                    "result_handler_fail", 0) + 1
                 if self._log:
-                    self._log("FIRE collect handler fail: %s" % type(e).__name__)
+                    try:
+                        self._log("FIRE collect handler fail tx=%s: %s: %s"
+                                  % (h, type(e).__name__, str(e)[:140]))
+                    except Exception:
+                        pass
         return done
 
     def _loop(self):

@@ -17,7 +17,8 @@ import sys
 import threading
 import types
 
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 import chain.execute as ex
 import chain.spec_fire_live as sfl_mod
 from chain.spec_fire_live import SpecFireLive

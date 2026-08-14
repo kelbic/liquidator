@@ -2,7 +2,8 @@
 import math
 import sys
 
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 from analysis.usde_watch import lif_of, slice_prize, heal_after, heal_days, SLICE_MAX_IMPACT
 
 # 1) LIF из LLTV по формуле Morpho Blue (было зашито 2.5% — на 0.915 реально 2.617%)

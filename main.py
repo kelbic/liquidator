@@ -28,6 +28,7 @@ from heartbeat import beat as hb_beat
 from strategy.scanner import load_covered_markets
 from strategy.guard import KillSwitch, GuardState
 from chain.rpc import BaseRpc
+from chain import chain_index                      # #110: фоновый индекс цепи (подача блоков)
 from chain.morpho import positions_at_risk, MORPHO_BLUE_ADDRESS
 from chain.simulate import assess_candidates_batched, estimate
 
@@ -937,6 +938,10 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
             async with websockets.connect(url, **conn_kw) as ws:
                 log.info("block source=%s connected — loop (mode=%s)", active, cfg.mode)
                 async for blk in gen(ws):
+                    # #110: подача блока фоновому индексу. Только присваивание номера и
+                    # Event.set — ни сети, ни лока, ни треда: вся работа живёт в СВОЁМ
+                    # долгоживущем треде индекса. Индекса нет -> мгновенный выход.
+                    chain_index.offer_block(blk)
                     # Гистерезис пробы (05.08): до подтверждённой стабильности fails НЕ сбрасываем —
                     # хлопающий источник (аптайм < stable_sec) валится в тихий probe-fail с бэкоффом,
                     # а не в пинг-понг 3с-реконнектов (урок 07-21: per-IP лимит flashblocks).
@@ -1006,6 +1011,12 @@ def main():
         from chain.failover import build_failover
         rpc = build_failover(rpc, cfg, alerter)   # без COMBAT_FAILOVER_URLS вернёт rpc как был
     ctx_cache: dict = {}   # immutable per-market params (oracle, lltv_wad), filled on first sight
+
+    # #110 ФОНОВЫЙ ИНДЕКС ЦЕПИ. Поднимается ДО петель, на СВОЁМ (не боевом) узле. Он не в
+    # горячем пути и ничего не отправляет: читает по одному блоку и раздаёт из памяти исходы
+    # наших проб, их ПОЗИЦИИ, tip транзита и свежих трупов. Без него приёмка любого пакета
+    # читается счётчиком, который под 429 лжёт (см. docs/ROLLBACKS.md, CHAIN_INDEX=0).
+    chain_index.start_index(cfg=cfg, watch_to=[cfg.liquidator_address])
 
     log.info("liquidator start: mode=%s chain=%s markets=%d rpc=%s",
              cfg.mode, cfg.chain, len(markets), "set" if rpc else "MISSING")

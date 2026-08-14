@@ -10,6 +10,7 @@
 (3) обе ручки в env с откатом; TTL 900с этим пакетом не трогаем.
 """
 import pathlib
+import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -79,7 +80,11 @@ finally:
 src = pathlib.Path("chain/spec_fire_live.py").read_text()
 assert "self._cooldown_until = self._now() + SPEC_FIRE_WIN_COOLDOWN_SEC" not in src, \
     "путь победы снова ставит глобальную паузу мимо ручек"
-assert src.count('self._set_cooldown(feed, "probe"') == 3, \
+# ИМЯ ПЕРЕМЕННОЙ ФИДА ЗДЕСЬ НЕ ПРЕДМЕТ ПРОВЕРКИ (р-7): в `_probe_win` пауза ставится в цикле
+# по фидам, ЧЕЙ ПЛАН совпал с планом взятой пробы (блокер B1 — ярлык последнего тика лгал в
+# 59% проб), поэтому аргумент называется `_f`. Держим ТО, ради чего проверка ставилась: все
+# три пути победы пробы идут через ручки, а не мимо них.
+assert len(re.findall(r'self\._set_cooldown\(\w+, "probe"', src)) == 3, \
     "не все три пути победы пробы переведены на ручки"
 assert "if self._cooldown_active(feed):" in src, "арм читает паузу мимо пер-фид скоупа"
 

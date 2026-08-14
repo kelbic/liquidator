@@ -93,12 +93,29 @@ try:
     print("OK 3/4: сквозной путь — живая нога сохранена, отстающая сброшена")
 
     # --- 6. СТРУКТУРНО: сверка стоит ПЕРЕД сбросом, а не после ---------------------------
+    # ЯКОРЬ ПЕРЕЕХАЛ (L1 р-8): денежная часть таймаута вынесена в `_engine_timeout_verdict`,
+    # а `_engine_timeout` стал тонкой обёрткой «деньги в try, бронь #93 в finally». Берём ОБА
+    # тела разом, иначе проверка молча смотрела бы в обёртку и не видела ни одного из двух
+    # имён — то есть засчитывала бы порядок, которого не проверяла.
     src = pathlib.Path("chain/spec_fire_live.py").read_text()
     i = src.index("def _engine_timeout(")
-    blk = src[i:src.index("\n    def ", i + 10)]
+    j = src.index("def _engine_timeout_verdict(")
+    blk = src[i:src.index("\n    def ", j + 10)]
     assert blk.index("volley_leg_landed(") < blk.index("volley_invalidate_nonce("), \
         "сверка nonce стоит ПОСЛЕ сброса — то есть бесполезна"
-    print("OK 4/4: сверка структурно предшествует сбросу")
+    # L1 р-8: УЧЁТ НЕ СТОИТ ПЕРЕД ДЕНЬГАМИ. Вердикт победы обязан быть вызван РАНЬШЕ, чем
+    # снятие брони #93: обратный порядок и был дефектом (бросок в учёте уносил wins, disarm,
+    # закрытие окна и защиту ноги, а коллектор глотал его голым except).
+    wrap = src[i:j]
+    wrap = wrap[wrap.index('"""', wrap.index('"""') + 3):]      # докстринг не код: он тоже
+    #                                                             называет обе строки, и по
+    #                                                             нему «порядок» читался бы
+    #                                                             из прозы, а не из вызовов
+    assert "finally:" in wrap, "бронь #93 обязана сниматься в finally — иначе не на всех выходах"
+    assert wrap.index("self._engine_timeout_verdict(") < wrap.index("finally:") \
+        < wrap.index("volley_gas_settle("), \
+        "снятие брони #93 стоит ПЕРЕД денежным вердиктом — учёт снова впереди денег"
+    print("OK 4/4: сверка структурно предшествует сбросу; вердикт — перед снятием брони")
 finally:
     ex._VOLLEY_NONCE.clear()
     ex._VOLLEY_NONCE.update(_saved)

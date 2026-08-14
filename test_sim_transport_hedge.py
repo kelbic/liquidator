@@ -2,7 +2,8 @@
 Классификатор строк ошибок simulate_tx + дефолт флага. Без сети."""
 import sys
 
-sys.path.insert(0, "/home/claude-agent/work/liquidator/.claude/worktrees/latency-race")
+import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 from chain.hotpath import _sim_transport_err, HOT_SIM_CONFIRMED_RETRY
 
 # транспорт -> дочитка

@@ -7,8 +7,11 @@ aggregators, calls on_update(market_ids, info) — NOTHING ELSE. No price, no as
 Import-clean: websockets/brotli/Morpho ABIs imported lazily.
 """
 from __future__ import annotations
+import logging
 import time
 from collections import defaultdict
+
+log = logging.getLogger("liquidator")
 
 FB_URL = "wss://mainnet.flashblocks.base.org/ws"
 ZERO = "0x0000000000000000000000000000000000000000"
@@ -98,6 +101,30 @@ EXTRA_LEG_GETTERS = ("BASE_FEED_2", "QUOTE_FEED_1", "QUOTE_FEED_2")
 EXTRA_LEG_MAX_AGE_SEC = 3 * 3600.0   # market-ноги (ETH/USD hb 20мин) всегда моложе; стейблы (hb 24ч) — старше
 
 _PRIMARY_AGG: dict = {}   # {market_id: BF1 watch-key} последнего resolve_feeds (см. primary_map)
+_LEGS_AGG: dict = {}      # {market_id: [все watch-ключи рынка]} последнего resolve_feeds
+_MAP_TS = [0.0]           # когда карту последний раз ОБНОВЛЯЛ успешный резолв (см. map_age)
+
+
+def map_age():
+    """Возраст карты владения в секундах (inf — не строилась ни разу).
+
+    Возраст обязан быть ЧИТАЕМЫМ снаружи: «карта старая» и «суд вслепую» — разные вещи, и
+    путать их значит принять слепоту за факт «владельца нет»."""
+    if not _MAP_TS[0]:
+        return float("inf")
+    return max(0.0, time.time() - _MAP_TS[0])
+
+
+def legs_map():
+    """{market_id: [ВСЕ watch-ноги рынка]} последнего resolve_feeds (primary первой).
+
+    Зачем отдельно от primary_map. Владение транзитом — свойство РЫНКА, а не одной его ноги:
+    композит цены двигает ЛЮБАЯ из ног (07-23 multi-leg именно поэтому и вводился), и в
+    up-окне рынка cbBTC/WETH транзит приезжает от ETH/USD-ноги, то есть НЕ от BF1. Судить по
+    одному BF1 значит объявлять собственный транзит ЧУЖИМ ровно в тех окнах, ради которых
+    метрика позиций и снимается.
+    """
+    return {k: list(v) for k, v in _LEGS_AGG.items()}
 
 
 def primary_map():
@@ -194,16 +221,41 @@ def resolve_feeds(rpc, markets, fallback_rpc=None):
     повторяем через запасной эндпоинт; легитимно пустые (не-Chainlink) просто пусты дважды."""
     aggs = defaultdict(list)
     prim = {}
+    legs_by_market = {}
     for m in markets:
         primary, legs = _resolve_legs(rpc, m.market_id, fallback_rpc)
         if not legs and fallback_rpc is not None:
             primary, legs = _resolve_legs(fallback_rpc, m.market_id)
         if primary:
             prim[m.market_id] = primary
+        if legs:
+            legs_by_market[m.market_id] = list(legs)
         for agg in legs:
             aggs[agg].append(m.market_id)
-    _PRIMARY_AGG.clear()
-    _PRIMARY_AGG.update(prim)
+    # ЖИВУЮ КАРТУ ВЛАДЕНИЯ ПУСТОТОЙ НЕ ЗАТИРАЕМ (ревью р-3, условие 4). Прежняя редакция звала
+    # clear()+update() ДО того, как узнавала, ЧТО принёс резолв: штормовой (пустой) ре-резолв
+    # обнулял и _LEGS_AGG, и запасной _PRIMARY_AGG, а `_agg_of_market` после этого отдавал
+    # None — каждая проба судилась ВСЛЕПУЮ, денежные probe_in_band/probe_tip_match были
+    # структурно нулями. При rescan_interval_sec=21600 это до 6 ЧАСОВ слепоты, причём карта
+    # фидов hot_loop в это время выглядит здоровой: у него свой гард (hotpath «re-resolve пуст
+    # — держу старую карту»), а модульную карту не берёг никто. Шторм на обоих эндпоинтах не
+    # гипотеза — ради него гард hot_loop и написан (инцидент 07-23 «hot path: 0 aggregators /
+    # 40 markets»), и он совпадает по времени с каскадом, то есть с жирным окном.
+    # ОБНОВЛЯЕМ ПО РЫНКАМ, а не целиком: частичный шторм (упал резолв части рынков) иначе
+    # стирал бы и тех, кто резолвнулся, — `if legs:` не кладёт, а clear() уже стёр.
+    _kept = [m.market_id for m in markets if m.market_id not in legs_by_market
+             and m.market_id in _LEGS_AGG]
+    if legs_by_market or prim:
+        _MAP_TS[0] = time.time()
+    for _mid, _lg in legs_by_market.items():
+        _LEGS_AGG[_mid] = list(_lg)
+    for _mid, _p in prim.items():
+        _PRIMARY_AGG[_mid] = _p
+    if _kept:
+        log.warning("КАРТА ВЛАДЕНИЯ не обновлена по %d рынкам из %d (резолв вернул пусто — "
+                    "шторм на обоих эндпоинтах?), держу прежние ноги, возраст карты %.0fс; "
+                    "стереть их значило бы судить позиции ВСЛЕПУЮ до следующего rescan",
+                    len(_kept), len(markets), map_age())
     return dict(aggs)
 
 
