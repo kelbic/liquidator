@@ -1693,6 +1693,9 @@ class SpecFireLive:
             # _audit (раз в проход), читатели — депт-долив на треде fire-refill И тред входа окна
             # (spec_fire_live._refill зовётся обоими). Один слот исключает рваное чтение.
             self._audit_base_fee = None
+            # #127 R2: слот курсора ротации аудита (см. _audit) — рядом с кэшем базы, оба суть
+            # состояние прохода аудита. None => первый проход стартует с головы протухшего списка.
+            self._audit_resign_cursor = None
 
             def _refill(addr, base_fee=None):
                 # #112 MAJOR-3: депт-долив зовёт БЕЗ base_fee, и presign_ladder тогда делает свой
@@ -1760,8 +1763,25 @@ class SpecFireLive:
                 # бёрста SPEC_FIRE_AUDIT_MAX_RESIGN (дефолт 5 ног = один 200мс-сегмент ядра, вывод
                 # у константы @220): один проход трогает <=5 ног, остаток протухших добивается
                 # следующими проходами (их лестницы остаются протухшими). 0 = откат к «без капа».
+                # #127 R2 (СТАРВАЦИЯ ХВОСТА): при устойчивом дребезге зеркала (мода<->статика<->
+                # вторая мода в probe_tip_for) первые SPEC_FIRE_AUDIT_MAX_RESIGN ног списка пере-
+                # протухают на КАЖДОМ проходе и кап всегда уходит на них — 105/110 ног не
+                # пересобираются НИКОГДА, хвост флота застывает на старом tip (а при экскурсии
+                # базы — с невключаемым max_fee). Круговой курсор ПО АДРЕСУ (состав stale
+                # плавает, индекс не годится): проход стартует с ноги, СЛЕДУЮЩЕЙ за последней
+                # обслуженной в прошлом проходе. Гарантия: устойчиво протухшая нога ждёт
+                # пересборки не дольше ceil(N/кап) проходов. Кап и порядок legs_fn (stale
+                # строится обходом addrs выше) НЕ тронуты.
+                _cursor = getattr(self, "_audit_resign_cursor", None)
+                _start = 0
+                if _cursor is not None:
+                    try:
+                        _start = (stale.index(_cursor) + 1) % len(stale)
+                    except ValueError:
+                        _start = 0            # курсор выпал из протухшего множества — с головы
+                order = stale[_start:] + stale[:_start]
                 n_resign = 0
-                for i, a in enumerate(stale):
+                for i, a in enumerate(order):
                     if SPEC_FIRE_AUDIT_MAX_RESIGN > 0 and n_resign >= SPEC_FIRE_AUDIT_MAX_RESIGN:
                         self._log("SPECFIRE аудит: пересобрано %d/%d ног за проход (кап "
                                   "SPEC_FIRE_AUDIT_MAX_RESIGN=%d) — остаток на следующий проход"
@@ -1773,6 +1793,8 @@ class SpecFireLive:
                         _ex.invalidate_ladder(a)      # иначе compat удержит старую цену
                         _refill(a, base_fee=bf)
                         n_resign += 1
+                        self._audit_resign_cursor = a   # обслужена — курсор на неё; следующий проход
+                        # стартует со СЛЕДУЮЩЕЙ ноги (ротация против старвации хвоста)
                     except Exception as e:
                         self._log("SPECFIRE аудит %s: %s" % (a[:10], _diag(e)))
 
