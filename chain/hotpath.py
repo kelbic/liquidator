@@ -137,6 +137,13 @@ HOT_PANIC_PROBE = os.environ.get("HOT_PANIC_PROBE", "1").lower() not in ("0", "f
 REFUSAL_LOSS_ALERT = os.environ.get("REFUSAL_LOSS_ALERT", "1").lower() not in ("0", "false", "no")
 REFUSAL_TTL_SEC = float(os.environ.get("REFUSAL_LOSS_TTL_SEC", "600"))
 _REFUSAL_REG: dict = {}          # (mid_lower, borrower_lower) -> (ts, bucket, debt_usd)
+# Дыра #123, вскрытая каскадом cbXRP 14.08 22:23 (25 ликвидаций в ОДНОМ блоке): индекс
+# обрабатывает Liquidate раньше, чем отказ записан в регистр, и одноблочная гонка молчит.
+# Фикс — ВСТРЕЧНЫЙ матчинг: вотчер копит недавние чужие победы в кольце, а _note_refusal при
+# записи отказа сам смотрит в кольцо (окно REFUSAL_RECENT_WIN_SEC). Кольцо и алерт — сбоку.
+REFUSAL_RECENT_WIN_SEC = float(os.environ.get("REFUSAL_RECENT_WIN_SEC", "30"))
+_RECENT_LIQ: list = []           # [(ts, mid_lower, borrower_lower, caller, tx)] — кольцо 64
+_RL_SINK = None                  # (alerter, cfg) — ставит make_refusal_loss_watcher (явный арм)
 # ИНКРЕМЕНТАЛЬНЫЙ HOT-DISPATCH («го» kelbic 07.08, дефект №3 вскрытия каскада 06.08): 11 preps
 # по ~0.6с СЕРИЕЙ + один батч-dispatch после всех = first-ready ждал хвост 7.8с. Окно победы
 # замерено 0.5-2.2мс — батч-барьер это структурная сдача гонки. ON: готовая цель уходит в
@@ -1390,12 +1397,30 @@ def _note_refusal(market_id, borrower, bucket, debt_usd):
     if not REFUSAL_LOSS_ALERT:
         return
     try:
-        _REFUSAL_REG[(str(market_id).lower(), str(borrower).lower())] = (
-            time.time(), str(bucket)[:32], float(debt_usd or 0.0))
+        _k = (str(market_id).lower(), str(borrower).lower())
+        _now = time.time()
+        _REFUSAL_REG[_k] = (_now, str(bucket)[:32], float(debt_usd or 0.0))
         if len(_REFUSAL_REG) > 512:                     # регистр не растёт бесконечно
-            _cut = time.time() - REFUSAL_TTL_SEC
-            for _k in [k for k, v in _REFUSAL_REG.items() if v[0] < _cut]:
-                _REFUSAL_REG.pop(_k, None)
+            _cut = _now - REFUSAL_TTL_SEC
+            for _kk in [k for k, v in _REFUSAL_REG.items() if v[0] < _cut]:
+                _REFUSAL_REG.pop(_kk, None)
+        # Встречный матчинг (одноблочная гонка): победа могла пройти индекс ДО этой записи
+        if _RL_SINK is not None:
+            for _ts, _m, _b, _caller, _tx in reversed(_RECENT_LIQ):
+                if _now - _ts > REFUSAL_RECENT_WIN_SEC:
+                    break
+                if (_m, _b) == _k:
+                    from chain.execute import _is_ours
+                    _al, _cfg = _RL_SINK
+                    if not _is_ours(_caller, _caller, _cfg):
+                        _REFUSAL_REG.pop(_k, None)      # один алерт на отказ
+                        _al.send_async(
+                            "\U0001FA78 ОТКАЗАЛИСЬ — ЗАБРАЛ КОНКУРЕНТ (одноблочная гонка):\n"
+                            "рынок %s заёмщик %s долг $%.0f | отказ %s | победитель %s tx %s"
+                            % (_k[0][:10], _k[1][:10], float(debt_usd or 0.0),
+                               str(bucket)[:24], str(_caller)[:12], str(_tx)[:14]),
+                            key="refusal-loss")
+                    break
     except Exception:
         pass
 
@@ -1406,8 +1431,18 @@ def make_refusal_loss_watcher(alerter, cfg):
     прибор не имеет права ронять ни индекс, ни огонь. Своя победа (контракт/флот/кошелёк,
     _is_ours) сообщением не считается. Один алерт на отказ (запись выбывает при совпадении);
     антифлуд ключа refusal-loss остаётся в Alerter."""
+    global _RL_SINK
+    _RL_SINK = (alerter, cfg)                           # арм встречного матчинга (одноблочные)
+
     def _cb(bn, liq_events):
         try:
+            _now0 = time.time()                         # кольцо недавних побед — ДО раннего выхода
+            for ev in (liq_events or []):
+                if isinstance(ev, dict):
+                    _RECENT_LIQ.append((_now0, str(ev.get("mid") or "").lower(),
+                                        str(ev.get("borrower") or "").lower(),
+                                        str(ev.get("caller") or ""), str(ev.get("tx") or "")))
+            del _RECENT_LIQ[:-64]
             if not _REFUSAL_REG:
                 return
             from chain.execute import _is_ours

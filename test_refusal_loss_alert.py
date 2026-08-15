@@ -117,6 +117,37 @@ check("проводка: арм ЯВНЫЙ в main.py", "set_on_liquidate" in sr
 # --- 8. Дефолт боевой: канал включён из коробки (иначе дыра Ш16 остаётся) ---
 check("дефолт: REFUSAL_LOSS_ALERT включён", hp.REFUSAL_LOSS_ALERT is True)
 
+# --- 9. ОДНОБЛОЧНАЯ ГОНКА (дыра каскада cbXRP 22:23): победа пришла ДО записи отказа ---
+al, cfg = fresh()
+hp._RECENT_LIQ.clear()
+cb = hp.make_refusal_loss_watcher(al, cfg)              # армит _RL_SINK
+cb(49978436, [ev])                                      # победа обработана ПЕРВОЙ (регистр пуст)
+check("одноблочная: победа в кольце, алертов пока 0", len(al.sent) == 0 and len(hp._RECENT_LIQ) == 1)
+hp._note_refusal(MID, BORROWER, "panic-underflow", 24789.0)   # отказ записан ПОСЛЕ
+check("одноблочная: встречный матч дал алерт", len(al.sent) == 1, repr(al.sent))
+if al.sent:
+    check("одноблочная: тело содержит победителя и бакет",
+          WINNER[:12] in al.sent[0][1] and "panic-underflow" in al.sent[0][1])
+check("одноблочная: запись выбыла (один алерт)", len(hp._REFUSAL_REG) == 0)
+
+# --- 10. Одноблочная: СВОЯ победа в кольце — тишина ---
+al, cfg = fresh()
+hp._RECENT_LIQ.clear()
+cb = hp.make_refusal_loss_watcher(al, cfg)
+cb(1, [dict(ev, caller=cfg.liquidator_address.lower())])
+hp._note_refusal(MID, BORROWER, "net-below-min", 100.0)
+check("одноблочная: своя победа — тишина", len(al.sent) == 0)
+
+# --- 11. Одноблочная: победа старше окна REFUSAL_RECENT_WIN_SEC — тишина ---
+al, cfg = fresh()
+hp._RECENT_LIQ.clear()
+hp.make_refusal_loss_watcher(al, cfg)
+hp._RECENT_LIQ.append((time.time() - hp.REFUSAL_RECENT_WIN_SEC - 5,
+                       MID.lower(), BORROWER.lower(), WINNER, "0xold"))
+hp._note_refusal(MID, BORROWER, "panic-underflow", 100.0)
+check("одноблочная: протухшая победа — тишина", len(al.sent) == 0)
+hp._RL_SINK = None                                      # снять арм за собой
+
 if FAILS:
     print("=== ДРЕЛЬ #123 КРАСНАЯ: %d провалов ===" % len(FAILS))
     sys.exit(1)
