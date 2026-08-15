@@ -66,7 +66,14 @@ LIMIT_HOT = 58000
 # ЭТАЛОН НЕИЗМЕННОСТИ ПРОМАХА (§5.9): числа ред.1 контракта, снятые ЭТИМ ЖЕ стендом на этом же
 # блоке ДО ротации §2.4 (явный байт / горячий указатель count=1 / count=4). Ротация обязана их
 # не сдвинуть: на промахе цикл огня не исполняется вовсе.
-MISS_REF = (54965, 57431, 57571)
+MISS_REF_R1 = (54965, 57431, 57571)          # ред.1/ред.2 (замер этого же стенда)
+# +3 газа в ред.3 — цена СОГЛАСОВАНИЯ ГРАНИЦ TTL (§2.5в: `now >= deadline` вместо `>`), а НЕ
+# ротации: ротация живёт после гарда `n == 0` и на промахе не исполняется. Attribution доказана
+# диффом рантайм-байткода двух сборок: разница ровно 1 байт (лишний ISZERO), 3 газа.
+MISS_TTL_COST = 3
+MISS_REF = tuple(v + MISS_TTL_COST for v in MISS_REF_R1)
+SEL_CANNOT_REPAY = "0x" + Web3.keccak(text="CannotRepay()")[:4].hex()
+SEL_ERROR_STRING = "0x08c379a0"
 VIRTUAL_SHARES = 10 ** 6
 VIRTUAL_ASSETS = 1
 
@@ -137,11 +144,11 @@ def call_fn(name, addr, fn, args):
     return cabi(name, addr).functions[fn](*args).call()
 
 
-def probe(addr, key, byte="01", gas=3_000_000):
+def probe(addr, key, byte="01", gas=3_000_000, nonce=None):
     """НАСТОЯЩАЯ проба: отдельная tx с ноги, <=1 байт калдаты. Вердикт с КВИТАНЦИИ."""
     acct = Account.from_key(key)
     tx = {"to": addr, "data": "0x" + byte, "chainId": 8453, "gas": gas,
-          "nonce": w3.eth.get_transaction_count(acct.address),
+          "nonce": w3.eth.get_transaction_count(acct.address) if nonce is None else nonce,
           "maxFeePerGas": int(2e9), "maxPriorityFeePerGas": int(1e6)}
     signed = acct.sign_transaction(tx)
     h = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -203,9 +210,24 @@ def raw_group(addr, g):
             packed & ((1 << 64) - 1), (packed >> 64) & 0xFF)
 
 
+def raw_borrower(addr, g, i):
+    """Один SLOAD: borrower цели (i-я ячейка группы g). Дешёвый зонд для замеров по флоту."""
+    return storage_at(addr, target_base(g) + 7 * i)
+
+
 def raw_hot(addr):
     v = storage_at(addr, SLOT_HOT)
     return v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & ((1 << 64) - 1)
+
+
+def write_hot_raw(addr, g0, count, until):
+    """Записать указатель ПРЯМО В СТОРАДЖ, минуя setHot. Нужно для проверки гардов ЧТЕНИЯ:
+    они обязаны держать ЛЮБОЕ содержимое слота, а не только то, что пропустил арм (после ред.3
+    негодный спан через setHot вообще не установить — а гард на чтении всё равно обязан быть)."""
+    v = (int(g0) & 0xFF) | ((int(count) & 0xFF) << 8) | ((int(until) & ((1 << 64) - 1)) << 16)
+    r = rpc("anvil_setStorageAt", [addr, hex(SLOT_HOT), "0x%064x" % v])
+    assert r.get("result") in (True, None, "0x0"), r
+    assert raw_hot(addr) == (int(g0), int(count), int(until)), "сырая запись указателя не легла"
 
 
 print("=" * 100)
@@ -233,6 +255,16 @@ MP = {"loanToken": Web3.to_checksum_address("0x833589fCD6eDb6E08f4c7C32D4f71b54b
       "lltv": 625000000000000000}
 MP_T = (MP["loanToken"], MP["collateralToken"], MP["oracle"], MP["irm"], int(MP["lltv"]))
 PX_SEL = "0x" + Web3.keccak(text="price()")[:4].hex()
+# Отпечаток рынка (§2.5б): keccak256(abi.encode(MarketParams)) — 5 статических полей подряд.
+MPH = Web3.keccak(hexstr="".join(["0" * 24 + MP["loanToken"][2:], "0" * 24 + MP["collateralToken"][2:],
+                                  "0" * 24 + MP["oracle"][2:], "0" * 24 + MP["irm"][2:],
+                                  "%064x" % int(MP["lltv"])]).lower())
+# Есть ли в боевом ABI отпечаток в setHot: стенд обязан уметь прогоняться и на ред.2 (красный
+# на базе), и на ред.3 — иначе «красный до / зелёный после» пришлось бы предъявлять двумя файлами.
+_HOT_IN = [f for f in ART["LiquidatorV6"]["abi"] if f.get("name") == "setHot"][0]["inputs"]
+HOT_FP = len(_HOT_IN) == 4
+print("    редакция контракта под замером: setHot(%s) => отпечаток рынка в подписи: %s"
+      % (",".join(i["type"] for i in _HOT_IN), "ЕСТЬ (ред.3)" if HOT_FP else "НЕТ (ред.2)"))
 
 _chain_mp = w3.eth.call({"to": MORPHO, "data": "0x" + Web3.keccak(
     text="idToMarketParams(bytes32)")[:4].hex() + MID[2:]}).hex()
@@ -299,20 +331,105 @@ print("    настоящий роут: router=%s, калдата %d байт (�
 LEGS = []                                  # авторизуются setAuthorizedBatch (пункт §5.8)
 # Нужны ноги ВСЕХ классов вычета: mod 4 — для спана горячего указателя (§5.4), mod 3 — для
 # ротации старта цикла огня (§5.9, n=3). Класс вычета — это и есть «смещение ноги».
-while (len({int(a.address, 16) % 8 for a in LEGS}) < 8
-       or len({int(a.address, 16) % 3 for a in LEGS}) < 3 or len(LEGS) < 5):
+while (len({int(Web3.keccak(hexstr=a.address).hex(), 16) % 8 for a in LEGS}) < 8
+       or len({int(a.address, 16) % 4 for a in LEGS}) < 4
+       or len({int(Web3.keccak(hexstr=a.address).hex(), 16) % 3 for a in LEGS}) < 3
+       or len(LEGS) < 5):
     LEGS.append(Account.create())
-    if len(LEGS) > 120:
+    if len(LEGS) > 200:
         break
-assert len({int(a.address, 16) % 8 for a in LEGS}) == 8, "не собрались ноги всех смещений mod 8"
+assert len({int(Web3.keccak(hexstr=a.address).hex(), 16) % 8 for a in LEGS}) == 8, \
+    "не собрались ноги всех СТАРТОВЫХ индексов"
 OUTSIDER = Account.create()                # НЕ авторизуется никогда (пункт §5.8)
 
 
+def start_model(addr, n):
+    """Старт цикла огня по §2.4 ред.3: keccak256(abi.encodePacked(msg.sender)) % n.
+    Это МОДЕЛЬ. Она не принимается на веру: §5.9 сверяет её с ЗАМЕРОМ по каждой ноге и
+    печатает долю совпадений. Прежняя модель (`uint160(addr) % n`) была вычетом ТОГО ЖЕ числа,
+    что и выбор группы — на ней стенд и покраснел, когда контракт развязали."""
+    return int(Web3.keccak(hexstr=addr).hex(), 16) % n
+
+
 def leg_with(mod, r):
-    """Нога с ЗАДАННЫМ смещением: старт цикла огня = uint160(msg.sender) % n (§2.4), поэтому
-    «какая цель сработает» — предсказуемая функция адреса ноги, и тест обязан её ПРЕДСКАЗЫВАТЬ,
-    а не полагать старт нулевым (первая редакция стенда полагала — и справедливо покраснела)."""
-    return next(a for a in LEGS if int(a.address, 16) % mod == r)
+    """Нога с ЗАДАННЫМ стартовым индексом при n=mod (выбор ЦЕЛИ). Выбор ГРУППЫ — другой вычет
+    (`uint160(addr) % count`), для него ноги подбираются отдельно (§5.4)."""
+    return next(a for a in LEGS if start_model(a.address, mod) == r)
+
+
+def hot_until():
+    """TTL указателя. С ред.3 группа обязана пережить указатель (`gr.deadline >= until`), а армы
+    стенда делаются на deadline()=now+TTL за секунды до этого — берём заведомо меньший срок."""
+    return deadline() - 60
+
+
+# --- ФРОНТ ДЛЯ ЗАМЕРА РОТАЦИИ (§5.9): не 4 ноги, а флот -------------------------------------
+# 512 ног ~ 4.6x боевого флота (110). Столько нужно ИМЕННО ДЛЯ ЧЕСТНОГО ПОКРЫТИЯ: при count=8
+# на группу приходится ~64 ноги, и «8 целей из 8» перестаёт зависеть от везения выборки.
+FLEET_N = int(os.environ.get("V6_FLEET", "512"))
+FLEET = [Account.create() for _ in range(FLEET_N)]
+for _a in FLEET:                            # заправка чит-кодом: заправка — не предмет замера
+    rpc("anvil_setBalance", [_a.address, hex(10 ** 18)])
+print("    фронт замера ротации: %d ног (боевой флот 110)" % FLEET_N)
+
+# НАСТОЯЩИЙ ЧУЖОЙ РЫНОК Base — для негатива отпечатка (§5.11) и демонстрации увода флота
+_f2m = json.load(open("feed_to_market.json"))
+FOREIGN = None
+for _agg, _v in _f2m.items():
+    for _mid in _v.get("markets", []):
+        try:
+            _raw = bytes(w3.eth.call({"to": MORPHO, "data": "0x" + Web3.keccak(
+                text="idToMarketParams(bytes32)")[:4].hex() + _mid[2:]}))
+            _lt, _ct, _orc, _irm, _lltv = ("0x" + _raw[12:32].hex(), "0x" + _raw[44:64].hex(),
+                                           "0x" + _raw[76:96].hex(), "0x" + _raw[108:128].hex(),
+                                           int(_raw[128:160].hex(), 16))
+            if _orc.lower() in (MP["oracle"].lower(), "0x" + "00" * 20):
+                continue
+            if int(w3.eth.call({"to": Web3.to_checksum_address(_orc), "data": PX_SEL}).hex(), 16) == 0:
+                continue
+        except Exception:
+            continue
+        FOREIGN = (Web3.to_checksum_address(_lt), Web3.to_checksum_address(_ct),
+                   Web3.to_checksum_address(_orc), Web3.to_checksum_address(_irm), _lltv)
+        break
+    if FOREIGN:
+        break
+assert FOREIGN, "чужой рынок Base с живым оракулом не найден — негатив отпечатка не построить"
+FOREIGN_MPH = Web3.keccak(hexstr="".join(["0" * 24 + FOREIGN[0][2:], "0" * 24 + FOREIGN[1][2:],
+                                          "0" * 24 + FOREIGN[2][2:], "0" * 24 + FOREIGN[3][2:],
+                                          "%064x" % FOREIGN[4]]).lower())
+print("    чужой рынок для негативов: oracle=%s (отпечаток %s...)"
+      % (FOREIGN[2][:12], FOREIGN_MPH.hex()[:10]))
+
+
+# --- ПРИБОР ВЫБОРА ЯЧЕЙКИ: 64 канарейки (по одной на клетку доски) -------------------------
+# Замер «какую цель выбрало кольцо» НЕ обязан жечь настоящую ликвидацию: 750 ликвидаций на
+# публичном апстриме упираются в rate-limit (первый прогон этого стенда там и завис — anvil
+# ждал ответа узла). Канарейка = unwrapTarget цели: `_liquidate` первым делом зовёт
+# IERC4626(unwrapTarget).asset(), канарейка ревертит СВОИМИ 4 байтами, они доезжают до
+# PlanFailed — и квитанция САМА называет клетку (g,i). Денежный путь при этом не исполняется:
+# он проверяется отдельно (§5.1, §5.3 и подпункт (в) ниже — там ликвидации настоящие).
+CANARY, SEL2CELL = {}, {}
+for _g in range(8):
+    for _i in range(8):
+        _a = Web3.to_checksum_address("0x%040x" % (0xCA0000 + _g * 16 + _i))
+        _sel = "aa%02x%02x00" % (_g, _i)
+        rpc("anvil_setCode", [_a, "0x63" + _sel + "600052" + "6004601cfd"])
+        CANARY[(_g, _i)] = _a
+        SEL2CELL["0x" + _sel] = (_g, _i)
+try:
+    w3.eth.call({"to": CANARY[(0, 0)], "data": "0x" + Web3.keccak(text="asset()")[:4].hex()})
+    raise AssertionError("канарейка не ревертит — прибор выбора ячейки неисправен")
+except Exception as _e:
+    assert "aa000000" in repr(_e).lower() or "revert" in repr(_e).lower(), repr(_e)
+print("    прибор выбора ячейки: 64 канарейки поставлены (отпечаток отказа = номер клетки)")
+
+
+def authorize_fleet(addr, legs):
+    for k in range(0, len(legs), 128):
+        cd = enc("LiquidatorV6", "setAuthorizedBatch", [[a.address for a in legs[k:k + 128]], True])
+        r, _ = send_raw({"to": addr, "data": cd}, gas=29_000_000)
+        assert r["status"] == 1
 
 
 def ring_first(start, n, eligible):
@@ -330,10 +447,10 @@ print("    ног стенда: %d (остатки msg.sender %% 4: %s), плю�
 
 
 def target(borrower=BORROWER, shares=None, seized=0, route=None, route_len=None,
-           trig=TRIG_HEAL, minprofit=0):
+           trig=TRIG_HEAL, minprofit=0, unwrap=ZERO):
     r = route if route is not None else bytes.fromhex("11" * (route_len or 0))
     sh = B_SHARES if shares is None else shares
-    return (borrower, int(sh), int(seized), ROUTER, r, int(minprofit), ZERO, int(trig))
+    return (borrower, int(sh), int(seized), ROUTER, r, int(minprofit), unwrap, int(trig))
 
 
 def proto_target(borrower=BORROWER, shares=None, route=None, route_len=None, trig=TRIG_HEAL):
@@ -353,6 +470,28 @@ def authorize_batch(addr, accts):
     cd = enc("LiquidatorV6", "setAuthorizedBatch", [[a.address for a in accts], True])
     r, _ = send_raw({"to": addr, "data": cd})
     assert r["status"] == 1
+    return r
+
+
+def set_hot(addr, g0, count, until=None, mph=None, expect=1, gas=6_000_000):
+    """Указатель. На ред.3 подпись несёт отпечаток рынка (§2.5б), на ред.2 — нет; стенд подаёт
+    то, что объявлено в ABI, и вердикт выносит по КВИТАНЦИИ (expect=0 — ждём отката).
+
+    TTL указателя по умолчанию берётся ИЗ ЦЕПИ (минимум дедлайнов групп спана), а не из
+    настенных часов: ред.3 требует `gr.deadline >= until`, и указатель, живущий дольше плана,
+    законно отвергается. Первый прогон стенда на этом и споткнулся — сам стенд после 512 проб
+    просил TTL длиннее плана, и гард сработал правильно."""
+    if until is None:
+        _dls = [raw_group(addr, g)[2] for g in range(int(g0), min(8, int(g0) + max(1, int(count))))]
+        _dls = [d for d in _dls if d > 0]
+        until = min(_dls) if _dls else deadline() - 60
+    args = [int(g0), int(count), int(until)]
+    if HOT_FP:
+        args.append(mph if mph is not None else MPH)
+    r, _ = send_raw({"to": addr, "data": enc("LiquidatorV6", "setHot", args)}, gas=gas)
+    if expect is not None:
+        assert r["status"] == expect, ("setHot(g0=%d,count=%d) status=%d, ожидался %d"
+                                       % (g0, count, r["status"], expect))
     return r
 
 
@@ -447,14 +586,14 @@ assert _n == 8 and _dl > 0 and int(_tb[0], 16) != 0, "G=8 x M=8 не армле�
 print("    арм 8 групп x 8 целей x роут %dБ занял %.1f с" % (ROUTE_TYPICAL, time.time() - t0))
 
 P2_EXPLICIT = miss_gas(c88, LEG.key.hex(), "01")
-r, _ = send_raw({"to": c88, "data": enc("LiquidatorV6", "setHot", [0, 1, deadline()])})
-assert r["status"] == 1 and logs_of(r, T_HOTSET), "setHot не сел"
+r = set_hot(c88, 0, 1)
+assert logs_of(r, T_HOTSET), "setHot прошёл без события HotSet"
 HOT_SET_GAS = r["gasUsed"]
 _hot_raw, _hot_view = raw_hot(c88), tuple(call_fn("LiquidatorV6", c88, "hotInfo", []))
 assert _hot_raw == _hot_view and _hot_raw[1] == 1, (
     "горячий указатель не записан либо view расходится со стораджем: %s / %s" % (_hot_raw, _hot_view))
 P2_HOT1 = miss_gas(c88, LEG.key.hex(), "ff")
-r, _ = send_raw({"to": c88, "data": enc("LiquidatorV6", "setHot", [0, 4, deadline()])})
+r = set_hot(c88, 0, 4)
 HOT_RESET_GAS = r["gasUsed"]               # ПЕРЕцеливание: слот уже ненулевой (боевой случай)
 P2_HOT4 = miss_gas(c88, LEG.key.hex(), "ff")
 _land = int(LEG.address, 16) % 4
@@ -574,7 +713,7 @@ authorize_batch(c, LEGS)
 _route = route_for(c)[0]
 for g in (2, 3, 4, 5):                     # спан g0=2, count=4 => группы #3..#6
     arm(c, g, [target(route=_route, trig=TRIG_FIRE)])
-send_raw({"to": c, "data": enc("LiquidatorV6", "setHot", [2, 4, deadline()])})
+set_hot(c, 2, 4)
 print("    hotInfo() = %s, СЫРОЙ сторадж _hot = %s"
       % (call_fn("LiquidatorV6", c, "hotInfo", []), raw_hot(c)))
 spread = {}
@@ -596,11 +735,17 @@ NEG = {}
 for label, args in (("count=0", (2, 0, None)), ("until протух", (2, 4, 1)),
                     ("g0+count>8", (6, 4, None))):
     s2 = snapshot()
-    until = args[2] if args[2] is not None else deadline()
-    send_raw({"to": c, "data": enc("LiquidatorV6", "setHot", [args[0], args[1], until])})
+    until = args[2] if args[2] is not None else min(raw_group(c, g)[2] for g in (2, 3, 4, 5))
+    # НЕГОДНЫЙ СПАН пишется прямо в сторадж: гард ЧТЕНИЯ обязан держать ЛЮБОЕ содержимое слота,
+    # а не только то, что пропустил арм (после ред.3 такой спан через setHot не установить —
+    # это проверяется отдельно, в §5.11, на пути АРМА).
+    if label == "g0+count>8":
+        write_hot_raw(c, args[0], args[1], until)
+    else:
+        set_hot(c, args[0], args[1], until if label != "count=0" else None)
     rn = probe(c, LEG.key.hex(), "ff")
     still = int(raw_target(c, 2 + (int(LEG.address, 16) % 4), 0)[0], 16) != 0
-    send_raw({"to": c, "data": enc("LiquidatorV6", "setHot", [2, 4, deadline()])})
+    set_hot(c, 2, 4)
     rp = probe(c, LEG.key.hex(), "ff")
     fired = bool(logs_of(rp, T_LIQUIDATED, c))
     NEG[label] = (not rn["logs"]) and still and fired
@@ -874,44 +1019,228 @@ print()
 print("=" * 100)
 print("П9 (§5.9). ОТКАЗЫВАЮЩАЯ ГОЛОВА НЕ ЗАПИРАЕТ ГРУППУ: старт цикла = смещение ноги")
 print("=" * 100)
-sid = snapshot()
+print("    КОНФИГУРАЦИЯ БОЯ: сентинел 0xFF, спан count, n=8 целей, флот %d ног." % FLEET_N)
+print("    Прежняя редакция пункта гоняла ротацию ЯВНЫМ байтом при n=3 — там, где корреляции")
+print("    вычетов НЕТ по построению, и выдала ПРОШЁЛ на свойстве, которого в бою не было.")
+sid_p9 = snapshot()
 c = deploy()
-authorize_batch(c, LEGS)
-_route = route_for(c)[0]
-BOGUS2 = Web3.to_checksum_address("0x" + "ad" * 20)
-# n=3: цели #0 и #1 — несуществующие позиции (отказывают ВСЕГДА), живая жертва в цели #2.
-# Прежняя редакция стартовала всегда с нуля => жертва недостижима БЕЗ clearTarget владельца.
-arm(c, 0, [target(borrower=BOGUS, route=_route, trig=TRIG_FIRE),
-           target(borrower=BOGUS2, route=_route, trig=TRIG_FIRE),
-           target(route=_route, trig=TRIG_FIRE)])
-rot = {}
-for k in range(3):
-    lg = next(a for a in LEGS if int(a.address, 16) % 3 == k)
-    s2 = snapshot()
-    r = probe(c, lg.key.hex(), "01")
-    fired = bool(logs_of(r, T_LIQUIDATED, c))
-    _pf = logs_of(r, T_PLANFAILED, c)
-    rot[k] = fired
-    print("    нога %s (смещение %d из n=3): %s -> %s, gasUsed=%d"
-          % (lg.address[:10], k, note(r),
-             "ВЗЯЛА ЖЕРТВУ (цель #3) БЕЗ clearTarget" if fired else "упёрлась в отказ",
-             r["gasUsed"]))
-    revert(s2)
-P9_FIRE = rot.get(2, False)                # нога со смещением 2 обязана взять живую цель #3
-P9_ANY = any(rot.values())
-print("    => жертву взяли ноги со смещениями %s из {0,1,2}; голова съедает пробы только своей "
-      "доли флота (~1/n), а не всего" % sorted([k for k, v in rot.items() if v]))
-# КОНТРОЛЬ НЕИЗМЕННОСТИ: цена промаха не сдвинулась (на промахе цикл не исполняется вовсе).
+authorize_fleet(c, FLEET)
+# 8 групп ОДНОГО рынка (смысл спана по §2.5б), в каждой 8 целей-КАНАРЕЕК: выбранная кольцом
+# клетка называет себя сама 4 байтами PlanFailed. Ни ликвидации, ни свопа — только ВЫБОР.
+for g in range(8):
+    arm(c, g, [target(route=b"", trig=TRIG_FIRE, unwrap=CANARY[(g, i)]) for i in range(8)])
+
+
+def sweep(legs, count, g0=0):
+    """Проба 0xFF с каждой ноги -> клетка (g,i) с КВИТАНЦИИ. Возвращает ячейки, старты по
+    группам, число молчаливых проб. Снимки не нужны: канарейка ничего не потребляет."""
+    set_hot(c, g0, count)
+    cells, per_g, silent, model_ok = {}, {}, 0, 0
+    for lg in legs:
+        r = probe(c, lg.key.hex(), "ff", gas=400_000)
+        pf = logs_of(r, T_PLANFAILED, c)
+        cell = SEL2CELL.get(("0x" + pf[0]["data"].hex()[:8]) if pf else "")
+        if cell is None:
+            silent += 1
+            continue
+        cells[cell] = cells.get(cell, 0) + 1
+        per_g.setdefault(cell[0], set()).add(cell[1])
+        if cell == (g0 + int(lg.address, 16) % count, start_model(lg.address, 8)):
+            model_ok += 1
+    MODEL[(count, len(legs))] = (model_ok, len(legs) - silent)
+    return cells, per_g, silent
+
+
+MODEL = {}
+# --- (а) БОЕВАЯ КОНФИГУРАЦИЯ count=4 --------------------------------------------------------
+LEGS_A = FLEET[:128]
+cells4, perg4, sil4 = sweep(LEGS_A, 4)
+starts4 = {g + 1: len(s) for g, s in sorted(perg4.items())}
+print("    (а) count=4, n=8, %d ног: РАЗНЫХ СТАРТОВ НА ГРУППУ %s (порог ТЗ: >=5 в КАЖДОЙ), "
+      "молчаливых проб %d" % (len(LEGS_A), starts4, sil4))
+P9A_OK = len(starts4) == 4 and all(v >= 5 for v in starts4.values())
+
+# --- (б) count=8: покрытие целей в группе ----------------------------------------------------
+cells8, perg8, sil8 = sweep(FLEET, 8)
+starts8 = {g + 1: len(s) for g, s in sorted(perg8.items())}
+COVER8 = len(cells8)
+print("    (б) count=8, n=8, %d ног: покрытие целей ПО ГРУППАМ %s; всего клеток %d из 64"
+      % (FLEET_N, starts8, COVER8))
+_c40 = sweep(FLEET[:40], 8)[0]
+print("        сверка с замером линзы на 40 ногах: клеток %d из 64 (у ред.2 было 8 из 64 — "
+      "ровно одна цель на группу)" % len(_c40))
+P9B_OK = len(starts8) == 8 and all(v >= 5 for v in starts8.values()) and COVER8 >= 48
+_mk, _mn = MODEL[(8, FLEET_N)]
+print("        сверка МОДЕЛИ с ЗАМЕРОМ: клетка (addr%%count, keccak(addr)%%n) совпала с квитанцией "
+      "в %d пробах из %d" % (_mk, _mn))
+P9B_OK = P9B_OK and _mk == _mn
+
+# --- (в) ТРУП в цели №1 не запирает группу — ЗДЕСЬ ЛИКВИДАЦИИ НАСТОЯЩИЕ ----------------------
+sid_c = snapshot()
+cc = deploy()
+authorize_fleet(cc, FLEET[:32])
+_route = route_for(cc)[0]
+arm(cc, 0, [target(borrower=BOGUS, route=_route, trig=TRIG_FIRE)]
+    + [target(route=_route, trig=TRIG_FIRE) for _ in range(7)])
+set_hot(cc, 0, 1)
+fired, corpse, taken = 0, 0, set()
+for lg in FLEET[:32]:
+    s = snapshot()
+    r = probe(cc, lg.key.hex(), "ff")
+    if logs_of(r, T_LIQUIDATED, cc):
+        fired += 1
+        taken.add([i for i in range(8) if raw_borrower(cc, 0, i) == 0][0])
+    elif logs_of(r, T_PLANFAILED, cc):
+        corpse += 1
+    revert(s)
+print("    (в) НАСТОЯЩИЕ ликвидации: труп (цель уже взял конкурент) в ячейке #1, count=1, 32 ноги:"
+      " ликвидировали %d, утонули в трупе %d (~1/n), взятые цели %s — БЕЗ clearTarget"
+      % (fired, corpse, sorted(i + 1 for i in taken)))
+P9C_OK = fired > 0 and len(taken) >= 5 and 0 not in taken
+revert(sid_c)
+
+# --- (г) КОНТРОЛЬ НЕИЗМЕННОСТИ ЦЕНЫ ПРОМАХА --------------------------------------------------
 MISS_NOW = (P2_EXPLICIT, P2_HOT1, P2_HOT4)
 P9_MISS_OK = MISS_NOW == MISS_REF
-print("    контроль неизменности промаха: явный %d/%d, hot(1) %d/%d, hot(4) %d/%d (замер/эталон "
-      "ред.1) => %s" % (P2_EXPLICIT, MISS_REF[0], P2_HOT1, MISS_REF[1], P2_HOT4, MISS_REF[2],
-                        "НЕ СДВИНУЛСЯ" if P9_MISS_OK else "СДВИНУЛСЯ"))
-verdict("§5.9", "живая цель #3 за двумя отказывающими взята БЕЗ clearTarget ногой со смещением 2 "
-        "(смещения, взявшие жертву: %s); цена промаха не сдвинулась: %d / %d / %d против эталона "
-        "%d / %d / %d" % (sorted([k for k, v in rot.items() if v]), P2_EXPLICIT, P2_HOT1, P2_HOT4,
-                          MISS_REF[0], MISS_REF[1], MISS_REF[2]), P9_FIRE and P9_MISS_OK)
-revert(sid)
+print("    (г) цена промаха: явный %d/%d, hot(1) %d/%d, hot(4) %d/%d (замер/эталон ред.3) => %s"
+      % (P2_EXPLICIT, MISS_REF[0], P2_HOT1, MISS_REF[1], P2_HOT4, MISS_REF[2],
+         "СОШЛАСЬ" if P9_MISS_OK else "РАЗОШЛАСЬ"))
+print("        ротация стоит 0 газа на промахе (цикл не исполняется); эталон ред.3 = ред.1 + %d "
+      "газа — это §2.5в (граница TTL `now >= deadline`), дельта рантайма ровно 1 байт ISZERO"
+      % MISS_TTL_COST)
+verdict("§5.9", "боевая конфигурация 0xFF: (а) count=4 разных стартов на группу %s (>=5); "
+        "(б) count=8 покрытие %s, клеток %d/64 (40 ног: %d/64); (в) настоящие ликвидации: труп "
+        "съел %d проб из 32, живые цели %s взяты без clearTarget; (г) промах %d/%d/%d = эталон"
+        % (list(starts4.values()), list(starts8.values()), COVER8, len(_c40), corpse,
+           sorted(i + 1 for i in taken), P2_EXPLICIT, P2_HOT1, P2_HOT4),
+        P9A_OK and P9B_OK and P9C_OK and P9_MISS_OK)
+revert(sid_p9)
+
+# ============================================================================================
+# П10. ВОСКРЕШЕНИЕ ЦЕЛЕЙ ПРОШЛОГО АРМА (§5.10, §2.5а)
+# ============================================================================================
+print()
+print("=" * 100)
+print("П10 (§5.10). setGroup(8) -> setGroup(2) -> setTargets(from=4): цели ПРОШЛОГО плана")
+print("=" * 100)
+sid_p10 = snapshot()
+c = deploy()
+authorize_fleet(c, FLEET[:64])
+# ПЛАН A: 8 целей с ПРОТУХШИМ роутом (получатель свопа — чужой адрес): попадание в такую цель
+# даёт CannotRepay, что отличимо от Error(string) плана B. «Куда ушла нога» читается по 4
+# байтам причины, а не по догадке.
+_stale = route_for(Web3.to_checksum_address("0x" + "11" * 20))[0]
+_good = route_for(c)[0]
+arm(c, 0, [target(route=_stale, trig=TRIG_FIRE) for _ in range(8)])
+arm(c, 0, [target(borrower=BOGUS, route=_good, trig=TRIG_FIRE) for _ in range(2)])
+_n_before = raw_group(c, 0)[3]
+cd_gap = enc("LiquidatorV6", "setTargets",
+             [0, 4, [target(borrower=BOGUS, route=_good, trig=TRIG_FIRE)]])
+r_gap, _ = send_raw({"to": c, "data": cd_gap}, gas=29_000_000)
+_n_after = raw_group(c, 0)[3]
+print("    n после перезарядки двумя целями: %d; докладка С ДЫРОЙ (from=4): status=%d, n стал %d"
+      % (_n_before, r_gap["status"], _n_after))
+if r_gap["status"] == 1:
+    ghosts = [i for i in range(_n_after) if raw_borrower(c, 0, i) == int(BORROWER, 16)]
+    hit_ghost = 0
+    for lg in FLEET[:24]:
+        s = snapshot()
+        rp = probe(c, lg.key.hex(), "01")
+        _pf = logs_of(rp, T_PLANFAILED, c)
+        if _pf and ("0x" + _pf[0]["data"].hex()[:8]) == SEL_CANNOT_REPAY:
+            hit_ghost += 1
+        revert(s)
+    print("    ЯЧЕЙКИ-ПРИЗРАКИ прошлого плана (сырой сторадж): %s — targetInfo показывает их как "
+          "обычные цели, событий об этом нет" % [i + 1 for i in ghosts])
+    print("    ЗАМЕР ФЛОТА: %d ног из 24 ушли в цель ПРОШЛОГО плана (причина %s = протухший роут)"
+          % (hit_ghost, SEL_CANNOT_REPAY))
+    P10_OK = False
+    P10_TXT = ("докладка с дырой ПРИНЯТА (n %d->%d), призраки %s, %d ног из 24 ушли в протухший роут"
+               % (_n_before, _n_after, [i + 1 for i in ghosts], hit_ghost))
+else:
+    cd_ok = enc("LiquidatorV6", "setTargets",
+                [0, _n_before, [target(route=_good, trig=TRIG_FIRE)]])
+    r_ok, _ = send_raw({"to": c, "data": cd_ok}, gas=29_000_000)
+    _n2 = raw_group(c, 0)[3]
+    hit = 0
+    for lg in FLEET[:24]:
+        s = snapshot()
+        rp = probe(c, lg.key.hex(), "01")
+        if logs_of(rp, T_LIQUIDATED, c):
+            hit += 1
+        revert(s)
+    print("    докладка С ДЫРОЙ ОТВЕРГНУТА; непрерывная докладка (from=n=%d): status=%d, n=%d"
+          % (_n_before, r_ok["status"], _n2))
+    print("    ПАРНЫЙ ПОЗИТИВ: дописанная цель ДОСТИЖИМА — %d ног из 24 её ликвидировали" % hit)
+    P10_OK = r_ok["status"] == 1 and _n2 == _n_before + 1 and hit > 0
+    P10_TXT = ("докладка с дырой отвергнута (tx откат); непрерывная докладка села (n %d->%d) и "
+               "цель достижима: %d ног из 24 ликвидировали" % (_n_before, _n2, hit))
+verdict("§5.10", P10_TXT, P10_OK)
+revert(sid_p10)
+
+# ============================================================================================
+# П11. ОТПЕЧАТОК ГОРЯЧЕГО УКАЗАТЕЛЯ (§5.11, §2.5б)
+# ============================================================================================
+print()
+print("=" * 100)
+print("П11 (§5.11). Указатель обязан нести признак ЦЕЛИ, а не голый индекс группы")
+print("=" * 100)
+sid_p11 = snapshot()
+c = deploy()
+authorize_fleet(c, FLEET[:64])
+_good = route_for(c)[0]
+arm(c, 0, [target(route=_good, trig=TRIG_FIRE)])                     # наш рынок, живая жертва
+_fmp = (FOREIGN[0], FOREIGN[1], FOREIGN[2], FOREIGN[3], FOREIGN[4])  # ЧУЖОЙ рынок
+_cdf = enc("LiquidatorV6", "setGroup", [1, _fmp, deadline(), 0,
+                                        [target(borrower=BOGUS, route=_good, trig=0)]])
+r, _ = send_raw({"to": c, "data": _cdf}, gas=29_000_000)
+assert r["status"] == 1, "чужая группа не армлена"
+arm(c, 2, [target(route=_good, trig=TRIG_FIRE)], dl=deadline() - 600)   # КОРОТКИЙ дедлайн
+if HOT_FP:
+    r1 = set_hot(c, 0, 1, mph=FOREIGN_MPH, expect=None)
+    r2 = set_hot(c, 1, 1, expect=None)
+    r3 = set_hot(c, 2, 1, until=raw_group(c, 0)[2], expect=None)   # until > dl группы
+    r4 = set_hot(c, 0, 2, expect=None)
+    r5 = set_hot(c, 6, 4, expect=None)
+    r6 = set_hot(c, 0, 1, expect=None)
+    rp = probe(c, FLEET[0].key.hex(), "ff")
+    print("    чужой отпечаток в подписи        : status=%d" % r1["status"])
+    print("    группа ЧУЖОГО рынка в спане      : status=%d" % r2["status"])
+    print("    группа с deadline < until        : status=%d" % r3["status"])
+    print("    спан «наш + чужой рынок»         : status=%d" % r4["status"])
+    print("    спан за границу доски (6+4)      : status=%d" % r5["status"])
+    print("    ВЕРНЫЙ указатель (парный позитив): status=%d, проба 0xFF -> %s"
+          % (r6["status"], note(rp)))
+    P11_OK = (r1["status"] == 0 and r2["status"] == 0 and r3["status"] == 0 and r4["status"] == 0
+              and r5["status"] == 0 and r6["status"] == 1 and bool(logs_of(rp, T_LIQUIDATED, c)))
+    P11_TXT = ("чужой отпечаток / чужая группа / deadline<until / смешанный спан / спан за 8 — "
+               "все ОТКАТ; верный указатель сел и ликвидировал")
+else:
+    set_hot(c, 1, 1)
+    away = 0
+    for lg in FLEET[:24]:
+        s = snapshot()
+        rr = probe(c, lg.key.hex(), "ff")
+        if not rr["logs"]:
+            away += 1
+        revert(s)
+    set_hot(c, 0, 4)
+    dead = 0
+    for lg in FLEET[:24]:
+        s = snapshot()
+        rr = probe(c, lg.key.hex(), "ff")
+        if not rr["logs"]:
+            dead += 1
+        revert(s)
+    print("    указатель на группу ЧУЖОГО рынка ПРИНЯТ (status=1): %d ног из 24 ушли туда молча"
+          % away)
+    print("    спан 4 групп, где часть протухла/пуста, ПРИНЯТ: %d проб из 40 вернулись МОЛЧА — "
+          "неотличимо от здорового промаха" % dead)
+    P11_OK = False
+    P11_TXT = ("отпечатка в setHot нет: указатель на чужой рынок принят (%d/24 ног уведены молча), "
+               "спан с протухшими группами принят (%d/24 проб молча погашены)" % (away, dead))
+verdict("§5.11", P11_TXT, P11_OK)
+revert(sid_p11)
 
 # ============================================================================================
 # ДОП. (вопрос сессии): сужение до uint128 обязано падать ГРОМКО, а не обрезать заявку
