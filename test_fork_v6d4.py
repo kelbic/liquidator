@@ -63,6 +63,10 @@ TTL_SEC = 900
 PROTO_REF_GAS = 54906
 LIMIT_EXPLICIT = 55200
 LIMIT_HOT = 58000
+# ЭТАЛОН НЕИЗМЕННОСТИ ПРОМАХА (§5.9): числа ред.1 контракта, снятые ЭТИМ ЖЕ стендом на этом же
+# блоке ДО ротации §2.4 (явный байт / горячий указатель count=1 / count=4). Ротация обязана их
+# не сдвинуть: на промахе цикл огня не исполняется вовсе.
+MISS_REF = (54965, 57431, 57571)
 VIRTUAL_SHARES = 10 ** 6
 VIRTUAL_ASSETS = 1
 
@@ -293,11 +297,31 @@ print("    настоящий роут: router=%s, калдата %d байт (�
 
 # --- ноги ------------------------------------------------------------------------------------
 LEGS = []                                  # авторизуются setAuthorizedBatch (пункт §5.8)
-while len({int(a.address, 16) % 4 for a in LEGS}) < 4 or len(LEGS) < 5:
+# Нужны ноги ВСЕХ классов вычета: mod 4 — для спана горячего указателя (§5.4), mod 3 — для
+# ротации старта цикла огня (§5.9, n=3). Класс вычета — это и есть «смещение ноги».
+while (len({int(a.address, 16) % 8 for a in LEGS}) < 8
+       or len({int(a.address, 16) % 3 for a in LEGS}) < 3 or len(LEGS) < 5):
     LEGS.append(Account.create())
-    if len(LEGS) > 40:
+    if len(LEGS) > 120:
         break
+assert len({int(a.address, 16) % 8 for a in LEGS}) == 8, "не собрались ноги всех смещений mod 8"
 OUTSIDER = Account.create()                # НЕ авторизуется никогда (пункт §5.8)
+
+
+def leg_with(mod, r):
+    """Нога с ЗАДАННЫМ смещением: старт цикла огня = uint160(msg.sender) % n (§2.4), поэтому
+    «какая цель сработает» — предсказуемая функция адреса ноги, и тест обязан её ПРЕДСКАЗЫВАТЬ,
+    а не полагать старт нулевым (первая редакция стенда полагала — и справедливо покраснела)."""
+    return next(a for a in LEGS if int(a.address, 16) % mod == r)
+
+
+def ring_first(start, n, eligible):
+    """Эталон выбора цели: первый по КОЛЬЦУ индекс из `eligible`, считается вне контракта."""
+    for k in range(n):
+        i = (start + k) % n
+        if i in eligible:
+            return i
+    return None
 for a in LEGS + [OUTSIDER]:
     send_raw({"to": a.address, "value": int(2 * 10 ** 18), "gas": 21000})
 LEG = LEGS[0]
@@ -495,33 +519,45 @@ sid = snapshot()
 c = deploy()
 authorize_batch(c, LEGS)
 _route = route_for(c)[0]
-# цели #1,#2 — личный порог ЗДОРОВ (px > t => пропуск), #3..#8 — порог ОГНЯ. Первой годной
-# оказывается цель #3: адресация внутри группы проверяется вместе с фильтром.
+# цели #1,#2 — личный порог ЗДОРОВ (px > t => пропуск), #3..#8 — порог ОГНЯ.
 arm(c, 0, [target(route=_route, trig=(TRIG_HEAL if i < 2 else TRIG_FIRE)) for i in range(8)])
 before = [raw_target(c, 0, i) for i in range(8)]
 assert all(int(b[0], 16) != 0 for b in before), "не все 8 целей армлены: %s" % [b[0] for b in before]
 print("    ЭТАЛОН до выстрела (СЫРОЙ сторадж): 8/8 целей с ненулевым borrower")
-rhit = probe(c, LEG.key.hex(), "01")
-after = [raw_target(c, 0, i) for i in range(8)]
-alive = [i for i, t in enumerate(after) if int(t[0], 16) != 0]
-_view = [call_fn("LiquidatorV6", c, "targetInfo", [0, i])[0] for i in range(8)]
-_view_alive = [i for i, v in enumerate(_view) if int(v, 16) != 0]
-_hdr = raw_group(c, 0)
-print("    выстрел (проба 0x01): gasUsed=%d %s" % (rhit["gasUsed"], note(rhit)))
-print("    СЫРОЙ сторадж после: живых целей %d из 8 -> %s; заголовок жив (deadline=%d, n=%d)"
-      % (len(alive), alive, _hdr[2], _hdr[3]))
-print("    сверка view targetInfo со стораджем: %s"
-      % ("сходится" if _view_alive == alive else "РАСХОДИТСЯ (%s)" % _view_alive))
-r_next = probe(c, LEG.key.hex(), "01")
-print("    следующая проба (та же группа): gasUsed=%d %s" % (r_next["gasUsed"], note(r_next)))
-P3_NEXT_GAS = r_next["gasUsed"]
-P3_OK = (bool(logs_of(rhit, T_LIQUIDATED, c)) and alive == [0, 1, 3, 4, 5, 6, 7]
-         and _view_alive == alive and _hdr[2] > 0 and _hdr[3] == 8
-         and bool(logs_of(r_next, T_PLANFAILED, c) or logs_of(r_next, T_LIQUIDATED, c)))
-verdict("§5.3", "снята РОВНО цель #3 (сырой сторадж: живы %s), заголовок жив (n=%d), следующая "
-        "проба ИСПОЛНЯЕТ (%s, %d газа)"
-        % (alive, _hdr[3], "PlanFailed" if logs_of(r_next, T_PLANFAILED) else "Liquidated",
-           P3_NEXT_GAS), P3_OK)
+# После §2.4 выбор цели зависит от СМЕЩЕНИЯ НОГИ, поэтому индекс не полагается нулевым, а
+# ПРЕДСКАЗЫВАЕТСЯ вне контракта (ring_first) и проверяется по сырому стораджу. Две разные ноги:
+# смещение 0 (проходит по отфильтрованным #1,#2 и садится на #3 — исходный сценарий редакции 1)
+# и смещение 5 (садится на #6) — ротация не должна ломать односрельность ни при каком старте.
+P3_CASES, P3_NEXT_GAS, P3_HIT_GAS = {}, 0, 0
+for off in (0, 5):
+    lg = leg_with(8, off)
+    exp = ring_first(off, 8, set(range(2, 8)))
+    s2 = snapshot()
+    rhit = probe(c, lg.key.hex(), "01")
+    after = [raw_target(c, 0, i) for i in range(8)]
+    alive = [i for i, t in enumerate(after) if int(t[0], 16) != 0]
+    _view_alive = [i for i in range(8)
+                   if int(call_fn("LiquidatorV6", c, "targetInfo", [0, i])[0], 16) != 0]
+    _hdr = raw_group(c, 0)
+    r_next = probe(c, lg.key.hex(), "01")
+    ok = (bool(logs_of(rhit, T_LIQUIDATED, c)) and alive == [i for i in range(8) if i != exp]
+          and _view_alive == alive and _hdr[2] > 0 and _hdr[3] == 8
+          and bool(logs_of(r_next, T_PLANFAILED, c) or logs_of(r_next, T_LIQUIDATED, c)))
+    P3_CASES[off] = (ok, exp, alive)
+    if off == 0:
+        P3_NEXT_GAS, P3_HIT_GAS = r_next["gasUsed"], rhit["gasUsed"]
+    print("    нога смещения %d: предсказана цель #%d -> выстрел %s (gasUsed=%d)"
+          % (off, exp + 1, note(rhit), rhit["gasUsed"]))
+    print("        СЫРОЙ сторадж: живых %d из 8 -> %s; заголовок жив (deadline=%d, n=%d); "
+          "view %s; следующая проба: %s (%d газа)"
+          % (len(alive), alive, _hdr[2], _hdr[3],
+             "сходится" if _view_alive == alive else "РАСХОДИТСЯ (%s)" % _view_alive,
+             note(r_next), r_next["gasUsed"]))
+    revert(s2)
+P3_OK = all(v[0] for v in P3_CASES.values())
+verdict("§5.3", "две ноги, два смещения: снята РОВНО предсказанная цель (#%d и #%d, сырой "
+        "сторадж), 7 живы, заголовок жив (n=8), следующая проба ИСПОЛНЯЕТ (PlanFailed, %d газа)"
+        % (P3_CASES[0][1] + 1, P3_CASES[5][1] + 1, P3_NEXT_GAS), P3_OK)
 revert(sid)
 
 # ============================================================================================
@@ -648,6 +684,8 @@ r_pr = probe(cp, LEG.key.hex(), "01")
 P5A_V6 = bool(logs_of(r_v6, T_PLANFAILED, c))
 P5A_PR = not r_pr["logs"]
 print("        v6       -> %s (gasUsed=%d)  <= попытка ДОШЛА до Morpho" % (note(r_v6), r_v6["gasUsed"]))
+print("        ЧТО В КВИТАНЦИИ: причина 0x00000000 — это КЛАСС «реверт без данных» (пустой реверт "
+      "оракула проброшен Morpho), а не опознание оракула; «Morpho healthy» даёт 0x08c379a0 (П7)")
 print("        ПРОТОТИП -> %s (gasUsed=%d)  <= дефект §2.2: тихий no-op" % (note(r_pr), r_pr["gasUsed"]))
 revert(s2)                                 # оракул восстановлен, доска та же
 
@@ -777,14 +815,16 @@ _route = route_for(c)[0]
 BOGUS = Web3.to_checksum_address("0x" + "de" * 20)     # позиции нет => Morpho отвергнет
 arm(c, 0, [target(borrower=BOGUS, route=_route, trig=TRIG_FIRE),
            target(route=_route, trig=TRIG_FIRE)])
-rf = probe(c, LEG.key.hex(), "01")
+# нога со смещением 0 (§2.4: start = addr % n) — та, что упирается именно в отказывающую голову
+LEG0 = leg_with(8, 0)
+rf = probe(c, LEG0.key.hex(), "01")
 _pf = logs_of(rf, T_PLANFAILED, c)
 REASON = ("0x" + _pf[0]["data"].hex()[:8]) if _pf else None
 print("    цель #1 = несуществующая позиция: %s, gasUsed=%d, причина %s (Error(string)=0x08c379a0)"
       % (note(rf), rf["gasUsed"], REASON))
 # ПАРНЫЙ ПОЗИТИВ на том же объекте: гасим отказавшую цель -> следующая ликвидирует по-настоящему
 send_raw({"to": c, "data": enc("LiquidatorV6", "clearTarget", [0, 0])})
-rok = probe(c, LEG.key.hex(), "01")
+rok = probe(c, LEG0.key.hex(), "01")
 P7_OK = bool(_pf) and REASON not in (None, "0x00000000") and bool(logs_of(rok, T_LIQUIDATED, c))
 print("    после clearTarget(0,0): %s, gasUsed=%d  <= парный позитив на том же контракте"
       % (note(rok), rok["gasUsed"]))
@@ -828,6 +868,83 @@ verdict("§5.8", "чужак: status=1, логов 0, план цел; авто�
 revert(sid)
 
 # ============================================================================================
+# П9. РОТАЦИЯ СТАРТА ЦИКЛА ОГНЯ (§5.9, ТЗ ред.2 §2.4)
+# ============================================================================================
+print()
+print("=" * 100)
+print("П9 (§5.9). ОТКАЗЫВАЮЩАЯ ГОЛОВА НЕ ЗАПИРАЕТ ГРУППУ: старт цикла = смещение ноги")
+print("=" * 100)
+sid = snapshot()
+c = deploy()
+authorize_batch(c, LEGS)
+_route = route_for(c)[0]
+BOGUS2 = Web3.to_checksum_address("0x" + "ad" * 20)
+# n=3: цели #0 и #1 — несуществующие позиции (отказывают ВСЕГДА), живая жертва в цели #2.
+# Прежняя редакция стартовала всегда с нуля => жертва недостижима БЕЗ clearTarget владельца.
+arm(c, 0, [target(borrower=BOGUS, route=_route, trig=TRIG_FIRE),
+           target(borrower=BOGUS2, route=_route, trig=TRIG_FIRE),
+           target(route=_route, trig=TRIG_FIRE)])
+rot = {}
+for k in range(3):
+    lg = next(a for a in LEGS if int(a.address, 16) % 3 == k)
+    s2 = snapshot()
+    r = probe(c, lg.key.hex(), "01")
+    fired = bool(logs_of(r, T_LIQUIDATED, c))
+    _pf = logs_of(r, T_PLANFAILED, c)
+    rot[k] = fired
+    print("    нога %s (смещение %d из n=3): %s -> %s, gasUsed=%d"
+          % (lg.address[:10], k, note(r),
+             "ВЗЯЛА ЖЕРТВУ (цель #3) БЕЗ clearTarget" if fired else "упёрлась в отказ",
+             r["gasUsed"]))
+    revert(s2)
+P9_FIRE = rot.get(2, False)                # нога со смещением 2 обязана взять живую цель #3
+P9_ANY = any(rot.values())
+print("    => жертву взяли ноги со смещениями %s из {0,1,2}; голова съедает пробы только своей "
+      "доли флота (~1/n), а не всего" % sorted([k for k, v in rot.items() if v]))
+# КОНТРОЛЬ НЕИЗМЕННОСТИ: цена промаха не сдвинулась (на промахе цикл не исполняется вовсе).
+MISS_NOW = (P2_EXPLICIT, P2_HOT1, P2_HOT4)
+P9_MISS_OK = MISS_NOW == MISS_REF
+print("    контроль неизменности промаха: явный %d/%d, hot(1) %d/%d, hot(4) %d/%d (замер/эталон "
+      "ред.1) => %s" % (P2_EXPLICIT, MISS_REF[0], P2_HOT1, MISS_REF[1], P2_HOT4, MISS_REF[2],
+                        "НЕ СДВИНУЛСЯ" if P9_MISS_OK else "СДВИНУЛСЯ"))
+verdict("§5.9", "живая цель #3 за двумя отказывающими взята БЕЗ clearTarget ногой со смещением 2 "
+        "(смещения, взявшие жертву: %s); цена промаха не сдвинулась: %d / %d / %d против эталона "
+        "%d / %d / %d" % (sorted([k for k, v in rot.items() if v]), P2_EXPLICIT, P2_HOT1, P2_HOT4,
+                          MISS_REF[0], MISS_REF[1], MISS_REF[2]), P9_FIRE and P9_MISS_OK)
+revert(sid)
+
+# ============================================================================================
+# ДОП. (вопрос сессии): сужение до uint128 обязано падать ГРОМКО, а не обрезать заявку
+# ============================================================================================
+print()
+print("=" * 100)
+print("ДОП. uint128: переполнение на АРМЕ падает громко (молчаливое обрезание = класс #121)")
+print("=" * 100)
+sid = snapshot()
+c = deploy()
+MARK = 0xDEAD0000DEAD
+cd_ok = enc("LiquidatorV6", "setGroup",
+            [0, MP_T, deadline(), TRIG_FIRE, [target(shares=MARK, route=b"")]])
+_w = "%064x" % MARK
+assert cd_ok.count(_w) == 1, "маркер заявки не найден в калдате арма ровно один раз"
+cd_bad = cd_ok.replace(_w, "%064x" % (2 ** 128))          # ровно на единицу выше uint128
+r_bad, _ = send_raw({"to": c, "data": cd_bad}, gas=29_000_000)
+cd_max = cd_ok.replace(_w, "%064x" % (2 ** 128 - 1))      # предельно допустимая заявка
+r_max, _ = send_raw({"to": c, "data": cd_max}, gas=29_000_000)
+_back = call_fn("LiquidatorV6", c, "targetInfo", [0, 0])[1]
+r_ok, _ = send_raw({"to": c, "data": cd_ok}, gas=29_000_000)   # парный позитив: та же калдата
+print("    repaidShares = 2^128     : status=%d (%s)" % (r_bad["status"],
+      "ОТКАТ — декодер calldata отверг" if r_bad["status"] == 0 else "СЕЛ — МОЛЧАЛИВОЕ ОБРЕЗАНИЕ"))
+print("    repaidShares = 2^128 - 1 : status=%d, targetInfo вернул %d (== 2^128-1: %s)"
+      % (r_max["status"], _back, _back == 2 ** 128 - 1))
+print("    та же калдата с законным значением (парный позитив): status=%d" % r_ok["status"])
+U128_OK = (r_bad["status"] == 0 and r_max["status"] == 1 and _back == 2 ** 128 - 1
+           and r_ok["status"] == 1)
+verdict("uint128", "2^128 -> откат tx (декодер), 2^128-1 -> сел и прочитан без обрезания, "
+        "законная калдата -> сел", U128_OK)
+revert(sid)
+
+# ============================================================================================
 print()
 print("=" * 100)
 print("ТАБЛИЦА ПРИЁМКИ §5 (форк-блок %d, газ — с квитанций)" % FORK_BLOCK)
@@ -845,4 +962,4 @@ print("=" * 100)
 if FAILS:
     print("ПРИЁМКА НЕ СДАНА: %s" % ", ".join(sorted(set(FAILS))))
     sys.exit(1)
-print("ПРИЁМКА СДАНА: 8/8")
+print("ПРИЁМКА СДАНА: %d/%d пунктов" % (len(RESULTS), len(RESULTS)))
