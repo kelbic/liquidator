@@ -790,6 +790,7 @@ class ChainIndex:
         # #123: подписчик Liquidate-событий. Арм ТОЛЬКО явный (set_on_liquidate из боевой точки
         # входа) — по умолчанию канал закрыт; забытый арм = молчание, не выстрел (канон notify_fn).
         self._on_liquidate = None
+        self._on_transit = None          # #104: подписчик транзитов (tip зеркала), тот же канон
         self._blocks = {}          # bn -> facts
         self._by_hash = {}         # tx hash -> fact
         self._seen = {}            # bn -> full?(bool) — покрытие, включая «пустые» блоки
@@ -1110,6 +1111,11 @@ class ChainIndex:
         Зовётся ТОЛЬКО из боевой точки входа (main.py) — см. канон notify_fn в __init__."""
         self._on_liquidate = fn
 
+    def set_on_transit(self, fn):
+        """#104: явный арм подписчика транзитов (fn(bn, transit_list); у элементов есть 'tip').
+        Тот же канон, что set_on_liquidate."""
+        self._on_transit = fn
+
     def corpses(self, max_age_blocks=None):
         """{(mid, borrower): (repaid_shares, bad_debt_shares)} за последние N блоков.
 
@@ -1384,6 +1390,15 @@ class ChainIndex:
                     _cb(bn, _liq)
                 except Exception:
                     log.exception("CHAIN-INDEX on_liquidate: колбэк упал (индекс жив)")
+        # #104: подписчик транзитов (tip зеркала) — тот же канон, что и #123.
+        _cbt = self._on_transit
+        if _cbt is not None and full and facts:
+            _tr = facts.get("transit") or []
+            if _tr:
+                try:
+                    _cbt(bn, _tr)
+                except Exception:
+                    log.exception("CHAIN-INDEX on_transit: колбэк упал (индекс жив)")
 
     def _trim(self):
         """Кольцо: держим последние KEEP блоков. Под локом вызывающего."""

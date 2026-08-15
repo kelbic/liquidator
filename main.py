@@ -1042,6 +1042,16 @@ def main():
                      "REFUSAL_LOSS_ALERT=0" if _idx123 is not None else "индекса нет")
     except Exception:
         log.exception("#123 refusal-loss: арм не удался — канал закрыт, огонь не затронут")
+    # #104: зеркало tip транзита — индекс кормит трекер execute; арм ЯВНЫЙ и только здесь.
+    # Осечка арма = зеркало мертво = статические тиры (незнание закрывает гард), огонь не тронут.
+    try:
+        from chain.execute import note_transit_tip as _ntt104
+        _idx104 = chain_index.get_index()
+        if _idx104 is not None:
+            _idx104.set_on_transit(lambda _bn, _tr: [_ntt104(t.get("tip")) for t in (_tr or [])])
+            log.info("#104 зеркало tip транзита АРМИРОВАНО (тиры проб от моды живых транзитов)")
+    except Exception:
+        log.exception("#104 зеркало: арм не удался — тиры статические, огонь не тронут")
 
     log.info("liquidator start: mode=%s chain=%s markets=%d rpc=%s",
              cfg.mode, cfg.chain, len(markets), "set" if rpc else "MISSING")

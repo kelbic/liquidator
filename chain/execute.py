@@ -413,6 +413,59 @@ _PROBE_TIP_WEI = int(os.environ.get("SPEC_FIRE_PROBE_TIP_WEI", "1000000"))   # 0
 _PROBE_TIP_TIERS = tuple(int(x) for x in os.environ.get(
     "SPEC_FIRE_PROBE_TIP_TIERS", "1000000,1100000,1775000,3000000").split(",") if x.strip())
 
+# Ш24b/#104: ЗЕРКАЛО ТРАНЗИТА (доказано боем 49978436, 14.08 22:23).
+#
+# Статические тиры выше калиброваны «классом БЛОКА» (feeHistory), но приз живёт в другом
+# распределении: победитель transit+1/+2 несёт tip = TIP ТРАНЗИТА ДО WEI (10/10 денежных
+# блоков), и в живом бою из наших 62 проб рабочими были лишь 21 — те, что случайно совпали
+# с транзитом (0.0010); всё выше сортируется ПЕРЕД ним, в старую цену. Класс блока живёт
+# 2 секунды (потому тиры и были портфелем), но tip ТРАНЗИТА — свойство ОПЕРАТОРА фида и
+# стабилен (0.0010-0.0012 неделями). Его теперь меряет индекс (#110: f["transit"][..]["tip"])
+# и кормит сюда через set_on_transit (арм ЯВНЫЙ в main.py, канон notify_fn).
+#
+# Зеркало = мода последних K транзитов при доле >=MIN_SHARE; тогда 3 ноги из 4 несут моду,
+# 4-я — вторую моду (хедж). Незнание/разброд/протухание -> статический портфель БИТ-В-БИТ
+# (незнание закрывает гард). Границы здравого смысла как у _DOM: вне [0.5e6, 2e7] отбрасываем.
+# Откат SPEC_FIRE_PROBE_TIP_MIRROR=0. Ограничение v1 (названо): мода ГЛОБАЛЬНАЯ по всем
+# агрегаторам цепи, не пер-фидная — гард доли защищает от разброда операторов.
+PROBE_TIP_MIRROR = os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR", "1").lower() not in ("0", "false", "no")
+_MIRROR_K = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_K", "12"))
+_MIRROR_TTL_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_TTL_SEC", "21600"))
+_MIRROR_MIN_SHARE = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MIN_SHARE", "0.5"))
+_MIRROR_MIN_N = 4
+_TRANSIT_TIPS: list = []                 # [(ts, tip_wei)] — кольцо K, под локом
+_TRANSIT_TIPS_LOCK = threading.Lock()
+
+
+def note_transit_tip(tip_wei, now=None) -> bool:
+    """#104: записать tip живого транзита (кормит индекс через main). Вне границ — отброс."""
+    try:
+        w = int(tip_wei)
+    except Exception:                                   # noqa: BLE001
+        return False
+    if not (500_000 <= w <= 20_000_000):
+        return False
+    n = float(now if now is not None else time.time())
+    with _TRANSIT_TIPS_LOCK:
+        _TRANSIT_TIPS.append((n, w))
+        del _TRANSIT_TIPS[:-_MIRROR_K]
+    return True
+
+
+def transit_tip_mirror(now=None):
+    """(мода, вторая_мода) | None. None = данных мало/протухли/разброд -> статический портфель."""
+    n = float(now if now is not None else time.time())
+    with _TRANSIT_TIPS_LOCK:
+        fresh = [w for ts, w in _TRANSIT_TIPS if n - ts <= _MIRROR_TTL_SEC]
+    if len(fresh) < _MIRROR_MIN_N:
+        return None
+    from collections import Counter
+    mc = Counter(fresh).most_common(2)
+    m, cnt = mc[0]
+    if cnt / len(fresh) < _MIRROR_MIN_SHARE:
+        return None
+    return (m, mc[1][0] if len(mc) > 1 else m)
+
 
 def probe_tip_for(addr) -> int:
     """Тир tip ЭТОЙ ноги. Детерминированно по адресу, без состояния и без сети.
@@ -421,13 +474,21 @@ def probe_tip_for(addr) -> int:
     тиров стоит ТОЧНО в классе транзита. Предсказывать величину, живущую две секунды, не
     требуется — вместо угадывания держим портфель.
 
-    Пустой список тиров возвращает прежнюю константу — откат одной переменной окружения."""
+    Пустой список тиров возвращает прежнюю константу — откат одной переменной окружения.
+
+    #104: при живом зеркале транзита (см. transit_tip_mirror) 3 ноги из 4 несут МОДУ tip
+    транзитов, 4-я — вторую моду (хедж); зеркало мертво/выключено -> портфель бит-в-бит."""
     if not _PROBE_TIP_TIERS:
         return _PROBE_TIP_WEI
     try:
         h = int(str(addr)[-8:], 16)
     except Exception:                                   # noqa: BLE001
         return _PROBE_TIP_TIERS[0]
+    if PROBE_TIP_MIRROR:
+        mm = transit_tip_mirror()
+        if mm is not None:
+            m, second = mm
+            return (m, m, m, second)[h % 4]
     return _PROBE_TIP_TIERS[h % len(_PROBE_TIP_TIERS)]
 
 
