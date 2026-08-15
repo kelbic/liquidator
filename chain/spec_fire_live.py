@@ -587,6 +587,22 @@ SPEC_FIRE_PREARM_MIN_REACH = float(os.environ.get(
 # Цена: реверты по невыехавшим транзитам (~$0.01/проба), кап проб/бакет прежние.
 # Откат: SPEC_FIRE_PEAK_OWED=0 (огонь только по текущему ret, disarm убивает окно).
 SPEC_FIRE_PEAK_OWED = os.environ.get("SPEC_FIRE_PEAK_OWED", "1") == "1"
+# ============ В1 (15.08): ЛИПКОЕ ОКНО — ЖИТЬ СЕРИЮ ПУШЕЙ ============
+#
+# Причина №4 вскрытия 110 проигрышей: окно закрывалось ПО ПЕРВОМУ транзиту, а деньги шли на
+# СЛЕДУЮЩЕМ пуше серии (замер: +30с нёс $27k / 26 ликвидаций; predict disarm за 0.6с до пуша).
+# Теперь confirmed/push НЕ закрывает окно, а засчитывает пуш серии — окно ре-армится на
+# следующий, пока: (а) возраст окна < V1_SERIES_TTL_SEC (жёсткий TTL — вечных окон нет);
+# (б) пушей серии < V1_MAX_PUSHES; (в) состояние ЧИТАЕТСЯ — K подряд нечитаемых тиков
+# (ret_fn=None: без mid ни reach, ни переоценка HF целей невозможны — это наш уровеньный
+# прокси «нечитаемых HF», честно назван) закрывают окно ГАРДОМ (незнание закрывает гард).
+# Гард #88 (ценностной, живой пересчёт EV) и #54 (выручка в kill-switch) — предусловия,
+# оба в бою. WIN-закрытие окна НЕ ТРОНУТО (замороженный слой). Откат SPEC_FIRE_V1=0 —
+# прежнее «одноразовое окно» бит-в-бит.
+SPEC_FIRE_V1 = os.environ.get("SPEC_FIRE_V1", "1") == "1"
+SPEC_FIRE_V1_SERIES_TTL_SEC = float(os.environ.get("SPEC_FIRE_V1_SERIES_TTL_SEC", "150"))
+SPEC_FIRE_V1_MAX_PUSHES = int(os.environ.get("SPEC_FIRE_V1_MAX_PUSHES", "4"))
+SPEC_FIRE_V1_UNREADABLE_K = int(os.environ.get("SPEC_FIRE_V1_UNREADABLE_K", "8"))
 SPEC_FIRE_OWED_HOLD_SEC = float(os.environ.get("SPEC_FIRE_OWED_HOLD_SEC", "75"))
 SPEC_FIRE_OWED_BAND = float(os.environ.get("SPEC_FIRE_OWED_BAND", "0.3"))   # доля dev
 # Двухфазный каденс (по замеру 24.07: транзит приходит через 22-31с ПОСЛЕ пробития dev —
@@ -714,6 +730,8 @@ class SpecFireLive:
         self.probe_board: dict = {}               # feed -> (mid, b, debt, calldata, gas, ts): свежая
                                                   # проба окна для яруса-2 pending (читает PendingDetect)
         self.pending_fire: dict = {}              # feed -> (mid, b, debt, ts): атомарный handoff (A2)
+        self._win_birth: dict = {}                # В1: feed -> ts арма окна (перезаписывается армом,
+        self._win_pushes: dict = {}               # чистка не нужна); feed -> пушей серии засчитано
         self.pending_healthy_fn = None            # () -> bool: pending-цикл жив (A3-кипэлайв)
         self._ws_handoff_ts: dict = {}            # feed -> ts последнего WS-handoff (кулдаун дублей)
         self._alert = None                        # (text, key) -> None: канал к ЧЕЛОВЕКУ. Ставится
@@ -2579,6 +2597,7 @@ class SpecFireLive:
         last_yield_log = 0.0
         fat_mode = False     # EV-плотность (06.08): жир в досягаемости -> каденс 0.12с, кап 600
         next_board_try = 0.0  # v5 доска: когда снова пробовать положить/переложить план
+        _unreadable = 0      # В1: нечитаемые тики подряд (ret_fn=None); K подряд закрывают окно
         # СНИМОК НА АРМЕ ОКНА: приёмка (б) судится ЗДЕСЬ И СЕЙЧАС, и она принадлежит ЭТОМУ
         # окну — параллельное окно каскада не имеет права её загрязнить. Ключ плана на арме
         # ещё неизвестен (доску кладёт тред прогрева), поэтому снимок берётся ПОЛНЫЙ, а ключ
@@ -2648,6 +2667,19 @@ class SpecFireLive:
                     r = self.ret_fn(feed)
                 except Exception:
                     pass
+                # В1-гард: K нечитаемых тиков ПОДРЯД (нет mid = не знаем состояние целей) —
+                # незнание закрывает гард: окно закрывается, а не стреляет вслепую серию.
+                if r is None:
+                    _unreadable = _unreadable + 1
+                    if SPEC_FIRE_V1 and _unreadable >= SPEC_FIRE_V1_UNREADABLE_K:
+                        self._log("SPECFIRE V1 feed=%s: %d нечитаемых тиков подряд — окно "
+                                  "закрыто гардом (незнание)" % (feed, _unreadable))
+                        with self._lock:
+                            self._windows.pop(feed, None)
+                        stop.set()
+                        break
+                else:
+                    _unreadable = 0
                 raw_hot = (r is not None and ((direction == "down" and r <= -thr)
                                               or (direction == "up" and r >= thr)))
                 _n = self._now()
@@ -2933,6 +2965,8 @@ class SpecFireLive:
                         self._armskip_ts["_nofacts"] = _n
                         self._log("SPECFIRE каскад-армы (%d/час) БЕЗ факт-флага — бустер молчит "
                                   "(fail-closed, штатный бакет)" % len(self._arm_ts))
+                self._win_birth[feed] = self._now()   # В1: рождение серии (перезапись = чистка)
+                self._win_pushes[feed] = 0
                 self._log("SPECFIRE LIVE window feed=%s dir=%s — жир на прицеле, огонь при |ret|>=%.3f%%" % (
                     feed, direction, self.dev_by.get(feed, 0.005) * SPEC_FIRE_THRESHOLD * 100.0))
                 threading.Thread(target=self._window_loop, args=(feed, direction, stop),
@@ -2941,6 +2975,22 @@ class SpecFireLive:
                 if kind in ("confirmed", "push"):
                     self.note_push(feed, updated_at=ev.get("updated_at"))
                     # решётка OCR: метка севшего апдейта — по времени ОРАКУЛА (#49)
+                    # В1: пуш сел — окно живёт СЕРИЮ, а не закрывается по первому транзиту.
+                    # Гарды: жёсткий TTL серии + кап пушей; нечитаемость закрывает ПЕТЛЯ.
+                    if SPEC_FIRE_V1 and feed in self._windows:
+                        _birth = self._win_birth.get(feed, 0.0)
+                        _pushes = self._win_pushes.get(feed, 0) + 1
+                        _age = self._now() - _birth
+                        if _birth > 0.0 and _age < SPEC_FIRE_V1_SERIES_TTL_SEC \
+                                and _pushes < SPEC_FIRE_V1_MAX_PUSHES:
+                            self._win_pushes[feed] = _pushes
+                            self.stats["v1_series_pushes"] = self.stats.get("v1_series_pushes", 0) + 1
+                            self._log("SPECFIRE V1 серия feed=%s: пуш №%d сел — окно живёт "
+                                      "(возраст %.0fс из %.0fс)" % (feed, _pushes, _age,
+                                                                    SPEC_FIRE_V1_SERIES_TTL_SEC))
+                            return None
+                        self._log("SPECFIRE V1 серия feed=%s ИСЧЕРПАНА (возраст %.0fс, пушей %d)"
+                                  % (feed, _age, _pushes))
                 if (SPEC_FIRE_PEAK_OWED and kind in ("disarm", "falsepos")
                         and self._owed.get(feed, 0.0) > self._now()
                         and feed in self._windows):
