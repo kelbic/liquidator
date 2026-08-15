@@ -1395,6 +1395,18 @@ def ladder_resign_needed(addr: str, base_fee: int, tip_wei: int) -> bool:
     st = _VOLLEY_LADDER.get(addr)
     if not st or not st.get("q"):
         return False                      # пустую лестницу поднимет обычный триггер глубины
+    # #127: tip вшит в raw-подпись ОДИН раз (presign_ladder), а полоса max_fee ниже его НЕ
+    # видит: разница тиров ±2M wei тонет в base*MULT (~100M wei при базе 0.005 gwei). Из-за
+    # этого зеркало #104 не доезжало до отправки НИКОГДА: лестницы подписаны на прогреве при
+    # пустом кольце (статика), и пересборки по смене tip не наступало (замер по цепи: у всех
+    # 110 ног ровно один tip за все пробы). Расхождение записанного tip с тиром ноги — теперь
+    # САМОСТОЯТЕЛЬНЫЙ триггер. Отсутствие поля (лестница от кода до #127 после деплоя) = tip
+    # неизвестен = протухла (незнание закрывает гард). Шторм пересборок капает существующий
+    # SPEC_FIRE_AUDIT_MAX_RESIGN: сходимость флота = 110 ног / 5 за проход = 22 прохода
+    # аудита, т.е. ~22с в окне (ENGINE_PRICE_AUDIT_SEC=1.0) и ~44 мин в штиле (120с).
+    _st_tip = st.get("tip")
+    if _st_tip is None or int(_st_tip) != int(tip_wei):
+        return True
     want = int(base_fee) * _VOLLEY_PRESIGN_MAXFEE_MULT + int(tip_wei)
     have = int(st.get("max_fee") or 0)
     if want <= 0:
@@ -1429,6 +1441,27 @@ def ladder_depth(addr: str) -> int:
     """Сколько готовых проб осталось у ноги (0 = лестницы нет)."""
     st = _VOLLEY_LADDER.get(addr)
     return len(st["q"]) if st else 0
+
+
+def ladder_tip(addr: str):
+    """#127: tip, которым подписана лестница ноги. None = лестницы нет или поле отсутствует
+    (лестница от кода до #127). Чтение для НАБЛЮДАЕМОСТИ (ветка аудита) — денег не трогает."""
+    st = _VOLLEY_LADDER.get(addr)
+    return st.get("tip") if st else None
+
+
+# #127: счётчик «пересборка по tip» — прибор СБОКУ (урок 13.08: счётчик атрибуции внутри
+# _prearm_board молча гасил арм). Зовётся ТОЛЬКО из ветки аудита spec_fire_live под её
+# собственным except; ни подписи, ни отправки, ни лестницы не трогает.
+_TIP_RESIGN_COUNT = 0
+_TIP_RESIGN_LAST = None
+
+
+def note_tip_resign(addr, old_tip, new_tip):
+    """Учёт ноги, чью лестницу аудит пересобирает из-за смены tip (старый -> новый)."""
+    global _TIP_RESIGN_COUNT, _TIP_RESIGN_LAST
+    _TIP_RESIGN_COUNT += 1
+    _TIP_RESIGN_LAST = (str(addr), old_tip, int(new_tip))
 
 
 def invalidate_ladder(addr: str = None):
@@ -1523,6 +1556,21 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
             _st_id = id(st)
             _snap_gas = st["gas"]
             _snap_max_fee = st["max_fee"]
+            # #127: долив подписывается tip'ом ЛЕСТНИЦЫ, а не свежим probe_tip_for — иначе в
+            # одной лестнице мешаются два tip и поле "tip" лжёт. Смена tip идёт ТОЛЬКО через
+            # пересборку (её триггерит аудит цены: ladder_resign_needed). Поле отсутствует
+            # (лестница от кода до #127) => tip неизвестен => НЕ доливаем, возвращаем текущую
+            # глубину — пересборку сделает аудит (незнание закрывает гард). Явный параметр
+            # tip= ведёт себя как раньше (контракт вызова не тронут).
+            if tip is None:
+                _snap_tip = st.get("tip")
+                if _snap_tip is None:
+                    if log:
+                        log.info("VOLLEY долив %s пропущен: лестница без поля tip (код до "
+                                 "#127) — пересборку сделает аудит", addr[:10])
+                    return len(st["q"])
+            else:
+                _snap_tip = None
             _tail = st["q"][-1][0] if st["q"] else None
             nxt = (_tail + 1) if _tail is not None else None   # пустой склад: pending вне лока
             count = depth - len(st["q"])
@@ -1553,6 +1601,11 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
 
     if count <= 0:
         return ladder_depth(addr)
+    if _mode == "topup" and _snap_tip is not None:
+        # #127: долив несёт tip лестницы (см. фазу 1) — переопределяем ДО подписи. max_fee
+        # пересчитывается тем же tip, чтобы подписанные байты не разъезжались с полем.
+        tip_wei = int(_snap_tip)
+        max_fee = base_fee * _VOLLEY_PRESIGN_MAXFEE_MULT + tip_wei
     # pending читаем ВНЕ лока — только если план его требует (пустая доточка / пересборка с
     # рассинхронённым счётчиком). Обычная пересборка по ЦЕНЕ берёт локальный старт выше (0 RTT).
     if nxt is None:
@@ -1607,8 +1660,10 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
                          "счётчик (%d -> %d), старт %d занят",
                          addr[:10], _n_snap, int(_VOLLEY_NONCE.get(addr, 0)), nxt)
             return ladder_depth(addr)
+        # #127: "tip" — часть формы лестницы. Аудит цены сверяет его с тиром ноги и триггерит
+        # пересборку при расхождении (полоса max_fee разницу тиров ±2M wei не видит).
         _VOLLEY_LADDER[addr] = {"q": list(signed), "gas": int(gas), "max_fee": max_fee,
-                                "ts": time.monotonic()}
+                                "tip": tip_wei, "ts": time.monotonic()}
         _VOLLEY_NONCE[addr] = nxt     # локальный счётчик и лестница выходят из одной точки
         if log:
             log.info("VOLLEY лестница %s: %d проб с nonce %d, maxFee %.4f gwei",

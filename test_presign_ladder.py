@@ -326,7 +326,11 @@ print("UNIT_OK: вздутая лестница пересобирается в�
 rpc = fresh()
 ex.presign_ladder(rpc, cfg, ADDR, KEY, GAS, depth=40, start_nonce=0)
 _norm = ex._VOLLEY_LADDER[ADDR]["max_fee"]
-_tip = ex._PROBE_TIP_WEI      # #91: аудит меряет тем же tip, которым подписано
+# #91: аудит меряет тем же tip, которым подписано. #127: это стало БУКВАЛЬНЫМ — лестница
+# подписана probe_tip_for(ADDR) (тир ноги, 1.1M), а тут стоял _PROBE_TIP_WEI (1.0M): дефект
+# стенда, невидимый пока полоса max_fee была слепа к tip. Боевой аудит и передаёт тир ноги
+# (spec_fire_live: ladder_resign_needed(a, bf, probe_tip_for(a))).
+_tip = ex.probe_tip_for(ADDR)
 
 # (а) ВЗДУТАЯ лестница при ПОЛНОМ складе распознана как требующая пересборки
 ex._VOLLEY_LADDER[ADDR]["max_fee"] = _norm * 50

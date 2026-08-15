@@ -1733,6 +1733,24 @@ class SpecFireLive:
                          if _ex.ladder_resign_needed(a, bf, _ex.probe_tip_for(a))]
                 if not stale:
                     return
+                # #127: учёт «пересборка по tip» — строго СБОКУ (свой try; ни подписи, ни
+                # отправки, ни лестниц внутри). Сбой прибора не имеет права тронуть пересборку —
+                # урок 13.08: счётчик атрибуции внутри _prearm_board молча гасил арм. Ноги со
+                # сменившимся tip уже вошли в stale (триггер в execute), здесь только счёт и лог.
+                try:
+                    _tip_mm = []
+                    for a in stale:
+                        _have = _ex.ladder_tip(a)
+                        _want = _ex.probe_tip_for(a)
+                        if _have is None or int(_have) != int(_want):
+                            _ex.note_tip_resign(a, _have, _want)
+                            _tip_mm.append("%s %s->%d" % (
+                                a[:8], _have if _have is not None else "?", _want))
+                    if _tip_mm:
+                        self._log("SPECFIRE аудит: пересборка по tip у %d ног (%s)"
+                                  % (len(_tip_mm), "; ".join(_tip_mm[:5])))
+                except Exception:
+                    pass
                 self._log("SPECFIRE аудит лестниц: %d ног с протухшей ценой (база %.4f gwei) — "
                           "пересборка" % (len(stale), bf / 1e9))
                 # #112 MAJOR-1: пересборка серийна и на ОДНОМ ядре монополизировала бы GIL на
