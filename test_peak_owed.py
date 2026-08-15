@@ -6,6 +6,8 @@ import types
 
 import chain.spec_fire_live as sfl
 from chain.spec_fire_live import SpecFireLive
+import chain.spec_fire_live as _sfl_v1
+_sfl_v1.SPEC_FIRE_V1_MAX_PUSHES = 1   # В1: этим стендам нужна семантика «пуш закрывает»
 
 # боевой порог из .env Шарлотты (дефолт модуля $500k срезал бы цель на арме)
 _orig_min = sfl.SPEC_FIRE_MIN_REPAID_USD

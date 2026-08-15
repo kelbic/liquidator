@@ -14,6 +14,8 @@ sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 import chain.spec_fire_live as sfl_mod
 import chain.execute as ex
 from chain.spec_fire_live import SpecFireLive
+import chain.spec_fire_live as _sfl_v1
+_sfl_v1.SPEC_FIRE_V1_MAX_PUSHES = 1   # В1: этим стендам нужна семантика «пуш закрывает»
 
 sfl_mod.SPEC_FIRE_PEAK_OWED = False   # тестируем тир, не owed-семантику
 
