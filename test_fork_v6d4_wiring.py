@@ -129,8 +129,34 @@ def gas_used(rec):
     return int(rec["gasUsed"], 16) if isinstance(rec["gasUsed"], str) else int(rec["gasUsed"])
 
 
-def deploy():
+def assert_artifact_fresh():
+    """ГАРД СВЕЖЕСТИ АРТЕФАКТА (добавлен сессией при приёмке 16.08).
+
+    Стенд деплоит ГОТОВЫЙ артефакт `contracts/out/...json`, а не собирает из исходника — значит
+    он способен судить БАЙТКОД, не соответствующий `contracts/src/LiquidatorV6.sol`. Ловушка
+    двухполярная, и одну полярность этот прогон дал живьём: сессия пересобрала артефакт под
+    БАЗОВУЮ редакцию (красный-на-базе форжем), и §8.5 выдал ЛОЖНЫЙ КРАСНЫЙ — «гард §1 не
+    сработал», потому что в задеплоенном байткоде его не было. Обратная полярность страшнее:
+    протухший артефакт С гардом дал бы ЛОЖНЫЙ ЗЕЛЁНЫЙ на исходнике БЕЗ гарда.
+
+    Эталон берём ИЗ ДРУГОГО ПРОХОДА — keccak256 исходника, записанный компилятором в
+    metadata.sources, а не самоотчёт стенда.
+    """
     a = json.load(open("contracts/out/LiquidatorV6.sol/LiquidatorV6.json"))
+    want = ((a.get("metadata") or {}).get("sources", {})
+            .get("src/LiquidatorV6.sol", {}).get("keccak256"))
+    got = "0x" + keccak(pathlib.Path("contracts/src/LiquidatorV6.sol").read_bytes()).hex()
+    if not want:
+        raise SystemExit("АРТЕФАКТ БЕЗ metadata.sources: свежесть недоказуема — forge build")
+    if want.lower() != got.lower():
+        raise SystemExit("АРТЕФАКТ ПРОТУХ: keccak(исходника)=%s, в артефакте %s — прогони "
+                         "`cd contracts && forge build`, иначе приёмка судит ЧУЖОЙ байткод"
+                         % (got[:18], want[:18]))
+    return a
+
+
+def deploy():
+    a = assert_artifact_fresh()
     data = a["bytecode"]["object"] + ("0" * 24 + MORPHO[2:]).lower()
     rec = send({"to": None, "data": data}, gas=8_000_000)
     assert status_of(rec) == 1, "деплой v6 не сел"
