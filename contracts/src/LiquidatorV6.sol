@@ -100,6 +100,9 @@ contract LiquidatorV6 {
     error ERC20OpFailed();
     error BadDeadline();
     error TooManySlots();
+    /// @notice §1 обвязки (остаточная дыра): перезарядка/зачистка группы ВНУТРИ живого спана
+    /// ломает инвариант «спан = один рынок» ПОСТФАКТУМ. Отказ ГРОМКИЙ, см. `_guardHotSpan`.
+    error HotSpanLive();
 
     event Liquidated(address indexed borrower, address indexed loanToken, uint256 profit);
     event OwnerChanged(address indexed from, address indexed to);
@@ -164,6 +167,27 @@ contract LiquidatorV6 {
 
     // --- арм доски -----------------------------------------------------------------------
 
+    /// @notice §1 ОБВЯЗКИ (остаточная дыра, ред.4 SPEC_V6D4_WIRING.md). Отпечаток рынка
+    /// сверяется на ЗАПИСИ указателя (`setHot`), но `setGroup`/`clearGroup` не смотрели на живой
+    /// `_hot`: перезарядка/зачистка группы ВНУТРИ живого спана НОВЫМ рынком ломала инвариант
+    /// «спан = один рынок» ПОСТФАКТУМ (fallback берёт `mp` из самой группы) — доля флота уходила
+    /// стрелять в другой рынок либо (при `clearGroup`) глохла МОЛЧА, неотличимо от здорового
+    /// промаха. Потери средств нет (огонь по нашему же законно армленному плану), цена — неверная
+    /// раскладка плотности, и она МОЛЧАЛИВА.
+    ///
+    /// Три умышленных свойства (SPEC §1):
+    ///   * Отказ ГРОМКИЙ (revert), а не тихое гашение `_hot`: молчаливое разоружение флота
+    ///     посреди окна выглядит как здоровый промах — ровно тот класс дефекта, что мы ловили.
+    ///   * `setTargets` НЕ гардится: докладка каскада не трогает заголовок (`mp`/`deadline` целы),
+    ///     инвариант спана сохраняется — это штатный рост каскада внутри окна, запрещать нельзя.
+    ///   * Горячий путь не платит: проверка живёт только в `onlyOwner`-пути арма.
+    /// Мёртвый указатель (`count==0`) и протухший (`now >= until`) доску НЕ запирают.
+    function _guardHotSpan(uint256 g) private view {
+        Hot storage h = _hot;
+        if (h.count != 0 && block.timestamp < h.until
+            && g >= h.g0 && g < uint256(h.g0) + uint256(h.count)) revert HotSpanLive();
+    }
+
     /// @notice Заголовок группы + цели. Дорого (~1.57M газа на цель с боевым роутом 2 КБ),
     /// поэтому делается ЗАРАНЕЕ, в тишине; в горячий момент двигается только `_hot`.
     /// @dev Цели с индексами >= ts.length НЕ затираются (это стоило бы газа за слоты, которые
@@ -178,6 +202,7 @@ contract LiquidatorV6 {
         if (deadline <= block.timestamp) revert BadDeadline();
         uint256 n = ts.length;
         if (g >= 8 || n > 8) revert TooManySlots();
+        _guardHotSpan(g);                 // §1: перезарядка группы живого спана — громкий отказ
         Group storage gr = _groups[g];
         gr.mp = mp;
         gr.gateTrigger = gateTrigger;
@@ -247,6 +272,7 @@ contract LiquidatorV6 {
     /// @notice Полное разоружение группы: заголовок + все 8 целей (возврат газа за очистку).
     function clearGroup(uint256 g) external onlyOwner {
         if (g >= 8) revert TooManySlots();
+        _guardHotSpan(g);                 // §1: зачистка группы живого спана — громкий отказ
         delete _groups[g];
         for (uint256 i = 0; i < 8; i++) delete _targets[g][i];
     }
