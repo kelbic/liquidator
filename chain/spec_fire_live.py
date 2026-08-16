@@ -3140,11 +3140,17 @@ class SpecFireLive:
             # никто не чинит: нога, замолчавшая на полу или без кэша патрона, до этого была
             # неотличима от «окно было пустым».
             try:
-                from chain.execute import volley_probe_skips, volley_maxfee_muted
+                from chain.execute import (volley_probe_skips, volley_maxfee_muted,
+                                            volley_budget_skips)
                 _fs, _us = volley_probe_skips()
                 _mm = len(volley_maxfee_muted())
+                # #132: немота ПО БЮДЖЕТУ тира — отдельное число. До этого отказ был немым и
+                # тонул в skipped_dry вместе со «склад пуст»; в каскаде (всплеск базы) он
+                # приходит первым и гасит половину флота.
+                _rs, _ifs = volley_budget_skips()
             except Exception:
                 _fs = _us = _mm = -1
+                _rs = _ifs = -1
             if _mm > 0 and self._alert is not None:
                 # У2 (решение kelbic 09.08): немота ног по комиссии = состояние, которое
                 # само не рассосётся (долив или ручка MAXFEE_RESERVE_MULT) и которое иначе
@@ -3181,10 +3187,11 @@ class SpecFireLive:
                 _pw = "УЧЁТ ПОЗИЦИЙ УПАЛ: %s: %s" % (type(_e).__name__, _e)
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
+                      "budget_reserve_skips=%d budget_inflight_skips=%d "
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _fs, _us, _mm, _es or "—", _cs or "—", _is,
+                          _fs, _us, _mm, _rs, _ifs, _es or "—", _cs or "—", _is,
                           ("%s/%s" % (_wkey[0][:10], _wkey[1][:10])) if _wkey else "НЕТ",
                           _pw, self.stats))
 

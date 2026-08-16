@@ -1062,6 +1062,14 @@ _VOLLEY_REFRESH_MIN_GAP = float(os.environ.get("SPEC_FIRE_VOLLEY_REFRESH_GAP_SEC
 _VOLLEY_MAXFEE_RESIGN_MULT = float(os.environ.get("SPEC_FIRE_PRESIGN_RESIGN_MULT", "3"))
 _VOLLEY_FLOOR_SKIPS = 0                  # отказов «патрон на поле»
 _VOLLEY_UNKNOWN_SKIPS = 0                # отказов «баланс неизвестен/протух» (fail-closed)
+# Г2д-3/#132: отказ по ОБЩЕМУ бакету «суточный факт + бронь в полёте» был НЕМЫМ — ни счётчика,
+# ни лога, и в stats движка он тонул в skipped_dry вперемешку со «склад пуст». Замер линзы
+# 16.08: при базе 0.02 gwei и $50 суточных флот немеет после 117 проб (1.1 обхода из 110), при
+# $100 — после 59, то есть ПОЛОВИНА флота молчит; каскад = всплеск базы, значит потолок
+# сжимается ровно в решающий момент. Сначала ВИДИМОСТЬ (этот счётчик), размер брони — только
+# по замеренной частоте (канон: не менять денежный гейт вслепую).
+_VOLLEY_RESERVE_SKIPS = 0                # отказов «суточный факт + бронь >= кап тира»
+_VOLLEY_INFLIGHT_SKIPS = 0               # отказов «боевая tx в полёте» (тот же гейт, вторая причина)
 _VOLLEY_MAXFEE_MUTE: set = set()         # ноги, отключённые ПОЛОМ ПАТРОНА (gas x max_fee):
                                          # это состояние требует человека — долив или
                                          # ручка множителя, поэтому оно кричит, а не молчит
@@ -1079,6 +1087,17 @@ def volley_probe_skips():
     неотличим от «окно было пустым», и нога, замолчавшая на 135-й пробе, выглядела бы штилем."""
     with _INFLIGHT_LOCK:
         return (_VOLLEY_FLOOR_SKIPS, _VOLLEY_UNKNOWN_SKIPS)
+
+
+def volley_budget_skips():
+    """#132: (reserve_skips, inflight_skips) — отказы ОБЩЕГО бакета тира, разведённые по причине.
+
+    `reserve_skips` растёт, когда «суточный факт + бронь в полёте» выбрали `CASCADE_TIER_GAS_USD`:
+    это НЕМОТА ФЛОТА ПО БЮДЖЕТУ, и она приходит тем раньше, чем выше база — то есть ровно в
+    каскаде. Пока числа не было, отказ тонул в `skipped_dry` вместе со «склад пуст».
+    Размер брони по этому числу и пересматривать: сначала частота, потом ручка."""
+    with _INFLIGHT_LOCK:
+        return (_VOLLEY_RESERVE_SKIPS, _VOLLEY_INFLIGHT_SKIPS)
 
 
 def volley_maxfee_muted():
@@ -1807,10 +1826,17 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
     Возврат hash|None. При неудаче запись возвращается В НАЧАЛО очереди (инвариант подряд).
     """
     global _VOLLEY_PROBES, _VOLLEY_FLOOR_SKIPS, _VOLLEY_UNKNOWN_SKIPS, _VOLLEY_GAS_RESERVED
+    global _VOLLEY_RESERVE_SKIPS, _VOLLEY_INFLIGHT_SKIPS
     with _INFLIGHT_LOCK:
         _volley_roll_day_locked()
-        if ((_VOLLEY_GAS_USD + _VOLLEY_GAS_RESERVED) >= CASCADE_TIER_GAS_USD
-                or (_INFLIGHT > 0 and not _ENGINE_PROBE_IGNORE_INFLIGHT)):
+        # #132: РАЗВЕДЁННЫЕ причины отказа. Раньше обе возвращали немой None, и «флот молчит,
+        # потому что бюджет тира выбран бронью» было неотличимо от «склад пуст» — то есть
+        # самый опасный отказ (немота ровно в каскаде) не имел ни одного числа.
+        if (_VOLLEY_GAS_USD + _VOLLEY_GAS_RESERVED) >= CASCADE_TIER_GAS_USD:
+            _VOLLEY_RESERVE_SKIPS += 1
+            return None
+        if _INFLIGHT > 0 and not _ENGINE_PROBE_IGNORE_INFLIGHT:
+            _VOLLEY_INFLIGHT_SKIPS += 1
             return None
     lk = _VOLLEY_LOCKS.get(addr)
     if lk is None:
