@@ -210,6 +210,75 @@ def measure_route_cap(rpc, token_in, token_out, batch_fn=None, log_fn=None):
     return eff
 
 
+# --- §9 (#133): КУМУЛЯТИВНЫЕ КОТИРОВКИ ОДНОГО РОУТА -----------------------------------------
+# Зачем отдельная дверь, если рядом уже есть measure_route_cap. Тот отвечает на вопрос «какой
+# размер роут ТЯНЕТ» и лестницу квот выбрасывает (rungs живут только в строке журнала). §9
+# спрашивает другое: «сколько отдаст пул НА КОНКРЕТНОМ кумулятивном входе» — и ответ нужен
+# ЧИСЛОМ, в точках, которые задаёт состав группы. Общего у них ровно транспорт.
+def cumulative_quotes(rpc, token_in, token_out, sizes, batch_fn=None):
+    """{размер: выход} у квотера ПРЯМОГО роута, ОДНОЙ пачкой aggregate3.
+
+    None вместо словаря = роута нет (Kyber-агрегат: путь размазан по нескольким пулам и
+    серверный minOut нам не принадлежит) либо транспорт отказал. Значение None у отдельного
+    размера = ступень РЕВЕРТНУЛА, и это ДАННЫЕ: пул такого кумулятивного входа не тянет.
+
+    Семантика ошибок повторяет measure_route_cap намеренно: реверт ступени — факт о пуле,
+    транспортная ошибка — незнание.
+    """
+    from eth_abi import encode
+    from chain.execute import _SWAP_ROUTES
+    key = (token_in.lower(), token_out.lower())
+    r = _SWAP_ROUTES.get(key)
+    if r is None:
+        return None
+    quoter = AERO_QUOTER if r["style"] == "v1" else UNIV3_QUOTER
+    sizes = [int(s) for s in sizes if int(s) > 0]
+    if not sizes:
+        return {}
+    calls = [(quoter, _QUOTE_SEL + encode(["bytes", "uint256"], [r["path"], s])) for s in sizes]
+    try:
+        res = (batch_fn or _quote_batch)(rpc, calls)
+    except Exception as e:
+        log.info("§9 quote transport-fail %s->%s: %s (котировок нет — §9 обязан отказать, "
+                 "а не выдумать запас)", token_in[:8], token_out[:8], type(e).__name__)
+        return None
+    out = {}
+    for s, (ok, d) in zip(sizes, res):
+        out[s] = int.from_bytes(d[:32], "big") if (ok and len(d) >= 32) else None
+    return out
+
+
+def make_cumulative_quote_fn(rpc, token_in, token_out, amounts_in, batch_fn=None):
+    """Квотер для `board_v6.same_pool_min_outs`: x -> выход за КУМУЛЯТИВНЫЙ вход x.
+
+    Спрашиваем РОВНО те точки, которые нужны худшему случаю (§9): суммарный вход группы T,
+    T−aᵢ по каждой цели (я исполняюсь ПОСЛЕДНИМ) и aᵢ (одиночный выход — для отчёта «сколько
+    стоит группировка»). Это <=2n+1 квот в ОДНОЙ пачке.
+
+    Возврат None = котировок для этого роута не существует. Вызывающий обязан прочитать это
+    как «данных нет» и отказать (или уйти в строгий disjoint-режим), а НЕ как «запас нулевой».
+    """
+    a = [int(x) for x in amounts_in if int(x) > 0]
+    if not a:
+        return None
+    total = sum(a)
+    want = sorted({total} | {total - x for x in a} | set(a))
+    table = cumulative_quotes(rpc, token_in, token_out, want, batch_fn=batch_fn)
+    if table is None:
+        return None
+
+    def _q(x):
+        x = int(x)
+        if x == 0:
+            return 0
+        if x not in table:
+            raise KeyError("§9: котировка на кумулятивный вход %d не запрашивалась — состав "
+                           "группы изменился после снятия квот" % x)
+        return table[x]
+
+    return _q
+
+
 def maybe_refresh(rpc, token_in, token_out, now=None, force=False, **kw):
     """Rate-limited обёртка measure_route_cap: не чаще LIVE_CAP_REFRESH_SEC на роут.
     Быстрый no-op для роутов без статик-капа. None = замер не проводился/не удался."""

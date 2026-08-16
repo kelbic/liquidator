@@ -1380,7 +1380,18 @@ class SpecFireLive:
         # §9: цели одной группы делят пул -> minOut второй посчитан ДО свопа первой. Проверку
         # ведёт board_v6 (два режима, #133); для группы из ОДНОЙ цели вопрос не стоит.
         if len(targets) > 1:
-            _v6mod.assert_disjoint_pools([p.get("pool") for p in plans])
+            # §9 (#133). Два режима, дефолт СТРОГИЙ (disjoint). Режим `same-pool` считает
+            # minOut каждой цели с запасом на n−1 предыдущих свопов ТОГО ЖЕ пула и требует
+            # трёх входов, которых в `plan` сегодня нет: пул цели, размер входа свопа и пол
+            # (repaid_assets+minProfit). Их обязан положить СБОРЩИК мультицелевой группы —
+            # ключи `pool` / `amount_in` / `floor`. Пусто = отказ ГРОМКИЙ (не тихий v5-minOut).
+            _pools = [p.get("pool") for p in plans]
+            _amts = [p.get("amount_in") for p in plans]
+            _flrs = [p.get("floor") for p in plans]
+            _qf = plans[0].get("quote_fn")
+            _v6mod.assert_group_min_out_safe(
+                _pools, amounts_in=None if any(x is None for x in _amts) else _amts,
+                floors=None if any(x is None for x in _flrs) else _flrs, quote_fn=_qf)
         g = int(_v6mod.SPEC_FIRE_V6_GROUP)
         dl = int(time.time()) + SPEC_FIRE_V2_PLAN_TTL_SEC
         # Грубый гейт группы = МАКСИМУМ персональных порогов, но НУЛЬ, если хоть у одной цели
