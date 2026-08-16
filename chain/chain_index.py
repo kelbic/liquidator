@@ -1111,6 +1111,28 @@ class ChainIndex:
         Зовётся ТОЛЬКО из боевой точки входа (main.py) — см. канон notify_fn в __init__."""
         self._on_liquidate = fn
 
+    def add_on_liquidate(self, fn):
+        """#135: ДОБАВИТЬ подписчика Liquidate, НЕ сняв уже армленного.
+
+        Слот один, а приборов на нём теперь два: алерт «отказались — забрал конкурент» (#123)
+        и гигиена доски v6 (§7 clearTarget). Прямой `set_on_liquidate` вторым вызовом снял бы
+        первый МОЛЧА — ровно тот класс, которым #123 был мёртв с рождения. Композиция явная,
+        и у КАЖДОГО подписчика свой except: падение одного не имеет права глушить второй.
+        """
+        prev = self._on_liquidate
+        if prev is None:
+            self._on_liquidate = fn
+            return
+
+        def _fan(bn, evs):
+            for cb in (prev, fn):
+                try:
+                    cb(bn, evs)
+                except Exception:
+                    log.exception("CHAIN-INDEX on_liquidate: подписчик упал (соседний жив)")
+
+        self._on_liquidate = _fan
+
     def set_on_transit(self, fn):
         """#104: явный арм подписчика транзитов (fn(bn, transit_list); у элементов есть 'tip').
         Тот же канон, что set_on_liquidate."""

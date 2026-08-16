@@ -720,11 +720,23 @@ class SpecFireLive:
                       "lattice_skips": 0,                      # фазовый гейт: тики без огня
                       "lattice_hits": 0, "lattice_misses": 0,  # пуш в фазе / вне фазы (живой валидатор)
                       "board_arms": 0, "board_probes": 0,      # v5 доска: записей плана / 1-байт проб
-                      "board_fails": 0}                        # арм не удался -> ноги ушли на V1
+                      "board_fails": 0,                        # арм не удался -> ноги ушли на V1
+                      # v6-D4 (#135). ТРИ РАЗНЫХ ИСХОДА, и их нельзя мешать: «не сел» —
+                      # доказанный отказ, «НЕИЗВЕСТНО» — узел не дорос (гард отставания),
+                      # «чужой адрес» — флаг включён на контракте v5.
+                      "board_v6_arms": 0, "board_v6_unlanded": 0,
+                      "board_v6_unknown": 0, "board_v6_wrong_addr": 0,
+                      "board_v6_cleared_targets": 0}
         self._push_ts: dict = {}                  # feed -> метки севших пушей (решётка OCR, 07.08)
         self._board: dict = {}                    # v5 доска: {"key": (mid,b), "until": ts, "armed_ts": ts}
         self._board_lock = threading.Lock()       # арм доски — одна запись за раз (nonce главного)
         self._board_arm_fn = None                 # шов юнитов: (calldata, gas, tag) -> hash|None
+        # --- v6-D4 (#135). Всё ниже мертво при SPEC_FIRE_V6=0 (дефолт) ---------------------
+        self._board_v6: dict = {}                 # раскладка живого спана: {"g","count","until",
+                                                  # "slots": {(mid,b): (g,i)}, "mp", "dl"}
+        self._v6_call_fn = None                   # шов стенда: (to, data) -> bytes
+        self._v6_send_fn = None                   # шов стенда: (calldata, gas) -> квитанция|None
+        self._v6_head_fn = None                   # шов стенда: () -> номер головы узла
         self._owed: dict = {}                     # feed -> owed_until (peak-owed, пишет петля окна)
         self._prio: dict = {}                     # feed -> (claim_debt, ts): заявки на слот (пакет B)
         self.probe_board: dict = {}               # feed -> (mid, b, debt, calldata, gas, ts): свежая
@@ -1241,6 +1253,12 @@ class SpecFireLive:
                         return True
                 elif _inc_ev is not None and plan_ev < _inc_ev * (1.0 + SPEC_FIRE_V2_EV_MARGIN):
                     return True               # не лучше живого инкумбента на порог — держим слот
+            # --- РАЗВИЛКА v5/v6 (#135). ВЫШЕ неё всё общее (дедуп, гард #88) — расходятся
+            # ровно ЗАПИСЬ и её приёмка. При SPEC_FIRE_V6=0 ветка не исполняется вовсе, и
+            # ниже идёт прежний тракт v5 бит-в-бит.
+            import chain.board_v6 as _v6mod
+            if _v6mod.v6_enabled():
+                return self._arm_board_v6(plan, mid, b, feed, debt=debt, plan_ev=plan_ev)
             import chain.execute as _ex
             dl = int(time.time()) + SPEC_FIRE_V2_PLAN_TTL_SEC
             cd = _ex.encode_set_plan(
@@ -1296,6 +1314,191 @@ class SpecFireLive:
             return False
         finally:
             self._board_lock.release()
+
+    # ==============================================================================================
+    # v6-D4 (#135): ГРУППА + ГОРЯЧИЙ УКАЗАТЕЛЬ. Живёт ТОЛЬКО под SPEC_FIRE_V6=1.
+    # ==============================================================================================
+    def _v6_io(self):
+        """(call_fn, send_fn, head_fn, addr) боевого тракта v6. Швы (`_v6_*_fn`) существуют
+        для стенда — в бою None, и берётся настоящий транспорт."""
+        import chain.execute as _ex
+        addr = self.cfg.liquidator_address
+        call_fn = self._v6_call_fn or (
+            lambda to, data: bytes(self.rpc.eth_call({"to": to, "data": data})))
+        send_fn = self._v6_send_fn or (
+            lambda cd, gas: _ex.send_owner_tx_v6(self.rpc, self.cfg, cd, gas, log=log, tag="v6"))
+        # ГАРД ОТСТАВАНИЯ УЗЛА (#129, боевой урок 16.08): читать состояние с узла, чья голова
+        # НИЖЕ блока нашей записи, нельзя — его «нет» это НЕЗНАНИЕ, а не факт. Балансируемый
+        # боевой RPC дал два ложных красных за один прогон деплоя. Прокидывается ОБЯЗАТЕЛЬНО:
+        # без head_fn модуль читает сразу и трактует отставание как «арм не сел» -> гасит огонь
+        # на живой доске.
+        head_fn = self._v6_head_fn or (lambda: int(self.rpc.block_number()))
+        return call_fn, send_fn, head_fn, addr
+
+    @staticmethod
+    def _v6_target(plan):
+        """План (сырые компоненты v5) -> ABI-цель v6. §6: дефолт repaidShares (seizedAssets=0),
+        то есть заявка ИНВАРИАНТНА к падению оракула — направлению каскада."""
+        import chain.board_v6 as _v6mod
+        return _v6mod.make_target(
+            plan["borrower"], repaid_shares=int(plan["repaid_shares"]),
+            swap_target=plan["router"], swap_calldata=plan["swap_calldata"],
+            min_profit=int(plan["min_profit"]),
+            unwrap_target=plan.get("unwrap_target") or _v6mod.ZERO_ADDR,
+            trigger_price=int(plan.get("trigger") or 0))
+
+    def _arm_board_v6(self, plan, mid, b, feed, debt=0.0, plan_ev=None, extra_plans=None):
+        """§2-§4: заармить ГРУППУ и навести на неё горячий указатель. Возврат: доска готова?
+
+        Отличия от v5-ветки, каждое из ТЗ:
+          * пишется ГРУППА (`setGroup`), а не один план — в ней от 1 до 8 целей ОДНОГО рынка;
+          * приёмка синхронная и ПО ЦЕПИ (`verify_arm`/`verify_hot` внутри board_v6): своего
+            треда `_verify_board` тут нет и быть не должно — арм признан только чтением;
+          * `until` указателя берётся С ЦЕПИ (min дедлайнов спана), а не из наших часов;
+          * `head_fn` прокинут, поэтому отставание узла даёт «состояние НЕИЗВЕСТНО», а не
+            ложное «арм не сел».
+
+        Зовётся ИЗ-ПОД `_board_lock` и из ФОНОВОГО треда прогрева (`_prearm_board`) — петля
+        окна на этих RTT не стоит. НАЗВАННЫЙ ПРЕДЕЛ: путь синхронный, и на зависшем узле он
+        держит `_board_lock` до таймаута квитанции; параллельные армы при этом не копятся —
+        они видят занятый лок и уходят (`acquire(blocking=False)` выше).
+        """
+        import chain.board_v6 as _v6mod
+        call_fn, send_fn, head_fn, addr = self._v6_io()
+        # ГАРД АДРЕСА (§0, шаг 4). Флаг включён, а LIQUIDATOR_ADDRESS остался на v5 — тогда
+        # setGroup ушёл бы в fallback v5, приёмка сказала бы «не сел», и три часа искали бы
+        # газ вместо опечатки в .env. Один eth_call, отказ ГРОМКИЙ.
+        if not _v6mod.is_v6_contract(call_fn, addr):
+            self.stats["board_v6_wrong_addr"] += 1
+            self.stats["board_fails"] += 1
+            self._log("SPECFIRE v6 ОТКАЗ: контракт %s не отвечает на hotInfo() — это НЕ v6. "
+                      "SPEC_FIRE_V6=1 при адресе v5: арм не пойдёт, огонь остаётся на V1"
+                      % str(addr)[:12])
+            return False
+        plans = [plan] + list(extra_plans or [])
+        targets = [self._v6_target(p) for p in plans]
+        # §9: цели одной группы делят пул -> minOut второй посчитан ДО свопа первой. Проверку
+        # ведёт board_v6 (два режима, #133); для группы из ОДНОЙ цели вопрос не стоит.
+        if len(targets) > 1:
+            # §9 (#133). Два режима, дефолт СТРОГИЙ (disjoint). Режим `same-pool` считает
+            # minOut каждой цели с запасом на n−1 предыдущих свопов ТОГО ЖЕ пула и требует
+            # трёх входов, которых в `plan` сегодня нет: пул цели, размер входа свопа и пол
+            # (repaid_assets+minProfit). Их обязан положить СБОРЩИК мультицелевой группы —
+            # ключи `pool` / `amount_in` / `floor`. Пусто = отказ ГРОМКИЙ (не тихий v5-minOut).
+            _pools = [p.get("pool") for p in plans]
+            _amts = [p.get("amount_in") for p in plans]
+            _flrs = [p.get("floor") for p in plans]
+            _qf = plans[0].get("quote_fn")
+            _v6mod.assert_group_min_out_safe(
+                _pools, amounts_in=None if any(x is None for x in _amts) else _amts,
+                floors=None if any(x is None for x in _flrs) else _flrs, quote_fn=_qf)
+        g = int(_v6mod.SPEC_FIRE_V6_GROUP)
+        dl = int(time.time()) + SPEC_FIRE_V2_PLAN_TTL_SEC
+        # Грубый гейт группы = МАКСИМУМ персональных порогов, но НУЛЬ, если хоть у одной цели
+        # порога нет: 0 значит «фильтра нет», и max затёр бы это в запрет для той самой цели,
+        # у которой мы не смогли посчитать границу здоровья (fail-open, как в v5).
+        _trigs = [int(t[7]) for t in targets]
+        gate = 0 if any(x == 0 for x in _trigs) else max(_trigs)
+        # §1: перезарядка группы ВНУТРИ живого спана ревертит HotSpanLive (гард в контракте).
+        # Штатный путь — снять указатель ПЕРЕД перезарядкой. Читаем состояние, а не гадаем:
+        # лишний clearHot стоит tx и nonce общего кошелька.
+        try:
+            rg0, rcnt, runtil = _v6mod.read_hot_info(call_fn, addr)
+            if rcnt and runtil > int(time.time()) and rg0 <= g < rg0 + rcnt:
+                self._log("SPECFIRE v6: указатель жив над группой %d — снимаем (clearHot) "
+                          "перед перезарядкой" % g)
+                send_fn(_v6mod.encode_clear_hot(), 80_000)
+        except Exception as e:
+            self._log("SPECFIRE v6: hotInfo не прочитан (%s) — перезарядка может законно "
+                      "откатиться HotSpanLive" % _diag(e))
+        ok, rec, why = _v6mod.arm_group(send_fn, call_fn, addr, g, plan["mp"], dl, gate,
+                                        targets, head_fn=head_fn)
+        if not ok:
+            return self._v6_arm_failed(feed, "setGroup", why)
+        ok_h, rec_h, why_h, until = _v6mod.set_hot_pointed(send_fn, call_fn, addr, g, 1,
+                                                           plan["mp"], head_fn=head_fn)
+        if not ok_h:
+            return self._v6_arm_failed(feed, "setHot", why_h)
+        # Доска признана боевой ТОЛЬКО здесь: обе записи прочитаны с цепи. Поэтому
+        # `verified=True` и `ready_at=сейчас` — окна оседания вслепую (v5) больше нет,
+        # мы уже ЗНАЕМ, что сторадж полон.
+        _left = max(0, int(until) - int(time.time()))
+        self._board = {"key": (mid, b), "armed_ts": self._now(), "debt": float(debt),
+                       "ev": plan_ev, "until": self._now() + _left - 30.0,
+                       "ready_at": self._now(), "verified": True,
+                       "tx": (rec or {}).get("transactionHash"), "dl": int(dl)}
+        self._board_v6 = {"g": g, "count": 1, "until": int(until), "dl": int(dl),
+                          "mp": plan["mp"],
+                          "slots": {(str(mid).lower(), str(t[0]).lower()): (g, i)
+                                    for i, t in enumerate(targets)}}
+        self.stats["board_arms"] += 1
+        self.stats["board_v6_arms"] += 1
+        self._log("SPECFIRE v6 доска armed feed=%s g=%d целей=%d %s/%s until=%d (%s; %s)" % (
+            feed, g, len(targets), str(mid)[:10], str(b)[:10], until, why, why_h))
+        return True
+
+    def _v6_arm_failed(self, feed, step, why):
+        """Разбор осечки v6-арма. ТРИ исхода, и мешать их нельзя.
+
+        «состояние НЕИЗВЕСТНО» (узел не дорос до блока нашей записи) — НЕ «арм не сел»: доска
+        могла сесть, и объявлять её мёртвой значит гасить огонь на живой. Огонь при этом всё
+        равно деградирует в V1 (незнание закрывает гард), но СЧЁТЧИК и ЖУРНАЛ обязаны назвать
+        разницу — иначе следующая сессия будет чинить газ вместо балансировщика RPC."""
+        unknown = "НЕИЗВЕСТНО" in str(why)
+        self.stats["board_v6_unknown" if unknown else "board_v6_unlanded"] += 1
+        self.stats["board_fails"] += 1
+        self._board = {}
+        self._board_v6 = {}
+        self._log("SPECFIRE v6 %s feed=%s: %s — %s" % (
+            step, feed, why,
+            "состояние НЕИЗВЕСТНО, доска снята консервативно, залп по V1" if unknown
+            else "не село, залп деградирует в V1"))
+        self._arm_retry(feed, "v6 %s: %s" % (step, why))
+        return False
+
+    def v6_on_liquidate(self, bn, liq_events):
+        """§7: ЧУЖАЯ ПОБЕДА по цели живой группы -> `clearTarget(g,i)`.
+
+        Труп в доске крадёт ~1/n огня группы (ротация старта смягчает, но не отменяет): в v5
+        протухшая цель стоила одного плана, в v6 стоит доли ВСЕЙ группы. Источник факта —
+        подписчик `Liquidate` фонового индекса (#110/#123), НЕ наш журнал: журнал знает лишь
+        про наши отправки, а забрать цель мог кто угодно.
+
+        Зовётся из треда индекса. Всё под except: прибор не имеет права ронять ни индекс, ни
+        огонь (канон «прибор висит СБОКУ от денежного пути»)."""
+        try:
+            import chain.board_v6 as _v6mod
+            if not _v6mod.v6_enabled():
+                return
+            st = self._board_v6 or {}
+            slots = st.get("slots") or {}
+            if not slots or not liq_events:
+                return
+            from chain.execute import _is_ours
+            call_fn, send_fn, _head_fn, addr = self._v6_io()
+            for ev in liq_events:
+                if not isinstance(ev, dict):
+                    continue                     # мусор не обрывает соседние события
+                key = (str(ev.get("mid") or "").lower(), str(ev.get("borrower") or "").lower())
+                gi = slots.get(key)
+                if gi is None:
+                    continue
+                caller = str(ev.get("caller") or "")
+                if _is_ours(caller, caller, self.cfg):
+                    # Взяли САМИ. Цель контракт уже погасил сам (`delete ts[i]` в fallback) —
+                    # тратить owner-tx не на что, но из раскладки её убрать надо.
+                    slots.pop(key, None)
+                    continue
+                g, i = gi
+                rec = send_fn(_v6mod.encode_clear_target(g, i), 80_000)
+                slots.pop(key, None)
+                self.stats["board_v6_cleared_targets"] += 1
+                self._log("SPECFIRE v6 §7 clearTarget(%d,%d) блок %d: цель %s/%s забрал %s "
+                          "tx=%s — труп больше не крадёт огонь группы" % (
+                              g, i, bn, key[0][:10], key[1][:10], caller[:12],
+                              str((rec or {}).get("transactionHash"))[:14]))
+        except Exception:
+            log.exception("v6 §7 clearTarget: прибор упал (индекс и огонь не затронуты)")
 
     def _verify_board(self, key, feed, txh, dl):
         """#84: ПОДТВЕРДИТЬ, что план ДЕЙСТВИТЕЛЬНО лежит в контракте.
@@ -1382,6 +1585,21 @@ class SpecFireLive:
             return False
         try:
             import chain.execute as _ex
+            import chain.board_v6 as _v6mod
+            if _v6mod.v6_enabled():
+                # #135: у v6 функции clearPlan НЕТ ВООБЩЕ — прежняя калдата ушла бы в fallback
+                # (4 байта > 1 => revert()) и «снятие доски» было бы молчаливой фикцией.
+                # Эквивалент снятия для мультислота — погасить УКАЗАТЕЛЬ: спан гаснет разом,
+                # пробы 0xFF становятся no-op'ом на двух SLOAD.
+                _cf, _sf, _hf, _addr = self._v6_io()
+                rec = _sf(_v6mod.encode_clear_hot(), 80_000)
+                h = (rec or {}).get("transactionHash")
+                self._board = {}
+                self._board_v6 = {}
+                self.stats["board_cleared"] = self.stats.get("board_cleared", 0) + 1
+                self._log("SPECFIRE v6 доска СНЯТА feed=%s %s/%s (%s) clearHot tx=%s" % (
+                    feed, mid[:10], b[:10], why, h))
+                return True
             cd = _ex.encode_clear_plan()
             h = (self._board_arm_fn or (lambda c, g, tag: _ex.send_board_tx(
                 self.rpc, self.cfg, c, g, log=log, tag=tag)))(cd, 120_000, "clearPlan")
@@ -2511,7 +2729,9 @@ class SpecFireLive:
         # v5 доска: план УЖЕ в контракте под ЭТУ цель и запись успела сесть -> ноги несут 1 байт
         # (цель не палится, газ калдаты ~в 200 раз меньше). Иначе — прежний полный calldata.
         board = self._board_live(mid, b)
-        _cd = _ex.V2_PROBE_CALLDATA if board else probe["calldata"]
+        # #135/§5: байт пробы зависит от флага (0x01 у v5, 0xFF = сентинел _hot у v6). Один
+        # источник истины — execute.probe_calldata(), тот же, которым подписаны лестницы.
+        _cd = _ex.probe_calldata() if board else probe["calldata"]
         _gas = SPEC_FIRE_V2_FIRE_GAS if board else probe["gas"]
         # ДВИЖОК ОГНЯ: план уже в контракте, значит пробе не нужен ни этот тик, ни эти треды —
         # тик лишь ПРОДЛЕВАЕТ право стрелять постоянному пулу. Порождать залп больше не нужно.

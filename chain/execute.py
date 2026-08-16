@@ -885,6 +885,117 @@ def send_board_tx(rpc, cfg, calldata: str, gas: int, log=None, tag="board"):
         return res["hash"]
 
 
+# --- v6-D4 (#135): owner-tx мультислота с ОБЩЕГО с ботом кошелька ---------------------------
+# Признаки КОЛЛИЗИИ NONCE у разных узлов/клиентов. Список — по НИЖНЕМУ регистру подстроки.
+# «replacement transaction underpriced» ловилось руками 16.08 при ручных tx владельца: бот
+# держит в мемпуле свою tx на том же nonce, и наша приходит ВТОРОЙ.
+_V6_NONCE_COLLISION = (
+    "replacement transaction underpriced",   # geth/reth: тот же nonce, цена не выше
+    "replacement gas too low",               # anvil/hardhat
+    "nonce too low",                         # номер уже израсходован
+    "already known",                         # тот же хэш уже в пуле
+    "known transaction",
+    "already imported",
+    "nonce has already been used",
+    "tx already in mempool",
+)
+
+
+def _is_nonce_collision(err) -> bool:
+    s = str(err).lower()
+    return any(p in s for p in _V6_NONCE_COLLISION)
+
+
+def send_owner_tx_v6(rpc, cfg, calldata: str, gas: int, log=None, tag="v6",
+                     tries: int = 8, receipt_timeout: float = 180.0, poll_sec: float = 0.4,
+                     wait: bool = True):
+    """v6-D4: управляющая tx владельца (setGroup / setHot / clearTarget / clearHot).
+
+    ДВА отличия от `send_board_tx` (v5), и оба — про то, что кошелёк владельца ОБЩИЙ с ботом:
+
+      1. **NONCE БЕРЁТСЯ PENDING С ЦЕПИ** (а не только из локального кэша): арм v6 идёт из
+         фонового треда прогрева и может разъехаться с боевым путём, который тем же ключом
+         шлёт выстрелы. Берём max(pending с цепи, локальный счётчик) — локальный знает про
+         наши уже разосланные, цепь знает про всё остальное.
+      2. **КОЛЛИЗИЯ ЧИНИТСЯ СЛЕДУЮЩИМ NONCE, А НИКОГДА ЦЕНОЙ.** Соблазн «подними tip и
+         перебей» здесь ЗАПРЕЩЁН: на том же nonce у нас может стоять СВОЯ БОЕВАЯ tx, и
+         перебить её значит выбросить выстрел ради арма. Приз дороже доски. Поэтому
+         maxFee/tip фиксируются ОДИН раз до цикла и в ретраях не трогаются вовсе.
+
+    Возврат: КВИТАНЦИЯ (dict с 'status'/'blockNumber'), а не хэш — приёмка §3 читается по
+    квитанции и по цепи («хэш tx — не эффект»). None = не ушла / квитанции нет.
+    """
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT > 0:
+            if log:
+                log.info("V6 %s: боевая tx в полёте — арм подождёт (у него TTL минуты)", tag)
+            return None
+    w3 = rpc._web3()
+    bot = account_for(w3, cfg.wallet_key).address
+    tip_wei = int(cfg.tip_gwei * 1e9)
+    from chain.hotpath import _fresh_basefee   # локально: hotpath тянет execute обратно
+    fb = _fresh_basefee()
+    if fb is None:
+        try:
+            fb = int(w3.eth.get_block("latest").get("baseFeePerGas") or 0)
+        except Exception:
+            fb = None
+    # ЦЕНА СЧИТАЕТСЯ ОДИН РАЗ И БОЛЬШЕ НЕ МЕНЯЕТСЯ (см. пункт 2 докстринга).
+    _fees = {} if fb is None else {"maxFeePerGas": int(fb * 2 + tip_wei),
+                                   "maxPriorityFeePerGas": tip_wei}
+    h = None
+    with _SEND_LOCK:
+        try:
+            n = max(int(_pending_nonce(w3, bot)), int(_LOCAL_NONCE.get(bot) or 0))
+        except Exception as e:
+            if log:
+                log.info("V6 %s: pending-nonce не прочитан (%s) — tx не отправлена",
+                         tag, type(e).__name__)
+            return None
+        for _k in range(max(1, int(tries))):
+            _tx = {"to": cfg.liquidator_address, "data": calldata, "nonce": n, "gas": int(gas)}
+            _tx.update(_fees)
+            try:
+                res = send_tx(rpc, cfg.wallet_key, _tx, wait=False, min_tip_wei=tip_wei)
+            except Exception as e:
+                if _is_nonce_collision(e):
+                    # Номер занят ЧУЖОЙ (нашей боевой) tx. Отходим на следующий свободный —
+                    # цену НЕ трогаем.
+                    if log:
+                        log.info("V6 %s: nonce %d занят (%s) -> пробуем %d, цена НЕ поднимается",
+                                 tag, n, type(e).__name__, n + 1)
+                    n += 1
+                    continue
+                _LOCAL_NONCE.pop(bot, None)   # неизвестно, съелся ли nonce -> ресинк с цепи
+                if log:
+                    log.info("V6 %s send fail: %s", tag, type(e).__name__)
+                return None
+            h = res.get("hash")
+            _LOCAL_NONCE[bot] = n + 1
+            break
+    if h is None:
+        if log:
+            log.info("V6 %s: свободный nonce не найден за %d попыток — tx НЕ отправлена "
+                     "(цену не поднимаем принципиально)", tag, tries)
+        return None
+    if not wait:
+        return {"transactionHash": h, "status": None, "blockNumber": None}
+    # Квитанция — ВНЕ _SEND_LOCK: ждать её под локом значило бы держать боевой путь.
+    _t0 = time.monotonic()
+    while time.monotonic() - _t0 < float(receipt_timeout):
+        try:
+            r = w3.eth.get_transaction_receipt(h)
+        except Exception:
+            r = None
+        if r:
+            return dict(r) if not isinstance(r, dict) else r
+        time.sleep(float(poll_sec))
+    if log:
+        log.info("V6 %s: квитанция не пришла за %.0fс — состояние НЕИЗВЕСТНО (не «не сел»)",
+                 tag, receipt_timeout)
+    return None
+
+
 def canary_invalidate_nonce(rpc, cfg):
     """Канарейка не замайнилась за timeout (возможно дропнута) -> _LOCAL_NONCE впереди чейна ->
     следующая tx уйдёт в дыру. Инвалидируем (как timeout-ветка dispatch, II нонс-фикс)."""
@@ -1407,6 +1518,14 @@ def ladder_resign_needed(addr: str, base_fee: int, tip_wei: int) -> bool:
     _st_tip = st.get("tip")
     if _st_tip is None or int(_st_tip) != int(tip_wei):
         return True
+    # #135/§5: БАЙТ ПРОБЫ тоже запечён в подпись, и его расхождение с нынешним флагом —
+    # САМОСТОЯТЕЛЬНЫЙ триггер. Иначе смена SPEC_FIRE_V6 оставляла бы флот с лестницами под
+    # чужой контракт: 110 ног стреляют, ни одна не попадает, счётчик проб при этом РАСТЁТ —
+    # ровно класс «мёртвый прибор с живым числом». Отсутствие поля = байт неизвестен =
+    # протухла (незнание закрывает гард; в живом процессе поле ставится всегда).
+    _st_cd = st.get("cd")
+    if _st_cd is None or _st_cd != probe_calldata():
+        return True
     want = int(base_fee) * _VOLLEY_PRESIGN_MAXFEE_MULT + int(tip_wei)
     have = int(st.get("max_fee") or 0)
     if want <= 0:
@@ -1512,11 +1631,14 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
     if base_fee is None:
         base_fee = int(w3.eth.get_block("latest").get("baseFeePerGas") or 0)
     max_fee = base_fee * _VOLLEY_PRESIGN_MAXFEE_MULT + tip_wei
+    # #135/§5: байт пробы — ЧАСТЬ ФОРМЫ лестницы (он запечён в подпись). Снимается ОДИН раз на
+    # проход: смена флага в середине подписи дала бы лестницу из двух разных байтов.
+    _cd_byte = probe_calldata()
 
     def _sign_run(n0, count):
         out = []
         for i in range(count):
-            t = {"from": addr, "to": cfg.liquidator_address, "data": V2_PROBE_CALLDATA,
+            t = {"from": addr, "to": cfg.liquidator_address, "data": _cd_byte,
                  "nonce": n0 + i, "gas": int(gas), "chainId": rpc.chain_id,
                  "maxFeePerGas": max_fee, "maxPriorityFeePerGas": tip_wei}
             signed = acct.sign_transaction(t)
@@ -1536,7 +1658,11 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
         # текущего, но и не абсурдно выше: сильно подорожавшую пересобираем по нынешней цене.
         _latched = bool(st and max_fee > 0
                         and int(st["max_fee"]) > int(max_fee) * _VOLLEY_MAXFEE_RESIGN_MULT)
-        compat = bool(st and st["gas"] == int(gas) and st["max_fee"] >= max_fee and not _latched)
+        # #135: БАЙТ — часть формы. Лестница, подписанная под 0x01, на контракте v6 — это 110
+        # ног, стреляющих в никуда (v6 читает 0x01 как «явная группа 0», а при флаге мы целим
+        # спан через _hot). Долив такой лестницы смешал бы два байта в одном складе.
+        compat = bool(st and st["gas"] == int(gas) and st["max_fee"] >= max_fee and not _latched
+                      and st.get("cd") == _cd_byte)
         if _latched and log:
             log.info("VOLLEY лестница %s: max_fee %.4f gwei против нынешних %.4f — пересборка "
                      "(иначе гейт патрона держал бы ногу немой до рестарта)",
@@ -1663,7 +1789,7 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
         # #127: "tip" — часть формы лестницы. Аудит цены сверяет его с тиром ноги и триггерит
         # пересборку при расхождении (полоса max_fee разницу тиров ±2M wei не видит).
         _VOLLEY_LADDER[addr] = {"q": list(signed), "gas": int(gas), "max_fee": max_fee,
-                                "tip": tip_wei, "ts": time.monotonic()}
+                                "tip": tip_wei, "cd": _cd_byte, "ts": time.monotonic()}
         _VOLLEY_NONCE[addr] = nxt     # локальный счётчик и лестница выходят из одной точки
         if log:
             log.info("VOLLEY лестница %s: %d проб с nonce %d, maxFee %.4f gwei",
@@ -2559,6 +2685,30 @@ _PLAN_INFO_SIG = "planInfo()"
 # Проба-доска: <=1 байта калдаты падает в fallback() контракта. Один байт, не ноль — нулевая
 # калдата у многих кошельков/релеев трактуется как простой перевод ETH.
 V2_PROBE_CALLDATA = "0x01"
+# v6-D4 §5: СЕНТИНЕЛ ГОРЯЧЕГО УКАЗАТЕЛЯ. У v6 байт 0x01..0x08 — ЯВНАЯ группа (дрели, прямой
+# огонь), а 0xFF означает «группу возьми из _hot». Дефолт боевых лестниц — сентинел: статическое
+# разбиение ног по группам делило бы плотность на 8 ровно в том звене, которое сейчас связывает.
+V6_PROBE_CALLDATA = "0xFF"
+
+
+def probe_calldata() -> str:
+    """Байт пробы ПРЕДПОДПИСАННОЙ ноги: 0x01 (v5) либо 0xFF (v6, §5).
+
+    Флаг читается ДИНАМИЧЕСКИ (атрибут модуля board_v6), а не копируется в константу при
+    импорте: стенд обязан уметь поставить ОБЕ полярности в одном процессе и сравнить их
+    ИСПОЛНЕНИЕМ. В бою флаг берётся из окружения один раз при импорте board_v6.
+
+    БАЙТ ЗАПЕЧЁН В ПОДПИСЬ. Поэтому смена флага в живом процессе сама по себе лестницы не
+    меняет — их протухание ловит `ladder_resign_needed` по полю "cd" (см. там). Штатный путь
+    смены — рестарт в тишине (§0, шаг 4).
+    """
+    try:
+        import chain.board_v6 as _b6
+        return V6_PROBE_CALLDATA if _b6.SPEC_FIRE_V6 else V2_PROBE_CALLDATA
+    except Exception:
+        # Обвязка v6 не импортируется => флаг взять неоткуда => v6 не армится ничем =>
+        # единственный БЕЗОПАСНЫЙ байт — прежний (незнание закрывает гард).
+        return V2_PROBE_CALLDATA
 
 
 def encode_set_plan(mp: dict, borrower: str, repaid_shares: int, swap_target: str,

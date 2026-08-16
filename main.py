@@ -777,6 +777,24 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                             log.info("#54 книжка выручки проб АРМИРОВАНА (kill-switch видит победы)")
                         except Exception:
                             log.exception("#54 книжка выручки: арм не удался — выручка невидима, огонь не тронут")
+                        # #135/§7: чужая победа по цели ЖИВОЙ ГРУППЫ v6 -> clearTarget(g,i).
+                        # Арм ЯВНЫЙ и только здесь (канон notify_fn); при SPEC_FIRE_V6=0
+                        # подписчик не ставится ВООБЩЕ, и путь #123 остаётся бит-в-бит.
+                        # Осечка арма = трупы копятся в группе, но огонь не тронут.
+                        try:
+                            import chain.board_v6 as _v6m135
+                            if _v6m135.v6_enabled():
+                                _idx135 = chain_index.get_index()
+                                if _idx135 is not None:
+                                    _idx135.add_on_liquidate(_sfl.v6_on_liquidate)
+                                    log.warning("#135 v6 §7 clearTarget АРМИРОВАН: чужая победа "
+                                                "по цели группы -> clearTarget (труп крадёт 1/n огня)")
+                                else:
+                                    log.warning("#135 v6 §7 НЕ армирован: индекса цепи нет — "
+                                                "трупы будут копиться в группе")
+                        except Exception:
+                            log.exception("#135 v6 §7: арм не удался — гигиена группы мертва, "
+                                          "огонь не затронут")
                         _handlers.append(_sfl.handle_event)
                         from chain.failover import set_windows_probe
                         set_windows_probe(lambda: len(_sfl._windows))   # назад-свитч не посреди окна
