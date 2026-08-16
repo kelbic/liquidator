@@ -1254,7 +1254,7 @@ class ChainIndex:
             need_full = (interesting and CHAIN_INDEX_FULL_ON_LOGS) or self._want_full()
         if not need_full:
             # Логи блока всё равно разобраны: трупы (#108) не зависят от полного чтения.
-            self._ingest(bn, {}, full=False, pairs=parsed["pairs"])
+            self._ingest(bn, {}, full=False, pairs=parsed["pairs"], liq=parsed["liquidate"])
             self.stats["light"] += 1
             return {}
         blk = self._rpc("eth_getBlockByNumber", [hex(bn), True])
@@ -1324,7 +1324,7 @@ class ChainIndex:
             else:
                 self._pairs[k] = (prev[0] + v[0], max(prev[1], v[1]), max(prev[2], bn))
 
-    def _ingest(self, bn, facts, full, pairs=None):
+    def _ingest(self, bn, facts, full, pairs=None, liq=None):
         """Положить факты блока в память и подвинуть учёт покрытия."""
         now = self._now()
         with self._lock:
@@ -1381,15 +1381,19 @@ class ChainIndex:
             self.stats["blocks"] += 1
             self._trim()
         # #123: подписчик Liquidate — СНАРУЖИ лока (прибор не имеет права держать индекс) и под
-        # except (не имеет права его ронять). Только полные сканы: на лёгких логи не разобраны.
+        # except (не имеет права его ронять). Победы берутся из facts["winners"] (полный скан)
+        # либо из liq (лёгкий скан: parse_logs отработал, блок целиком не читан) — подписчик
+        # НЕ зависит от CHAIN_INDEX_FULL_ON_LOGS. Ключа "liquidate" в facts не существует:
+        # прежнее чтение facts.get("liquidate") держало подписчика мёртвым с рождения при
+        # живом счётчике побед — тот питается этим же winners (вскрытие 16.08, cbADA 50023720:
+        # отказ 23:33:05.9 + чужая победа 23:33:07 в TTL-окне, алерта нет, срабатываний 0).
         _cb = self._on_liquidate
-        if _cb is not None and full and facts:
-            _liq = facts.get("liquidate") or []
-            if _liq:
-                try:
-                    _cb(bn, _liq)
-                except Exception:
-                    log.exception("CHAIN-INDEX on_liquidate: колбэк упал (индекс жив)")
+        _liq = (facts.get("winners") if facts else None) or liq or []
+        if _cb is not None and _liq:
+            try:
+                _cb(bn, _liq)
+            except Exception:
+                log.exception("CHAIN-INDEX on_liquidate: колбэк упал (индекс жив)")
         # #104: подписчик транзитов (tip зеркала) — тот же канон, что и #123.
         _cbt = self._on_transit
         if _cbt is not None and full and facts:

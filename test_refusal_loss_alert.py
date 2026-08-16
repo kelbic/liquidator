@@ -111,6 +111,41 @@ check("проводка: net-below-min пишет отказ", '_note_refusal(ma
 check("проводка: fast-net пишет отказ", '_note_refusal(market_id, borrower, "fast-net-below-min"' in src_hot)
 src_idx = open(os.path.join(os.path.dirname(hp.__file__), "chain_index.py")).read()
 check("проводка: индекс зовёт подписчика в _ingest", "_cb(bn, _liq)" in src_idx and "set_on_liquidate" in src_idx)
+
+# --- 7б. ШОВ ИСПОЛНЕНИЕМ, а не строкой (вскрытие 16.08: подписчик читал facts["liquidate"],
+# ключа в facts не существовало — прибор мёртв с рождения при зелёной строковой проводке выше
+# и живом счётчике побед). Гоняем НАСТОЯЩИЙ шов: parse_logs/build_facts -> ChainIndex._ingest
+# (не реплику его выражения!) -> подписчик. Оба режима скана.
+from chain import chain_index as _ci
+_mid66 = "0x" + "d7" * 32
+_bor = "0x" + "00" * 12 + "b0" * 20
+_raw_log = {"address": "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",
+            "topics": [_ci.MORPHO_LIQUIDATE_TOPIC,
+                       _mid66, "0x" + "00" * 12 + "ca" * 20, _bor],
+            "data": "0x" + "00" * 320, "transactionHash": "0x" + "ee" * 32,
+            "blockNumber": "0x1", "transactionIndex": "0x5", "logIndex": "0x0"}
+_blk = {"number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x0",
+        "transactions": [{"hash": "0x" + "ee" * 32, "transactionIndex": "0x5",
+                          "maxPriorityFeePerGas": "0xf4240", "maxFeePerGas": "0xf4240",
+                          "gas": "0x5208", "from": "0x" + "ca" * 20, "to": "0x" + "aa" * 20,
+                          "input": "0x", "nonce": "0x0", "value": "0x0"}]}
+_facts_full = _ci.build_facts(_blk, [_raw_log], watch_to=())
+_parsed = _ci.parse_logs([_raw_log])
+for _tag, _facts, _full, _liq_kw in (("полный", _facts_full, True, None),
+                                     ("лёгкий", {}, False, _parsed["liquidate"])):
+    hp._REFUSAL_REG.clear()
+    del hp._RECENT_LIQ[:]          # кольцо глобально: победа прошлой итерации гасила бы регистр
+    hp._note_refusal(_mid66, "0x" + "b0" * 20, "stand-seam", 50.0)
+    _al2 = FakeAlerter()
+    _idx = _ci.ChainIndex(url="http://stub.invalid")
+    _idx.set_on_liquidate(hp.make_refusal_loss_watcher(_al2, FakeCfg()))
+    if _liq_kw is None:                  # полный скан зовётся как в бою — без liq: на базе
+        _idx._ingest(1, _facts, _full)   # ред.до-фикса это даёт ТИХОЕ молчание, не TypeError
+    else:
+        _idx._ingest(1, _facts, _full, liq=_liq_kw)
+    check("шов исполнением (%s скан): отказ+победа через настоящий _ingest дают алерт" % _tag,
+          bool(_al2.sent), "facts_keys=%r sent=%r" % (sorted((_facts or {}).keys()), _al2.sent[:1]))
+hp._REFUSAL_REG.clear()
 src_main = open(os.path.join(os.path.dirname(os.path.dirname(hp.__file__)), "main.py")).read()
 check("проводка: арм ЯВНЫЙ в main.py", "set_on_liquidate" in src_main and "make_refusal_loss_watcher" in src_main)
 
