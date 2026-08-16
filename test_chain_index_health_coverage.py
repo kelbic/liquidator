@@ -161,9 +161,14 @@ print("UNIT_OK: пропуск догона ПО УСТУПКЕ (%d) назва�
 # МУТАЦИЯ М3: вернуть слияние причин (как было в р-5) — «ЧИТАЮ ЦЕПЬ» обязано исчезнуть.
 _sv_ing = ci.ChainIndex._ingest
 try:
-    def _ingest_merge(self, bn, facts, full, pairs=None):
+    def _ingest_merge(self, *a, **kw):
+        # СИГНАТУРО-НЕЗАВИСИМАЯ обёртка (16.08): раньше здесь стояла копия сигнатуры
+        # `(self, bn, facts, full, pairs=None)`, и добавление боевого аргумента `liq=` (#131,
+        # подписчик Liquidate на лёгком скане) роняло КАЖДЫЙ скан по TypeError. Стенд краснел
+        # «мутация не сработала» при том, что мутация не исполнялась вовсе — ложный красный,
+        # маскирующий настоящую проверку. Обёртка обязана пропускать аргументы как есть.
         self._skip_shed = False        # причина пропуска стёрта: всякая дыра считается дырой узла
-        return _sv_ing(self, bn, facts, full, pairs=pairs)
+        return _sv_ing(self, *a, **kw)
 
     ci.ChainIndex._ingest = _ingest_merge
     _i2, _l2, _ok2, _fr2, _st2 = drill(shed_fn=lambda t: (t % 100.0) < 40.0)
