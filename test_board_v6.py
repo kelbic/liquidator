@@ -272,6 +272,58 @@ def test_clear_and_batch_encoders():
     assert ok is True and len(addrs) == 2
 
 
+
+def test_lag_guard_no_false_negative_on_stale_node():
+    """БОЕВОЙ УРОК 16.08 (два ложных красных за один прогон деплоя): чтение состояния сразу за
+    квитанцией попадало на отставший узел балансировщика, и севший арм/указатель читался как
+    «не сел». В бою цена такой ошибки несимметрична — ложное «доска не armed» ГАСИТ огонь.
+
+    Красный-на-базе: без гарда те же входные данные дают ok=False.
+    """
+    land = 1000
+    rec = {"status": 1, "blockNumber": land}
+
+    # узел отстал на 2 блока, затем догоняет (как в бою)
+    head = {"n": land - 2}
+    def head_fn():
+        head["n"] += 1
+        return head["n"]
+
+    seen = {"reads": 0}
+    def call_fn(to, data):
+        seen["reads"] += 1
+        # состояние ВЕРНОЕ: узел, доросший до блока записи, отдаёт наш арм
+        if data.startswith("0x" + b.selector("groupInfo").hex()):
+            return abi_encode(["address", "uint64", "uint256", "uint8"],
+                              ["0x" + "11" * 20, 777, 0, 1])
+        return abi_encode(["address", "uint128", "uint128", "uint256"],
+                          ["0x" + "b0" * 20, 1, 0, 0])
+
+    ok, why = b.verify_arm(call_fn, "0x" + "cc" * 20, 0, rec, 777, ["0x" + "b0" * 20],
+                            head_fn=head_fn)
+    assert ok, "гард не дождался головы узла: %s" % why
+    assert head["n"] >= land, "чтение пошло РАНЬШЕ блока записи (гард не сработал)"
+
+    # ПОЗИТИВНЫЙ КОНТРОЛЬ ГАРДА: узел, который НИКОГДА не догоняет, обязан дать ГРОМКОЕ незнание,
+    # а не «арм не сел» — и не молчаливое True.
+    ok2, why2 = b.verify_arm(call_fn, "0x" + "cc" * 20, 0, rec, 777, ["0x" + "b0" * 20],
+                              head_fn=lambda: land - 5)
+    assert not ok2 and "НЕИЗВЕСТНО" in why2, "вечно отстающий узел должен давать незнание: %s" % why2
+
+
+def test_lag_guard_hot_pointer():
+    """То же для указателя: hotInfo читается не раньше блока записи setHot."""
+    rec = {"status": 1, "blockNumber": 500}
+    def call_fn(to, data):
+        return abi_encode(["uint8", "uint8", "uint64"], [0, 1, 12345])
+    ok, why = b.verify_hot(call_fn, "0x" + "cc" * 20, 0, 1, 12345,
+                            our_receipt=rec, head_fn=lambda: 500)
+    assert ok, why
+    ok2, why2 = b.verify_hot(call_fn, "0x" + "cc" * 20, 0, 1, 12345,
+                              our_receipt=rec, head_fn=lambda: 499)
+    assert not ok2 and "НЕИЗВЕСТНО" in why2, why2
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":

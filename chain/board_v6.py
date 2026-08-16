@@ -21,6 +21,7 @@ I/O ИНЖЕКТИРУЕТСЯ: функции цепи берут `call_fn(to, 
 параметрами. Это делает приёмку §3/§4 тестируемой без форка и разводит логику с транспортом
 (транспорт — send_board_tx образца v5; проводку делает сессия при переключении).
 """
+import time
 import os
 from eth_abi import encode as _abi_encode
 from eth_abi import decode as _abi_decode
@@ -298,7 +299,31 @@ def status_of(receipt) -> int:
     return int(s, 16) if isinstance(s, str) else int(s)
 
 
-def verify_arm(call_fn, addr, g, our_receipt, expected_deadline, borrowers):
+def _await_head(head_fn, min_block, tries=15, sleep_fn=None):
+    """ГАРД ОТСТАВАНИЯ УЗЛА перед чтением состояния (боевой урок 16.08, ДВА ложных красных за
+    один прогон деплоя: авторизация 110 ног прочиталась как «107 из 110», а севший `setHot`
+    (status=1, газ 61 887) — как «указатель не сел»). Боевой RPC балансируется, и чтение сразу
+    за квитанцией попадает на узел, отставший на блок.
+
+    Отрицательный ответ узла, ГОЛОВА которого ниже блока нашей записи, — это НЕЗНАНИЕ, а не
+    факт. В бою цена ошибки несимметрична: ложное «арм не сел» гасит огонь на живой доске.
+    Возврат: True — голова доросла (читать можно), False — узел так и не догнал.
+    """
+    if head_fn is None or min_block is None:
+        return True
+    _sleep = sleep_fn or time.sleep
+    for _ in range(int(tries)):
+        try:
+            if int(head_fn()) >= int(min_block):
+                return True
+        except Exception:
+            pass
+        _sleep(1.0)
+    return False
+
+
+def verify_arm(call_fn, addr, g, our_receipt, expected_deadline, borrowers,
+               head_fn=None):
     """§3: армленная группа засчитывается ТОЛЬКО если ОБА доказательства с НАШЕЙ tx:
       1) квитанция НАШЕГО хэша status==1;
       2) groupInfo(g).deadline == НАШ deadline И groupInfo(g).n == число отправленных целей,
@@ -308,6 +333,10 @@ def verify_arm(call_fn, addr, g, our_receipt, expected_deadline, borrowers):
     """
     if status_of(our_receipt) != 1:
         return False, "квитанция НАШЕЙ tx status!=1 (арм сгорел/не сел, #84) — доска НЕ armed"
+    land = (our_receipt or {}).get("blockNumber")
+    if not _await_head(head_fn, land):
+        return False, ("узел не дорос до блока записи %s — состояние НЕИЗВЕСТНО (не читаем "
+                       "отставший узел как «арм не сел»)" % land)
     oracle, dl, gate, n = read_group_info(call_fn, addr, g)
     if int(dl) != int(expected_deadline):
         return False, ("groupInfo.deadline=%d != наш deadline=%d (чужой слот/протухший переарм)"
@@ -322,8 +351,14 @@ def verify_arm(call_fn, addr, g, our_receipt, expected_deadline, borrowers):
     return True, "арм сел по цепи: deadline+n+%d borrower'ов совпали" % len(borrowers)
 
 
-def verify_hot(call_fn, addr, g0, count, until):
-    """§8.2: указатель сел и наведён верно — hotInfo() == наши g0/count/until (с цепи)."""
+def verify_hot(call_fn, addr, g0, count, until, our_receipt=None, head_fn=None):
+    """§8.2: указатель сел и наведён верно — hotInfo() == наши g0/count/until (с цепи).
+
+    Читаем не раньше блока нашей записи (см. `_await_head`): 16.08 севший setHot прочитался
+    как (0,0,0) с отставшего узла балансировщика."""
+    land = (our_receipt or {}).get("blockNumber") if our_receipt else None
+    if not _await_head(head_fn, land):
+        return False, ("узел не дорос до блока записи %s — состояние указателя НЕИЗВЕСТНО" % land)
     rg0, rcnt, runtil = read_hot_info(call_fn, addr)
     if (rg0, rcnt, runtil) != (int(g0), int(count), int(until)):
         return False, ("hotInfo()=(%d,%d,%d) != наш (%d,%d,%d)"
@@ -438,7 +473,7 @@ def choose_eviction(slots, incoming_ev, *, ev_margin=EV_MARGIN):
 # ОРКЕСТРАЦИЯ (I/O инжектируется). Транспорт — образец send_board_tx v5; проводит сессия.
 # ==================================================================================================
 def arm_group(send_fn, call_fn, addr, g, mp, deadline, gate_trigger, targets, *,
-              route_bytes=None, gas=None):
+              route_bytes=None, gas=None, head_fn=None):
     """Заармить группу и ПОДТВЕРДИТЬ по цепи (§3). send_fn(calldata, gas)->receipt (квитанция
     НАШЕГО хэша), call_fn(to,data)->bytes. Возврат (ok, receipt, reason). НЕ признаёт арм по хэшу.
     """
@@ -448,11 +483,11 @@ def arm_group(send_fn, call_fn, addr, g, mp, deadline, gate_trigger, targets, *,
         gas = arm_gas_limit(len(targets), rb)
     rec = send_fn(cd, gas)
     borrowers = [t[0] for t in targets]
-    ok, reason = verify_arm(call_fn, addr, g, rec, deadline, borrowers)
+    ok, reason = verify_arm(call_fn, addr, g, rec, deadline, borrowers, head_fn=head_fn)
     return ok, rec, reason
 
 
-def set_hot_pointed(send_fn, call_fn, addr, g0, count, mp, *, gas=None):
+def set_hot_pointed(send_fn, call_fn, addr, g0, count, mp, *, gas=None, head_fn=None):
     """§4: навести указатель на спан [g0,g0+count). until берётся С ЦЕПИ (min дедлайнов спана),
     mpHash — от армленных параметров. Подтверждение по цепи (verify_hot). Возврат (ok, receipt,
     reason, until)."""
@@ -463,5 +498,5 @@ def set_hot_pointed(send_fn, call_fn, addr, g0, count, mp, *, gas=None):
     rec = send_fn(cd, gas if gas is not None else 200_000)
     if status_of(rec) != 1:
         return False, rec, "setHot квитанция status!=1 (until>deadline спана? отпечаток?)", until
-    ok, reason = verify_hot(call_fn, addr, g0, count, until)
+    ok, reason = verify_hot(call_fn, addr, g0, count, until, our_receipt=rec, head_fn=head_fn)
     return ok, rec, reason, until
