@@ -3141,16 +3141,22 @@ class SpecFireLive:
             # неотличима от «окно было пустым».
             try:
                 from chain.execute import (volley_probe_skips, volley_maxfee_muted,
-                                            volley_budget_skips)
+                                            volley_budget_skips, volley_pacer_stats)
                 _fs, _us = volley_probe_skips()
                 _mm = len(volley_maxfee_muted())
                 # #132: немота ПО БЮДЖЕТУ тира — отдельное число. До этого отказ был немым и
                 # тонул в skipped_dry вместе со «склад пуст»; в каскаде (всплеск базы) он
                 # приходит первым и гасит половину флота.
                 _rs, _ifs = volley_budget_skips()
+                # #136: пейсер+spill рассылки. pacer_dry (нет токенов, спилл без сети) и
+                # transport_reject («over rate limit») РАЗДЕЛЬНО — без числа немота эндпоинта
+                # неотличима от «склад пуст», ровно как бюджетная (#132).
+                _pdry, _pspill, _prej = volley_pacer_stats()
             except Exception:
                 _fs = _us = _mm = -1
                 _rs = _ifs = -1
+                _pdry = _pspill = {}
+                _prej = -1
             if _mm > 0 and self._alert is not None:
                 # У2 (решение kelbic 09.08): немота ног по комиссии = состояние, которое
                 # само не рассосётся (долив или ручка MAXFEE_RESERVE_MULT) и которое иначе
@@ -3188,10 +3194,12 @@ class SpecFireLive:
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
                       "budget_reserve_skips=%d budget_inflight_skips=%d "
+                      "pacer_dry=%s spill_sent=%s transport_reject=%d "
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _fs, _us, _mm, _rs, _ifs, _es or "—", _cs or "—", _is,
+                          _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej,
+                          _es or "—", _cs or "—", _is,
                           ("%s/%s" % (_wkey[0][:10], _wkey[1][:10])) if _wkey else "НЕТ",
                           _pw, self.stats))
 

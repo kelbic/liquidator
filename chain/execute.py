@@ -1884,39 +1884,99 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
     # пред-подписанной пробы известен из подписи, поэтому ответ Alchemy не нужен ВООБЩЕ.
     # Отсюда потолок: 16 тредов x 1/0.0325 = ~493 отправки/с = ~986 проб/блок против прежних
     # 267 (насыщение окна победы — 1480).
-    try:
-        _seq = None
-        for _u in (broadcast_raw_urls or []):
-            _seq = _u
-            break
-        if _seq is not None:
-            ok, err = _post_raw_sync(_seq, raw_hex)
-            if not ok:
-                raise RuntimeError(err or "sequencer post failed")
+    # #136: обход ВСЕХ каналов по порядку. HEAD брал только broadcast_raw_urls[0]; теперь на
+    # каждом канале try-take из его ведра -> отправка, spill на следующий И при pacer_dry, И при
+    # «over rate limit» (повтор тех же подписанных байт на другом канале идемпотентен). Каждый
+    # канал пробуется максимум один раз. Все отказали -> запись В НАЧАЛО очереди (как HEAD).
+    if not _VOLLEY_PACER_ON:
+        # ---- ОТКАТ (VOLLEY_PACER=off): путь HEAD БИТ-В-БИТ (первый url, одна попытка, без вёдер).
+        try:
+            _seq = None
+            for _u in (broadcast_raw_urls or []):
+                _seq = _u
+                break
+            if _seq is not None:
+                ok, err = _post_raw_sync(_seq, raw_hex)
+                if not ok:
+                    raise RuntimeError(err or "sequencer post failed")
+            else:
+                rpc._web3().eth.send_raw_transaction(raw_hex)
+        except Exception as e:
+            _msg = str(e).lower()
+            if "already known" not in _msg and "nonce too low" not in _msg:
+                with lk:                      # НЕ пропускаем nonce: дыра повесит всю ногу
+                    st = _VOLLEY_LADDER.get(addr)
+                    if st is not None:
+                        st["q"].insert(0, (nonce, raw_hex, h))
+                if log:
+                    # #104: контекст ОТКАЗА, чтобы боевое окно САМО было замером и дрель не
+                    # требовалась. Питоновский логгер уже даёт миллисекунды, поэтому связка
+                    # (мс, тред, нога, nonce) позволяет ПОСЧИТАТЬ мгновенную интенсивность и
+                    # форму трафика: пачка это или поток, сколько ног в пиковом окне, растёт ли
+                    # очередь будущих nonce. Без этого мы считали отказы посекундными вёдрами и
+                    # чуть не приняли пик 193/с за истину — при том что 193 отказа за 50мс это
+                    # 3860/с. Секвенсер режет по ПИКУ, а среднее за секунду его не описывает.
+                    log.info("VOLLEY лестница %s: рассылка не удалась (%s), запись возвращена"
+                             " [nonce=%d тред=%s глубина=%d]",
+                             addr[:10], _send_fail_diag(e), int(nonce),
+                             threading.current_thread().name, ladder_depth(addr))
+                return None
+            # «already known»/«nonce too low» — байты УЖЕ у секвенсера (SEND-3 обогнал):
+            # запись потрачена по назначению, возвращать её нельзя.
+    else:
+        # ---- ПЕЙСЕР+SPILL: каждый канал ровно раз; первый — первичное ведро, остальные — запасное.
+        _urls = list(broadcast_raw_urls or [])
+        _sent = False
+        _terminal = False           # байты уже у ордерера (already known/nonce too low): потрачено
+        _last_err = None
+        if _urls:
+            for _i, _u in enumerate(_urls):
+                if _i == 0:
+                    # первичный канал (секвенсер): дефолты пейсера (_PACER_RATE/_PACER_BURST) —
+                    # вызов БИТ-В-БИТ как в HEAD (_post_raw_sync(url, raw_hex)), чтобы транспортные
+                    # стенды с сигнатурой (url, raw_hex, timeout) не ломались, а spill (idx>0)
+                    # шёл своей полосой.
+                    ok, err = _post_raw_sync(_u, raw_hex)
+                else:
+                    ok, err = _post_raw_sync(_u, raw_hex, paced=True,
+                                             rate=_SPILL_RATE, burst=_SPILL_BURST)
+                if ok:
+                    _sent = True
+                    if _i > 0:
+                        _pacer_note_spill(_u)      # доставлено ЗАПАСНЫМ каналом
+                    break
+                _e = (err or "").lower()
+                if "already known" in _e or "nonce too low" in _e:
+                    _terminal = True               # потрачено по назначению — не возвращаем
+                    break
+                if err == "pacer_dry":
+                    _pacer_note_dry(_u)            # сухо: спилл без сети (причина РАЗДЕЛЬНО от reject)
+                else:
+                    _pacer_note_reject()          # «over rate limit» и пр. — сетевой отказ
+                _last_err = err
+                # spill на следующий канал (та же подписанная tx идемпотентна)
         else:
-            rpc._web3().eth.send_raw_transaction(raw_hex)
-    except Exception as e:
-        _msg = str(e).lower()
-        if "already known" not in _msg and "nonce too low" not in _msg:
+            try:
+                rpc._web3().eth.send_raw_transaction(raw_hex)
+                _sent = True
+            except Exception as e:
+                _e = str(e).lower()
+                if "already known" in _e or "nonce too low" in _e:
+                    _terminal = True
+                else:
+                    _last_err = str(e)
+        if not _sent and not _terminal:
             with lk:                      # НЕ пропускаем nonce: дыра повесит всю ногу
                 st = _VOLLEY_LADDER.get(addr)
                 if st is not None:
                     st["q"].insert(0, (nonce, raw_hex, h))
             if log:
-                # #104: контекст ОТКАЗА, чтобы боевое окно САМО было замером и дрель не
-                # требовалась. Питоновский логгер уже даёт миллисекунды, поэтому связка
-                # (мс, тред, нога, nonce) позволяет ПОСЧИТАТЬ мгновенную интенсивность и
-                # форму трафика: пачка это или поток, сколько ног в пиковом окне, растёт ли
-                # очередь будущих nonce. Без этого мы считали отказы посекундными вёдрами и
-                # чуть не приняли пик 193/с за истину — при том что 193 отказа за 50мс это
-                # 3860/с. Секвенсер режет по ПИКУ, а среднее за секунду его не описывает.
+                # #104: тот же контекст (мс/тред/нога/nonce/глубина) — боевое окно САМО замер.
                 log.info("VOLLEY лестница %s: рассылка не удалась (%s), запись возвращена"
                          " [nonce=%d тред=%s глубина=%d]",
-                         addr[:10], _send_fail_diag(e), int(nonce),
-                         threading.current_thread().name, ladder_depth(addr))
+                         addr[:10], _send_fail_diag(RuntimeError(_last_err or "все каналы сухи/отказ")),
+                         int(nonce), threading.current_thread().name, ladder_depth(addr))
             return None
-        # «already known»/«nonce too low» — байты УЖЕ у секвенсера (SEND-3 обогнал):
-        # запись потрачена по назначению, возвращать её нельзя.
     with lk:
         _VOLLEY_NONCE[addr] = nonce + 1
         if addr in _VOLLEY_MAXFEE_MUTE:
@@ -1941,10 +2001,76 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
     return h
 
 
-def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5):
+# --- #136: token-bucket ПО ЭНДПОИНТУ (proxyd секвенсера режет «over rate limit» ПО ПИКУ: лимитер
+# фикс-окна ~2с = блок Base; пачка в голове блока выжигает квоту за ~0.7с). Ведро — монотонные часы,
+# пополнение ЛЕНИВОЕ при try-take, O(1). Никаких тредов, никакого sleep под локом. Дефолты:
+# секвенсер 200/с burst 50; запасные каналы 50/с burst 10. Всё настраиваемо env; VOLLEY_PACER=off
+# снимает МЕХАНИЗМ целиком (поведение HEAD бит-в-бит). Причины отказа РАЗДЕЛЬНО (дисциплина #132):
+# pacer_dry (нет токенов, без сети) vs transport_reject («over rate limit» и прочие сетевые).
+_VOLLEY_PACER_ON = (os.environ.get("VOLLEY_PACER", "on") or "on").lower() not in ("0", "off", "false", "no")
+_PACER_RATE = float(os.environ.get("VOLLEY_PACER_RATE", "200"))     # секвенсер (первичный канал)
+_PACER_BURST = float(os.environ.get("VOLLEY_PACER_BURST", "50"))
+_SPILL_RATE = float(os.environ.get("VOLLEY_SPILL_RATE", "50"))      # запасные каналы
+_SPILL_BURST = float(os.environ.get("VOLLEY_SPILL_BURST", "10"))
+_PACER_LOCK = threading.Lock()
+_PACER_BUCKETS: dict = {}          # url -> [tokens, last_monotonic]
+_PACER_DRY: dict = {}              # url -> сколько раз ведро было сухим (спилл без сети)
+_PACER_SPILL_SENT: dict = {}       # url -> сколько проб доставлено ЗАПАСНЫМ каналом
+_PACER_TRANSPORT_REJECT = 0        # суммарно сетевых отказов (over rate limit и пр.)
+
+
+def _pacer_take(url: str, rate: float, burst: float) -> bool:
+    """O(1) try-take: ленивое пополнение по монотонным часам. Токен есть -> True (списываем)."""
+    now = time.monotonic()
+    with _PACER_LOCK:
+        tok, last = _PACER_BUCKETS.get(url, (float(burst), now))
+        tok = min(float(burst), tok + max(0.0, now - last) * float(rate))
+        if tok >= 1.0:
+            _PACER_BUCKETS[url] = [tok - 1.0, now]
+            return True
+        _PACER_BUCKETS[url] = [tok, now]
+        return False
+
+
+def _pacer_note_dry(url: str):
+    with _PACER_LOCK:
+        _PACER_DRY[url] = _PACER_DRY.get(url, 0) + 1
+
+
+def _pacer_note_spill(url: str):
+    with _PACER_LOCK:
+        _PACER_SPILL_SENT[url] = _PACER_SPILL_SENT.get(url, 0) + 1
+
+
+def _pacer_note_reject():
+    global _PACER_TRANSPORT_REJECT
+    with _PACER_LOCK:
+        _PACER_TRANSPORT_REJECT += 1
+
+
+def volley_pacer_stats():
+    """#136: (pacer_dry по каналам, spill_sent по каналам, transport_reject суммарно) с момента
+    старта. Как volley_budget_skips (#132): без числа спилл и немота эндпоинта неотличимы от
+    «склад пуст». Причины РАЗДЕЛЬНО — pacer_dry (без сети) vs transport_reject (сетевой отказ)."""
+    with _PACER_LOCK:
+        return (dict(_PACER_DRY), dict(_PACER_SPILL_SENT), _PACER_TRANSPORT_REJECT)
+
+
+def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5,
+                   paced: bool = True, rate: float = None, burst: float = None):
     """Синхронная рассылка raw в секвенсер тёплой сессией. Возврат (ok, err_msg).
     В отличие от _post_raw_tx (best-effort в треде, глотает всё) ЗДЕСЬ исход нужен вызывающему:
-    от него зависит, вернуть ли запись лестницы на место или считать её потраченной."""
+    от него зависит, вернуть ли запись лестницы на место или считать её потраченной.
+
+    #136 ПЕЙСЕР: paced=True и VOLLEY_PACER=on -> сначала token-bucket ПО url. Нет токенов ->
+    (False, 'pacer_dry') БЕЗ сетевого похода, вызывающий мгновенно спиллит на следующий канал.
+    paced=False — ПРИОРИТЕТНАЯ ПОЛОСА: боевая tx не пейсится НИКОГДА (в этот чокпоинт она и не
+    приходит — бой идёт через _post_raw_tx, — но флаг делает инвариант явным и проверяемым)."""
+    if paced and _VOLLEY_PACER_ON:
+        _r = _PACER_RATE if rate is None else rate
+        _b = _PACER_BURST if burst is None else burst
+        if not _pacer_take(url, _r, _b):
+            return False, "pacer_dry"          # сухо: отдельный сигнал вызывающему, без RTT
     try:
         payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
                    "params": [raw_hex]}
