@@ -1343,6 +1343,91 @@ def _poll_changed(prices, poll_seen, oracle2agg, feed_handled=None, bn=None):
     return changed
 
 
+# --- #139: одиночный стоячий воркер поблочного опроса цен (latest-wins) -------------------------
+# Факт боя 18.08 02:56:36: recv-петля спавнила отдельный поток _poll_prices НА КАЖДЫЙ
+# блок. В тишине это ~56 тредов; в шторм кап TasksMax=256 пробивался и hot_loop падал
+# (RuntimeError: can't start new thread) в самый дорогой момент. Замена — ровно паттерн
+# _chain_index.offer_block: recv только КЛАДЁТ (bn, конфиг) и будит ЕДИНСТВЕННЫЙ тред; занят
+# воркер — промежуточные bn перезатираются последним (очереди НЕТ). Тред один на процесс:
+# self-heal hot_loop переустанавливает конфиг атомарно, второго воркера не создаёт.
+_POLL_WORKER_LOCK = threading.Lock()
+_POLL_WORKER_THREAD = None
+_POLL_WORKER_WAKE = threading.Event()
+_POLL_WORKER_STOP = threading.Event()
+_POLL_STATE = None      # (bn, kwargs) — последняя поданная работа; ребайнд кортежа атомарен под GIL
+
+# Сетевые вызовы опроса ОБЯЗАНЫ иметь жёсткий таймаут. Thread-на-блок терпел зависший опрос
+# (следующий блок спавнил свежий тред); одиночный воркер — нет: зависший read_preconf_prices
+# заморозил бы ВЕСЬ поблочный триггер. read_preconf_prices делает максимум ДВА последовательных
+# aggregate3 (preconf + добор latest), поэтому 2×таймаут обязан лежать ЗАМЕТНО ниже времени блока
+# (~2с). 0.8с ⇒ ≤1.6с на худший опрос. Клоны ОТДЕЛЬНЫЕ: боевой preconf_rpc и _bg_rpc (цикл кэша
+# штатно живёт 1.9-2.4с) свой таймаут сохраняют — их мы не трогаем.
+_POLL_RPC_TIMEOUT_SEC = float(os.environ.get("HOT_POLL_RPC_TIMEOUT_SEC", "0.8"))
+
+
+def _poll_rpc(base):
+    """Клон боевого RPC с жёстким пер-запросным таймаутом ДЛЯ ПОБЛОЧНОГО ОПРОСА (см. #139).
+    None -> None (вызыватель падает на прежний путь)."""
+    if base is None:
+        return None
+    try:
+        from chain.rpc import BaseRpc
+        return BaseRpc(base.rpc_url, getattr(base, "chain_id", 8453),
+                       request_timeout=_POLL_RPC_TIMEOUT_SEC)
+    except Exception:
+        return base            # клон не удался -> прежний rpc, опрос жив (таймаут провайдера по умолчанию)
+
+
+def offer_poll_block(bn, **kwargs):
+    """Точка входа из recv-петли: только присвоение и Event.set (сети нет, лока опроса нет).
+
+    latest-wins: занятой воркер увидит лишь ПОСЛЕДНИЙ bn, промежуточные перезатрутся — очередь не
+    копится. Конфиг (kwargs: feeds/meta/spawn_kwargs после ре-резолва) заменяется АТОМАРНО одним
+    ребайндом кортежа — self-heal hot_loop подаёт свежий конфиг, воркер берёт его на следующем
+    обороте, старые kwargs не залипают."""
+    global _POLL_STATE
+    _POLL_STATE = (bn, kwargs)
+    _ensure_poll_worker()
+    _POLL_WORKER_WAKE.set()
+
+
+def _ensure_poll_worker():
+    """Ленивый старт единственного воркера под локом. Идемпотентно: self-heal hot_loop зовёт
+    offer_poll_block заново, второй тред не создаётся."""
+    global _POLL_WORKER_THREAD
+    t = _POLL_WORKER_THREAD
+    if t is not None and t.is_alive():
+        return
+    with _POLL_WORKER_LOCK:
+        t = _POLL_WORKER_THREAD
+        if t is not None and t.is_alive():
+            return
+        _POLL_WORKER_STOP.clear()
+        _POLL_WORKER_THREAD = threading.Thread(target=_poll_worker_loop, daemon=True, name="hot-poll")
+        _POLL_WORKER_THREAD.start()
+
+
+def _poll_worker_loop():
+    """Единственный потребитель заявок опроса. Ошибка ОДНОГО опроса не имеет права убить воркер —
+    мёртвый стоячий воркер хуже Thread-на-блок (тот хоть на следующем блоке оживал)."""
+    while not _POLL_WORKER_STOP.is_set():
+        _POLL_WORKER_WAKE.wait()
+        _POLL_WORKER_WAKE.clear()
+        if _POLL_WORKER_STOP.is_set():
+            break
+        job = _POLL_STATE                       # атомарное чтение последней заявки (latest-wins)
+        if not job:
+            continue
+        _bn, _kw = job
+        try:
+            _poll_prices(bn=_bn, **_kw)         # ГЛОБАЛ (позднее связывание): тест подменяет транспорт
+        except Exception:
+            try:
+                (_kw.get("log") or log).exception("hot-poll worker: опрос bn=%s упал", _bn)
+            except Exception:
+                pass
+
+
 def _poll_prices(*, preconf_rpc, rpc_fallback, feeds, meta, poll_seen, stats, spawn_kwargs, bn, log, feed_handled=None):
     """Per-block trigger: batch-read all oracle preconf prices; spawn a (gated) _process_transmit for
     each aggregator whose price moved. The agg-level gate dedups vs any bare-match spawn. This is what
@@ -2382,6 +2467,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     from chain.rpc import BaseRpc
     _fb_resolve_rpc = BaseRpc(os.environ.get("FEEDS_FALLBACK_RPC", "https://mainnet.base.org"),
                               getattr(rpc, "chain_id", 8453), request_timeout=8.0)
+    # #139: поблочный опрос — на КЛОНАХ с жёстким таймаутом (боевой preconf_rpc и _bg_rpc свой
+    # таймаут сохраняют: цикл кэша штатно живёт 1.9-2.4с на _bg_rpc, ему тесная граница вредна).
+    _poll_preconf_rpc = _poll_rpc(preconf_rpc)
+    _poll_fb_rpc = _poll_rpc(_bg_rpc)
     feeds = _init_resolve_retry(resolve_feeds, _bg_rpc, markets, rpc,   # 25.07: резолв (283 лёгких
                                 # вызова × 2 на рестарт + раз в 6ч) — фон, ему не место на платном
                                 what="feeds", log=log, empty_ok=False)
@@ -2652,14 +2741,16 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         _bf = basefee_of(d)                   # 5a: index-0 кадр несёт base-хедер
                         if _bf is not None:
                             _basefee_probe(bn=bn, fb=_bf, rpc=rpc, log=log)
-                        threading.Thread(target=_poll_prices, daemon=True,
-                                         kwargs=dict(preconf_rpc=preconf_rpc, rpc_fallback=_bg_rpc, feeds=feeds, meta=meta,
-                                                     poll_seen=poll_seen, stats=stats, bn=bn, log=log,
-                                                     feed_handled=feed_handled,
-                                                     spawn_kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,
-                                                                       feeds=feeds, meta=meta, shared=shared,
-                                                                       store=store, guard=guard, alerter=alerter,
-                                                                       log=log, last_price=last_price, stats=stats))).start()
+                        # #139: БЕЗ Thread-на-блок. Кладём (bn, конфиг) единственному стоячему
+                        # воркеру и будим его (latest-wins). Опрос-читатель — на клонах с жёстким
+                        # таймаутом; spawn_kwargs денежного пути держит БОЕВОЙ preconf_rpc/rpc.
+                        offer_poll_block(bn, preconf_rpc=_poll_preconf_rpc, rpc_fallback=_poll_fb_rpc,
+                                         feeds=feeds, meta=meta, poll_seen=poll_seen, stats=stats, log=log,
+                                         feed_handled=feed_handled,
+                                         spawn_kwargs=dict(rpc=rpc, preconf_rpc=preconf_rpc, cfg=cfg,
+                                                           feeds=feeds, meta=meta, shared=shared,
+                                                           store=store, guard=guard, alerter=alerter,
+                                                           log=log, last_price=last_price, stats=stats))
                         # Layer 2, measurement phase (C temporary — see STATE.md): fills _POSITION_CACHE +
                         # logs refresh-miss/cycle timing. Does NOT touch reads_fn — read_positions_cached
                         # is not wired into _process_transmit yet, so this has zero effect on hot-path behavior.
