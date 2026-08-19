@@ -734,7 +734,10 @@ class SpecFireLive:
                       # арм-событий уже считает board_v6_arms, а здесь нужен счёт ЦЕЛЕЙ.
                       "group_assembled": 0, "group_skipped_kyber_owner": 0,
                       "group_skipped_no_extras": 0, "group_skipped_quotes_none": 0,
-                      "group_skipped_infeasible": 0}
+                      "group_skipped_infeasible": 0, "group_skipped_no_trigger": 0,
+                      # дверь §9 отбила уже собранную группу на самом арме (чужой стэш,
+                      # разъехавшийся состав): арм не сел, но прогрев обязан доработать
+                      "board_v6_group_refused": 0}
         self._push_ts: dict = {}                  # feed -> метки севших пушей (решётка OCR, 07.08)
         self._board: dict = {}                    # v5 доска: {"key": (mid,b), "until": ts, "armed_ts": ts}
         self._board_lock = threading.Lock()       # арм доски — одна запись за раз (nonce главного)
@@ -1284,8 +1287,29 @@ class SpecFireLive:
                 # §9/#133: экстры берутся ИЗ СТЭША и ровно ОДИН РАЗ (pop). Котировки, из которых
                 # посчитаны их minOut, сняты прогревом секунды назад; доехать до ДРУГОГО арма
                 # они не имеют права — состав группы пересобирается новым прогоном сборщика.
-                return self._arm_board_v6(plan, mid, b, feed, debt=debt, plan_ev=plan_ev,
-                                          extra_plans=self._group_extra.pop((mid, b), None))
+                #
+                # ИДЕНТИЧНОСТЬ ПЛАНА, а не только ключа (mid,b) — линза денежного пути. Два
+                # прогрева РАЗНЫХ фидов могут выбрать ОДНОГО владельца; второй перезапишет стэш,
+                # и первый принёс бы к СВОЕМУ (мутированному им же) плану ЧУЖИЕ экстры — тогда
+                # quote_fn владельца, снятый на своих размерах, встретил бы чужие точки состава
+                # и кинул KeyError прямо на пути арма. Стэш несёт id(плана), которому он
+                # принадлежит; чужой прогон молча деградирует к n=1 (безопасная сторона).
+                _ent = self._group_extra.pop((mid, b), None)
+                _extras = _ent[1] if (_ent and _ent[0] == id(plan)) else None
+                try:
+                    return self._arm_board_v6(plan, mid, b, feed, debt=debt, plan_ev=plan_ev,
+                                              extra_plans=_extras)
+                except (_v6mod.SamePoolInfeasible, KeyError) as e:
+                    # ДВЕРЬ §9 ОТБИЛА ГРУППУ — это отказ АРМА, а не отказ прогрева. Исключение,
+                    # выпущенное наверх, вынесло бы вместе с собой хвост `_prearm_board`:
+                    # публикацию probe_board (#47) и подъём движка (#78) — то есть один
+                    # неудачный расчёт запаса гасил бы и детект транзита, и склад лестниц.
+                    self.stats["board_v6_group_refused"] = self.stats.get(
+                        "board_v6_group_refused", 0) + 1
+                    self.stats["board_fails"] += 1
+                    self._log("SPECFIRE v6 ОТКАЗ ДВЕРИ §9 feed=%s %s/%s: %s — арм не сел, "
+                              "ретрай штатный" % (feed, str(mid)[:10], str(b)[:10], _diag(e)))
+                    return False
             import chain.execute as _ex
             dl = int(time.time()) + SPEC_FIRE_V2_PLAN_TTL_SEC
             cd = _ex.encode_set_plan(
@@ -1416,6 +1440,17 @@ class SpecFireLive:
                           "пул неизвестен, запас худшего порядка считать не из чего" % mid[:10])
                 return None
             owner_plan = owner_probe.get("plan") or {}
+            # ВЛАДЕЛЕЦ БЕЗ ГРАНИЦЫ ЗДОРОВЬЯ — ТОЖЕ СТОП, и по той же причине, что и экстра:
+            # gate группы обнуляется ЛЮБЫМ нулевым триггером, а gate==0 выключает чтение цены
+            # для ВСЕХ целей спана. Одиночная доска такое переживает (лишняя проба), группа —
+            # нет. Проверка стоит ЗДЕСЬ, до всякой RPC-работы.
+            if int(owner_plan.get("trigger") or 0) <= 0:
+                self.stats["group_skipped_no_trigger"] = self.stats.get(
+                    "group_skipped_no_trigger", 0) + 1
+                self._log("SPECFIRE §9 группа НЕ собрана %s: у владельца нет границы здоровья "
+                          "(trigger=0) — gate группы обнулится и погасит фильтр цены ВСЕЙ "
+                          "группы; арм идёт одной целью" % mid[:10])
+                return None
             coll, loan = owner_plan.get("coll"), owner_plan.get("loan")
             if not coll or not loan or not owner_plan.get("seized"):
                 self.stats["group_skipped_no_extras"] = self.stats.get(
@@ -1461,6 +1496,15 @@ class SpecFireLive:
                 if str(pl2.get("coll", "")).lower() != str(coll).lower() or \
                         str(pl2.get("loan", "")).lower() != str(loan).lower():
                     continue
+                # СЛЕПАЯ ЦЕЛЬ ОТРАВЛЯЕТ ВСЮ ГРУППУ (линза денежного пути). Гейт группы в
+                # `_arm_board_v6` = 0, если хоть у одной цели trigger==0 (fail-open на уровне
+                # ОДНОЙ цели), а контракт при gate==0 не читает цену ВООБЩЕ — и тогда
+                # ПЕРСОНАЛЬНЫЕ триггеры остальных целей тоже не применяются (`pxKnown` ложь).
+                # Одна цель без границы здоровья превращает 110 ног в молотилку по здоровым
+                # позициям всей группы. В одиночной доске цена этого решения — одна лишняя
+                # проба, в группе — вся группа.
+                if int(pl2.get("trigger") or 0) <= 0:
+                    continue
                 extras.append((_k, ev2, pl2))
             if not extras:
                 self.stats["group_skipped_no_extras"] = self.stats.get(
@@ -1473,7 +1517,18 @@ class SpecFireLive:
             # = НОВЫЙ квотер: таблица квот снята ровно в точках {T, T−aᵢ, aᵢ} этого состава, и
             # старый qf на новых точках кинет KeyError (это его контракт, а не дефект).
             from chain.route_depth import make_cumulative_quote_fn
-            hr = int(os.environ.get("SPEC_FIRE_SAME_POOL_HEADROOM_BPS", "0"))
+            # ЗАПАС (линза денежного пути). ПОЧЕМУ НЕ 0: котировки снимаются ПРОГРЕВОМ, когда
+            # цель ещё ЗДОРОВА, а огонь идёт ПОСЛЕ просадки за триггер — просадка не шум, она
+            # систематична и по масштабу равна арм-расстоянию (300-450 bps). При hr=0 весь
+            # допуск между worst и полом (14-137 bps на замерах) съедается этой просадкой, и
+            # ВЗЯТАЯ гонка превращается в реверт по minOut: приз мимо, газ сожжён. Реверт хуже
+            # тонкой прибыли — прибыль стережёт minProfit КОНТРАКТА, а не minOut роутера.
+            # ПОЧЕМУ 1300: это больше максимального бонуса карты роутов (12.68%, cbLTC/cbDOGE),
+            # то есть клэмп `max(floor, worst*(1-hr))` связывает ВЕЗДЕ и minOut садится ровно на
+            # пол — сегодняшнюю боевую семантику. Вся ценность §9 при этом цела: она в ВЫНОСЕ
+            # целей, у которых `worst < floor`, а этот критерий от hr не зависит вовсе.
+            # Отрицательное значение подняло бы minOut ВЫШЕ worst (запас наоборот) — режем.
+            hr = max(0, int(os.environ.get("SPEC_FIRE_SAME_POOL_HEADROOM_BPS", "1300")))
             plans, qf, rows = [owner_plan] + [e[2] for e in extras], None, None
             while True:
                 amounts = [int(p["seized"]) for p in plans]
@@ -1970,7 +2025,9 @@ class SpecFireLive:
                 # прошлой стоит выше и безусловно (см. комментарий у `self._group_extra = {}`).
                 _grp = self._assemble_group(feed, direction, mid, b, probe)
                 if _grp:
-                    self._group_extra = {(mid, b): _grp}
+                    # id ПЛАНА в ключе записи: экстры годны только тому объекту плана, который
+                    # мутировал этот же прогон сборщика (см. развилку v6 в `_arm_board`).
+                    self._group_extra = {(mid, b): (id(probe.get("plan")), _grp)}
                 if not self._arm_board(probe, mid, b, feed, debt=d):
                     self._arm_retry(feed, "setPlan не подтвердился")
                 # #47: ПУБЛИКУЕМ probe_board уже на прогреве. Раньше он заполнялся ТОЛЬКО при

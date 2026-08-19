@@ -54,6 +54,8 @@ MP = {"loanToken": LOAN, "collateralToken": COLL, "oracle": "0x" + "0a" * 20,
 SEIZED = {OWNER: 100_000_000, E1: 150_000_000, E2: 50_000_000, E3: 50_000_000}
 REPAID = {OWNER: 90_000_000_000, E1: 135_000_000_000, E2: 49_500_000_000, E3: 45_000_000_000}
 DEBT_USD = {OWNER: 9_000_000.0, E1: 13_500_000.0, E2: 4_950_000.0, E3: 4_500_000.0}
+TRIGGER = 2 * 10 ** 36              # граница здоровья цели (fail-open только при 0)
+HR_DEFAULT = 1300                   # боевой дефолт запаса §9 (см. _assemble_group)
 
 
 class Pool:
@@ -79,7 +81,7 @@ POOL = Pool(20_000_000_000, 20_000_000_000_000)    # 200 BTC / 20M USDC — ме
 # ===================================================================================================
 # СТЕНД
 # ===================================================================================================
-def _mk_plan(borrower, seized=None, repaid=None):
+def _mk_plan(borrower, seized=None, repaid=None, trigger=None):
     """Плановая часть пробы РОВНО той формы, что отдаёт `_build` (включая новые ключи §9),
     со свопом, собранным БОЕВЫМ direct_swap по одиночной семантике (minOut = долг)."""
     s = SEIZED[borrower] if seized is None else int(seized)
@@ -88,7 +90,10 @@ def _mk_plan(borrower, seized=None, repaid=None):
     assert sw is not None, "роут cbBTC->USDC обязан существовать — стенд без него бессмыслен"
     return {"mp": MP, "borrower": borrower, "repaid_shares": s * 7,
             "router": sw["router"], "swap_calldata": sw["calldata"],
-            "min_profit": ra * sfl_mod.SPEC_FIRE_MIN_PROFIT_BPS // 10000, "trigger": 0,
+            "min_profit": ra * sfl_mod.SPEC_FIRE_MIN_PROFIT_BPS // 10000,
+            # НЕНУЛЕВОЙ по умолчанию: trigger==0 у любой цели обнуляет gate ВСЕЙ группы и
+            # выключает фильтр цены для всех — сборщик обязан такую цель не брать (см. П10)
+            "trigger": TRIGGER if trigger is None else int(trigger),
             "seized": s, "repaid_assets": ra, "coll": COLL, "loan": LOAN}
 
 
@@ -169,12 +174,12 @@ def _min_out_of(calldata):
     return abi_decode(["(bytes,address,uint256,uint256)"], raw)[0][3]
 
 
-def _reference_rows(borrowers):
+def _reference_rows(borrowers, hr=HR_DEFAULT):
     """ЭТАЛОН НЕЗАВИСИМЫМ ПРОХОДОМ: тот же расчёт §9, но котировщик построен ПРЯМО из модели
     пула — ни route_depth, ни карты роутов, ни кодирования пути здесь нет."""
     amounts = [SEIZED[b] for b in borrowers]
     floors = [REPAID[b] + REPAID[b] * sfl_mod.SPEC_FIRE_MIN_PROFIT_BPS // 10000 for b in borrowers]
-    return bd.same_pool_min_outs(amounts, POOL.quote, floors=floors, headroom_bps=0)
+    return bd.same_pool_min_outs(amounts, POOL.quote, floors=floors, headroom_bps=hr)
 
 
 def _door(plans):
@@ -245,6 +250,8 @@ def test_p2_keys_and_baked_min_out_match_reference():
         for p, r in zip(plans, ref):
             assert _min_out_of(p["swap_calldata"]) == r["min_out"], (p["borrower"], r)
             assert r["min_out"] > p["repaid_assets"], "групповой пол обязан быть ВЫШЕ долга"
+            # боевой запас 1300bps шире любого бонуса карты роутов => клэмп полом связывает
+            assert r["min_out"] == p["floor"], (p["borrower"], r["min_out"], p["floor"])
         # негативный контроль измерения: ДО сборки в калдате владельца стоял одиночный пол
         assert _min_out_of(before) == REPAID[OWNER]
         assert before != plans[0]["swap_calldata"]
@@ -387,13 +394,13 @@ def test_p7_stash_is_consumed_once():
         sf._arm_board(bh._probes[OWNER], MID, OWNER, "BTC", debt=DEBT_USD[OWNER])
         assert bh.armed[-1][1] is None, bh.armed[-1]
         # отказ сборщика на следующем проходе обязан СНИМАТЬ прошлую группу, а не оставлять её
-        sf._group_extra = {(MID, OWNER): [object()]}
+        sf._group_extra = {(MID, OWNER): (id(bh._probes[OWNER]["plan"]), [object()])}
         sf._assemble_group = lambda *a, **k: None
         sf._prearm_board("BTC", "down", 0.01)
         assert bh.armed[-1][1] is None and sf._group_extra == {}, sf._group_extra
         # ...и то же самое, когда проба ВООБЩЕ не собралась: снятие обязано стоять ДО развилки,
         # иначе придержанная армом группа переживает проход "gone" и всплывает с чужой глубиной.
-        sf._group_extra = {(MID, OWNER): [object()]}
+        sf._group_extra = {(MID, OWNER): (id(bh._probes[OWNER]["plan"]), [object()])}
         sf._build_fn = lambda m, b2, d: "gone"
         sf._prearm_board("BTC", "down", 0.01)
         assert sf._group_extra == {}, sf._group_extra
@@ -437,23 +444,135 @@ def test_p8_direct_swap_min_out_both_styles():
 # ===================================================================================================
 # П9. ЗАПАС (headroom): ручка живёт, дефолт 0, и НИЖЕ ПОЛА minOut не опускается никогда.
 # ===================================================================================================
-def test_p9_headroom_never_below_floor():
-    os.environ["SPEC_FIRE_SAME_POOL_HEADROOM_BPS"] = "50"
+def test_p9_headroom_default_clamps_to_floor_and_knob_binds():
+    """Дефолт 1300bps ШИРЕ любого бонуса карты роутов => minOut = пол ВЕЗДЕ (боевая семантика,
+    прибыль стережёт minProfit контракта). Ручка обязана двигать число в обе стороны — иначе
+    «дефолт 1300» неотличим от «запас не применяется вовсе»."""
     bh = _bench(borrowers=(OWNER, E1))
     try:
         sf = bh.sf
         extras = sf._assemble_group("BTC", "down", MID, OWNER, bh._probes[OWNER])
         assert extras is not None
         plans = [bh._probes[OWNER]["plan"]] + extras
-        ref = bd.same_pool_min_outs(
-            [SEIZED[b] for b in (OWNER, E1)], POOL.quote,
-            floors=[p["floor"] for p in plans], headroom_bps=50)
-        for p, r in zip(plans, ref):
-            assert _min_out_of(p["swap_calldata"]) == r["min_out"], (p["borrower"], r)
-            assert r["min_out"] >= p["floor"], "запас НЕ вправе опустить minOut ниже пола"
-        assert ref[0]["min_out"] < _reference_rows([OWNER, E1])[0]["min_out"], "ручка обязана влиять"
+        ref_def = _reference_rows([OWNER, E1], hr=HR_DEFAULT)
+        for p, r in zip(plans, ref_def):
+            assert _min_out_of(p["swap_calldata"]) == r["min_out"] == p["floor"], (p, r)
+    finally:
+        bh.close()
+    # НЕГАТИВНЫЙ КОНТРОЛЬ РУЧКИ: при hr=0 тот же вход даёт minOut = worst_out, СТРОГО выше пола
+    os.environ["SPEC_FIRE_SAME_POOL_HEADROOM_BPS"] = "0"
+    bh = _bench(borrowers=(OWNER, E1))
+    try:
+        sf = bh.sf
+        extras = sf._assemble_group("BTC", "down", MID, OWNER, bh._probes[OWNER])
+        plans = [bh._probes[OWNER]["plan"]] + extras
+        ref0 = _reference_rows([OWNER, E1], hr=0)
+        for p, r in zip(plans, ref0):
+            assert _min_out_of(p["swap_calldata"]) == r["min_out"] == r["worst_out"]
+            assert r["min_out"] > p["floor"], "при нулевом запасе пол перестаёт связывать"
     finally:
         os.environ.pop("SPEC_FIRE_SAME_POOL_HEADROOM_BPS", None)
+        bh.close()
+    # ОТРИЦАТЕЛЬНЫЙ ЗАПАС — не «наоборот», а ноль: minOut ВЫШЕ worst искал бы прибыль там, где
+    # роутер обязан лишь не пустить нас в убыток.
+    os.environ["SPEC_FIRE_SAME_POOL_HEADROOM_BPS"] = "-500"
+    bh = _bench(borrowers=(OWNER, E1))
+    try:
+        sf = bh.sf
+        extras = sf._assemble_group("BTC", "down", MID, OWNER, bh._probes[OWNER])
+        plans = [bh._probes[OWNER]["plan"]] + extras
+        for p, r in zip(plans, _reference_rows([OWNER, E1], hr=0)):
+            assert _min_out_of(p["swap_calldata"]) == r["min_out"]
+    finally:
+        os.environ.pop("SPEC_FIRE_SAME_POOL_HEADROOM_BPS", None)
+        bh.close()
+
+
+# ===================================================================================================
+# П10. СЛЕПАЯ ЦЕЛЬ (trigger=0) ОТРАВЛЯЕТ ГЕЙТ ВСЕЙ ГРУППЫ -> в группу не берётся; владелец без
+#      границы здоровья закрывает сборку целиком.
+# ===================================================================================================
+def test_p10_zero_trigger_extra_is_dropped():
+    probes = {OWNER: _mk_probe(OWNER), E1: _mk_probe(E1, trigger=0), E3: _mk_probe(E3)}
+    bh = _bench(borrowers=(OWNER, E1, E3), probes=probes)
+    try:
+        sf = bh.sf
+        extras = sf._assemble_group("BTC", "down", MID, OWNER, probes[OWNER])
+        assert [p["borrower"] for p in extras] == [E3], "слепая цель обязана выпасть из состава"
+    finally:
+        bh.close()
+    # ПОЗИТИВНЫЙ КОНТРОЛЬ на том же объекте: верни E1 границу — и она снова в группе
+    probes = {OWNER: _mk_probe(OWNER), E1: _mk_probe(E1), E3: _mk_probe(E3)}
+    bh = _bench(borrowers=(OWNER, E1, E3), probes=probes)
+    try:
+        extras = bh.sf._assemble_group("BTC", "down", MID, OWNER, probes[OWNER])
+        assert [p["borrower"] for p in extras] == [E1, E3]
+    finally:
+        bh.close()
+
+
+def test_p10b_zero_trigger_owner_stops_assembly():
+    probes = {OWNER: _mk_probe(OWNER, trigger=0), E1: _mk_probe(E1)}
+    bh = _bench(borrowers=(OWNER, E1), probes=probes)
+    try:
+        sf = bh.sf
+        assert sf._assemble_group("BTC", "down", MID, OWNER, probes[OWNER]) is None
+        assert sf.stats["group_skipped_no_trigger"] == 1, sf.stats
+        assert bh.quote_batches == 0 and bh.builds == [], "отказ обязан стоить НОЛЬ RPC"
+        assert probes[OWNER]["plan"].get("pool") is None
+    finally:
+        bh.close()
+
+
+# ===================================================================================================
+# П11. ГОНКА СТЭША МЕЖДУ ФИДАМИ: экстры годны ТОЛЬКО тому объекту плана, который их мутировал.
+# ===================================================================================================
+def test_p11_stash_belongs_to_its_plan_object():
+    bh = _bench(borrowers=(OWNER, E1))
+    try:
+        sf = bh.sf
+        probe_mine = bh._probes[OWNER]
+        extras = sf._assemble_group("BTC", "down", MID, OWNER, probe_mine)
+        assert extras
+        # ЧУЖОЙ прогрев того же владельца: стэш принадлежит ЕГО плану, а армим МЫ — своим
+        alien_plan = _mk_plan(OWNER)
+        sf._group_extra = {(MID, OWNER): (id(alien_plan), extras)}
+        sf._arm_board(probe_mine, MID, OWNER, "BTC", debt=DEBT_USD[OWNER])
+        assert bh.armed[-1][1] is None, "чужие экстры обязаны молча деградировать к n=1"
+        assert sf._group_extra == {}, "и всё равно быть съедены (не копиться)"
+        # ПОЗИТИВНЫЙ КОНТРОЛЬ: СВОЙ id -> та же группа доезжает
+        sf._group_extra = {(MID, OWNER): (id(probe_mine["plan"]), extras)}
+        sf._arm_board(probe_mine, MID, OWNER, "BTC", debt=DEBT_USD[OWNER])
+        assert bh.armed[-1][1] == extras
+    finally:
+        bh.close()
+
+
+def test_p11b_door_exception_does_not_escape_arm():
+    """Исключение ДВЕРИ §9 — отказ АРМА, а не отказ прогрева: наверх оно уйти не вправе, иначе
+    вынесет публикацию probe_board и подъём движка (хвост #47/#78)."""
+    bh = _bench(borrowers=(OWNER, E1))
+    try:
+        sf = bh.sf
+        extras = sf._assemble_group("BTC", "down", MID, OWNER, bh._probes[OWNER])
+        assert extras
+
+        def _boom(*a, **k):
+            raise bd.SamePoolInfeasible("§9: состав разъехался")
+
+        sf._arm_board_v6 = _boom
+        sf._group_extra = {(MID, OWNER): (id(bh._probes[OWNER]["plan"]), extras)}
+        assert sf._arm_board(bh._probes[OWNER], MID, OWNER, "BTC",
+                             debt=DEBT_USD[OWNER]) is False
+        assert sf.stats["board_v6_group_refused"] == 1, sf.stats
+        assert any("ДВЕРИ" in m for m in bh.logs), bh.logs
+        # тот же случай для KeyError чужого котировщика
+        sf._arm_board_v6 = lambda *a, **k: (_ for _ in ()).throw(KeyError("чужая точка состава"))
+        sf._group_extra = {(MID, OWNER): (id(bh._probes[OWNER]["plan"]), extras)}
+        assert sf._arm_board(bh._probes[OWNER], MID, OWNER, "BTC",
+                             debt=DEBT_USD[OWNER]) is False
+        assert sf.stats["board_v6_group_refused"] == 2, sf.stats
+    finally:
         bh.close()
 
 
