@@ -1079,9 +1079,11 @@ def main():
             ch = _msc104()
             if ch is not None:
                 slots, prev = ch
+                # Цена считается по ЖИВОЙ цене ETH из конфига (константа в модуле execute
+                # соврала бы на любом движении рынка) и по замеренному газу пробы.
                 log.info("#104 зеркало v2: слоты %s (было %s), ожидаемая цена tip проб "
                          "~$%.2f/окно", list(slots) or "статика", list(prev) or "статика",
-                         _mcost104(slots) if slots else 0.0)
+                         _mcost104(slots, cfg.eth_price_usd) if slots else 0.0)
 
         if _idx104 is not None:
             _idx104.set_on_transit(_on_transit_104)
