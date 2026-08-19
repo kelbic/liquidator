@@ -3,7 +3,9 @@
 
 Гейт снят данными (см. STATE 24.07): бэктест каскада 24-25.06 (87% ликвидаций при армленном
 окне, lead med 67с) + live spec-canary DELTA=4/3 (предочередь достижима). Дизайн:
-- ОКНО: arm-событие с целями >= SPEC_FIRE_MIN_REPAID_USD ($500k, директива kelbic).
+- ОКНО: arm-событие с целями >= SPEC_FIRE_MIN_REPAID_USD ($1000 — боевое значение; ранний
+  Stage B стартовал с $500k «только жир», порог давно снижен env'ом, дефолт-призрак $500k
+  убран 19.08 по слову kelbic: потеря строки env не должна молча закрывать почти всё поле).
 - ОГОНЬ: только когда |ret| >= dev × SPEC_FIRE_THRESHOLD (1.0) — транзит неминуем в секундах
   (оракул триггерится на dev); до порога НЕ стреляем (там lead минуты — пробы в пустоту).
 - ПРОБА: настоящий liquidate-calldata top-1 жирной цели: полный repaid, своп из PREARM-кэша
@@ -47,7 +49,7 @@ def _diag(e) -> str:
     tag = " ДЕФЕКТ КОДА" if isinstance(e, _CODE_BUGS) else ""
     return "%s%s: %s" % (type(e).__name__, tag, redact(e)[:200])
 
-SPEC_FIRE_MIN_REPAID_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_USD", "500000"))
+SPEC_FIRE_MIN_REPAID_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_USD", "1000"))
 SPEC_FIRE_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_INTERVAL_SEC", "0.7"))
 # ПЛОТНЫЙ РЕЖИМ (31.07: первая боевая гонка cbBTC 14:07 проиграна ДЕНЬГАМИ — победитель сидел
 # в предочереди блока транзита idx 2928 с tip 0.0034, наша реакция 106мс легла блоком позже с

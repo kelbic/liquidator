@@ -7,6 +7,9 @@ import types
 import pathlib as _pl                 # РЕПО ЭТОГО ФАЙЛА, а не чужой worktree:
 sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
 import chain.spec_fire_live as sfl_mod
+# Стенд различает «жир» ($1.5M) и «пыль» ($90k) ГЕЙТОМ порога — пин явный: тест проверяет
+# сам механизм отсечки, а не дефолт модуля (дефолт-призрак $500k убран 19.08 по слову kelbic).
+sfl_mod.SPEC_FIRE_MIN_REPAID_USD = 500_000.0
 import chain.execute as ex
 from chain.spec_fire_live import SpecFireLive
 import chain.spec_fire_live as _sfl_v1
