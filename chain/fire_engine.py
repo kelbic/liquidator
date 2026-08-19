@@ -454,6 +454,18 @@ class FireEngine:
         if self._log:
             self._log("FIRE движок поднят: %d тредов, потолок %.0f отправок/с, TTL %.1fс" % (
                 self._nthreads, self._rate, self._ttl))
+            # #136: темп режут ДВЕ независимые ручки — потолок движка (наш бюджет) и пейсер
+            # эндпоинта в execute (квота приёма секвенсера, замер 11.08: ~115/с устойчиво).
+            # Связывающий — меньший; подъём SPEC_FIRE_ENGINE_MAX_RATE без VOLLEY_PACER_RATE
+            # молча уйдёт в pacer_dry. Строка ниже делает связывающий потолок видимым на старте.
+            try:
+                from chain.execute import _VOLLEY_PACER_ON, _PACER_RATE
+                if _VOLLEY_PACER_ON:
+                    self._log("FIRE потолки: движок %.0f/с, пейсер эндпоинта %.0f/с — "
+                              "связывающий %.0f/с" % (self._rate, _PACER_RATE,
+                                                      min(self._rate, _PACER_RATE)))
+            except Exception:
+                pass
 
     def stop(self):
         self._stop.set()
