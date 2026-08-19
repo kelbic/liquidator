@@ -391,6 +391,12 @@ def test_p7_stash_is_consumed_once():
         sf._assemble_group = lambda *a, **k: None
         sf._prearm_board("BTC", "down", 0.01)
         assert bh.armed[-1][1] is None and sf._group_extra == {}, sf._group_extra
+        # ...и то же самое, когда проба ВООБЩЕ не собралась: снятие обязано стоять ДО развилки,
+        # иначе придержанная армом группа переживает проход "gone" и всплывает с чужой глубиной.
+        sf._group_extra = {(MID, OWNER): [object()]}
+        sf._build_fn = lambda m, b2, d: "gone"
+        sf._prearm_board("BTC", "down", 0.01)
+        assert sf._group_extra == {}, sf._group_extra
     finally:
         bh.close()
 
