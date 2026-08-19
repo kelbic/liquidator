@@ -2607,11 +2607,20 @@ def _effective_cap(key, now=None):
     return static
 
 
-def direct_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_assets, slippage_bps=100):
+def direct_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_assets,
+                slippage_bps=100, min_out=None):
     """Drop-in for kyber_swap на прямых маршрутах, NO in-race quote. P1-8 fix: token_out ЧЕСТНЫЙ
     ключ маршрута (раньше univ3_swap хардкодил USDC-выход — для EURC-рынка контракт получил бы
     USDC и упал CannotRepay). amountOutMinimum=repaid_assets (debt floor); profit protected by
-    preconf sim + contract minProfit. Returns {router, calldata} или None (caller -> kyber_swap)."""
+    preconf sim + contract minProfit. Returns {router, calldata} или None (caller -> kyber_swap).
+
+    min_out (§9/#133): ЯВНЫЙ amountOutMinimum. None = прежнее поведение бит-в-бит (пол = долг).
+    Нужен мультицелевой группе v6: цели одного пула исполняются ОДНОЙ tx подряд, и вторая
+    свопает уже по сдвинутой цене — её пол обязан считаться от ХУДШЕГО порядка (все n−1 раньше),
+    а не от одиночной котировки. Отдельный параметр, а не переиспользование repaid_assets:
+    repaid_assets — это ДОЛГ (величина Morpho), min_out — ТРЕБОВАНИЕ К СВОПУ (величина пула);
+    смешать их в одном имени значит потерять, какая из двух ролей поехала при разборе.
+    """
     from eth_abi import encode
     r = _SWAP_ROUTES.get((token_in.lower(), token_out.lower()))
     if r is None:
@@ -2623,12 +2632,15 @@ def direct_swap(token_in, token_out, amount_in, sender, recipient, *, repaid_ass
     _cap = _effective_cap((token_in.lower(), token_out.lower()))
     if _cap is not None and int(amount_in) > int(_cap):
         return None
+    # Пол свопа: явный min_out либо (дефолт) долг. Считается ОДИН раз на обе ветки стилей —
+    # разъехавшиеся полы у v1 и UniV3 были бы дефектом, невидимым в тестах одной ветки.
+    _min_out = int(repaid_assets) if min_out is None else int(min_out)
     if r["style"] == "v1":     # Slipstream: v1-форма с deadline
         params = encode(["(bytes,address,uint256,uint256,uint256)"],
-                        [(r["path"], recipient, _AERO_DEADLINE, int(amount_in), int(repaid_assets))])
+                        [(r["path"], recipient, _AERO_DEADLINE, int(amount_in), _min_out)])
         return {"router": r["router"], "calldata": "0x" + _AERO_EXACT_INPUT_SEL + params.hex()}
     params = encode(["(bytes,address,uint256,uint256)"],
-                    [(r["path"], recipient, int(amount_in), int(repaid_assets))])
+                    [(r["path"], recipient, int(amount_in), _min_out)])
     return {"router": r["router"], "calldata": "0x" + _UNIV3_EXACT_INPUT_SEL + params.hex()}
 
 

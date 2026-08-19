@@ -726,7 +726,18 @@ class SpecFireLive:
                       # «чужой адрес» — флаг включён на контракте v5.
                       "board_v6_arms": 0, "board_v6_unlanded": 0,
                       "board_v6_unknown": 0, "board_v6_wrong_addr": 0,
-                      "board_v6_cleared_targets": 0}
+                      "board_v6_cleared_targets": 0,
+                      # §9/#133 СБОРЩИК ГРУППЫ. Осечка сборщика безопасна (деградация к n=1),
+                      # и ровно поэтому она обязана быть НАЗВАНА: молчаливый откат к одной цели
+                      # неотличим от «кандидатов не было», и мультицель три недели «работала бы»
+                      # на группе из одного. group_assembled растёт НА РАЗМЕР группы — число
+                      # арм-событий уже считает board_v6_arms, а здесь нужен счёт ЦЕЛЕЙ.
+                      "group_assembled": 0, "group_skipped_kyber_owner": 0,
+                      "group_skipped_no_extras": 0, "group_skipped_quotes_none": 0,
+                      "group_skipped_infeasible": 0, "group_skipped_no_trigger": 0,
+                      # дверь §9 отбила уже собранную группу на самом арме (чужой стэш,
+                      # разъехавшийся состав): арм не сел, но прогрев обязан доработать
+                      "board_v6_group_refused": 0}
         self._push_ts: dict = {}                  # feed -> метки севших пушей (решётка OCR, 07.08)
         self._board: dict = {}                    # v5 доска: {"key": (mid,b), "until": ts, "armed_ts": ts}
         self._board_lock = threading.Lock()       # арм доски — одна запись за раз (nonce главного)
@@ -752,6 +763,13 @@ class SpecFireLive:
         self._board_probe_cache: dict = {}        # (mid,b) -> (debt, calldata, gas): проба под
                                                   # живым планом, чтобы окна 2..N публиковали
                                                   # доску без пересборки (HIGH N1)
+        # §9/#133: ЭКСТРА-ЦЕЛИ ГРУППЫ, собранные прогревом под ВЛАДЕЛЬЦА (mid,b). Стэш, а не
+        # параметр `_arm_board`: сигнатуру метода пинят юнит-стабы prearm (см. коммент в
+        # _arm_board), и лишний kwarg сорвал бы их TypeError'ом. Ровно ОДНА запись, как у
+        # _board_probe_cache: словарь ПЕРЕЗАПИСЫВАЕТСЯ каждым проходом сборщика (в т.ч. пустым),
+        # потому что котировки в планах привязаны к моменту снятия — доехать до двери на
+        # следующем арме они не должны. Читается consume-once (pop) в v6-ветке арма.
+        self._group_extra: dict = {}
         # СЧЁТЧИКИ ПОЗИЦИЙ — ПО КЛЮЧУ ДОСКИ (mid, borrower), ревью р-6, БЛОКЕР C.
         #
         # Общий self.stats годился, пока окна шли ПОДРЯД; в каскаде окна разных фидов живут
@@ -919,7 +937,15 @@ class SpecFireLive:
                 "swap_meta": swap_meta,
                 "plan": {"mp": mp, "borrower": borrower, "repaid_shares": repaid_shares,
                          "router": swap["router"], "swap_calldata": swap["calldata"],
-                         "min_profit": min_profit, "trigger": int(trigger)}}
+                         "min_profit": min_profit, "trigger": int(trigger),
+                         # §9 (#133): сырьё для сборщика мультицелевой группы. Все четыре поля
+                         # берутся ПОСЛЕ частичной ветки (она переприсваивает seized/repaid_assets
+                         # на урезанные zp/ap) — считать запас группы по ДОплановой величине
+                         # значило бы котировать размер, которого в свопе нет (класс #77).
+                         # Kyber-план (swap_meta is None) поля тоже несёт, но в группу не идёт:
+                         # его пул нам не принадлежит, котировать нечего (решает сборщик).
+                         "seized": int(seized), "repaid_assets": int(repaid_assets),
+                         "coll": coll, "loan": loan}}
 
     def _consume_cap(self, spent, key, probe):
         """Consume-хук (05.08): ПЕРВАЯ успешная отправка цели списывает её direct-сайз из
@@ -1258,7 +1284,32 @@ class SpecFireLive:
             # ниже идёт прежний тракт v5 бит-в-бит.
             import chain.board_v6 as _v6mod
             if _v6mod.v6_enabled():
-                return self._arm_board_v6(plan, mid, b, feed, debt=debt, plan_ev=plan_ev)
+                # §9/#133: экстры берутся ИЗ СТЭША и ровно ОДИН РАЗ (pop). Котировки, из которых
+                # посчитаны их minOut, сняты прогревом секунды назад; доехать до ДРУГОГО арма
+                # они не имеют права — состав группы пересобирается новым прогоном сборщика.
+                #
+                # ИДЕНТИЧНОСТЬ ПЛАНА, а не только ключа (mid,b) — линза денежного пути. Два
+                # прогрева РАЗНЫХ фидов могут выбрать ОДНОГО владельца; второй перезапишет стэш,
+                # и первый принёс бы к СВОЕМУ (мутированному им же) плану ЧУЖИЕ экстры — тогда
+                # quote_fn владельца, снятый на своих размерах, встретил бы чужие точки состава
+                # и кинул KeyError прямо на пути арма. Стэш несёт id(плана), которому он
+                # принадлежит; чужой прогон молча деградирует к n=1 (безопасная сторона).
+                _ent = self._group_extra.pop((mid, b), None)
+                _extras = _ent[1] if (_ent and _ent[0] == id(plan)) else None
+                try:
+                    return self._arm_board_v6(plan, mid, b, feed, debt=debt, plan_ev=plan_ev,
+                                              extra_plans=_extras)
+                except (_v6mod.SamePoolInfeasible, KeyError) as e:
+                    # ДВЕРЬ §9 ОТБИЛА ГРУППУ — это отказ АРМА, а не отказ прогрева. Исключение,
+                    # выпущенное наверх, вынесло бы вместе с собой хвост `_prearm_board`:
+                    # публикацию probe_board (#47) и подъём движка (#78) — то есть один
+                    # неудачный расчёт запаса гасил бы и детект транзита, и склад лестниц.
+                    self.stats["board_v6_group_refused"] = self.stats.get(
+                        "board_v6_group_refused", 0) + 1
+                    self.stats["board_fails"] += 1
+                    self._log("SPECFIRE v6 ОТКАЗ ДВЕРИ §9 feed=%s %s/%s: %s — арм не сел, "
+                              "ретрай штатный" % (feed, str(mid)[:10], str(b)[:10], _diag(e)))
+                    return False
             import chain.execute as _ex
             dl = int(time.time()) + SPEC_FIRE_V2_PLAN_TTL_SEC
             cd = _ex.encode_set_plan(
@@ -1346,6 +1397,235 @@ class SpecFireLive:
             min_profit=int(plan["min_profit"]),
             unwrap_target=plan.get("unwrap_target") or _v6mod.ZERO_ADDR,
             trigger_price=int(plan.get("trigger") or 0))
+
+    # --- §9/#133: СБОРЩИК МУЛЬТИЦЕЛЕВОЙ ГРУППЫ (same-pool) ------------------------------------
+    # Каркас §9 стоял целиком (математика худшего порядка, единая дверь, кумулятивный квотер),
+    # но extra_plans не заполнял НИКТО — группа всегда была n=1, то есть мультицель существовала
+    # только на бумаге. Здесь звено замыкается: кандидаты ТОГО ЖЕ рынка -> котировки одного пула
+    # -> minOut каждой цели от ХУДШЕГО порядка -> выпечка в калдату.
+    #
+    # ГЛАВНОЕ СВОЙСТВО: осечка сборщика безопасна ПО ПОСТРОЕНИЮ. Всё, что он делает, — добавляет
+    # цели; отказ на любом шаге возвращает None, дверь §9 при n=1 не спрашивается, и тракт
+    # остаётся прежним бит-в-бит. Поэтому весь метод под широким except — но КАЖДЫЙ отказ
+    # печатается и считается: тихая деградация к одной цели неотличима от исправной работы.
+    def _assemble_group(self, feed, direction, mid, b, owner_probe):
+        """(mid,b) владельца слота + его проба -> список ПЛАНОВ экстра-целей (или None).
+
+        Побочный эффект (намеренный): план ВЛАДЕЛЬЦА мутируется по месту — в него кладутся
+        ключи двери (pool/amount_in/floor/quote_fn) и перепечённая калдата свопа. Иначе никак:
+        дверь читает pools/amounts/floors со ВСЕХ планов группы, а владелец уходит в арм
+        отдельным аргументом. Мутация — ПОСЛЕДНИМ шагом и только когда пересборка свопов
+        удалась ЦЕЛИКОМ: полу-мутированный владелец (полы записаны, калдата старая) хуже,
+        чем отсутствие группы вовсе.
+        """
+        try:
+            import chain.board_v6 as _v6mod
+            # (а) ГЕЙТ РЕЖИМА. Константа берётся ИЗ МОДУЛЯ, а не перечитывается из env: у режима
+            # один источник истины, и он же читается дверью — разъехаться они не могут. В
+            # строгом disjoint-режиме сборщик не стоит НИЧЕГО (ни одного RPC): цели одного рынка
+            # делят пул по построению, и дверь отбила бы группу целиком.
+            if not _v6mod.v6_enabled():
+                return None
+            _mode = str(_v6mod.SPEC_FIRE_V6_POOL_MODE or "").strip().lower()
+            if _mode != _v6mod.POOL_MODE_SAME_POOL:
+                return None
+            # (б) KYBER-ВЛАДЕЛЕЦ = СТОП. Его своп идёт агрегатом: путь размазан по нескольким
+            # пулам, minOut считает сервер, и пул для §9 НЕИЗВЕСТЕН. Собрав такую группу, мы
+            # довели бы до двери план без `pool` — а она обязана отбить это ГРОМКО, то есть
+            # осечка арма на живом окне. Отказываемся здесь, где это стоит одну строку журнала.
+            if owner_probe.get("swap_meta") is None:
+                self.stats["group_skipped_kyber_owner"] = self.stats.get(
+                    "group_skipped_kyber_owner", 0) + 1
+                self._log("SPECFIRE §9 группа НЕ собрана %s: владелец идёт через Kyber-агрегат — "
+                          "пул неизвестен, запас худшего порядка считать не из чего" % mid[:10])
+                return None
+            owner_plan = owner_probe.get("plan") or {}
+            # ВЛАДЕЛЕЦ БЕЗ ГРАНИЦЫ ЗДОРОВЬЯ — ТОЖЕ СТОП, и по той же причине, что и экстра:
+            # gate группы обнуляется ЛЮБЫМ нулевым триггером, а gate==0 выключает чтение цены
+            # для ВСЕХ целей спана. Одиночная доска такое переживает (лишняя проба), группа —
+            # нет. Проверка стоит ЗДЕСЬ, до всякой RPC-работы.
+            if int(owner_plan.get("trigger") or 0) <= 0:
+                self.stats["group_skipped_no_trigger"] = self.stats.get(
+                    "group_skipped_no_trigger", 0) + 1
+                self._log("SPECFIRE §9 группа НЕ собрана %s: у владельца нет границы здоровья "
+                          "(trigger=0) — gate группы обнулится и погасит фильтр цены ВСЕЙ "
+                          "группы; арм идёт одной целью" % mid[:10])
+                return None
+            coll, loan = owner_plan.get("coll"), owner_plan.get("loan")
+            if not coll or not loan or not owner_plan.get("seized"):
+                self.stats["group_skipped_no_extras"] = self.stats.get(
+                    "group_skipped_no_extras", 0) + 1
+                self._log("SPECFIRE §9 группа НЕ собрана %s: в плане владельца нет сырья "
+                          "(coll/loan/seized) — старая проба под новым сборщиком" % mid[:10])
+                return None
+            # (в) КАНДИДАТЫ ТОГО ЖЕ РЫНКА. `_top_fat` НЕ трогаем: его контракт (top-1 по долгу +
+            # отдельная кромка) запинен test_spec_fire_edge_slot, и расширять его под группу
+            # значило бы менять арбитраж ОДНОГО слота ради состава группы. Отдельный проход:
+            # снимок под локом, фильтр и ранг — вне лока (ноль общих локов с fire-путём, A4).
+            with self.shared.lock:
+                borrowers = list(self.shared.groups.get(mid) or [])
+                debt_by = dict(self.shared.debt_by)
+                hf_by = dict(getattr(self.shared, "hf_by", {}) or {})
+            cands = []
+            for b2 in borrowers:
+                if b2 == b:
+                    continue
+                d2 = float(debt_by.get((mid, b2), 0.0) or 0.0)
+                if d2 < SPEC_FIRE_MIN_REPAID_USD:
+                    continue
+                ev2 = _plan_ev_val(d2, hf_by.get((mid, b2)), direction)
+                # None-EV (HF нечитаем) — в НИЖНИЙ бакет, а не в отказ: незнание близости не
+                # обязано выкидывать жирную цель из группы, но и вперёд известной её не пускает.
+                cands.append((0 if ev2 is None else 1, float(ev2 or 0.0), d2, b2))
+            cands.sort(key=lambda t: (-t[0], -t[1], -t[2]))
+            cands = cands[:7]                     # <=8 целей в группе: владелец + 7 (индексы 0..7)
+            # (г) СБОРКА ЭКСТР. Kyber-цели отсеиваются по той же причине, что и Kyber-владелец.
+            extras = []                           # [(ev_rank, ev, plan)]
+            for _k, ev2, d2, b2 in cands:
+                p2 = (self._build_fn or self._build)(mid, b2, d2)
+                if not isinstance(p2, dict):
+                    continue                      # "gone"/None — цели нет либо не собралась
+                if p2.get("swap_meta") is None:
+                    continue
+                pl2 = p2.get("plan") or {}
+                if not pl2.get("seized") or not pl2.get("repaid_assets"):
+                    continue
+                # Идентичность прямого роута: группа котируется ОДНИМ пулом, и цель с другой
+                # парой токенов в этой таблице квот не считается вовсе (один рынок ⇒ одна пара,
+                # но проверка стоит один сравнительный if, а её отсутствие — неверный запас).
+                if str(pl2.get("coll", "")).lower() != str(coll).lower() or \
+                        str(pl2.get("loan", "")).lower() != str(loan).lower():
+                    continue
+                # СЛЕПАЯ ЦЕЛЬ ОТРАВЛЯЕТ ВСЮ ГРУППУ (линза денежного пути). Гейт группы в
+                # `_arm_board_v6` = 0, если хоть у одной цели trigger==0 (fail-open на уровне
+                # ОДНОЙ цели), а контракт при gate==0 не читает цену ВООБЩЕ — и тогда
+                # ПЕРСОНАЛЬНЫЕ триггеры остальных целей тоже не применяются (`pxKnown` ложь).
+                # Одна цель без границы здоровья превращает 110 ног в молотилку по здоровым
+                # позициям всей группы. В одиночной доске цена этого решения — одна лишняя
+                # проба, в группе — вся группа.
+                if int(pl2.get("trigger") or 0) <= 0:
+                    continue
+                extras.append((_k, ev2, pl2))
+            if not extras:
+                self.stats["group_skipped_no_extras"] = self.stats.get(
+                    "group_skipped_no_extras", 0) + 1
+                self._log("SPECFIRE §9 группа НЕ собрана %s: кандидатов рынка %d, годных экстр 0 "
+                          "— арм идёт одной целью" % (mid[:10], len(cands)))
+                return None
+            # (д)-(е) КОТИРОВКИ И РАСЧЁТ. Состав может УРЕЗАТЬСЯ: цель, не выживающая худший
+            # порядок, ВЫНОСИТСЯ из группы, а не отправляется в реверт по minOut. Смена состава
+            # = НОВЫЙ квотер: таблица квот снята ровно в точках {T, T−aᵢ, aᵢ} этого состава, и
+            # старый qf на новых точках кинет KeyError (это его контракт, а не дефект).
+            from chain.route_depth import make_cumulative_quote_fn
+            # ЗАПАС (линза денежного пути). ПОЧЕМУ НЕ 0: котировки снимаются ПРОГРЕВОМ, когда
+            # цель ещё ЗДОРОВА, а огонь идёт ПОСЛЕ просадки за триггер — просадка не шум, она
+            # систематична и по масштабу равна арм-расстоянию (300-450 bps). При hr=0 весь
+            # допуск между worst и полом (14-137 bps на замерах) съедается этой просадкой, и
+            # ВЗЯТАЯ гонка превращается в реверт по minOut: приз мимо, газ сожжён. Реверт хуже
+            # тонкой прибыли — прибыль стережёт minProfit КОНТРАКТА, а не minOut роутера.
+            # ПОЧЕМУ 1300: это больше максимального бонуса карты роутов (12.68%, cbLTC/cbDOGE),
+            # то есть клэмп `max(floor, worst*(1-hr))` связывает ВЕЗДЕ и minOut садится ровно на
+            # пол — сегодняшнюю боевую семантику. Вся ценность §9 при этом цела: она в ВЫНОСЕ
+            # целей, у которых `worst < floor`, а этот критерий от hr не зависит вовсе.
+            # Отрицательное значение подняло бы minOut ВЫШЕ worst (запас наоборот) — режем.
+            hr = max(0, int(os.environ.get("SPEC_FIRE_SAME_POOL_HEADROOM_BPS", "1300")))
+            plans, qf, rows = [owner_plan] + [e[2] for e in extras], None, None
+            while True:
+                amounts = [int(p["seized"]) for p in plans]
+                floors = [int(p["repaid_assets"]) + int(p.get("min_profit") or 0) for p in plans]
+                qf = make_cumulative_quote_fn(self.rpc, coll, loan, amounts)
+                if qf is None:
+                    # НЕТ РОУТА либо молчит транспорт. Это НЕЗНАНИЕ, а не «запас нулевой»:
+                    # отдельный счётчик от infeasible намеренно — первое чинится сетью/картой
+                    # роутов, второе есть факт о глубине пула.
+                    self.stats["group_skipped_quotes_none"] = self.stats.get(
+                        "group_skipped_quotes_none", 0) + 1
+                    self._log("SPECFIRE §9 группа НЕ собрана %s: котировок %s->%s НЕТ (роут "
+                              "агрегатный либо транспорт молчит) — арм одной целью"
+                              % (mid[:10], str(coll)[:8], str(loan)[:8]))
+                    return None
+                try:
+                    rows = _v6mod.same_pool_min_outs(amounts, qf, floors=floors, headroom_bps=hr)
+                except _v6mod.SamePoolInfeasible as e:
+                    # Ступень, которую пул НЕ ТЯНЕТ, ревертит у квотера -> None в таблице ->
+                    # отказ. Отдельного гарда «суммарный кап пула» здесь нет и не нужно: §9
+                    # закрывает его по построению, а дубль-гард со своей формулой разъехался бы
+                    # с настоящей глубиной.
+                    self.stats["group_skipped_infeasible"] = self.stats.get(
+                        "group_skipped_infeasible", 0) + 1
+                    self._log("SPECFIRE §9 группа НЕ собрана %s: расчёт худшего порядка "
+                              "невозможен (%s)" % (mid[:10], _diag(e)))
+                    return None
+                bad = [i for i, r in enumerate(rows) if not r["ok"]]
+                if not bad:
+                    break
+                # Кого выносить. Владельца — НИКОГДА (слот доски выбран арбитром EV выше, и
+                # менять его состав группы не вправе). Из экстр берём ХУДШУЮ ПО EV среди
+                # непроходных; если непроходной оказался только владелец — худшую по EV вообще
+                # (вынос любой соседки поднимает его худший выход: конкурентов за глубину меньше).
+                rem = [i for i in bad if i > 0] or list(range(1, len(plans)))
+                if not rem:
+                    self.stats["group_skipped_infeasible"] = self.stats.get(
+                        "group_skipped_infeasible", 0) + 1
+                    self._log("SPECFIRE §9 группа НЕ собрана %s: даже одиночный владелец не "
+                              "выживает собственный пол — группы нет" % mid[:10])
+                    return None
+                worst = min(rem, key=lambda i: (extras[i - 1][0], extras[i - 1][1]))
+                self._log("SPECFIRE §9 %s: цель %s не выживает худший порядок (выход %s < пола "
+                          "%s) — ВЫНОСИМ из группы, пересчёт на составе %d"
+                          % (mid[:10], str(plans[worst].get("borrower"))[:10],
+                             rows[worst]["worst_out"], rows[worst]["floor"], len(plans) - 1))
+                plans.pop(worst)
+                extras.pop(worst - 1)
+                if len(plans) < 2:
+                    self.stats["group_skipped_infeasible"] = self.stats.get(
+                        "group_skipped_infeasible", 0) + 1
+                    self._log("SPECFIRE §9 группа НЕ собрана %s: после выносов остался один "
+                              "владелец — мультицели нет" % mid[:10])
+                    return None
+            # (ж) ВЫПЕЧКА minOut В КАЛДАТУ. Сперва СОБИРАЕМ все свопы и только потом пишем: живой
+            # кап роута мог сжаться между стройкой пробы и этим моментом (consume_live_cap), и
+            # direct_swap законно вернёт None — половинчатая мутация владельца была бы хуже
+            # отсутствия группы.
+            from chain.execute import direct_swap
+            liq = self.cfg.liquidator_address
+            baked = []
+            for p, r in zip(plans, rows):
+                sw = direct_swap(coll, loan, int(p["seized"]), liq, liq,
+                                 repaid_assets=int(p["repaid_assets"]), min_out=int(r["min_out"]))
+                if sw is None:
+                    self.stats["group_skipped_infeasible"] = self.stats.get(
+                        "group_skipped_infeasible", 0) + 1
+                    self._log("SPECFIRE §9 группа НЕ собрана %s: своп с групповым minOut не "
+                              "пересобрался для %s (кап роута сжался?) — арм одной целью"
+                              % (mid[:10], str(p.get("borrower"))[:10]))
+                    return None
+                baked.append(sw)
+            # (з) КЛЮЧИ ДВЕРИ — В КАЖДЫЙ план, включая владельца: дверь читает pools/amounts/
+            # floors со ВСЕХ планов и падает на первом же None. `quote_fn` — только у plans[0]
+            # (владельца), таким её и читает дверь; он же соответствует ФИНАЛЬНОМУ составу.
+            pool_key = ["%s->%s" % (str(coll).lower(), str(loan).lower())]
+            for p, r, sw in zip(plans, rows, baked):
+                p["router"], p["swap_calldata"] = sw["router"], sw["calldata"]
+                p["pool"] = list(pool_key)
+                p["amount_in"] = int(r["amount_in"])
+                p["floor"] = int(r["floor"])
+            plans[0]["quote_fn"] = qf
+            # ВЛАДЕЛЬЦУ НЕ ПЕРЕСОБИРАЕМ probe["calldata"] (полная V1-калдата запасного пути)
+            # НАМЕРЕННО: V1 стреляет ОДНОЙ целью, и одиночная семантика minOut=долг там верна.
+            # Групповой пол в одиночном выстреле лишь ужесточил бы условие без причины.
+            self.stats["group_assembled"] = self.stats.get("group_assembled", 0) + len(plans)
+            self._log("SPECFIRE §9 группа собрана %s: целей %d (владелец %s + %d), пул %s, "
+                      "minOut от худшего порядка=[%s] запас=%dbps"
+                      % (mid[:10], len(plans), str(b)[:10], len(plans) - 1, pool_key[0],
+                         " ".join(str(r["min_out"]) for r in rows), hr))
+            return plans[1:]
+        except Exception as e:
+            # Деградация к n=1 безопасна (дверь §9 при одной цели не спрашивается), но МОЛЧА
+            # деградировать нельзя — иначе мультицель «работает» на группе из одного.
+            self._log("SPECFIRE §9 сборщик группы упал %s: %s — арм идёт одной целью"
+                      % (str(mid)[:10], _diag(e)))
+            return None
 
     def _arm_board_v6(self, plan, mid, b, feed, debt=0.0, plan_ev=None, extra_plans=None):
         """§2-§4: заармить ГРУППУ и навести на неё горячий указатель. Возврат: доска готова?
@@ -1714,6 +1994,13 @@ class SpecFireLive:
                 # кэша нет (рестарт под живым планом) — НЕ выходим: собираем пробу ради
                 # публикации; повторного setPlan не будет, дедуп стоит внутри _arm_board.
             probe = (self._build_fn or self._build)(mid, b, d)
+            # §9/#133: СТЭШ ГРУППЫ СНИМАЕТСЯ ЗДЕСЬ — ДО развилки «проба собралась», а не внутри
+            # неё. Иначе есть живой путь протухания: проход N собрал группу, арм придержал слот
+            # (дедуп либо ценностной гард #88 — оба выходят ДО pop), проход N+1 получил "gone" и
+            # прошёл мимо ветки dict, а следующий арм той же цели вытащил бы квоты возрастом в
+            # каденс прогрева. Котировки — величина мгновения; не снять их значит доехать до
+            # двери §9 с чужой глубиной.
+            self._group_extra = {}
             if not isinstance(probe, dict):
                 if probe == "gone":
                     # #78 хвост (ревьюер 09.08): здесь "gone" был неотличим от осечки сборки и
@@ -1732,6 +2019,15 @@ class SpecFireLive:
                 # ровно на старте окна победы, при том что подписывать можно было заранее.
                 self._engine()
             if isinstance(probe, dict):
+                # §9/#133: МУЛЬТИЦЕЛЬ СОБИРАЕТСЯ ЗДЕСЬ — до арма и в том же фоновом треде
+                # прогрева, потому что стоит она RPC (сборка экстр + пачка котировок), а петля
+                # окна на этих RTT стоять не должна. Запись КЛАДЁТСЯ только на успех; снятие
+                # прошлой стоит выше и безусловно (см. комментарий у `self._group_extra = {}`).
+                _grp = self._assemble_group(feed, direction, mid, b, probe)
+                if _grp:
+                    # id ПЛАНА в ключе записи: экстры годны только тому объекту плана, который
+                    # мутировал этот же прогон сборщика (см. развилку v6 в `_arm_board`).
+                    self._group_extra = {(mid, b): (id(probe.get("plan")), _grp)}
                 if not self._arm_board(probe, mid, b, feed, debt=d):
                     self._arm_retry(feed, "setPlan не подтвердился")
                 # #47: ПУБЛИКУЕМ probe_board уже на прогреве. Раньше он заполнялся ТОЛЬКО при
