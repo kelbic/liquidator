@@ -254,6 +254,7 @@ if _qf is not None:
                                                          r["loss_bps"]) for r in _rows))
 
 # --- П4. ДЕНЕЖНЫЙ ПУТЬ НА ЦЕПИ ------------------------------------------------------------------
+SNAP = rpc("evm_snapshot", [])
 print("\nП4. ДЕНЕЖНЫЙ ПУТЬ: арм v6 боевым путём + выстрел ноги, вердикт с КВИТАНЦИИ")
 send_owner(bd.encode_clear_hot(), 100_000)         # на форке жива боевая доска — снимаем (стенд)
 ARMED = SF._arm_board(PROBE, MID, BOR, "BTC", debt=DEBT_USD)
@@ -289,6 +290,113 @@ verdict("П4.3", "профит покрыл minProfit плана (гард ко�
 _sh_after, _ = position()
 verdict("П4.4", "позиция жертвы РАЗОБРАНА (shares %d -> %d) — приз, ушедший 0x218172c1"
         % (SH, _sh_after), _sh_after < SH, "tx победителя эпизода: %s" % WIN_TX[:20])
+
+# --- П5. ВЕТКА «ВЕСЬ ЗАЛОГ» (cap_repaid_shares) — ТА, ЧТО ЧАЩЕ ВСЕГО НА lltv 0.915 -------------
+# В самом эпизоде кап НЕ сработал (залог 6 416 775 > сейза 6 021 293), то есть форк-приёмка
+# выше проверила только «обычную» ветку. Здесь состояние ПОДКРУЧИВАЕТСЯ (залог урезан прямой
+# записью в сторадж Morpho), чтобы полная заявка не влезала в залог и `_cap_repaid_shares`
+# обязан был её урезать. Смысл проверки: РЕВЕРТ допустим (гонку и так не берём), ПОТЕРЯ — нет;
+# Panic 0x11 (0x4e487b71) в этой ветке называется как есть, а не прячется в «не сработало».
+print("\nП5. ВЕТКА «ВЕСЬ ЗАЛОГ»: залог урезан, заявка обязана быть УРЕЗАНА, а не панично упасть")
+assert rpc("evm_revert", [SNAP]) in (True, "0x1"), "откат к снимку не прошёл"
+SNAP = rpc("evm_snapshot", [])
+
+
+def _pos_slot():
+    """Слот packed(borrowShares|collateral<<128) позиции. Раскладка НЕ берётся из памяти:
+    перебираем слоты mapping'а и принимаем ТОЛЬКО тот, что совпал с position() до бита."""
+    from eth_abi import encode as _enc
+    for base in range(0, 10):
+        inner = keccak(_enc(["bytes32", "uint256"], [bytes.fromhex(MID[2:]), base]))
+        s = int.from_bytes(keccak(_enc(["address", "bytes32"], [BOR, inner])), "big") + 1
+        raw = int(rpc("eth_getStorageAt", [MORPHO, hex(s), "latest"]), 16)
+        if (raw & ((1 << 128) - 1)) == SH and (raw >> 128) == COL:
+            return s
+    return None
+
+
+_slot = _pos_slot()
+verdict("П5.1", "слот позиции найден и СОВПАЛ с position() до бита (позитивный контроль "
+        "раскладки, а не вера в неё)", _slot is not None,
+        "slot=%s" % (hex(_slot) if _slot else "НЕ НАЙДЕН"))
+if _slot is not None:
+    _new_col = 3_000_000                                  # вдвое меньше полного сейза
+    rpc("anvil_setStorageAt", [MORPHO, hex(_slot),
+                               "0x%064x" % ((_new_col << 128) | SH)])
+    _sh2, _col2 = position()
+    verdict("П5.2", "состояние подкручено: залог %d -> %d при том же долге (полная заявка "
+            "теперь НЕ влезает)" % (COL, _col2), _col2 == _new_col and _sh2 == SH)
+    _probe_cap = new_sf()._build(MID, BOR, DEBT_USD)
+    _plc = _probe_cap["plan"] if isinstance(_probe_cap, dict) else {}
+    verdict("П5.3", "план собрался и заявка УРЕЗАНА капом залога (shares %s < полных %d, "
+            "сейз %s <= залога %d)" % (_plc.get("repaid_shares"), SH, _plc.get("seized"), _col2),
+            isinstance(_probe_cap, dict) and 0 < int(_plc.get("repaid_shares", 0)) < SH
+            and 0 < int(_plc.get("seized", 0)) <= _col2)
+    if isinstance(_probe_cap, dict):
+        send_owner(bd.encode_clear_hot(), 100_000)
+        _armed2 = new_sf()._arm_board(_probe_cap, MID, BOR, "BTC", debt=DEBT_USD)
+        _leg2 = Account.create()
+        rpc("anvil_setBalance", [_leg2.address, hex(10 ** 18)])
+        send_owner(bd.encode_set_authorized_batch([_leg2.address], True), 300_000)
+        _b0 = balance_of(WETH, OWNER)
+        _tx2 = {"to": V6, "data": "0xff", "chainId": 8453, "gas": 3_000_000,
+                "nonce": int(rpc("eth_getTransactionCount", [_leg2.address, "pending"]), 16),
+                "maxFeePerGas": int(2e9), "maxPriorityFeePerGas": int(1e6)}
+        _rec2 = wait_receipt(rpc("eth_sendRawTransaction",
+                                 ["0x" + _leg2.sign_transaction(_tx2).raw_transaction.hex()]))
+        _b1 = balance_of(WETH, OWNER)
+        _liq2 = logs_of(_rec2, T_MORPHO_LIQ, MORPHO)
+        _pf2 = logs_of(_rec2, T_PLANFAILED, V6)
+        _sel2 = ("0x" + _pf2[0]["data"][2:10]) if _pf2 else None
+        _panic = _sel2 == "0x4e487b71"
+        _repaid2 = _seized2 = 0
+        if _liq2:
+            _d2 = bytes.fromhex(_liq2[0]["data"][2:])
+            _repaid2 = int.from_bytes(_d2[0:32], "big")
+            _seized2 = int.from_bytes(_d2[64:96], "big")
+        print("      исход: %s | PlanFailed=%s%s | профит=%.9f WETH | газ=%d"
+              % ("ЛИКВИДАЦИЯ" if _liq2 else "огня нет", _sel2 or "нет",
+                 " (Panic 0x11 — тот самый класс #124)" if _panic else "",
+                 (_b1 - _b0) / 1e18, _rec2["gasUsed"]))
+        verdict("П5.4", "ПОТЕРИ НЕТ: либо ликвидация с профитом, либо чистый отказ — но не "
+                "минус на балансе владельца", (_b1 - _b0) >= 0,
+                "дельта владельца %d wei" % (_b1 - _b0))
+        # ОТКАЗ ЗДЕСЬ ДОПУСТИМ, ПОТЕРЯ — НЕТ. Что обязано выполняться при отказе: он ЧИСТЫЙ
+        # (реверт пойман контрактом, PlanFailed эмитится) и цель НЕ гасится — `delete ts[i]`
+        # в v6 стоит только на успешной ветке, иначе одна неудачная проба стирала бы цель из
+        # группы и остальные ноги били бы в пустоту.
+        _tb, _trs, _tsa, _ttp = bd.read_target_info(lambda to, d: call(to, d), V6, G, 0)
+        verdict("П5.5", "отказ ЧИСТЫЙ: класс назван квитанцией (%s), цель в группе ЖИВА, "
+                "газ ограничен (%d)" % (_sel2 or "нет", _rec2["gasUsed"]),
+                (bool(_liq2) or bool(_pf2)) and _tb.lower() == BOR.lower()
+                and _rec2["gasUsed"] < 1_000_000,
+                "Panic 0x11 (#124) на БОЕВОЙ tx, состояние ПОСЛЕ флипа" if _panic else "")
+        if _panic:
+            # ДИАГНОСТИКА ПРИЧИНЫ (позитивный контроль на том же объекте): если та же ветка с
+            # заявкой на 1% меньше проходит, значит паникует не «весь залог» как класс, а
+            # ГРАНИЦА — наш кап целится в collateral-1 и не оставляет запаса на округление
+            # внутри Morpho. Это диагноз, а не починка: правка кэпа — отдельная задача.
+            _shaved = dict(_plc)
+            _shaved["repaid_shares"] = int(_plc["repaid_shares"] * 99 // 100)
+            _sz = int(int(_plc["seized"]) * 99 // 100)
+            _sw = ex.direct_swap(CBBTC, WETH, _sz, V6, V6,
+                                 repaid_assets=int(_plc["repaid_assets"] * 99 // 100))
+            _shaved["swap_calldata"], _shaved["router"] = _sw["calldata"], _sw["router"]
+            send_owner(bd.encode_clear_hot(), 100_000)
+            new_sf()._arm_board({"plan": _shaved, "calldata": "0x00", "gas": 600_000,
+                                 "swap_meta": (CBBTC, WETH, _sz)}, MID, BOR, "BTC", debt=DEBT_USD)
+            _tx3 = {"to": V6, "data": "0xff", "chainId": 8453, "gas": 3_000_000,
+                    "nonce": int(rpc("eth_getTransactionCount", [_leg2.address, "pending"]), 16),
+                    "maxFeePerGas": int(2e9), "maxPriorityFeePerGas": int(1e6)}
+            _rec3 = wait_receipt(rpc("eth_sendRawTransaction",
+                                     ["0x" + _leg2.sign_transaction(_tx3).raw_transaction.hex()]))
+            _liq3 = logs_of(_rec3, T_MORPHO_LIQ, MORPHO)
+            _pf3 = logs_of(_rec3, T_PLANFAILED, V6)
+            verdict("П5.6", "ДИАГНОЗ: та же ветка с заявкой −1%% %s => паникует ГРАНИЦА "
+                    "(кап целится в collateral−1, запаса на округление Morpho нет), а не "
+                    "«весь залог» как класс" % ("ПРОХОДИТ" if _liq3 else "тоже падает"),
+                    bool(_liq3),
+                    "PlanFailed=%s" % (("0x" + _pf3[0]["data"][2:10]) if _pf3 else "нет"))
 
 print("\n" + "=" * 100)
 for p, what, ok in RESULTS:
