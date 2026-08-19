@@ -428,43 +428,122 @@ _PROBE_TIP_TIERS = tuple(int(x) for x in os.environ.get(
 # (незнание закрывает гард). Границы здравого смысла как у _DOM: вне [0.5e6, 2e7] отбрасываем.
 # Откат SPEC_FIRE_PROBE_TIP_MIRROR=0. Ограничение v1 (названо): мода ГЛОБАЛЬНАЯ по всем
 # агрегаторам цепи, не пер-фидная — гард доли защищает от разброда операторов.
+# Ш24b v2 (19.08, вскрытие потери 50191667 — $3905): МОДА СТАЛА ПЕР-АГГРЕГАТОРНОЙ.
+#
+# ЧТО СЛОМАЛОСЬ В v1. Мода считалась ГЛОБАЛЬНО по всем агрегаторам цепи. Транзиты cbADA идут с
+# полом 1.0-1.2 mgwei и их МНОГО; транзиты 0x1e0b2c38/0x0e3dc8a6 в режиме затора несут 31-33
+# mgwei и их МАЛО. Глобальная выборка топится полами: доля 50% не собирается ЛИБО собирается на
+# поле — и в блоке 50191666 наши 22 пробы стояли с tip 1.0-3.0 против транзита 31.2, tip-match=0.
+# Приз ушёл целиком. Кольцо ПЕР-АГГ разводит эти два распределения, и каждое даёт свой слот.
+#
+# ВРЕМЯЗАВИСИМОСТЬ. Высокий tip — не свойство оператора, а РЕЖИМ ЗАТОРА: 19.08 в 20:51 ОБА
+# агрегатора несли 31-33 mgwei три судимых блока подряд, а в моде того же оператора за неделю
+# стоит 1.0-1.15. Поэтому кольцо по СВЕЖЕСТИ (K последних + TTL) адаптивно само — если его
+# кормить. Кормить и чинится: разводка main.py передавала только tip, а "agg" в транзит-дикте
+# индекса лежал с самого начала (chain_index.py:645,1060).
+#
+# ГРАНИЦЫ ВХОДА. Верх поднят 2e7 -> 5e7. Прежние 2e7 отбрасывали ВЕСЬ режим 21.2-34.6 mgwei
+# ПРЯМО НА ВХОДЕ — то есть первичная слепота была не в статистике, а в фильтре. Граница здесь
+# не «здравый смысл», а ЭКОНОМИЧЕСКИЙ КЭП: это максимальная цена пробы, которую чужая мода
+# вправе нам навязать. 5e7 wei × 52k газа × 110 ног ≈ $1.0 за полный залп при ETH $1730 —
+# терпимо; выше начинается класс, где зеркало само становится источником убытка, и там мы
+# предпочитаем НЕ участвовать в гонке, а не платить сколько скажут.
 PROBE_TIP_MIRROR = os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR", "1").lower() not in ("0", "false", "no")
 _MIRROR_K = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_K", "12"))
 _MIRROR_TTL_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_TTL_SEC", "21600"))
 _MIRROR_MIN_SHARE = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MIN_SHARE", "0.5"))
 _MIRROR_MIN_N = 4
-_TRANSIT_TIPS: list = []                 # [(ts, tip_wei)] — кольцо K, под локом
+_MIRROR_TIP_MIN = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MIN", "500000"))
+_MIRROR_TIP_MAX = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MAX", "50000000"))
+_MIRROR_SLOTS = 4                        # слотов портфеля = длине статического портфеля
+# ЗАМЕР 7 СУТОК ЖУРНАЛА (позиции судимых блоков, 19.08) — числа, ради которых поднят верх:
+#   0x0e3dc8a6: мода 1.0-1.15 mgwei (30+ сэмплов), режимные выбросы 21.2 и 33.4 (4 сэмпла);
+#   0x9491aedf: мода 1.0-1.2, выброс 10.1;   0x1e0b2c38: 10.0 ×2, 19.08 — 31.2;
+#   0x92a7c3a5 / 0x5bf848b4 / 0xf0f5eebe: полы 1.0-2.5, выбросы до 10.5;
+#   максимум наблюдённый за неделю — 34 597 197 wei.
+_TRANSIT_TIPS: dict = {}                 # agg -> [(ts, tip_wei)]: кольцо K НА КАЖДЫЙ агрегатор
 _TRANSIT_TIPS_LOCK = threading.Lock()
+_MIRROR_UNKNOWN = "unknown"              # agg не назван -> СВОЁ кольцо, не подмешивать к чужим
+_MIRROR_LAST_SLOTS: tuple = ()           # прошлый состав портфеля (только для строки журнала)
 
 
-def note_transit_tip(tip_wei, now=None) -> bool:
-    """#104: записать tip живого транзита (кормит индекс через main). Вне границ — отброс."""
+def note_transit_tip(tip_wei, agg=None, now=None) -> bool:
+    """#104/Ш24b v2: записать tip живого транзита В КОЛЬЦО ЕГО АГРЕГАТОРА.
+
+    agg=None не смешивается с именованными: неизвестное происхождение — это отдельное
+    распределение, а не «чьё-то». Вне границ [_MIRROR_TIP_MIN, _MIRROR_TIP_MAX] — отброс.
+    """
     try:
         w = int(tip_wei)
     except Exception:                                   # noqa: BLE001
         return False
-    if not (500_000 <= w <= 20_000_000):
+    if not (_MIRROR_TIP_MIN <= w <= _MIRROR_TIP_MAX):
         return False
+    key = str(agg).lower() if agg else _MIRROR_UNKNOWN
     n = float(now if now is not None else time.time())
     with _TRANSIT_TIPS_LOCK:
-        _TRANSIT_TIPS.append((n, w))
-        del _TRANSIT_TIPS[:-_MIRROR_K]
+        ring = _TRANSIT_TIPS.setdefault(key, [])
+        ring.append((n, w))
+        del ring[:-_MIRROR_K]
     return True
 
 
-def transit_tip_mirror(now=None):
-    """(мода, вторая_мода) | None. None = данных мало/протухли/разброд -> статический портфель."""
-    n = float(now if now is not None else time.time())
-    with _TRANSIT_TIPS_LOCK:
-        fresh = [w for ts, w in _TRANSIT_TIPS if n - ts <= _MIRROR_TTL_SEC]
+def _agg_mode(fresh):
+    """Мода ОДНОГО кольца при доле >= MIN_SHARE и n >= MIN_N. None = мало данных либо разброд.
+    Разброд внутри агрегатора — законное «не знаю»: у оператора либо есть tip-класс, либо он
+    его меняет от блока к блоку, и тогда угадывать нечего."""
     if len(fresh) < _MIRROR_MIN_N:
         return None
     from collections import Counter
-    mc = Counter(fresh).most_common(2)
-    m, cnt = mc[0]
-    if cnt / len(fresh) < _MIRROR_MIN_SHARE:
+    m, cnt = Counter(fresh).most_common(1)[0]
+    return m if cnt / len(fresh) >= _MIRROR_MIN_SHARE else None
+
+
+def transit_tip_portfolio(now=None) -> tuple:
+    """ПОРТФЕЛЬ ИЗ 4 СЛОТОВ или () при полном незнании (-> статические тиры бит-в-бит).
+
+    Слоты = РАЗЛИЧНЫЕ живые пер-агг моды (до 4), остальные — статические тиры В ИХ ПОРЯДКЕ.
+    Два решения, каждое оплачено боем:
+      * НЕ 3/4 в одну моду (v1): полы 1.0-1.2 mgwei — тоже призовой класс (победители cbADA
+        стоят ровно там), и отдать им один слот из четырёх дешевле, чем потерять весь класс;
+      * ПОРЯДОК СЛОТОВ СТАБИЛЕН — сортировка по ВЕЛИЧИНЕ моды (убыв.), а НЕ по свежести.
+        Порядок определяет, какая нога какой tip несёт (h%4), а смена tip ноги = пересборка
+        её лестницы (#127). Сортировка по свежести давала бы перестановку слотов на каждом
+        новом транзите: 110 ног × 28-32с подписи в самый горячий момент.
+    """
+    n = float(now if now is not None else time.time())
+    with _TRANSIT_TIPS_LOCK:
+        rings = {k: [w for ts, w in v if n - ts <= _MIRROR_TTL_SEC]
+                 for k, v in _TRANSIT_TIPS.items()}
+    modes = sorted({m for m in (_agg_mode(f) for f in rings.values()) if m is not None},
+                   reverse=True)[:_MIRROR_SLOTS]
+    if not modes:
+        return ()
+    slots = list(modes)
+    for t in _PROBE_TIP_TIERS:                          # добивка статикой, без дублей
+        if len(slots) >= _MIRROR_SLOTS:
+            break
+        if t not in slots:
+            slots.append(int(t))
+    while len(slots) < _MIRROR_SLOTS:                   # вырожденный список тиров
+        slots.append(slots[-1])
+    return tuple(slots)
+
+
+def _mirror_cost_usd(slots) -> float:
+    """Ожидаемая цена tip-проб окна при этом составе портфеля, $. ОЦЕНКА ДЛЯ ЖУРНАЛА, не гейт:
+    ~1200 совпадающих проб на окно, поровну по 4 слотам, 52k газа на пробу."""
+    eth = float(os.environ.get("ETH_PRICE_USD", "1730") or 1730)
+    return sum((1200.0 / max(1, len(slots))) * int(t) * 52_000 * eth / 1e18 for t in slots)
+
+
+def transit_tip_mirror(now=None):
+    """СОВМЕСТИМОСТЬ v1: (мода, вторая_мода) | None. Читатели-наблюдатели (стенды, rev-скрипты)
+    смотрят сюда; денежный путь ходит через `transit_tip_portfolio`."""
+    slots = transit_tip_portfolio(now=now)
+    if not slots:
         return None
-    return (m, mc[1][0] if len(mc) > 1 else m)
+    return (slots[0], slots[1] if len(slots) > 1 else slots[0])
 
 
 def probe_tip_for(addr) -> int:
@@ -476,8 +555,10 @@ def probe_tip_for(addr) -> int:
 
     Пустой список тиров возвращает прежнюю константу — откат одной переменной окружения.
 
-    #104: при живом зеркале транзита (см. transit_tip_mirror) 3 ноги из 4 несут МОДУ tip
-    транзитов, 4-я — вторую моду (хедж); зеркало мертво/выключено -> портфель бит-в-бит."""
+    Ш24b v2: при живом зеркале слоты — РАЗЛИЧНЫЕ пер-агг моды плюс статические тиры
+    (transit_tip_portfolio); зеркало мертво/выключено -> статический портфель БИТ-В-БИТ.
+    Контекста окна здесь нет и быть не может: лестницы подписываются ЗАРАНЕЕ, а тир обязан
+    быть функцией одного адреса — иначе подписанная лестница и «свежий тир» разъедутся (#127)."""
     if not _PROBE_TIP_TIERS:
         return _PROBE_TIP_WEI
     try:
@@ -485,11 +566,24 @@ def probe_tip_for(addr) -> int:
     except Exception:                                   # noqa: BLE001
         return _PROBE_TIP_TIERS[0]
     if PROBE_TIP_MIRROR:
-        mm = transit_tip_mirror()
-        if mm is not None:
-            m, second = mm
-            return (m, m, m, second)[h % 4]
+        slots = transit_tip_portfolio()
+        if slots:
+            return slots[h % len(slots)]
     return _PROBE_TIP_TIERS[h % len(_PROBE_TIP_TIERS)]
+
+
+def mirror_slots_changed(now=None):
+    """СМЕНА СОСТАВА портфеля (для строки журнала экономики). Возврат: (слоты, было) либо None,
+    если состав тот же. Прибор стоит СБОКУ от денежного пути: probe_tip_for сюда не заходит,
+    а зовёт эту функцию наблюдатель (аудит цены), и её отказ огня не касается."""
+    global _MIRROR_LAST_SLOTS
+    slots = transit_tip_portfolio(now=now) if PROBE_TIP_MIRROR else ()
+    with _TRANSIT_TIPS_LOCK:
+        prev = _MIRROR_LAST_SLOTS
+        if slots == prev:
+            return None
+        _MIRROR_LAST_SLOTS = slots
+    return slots, prev
 
 
 def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=None,
