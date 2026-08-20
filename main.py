@@ -1010,7 +1010,15 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                           os.environ.get("WS_READ_SRC_IP", ""), type(_e).__name__)
         try:
             async with websockets.connect(url, **conn_kw) as ws:
-                log.info("block source=%s connected — loop (mode=%s)", active, cfg.mode)
+                # 20.08: печатаем ФАКТИЧЕСКИЙ исходный адрес. Вывод «привязка сработала» из
+                # конфига — это самоотчёт; троттлинг сидит на АДРЕСЕ, поэтому адрес обязан быть
+                # виден в журнале, а не выводиться из наличия env-ручки.
+                try:
+                    _sn = ws.transport.get_extra_info("sockname")
+                    _src = _sn[0] if _sn else "?"
+                except Exception:
+                    _src = "?"
+                log.info("block source=%s connected — loop (mode=%s) src=%s", active, cfg.mode, _src)
                 async for blk in gen(ws):
                     # #110: подача блока фоновому индексу. Только присваивание номера и
                     # Event.set — ни сети, ни лока, ни треда: вся работа живёт в СВОЁМ

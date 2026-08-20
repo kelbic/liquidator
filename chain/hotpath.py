@@ -2783,6 +2783,11 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     while not stop.is_set():
         try:
             async with ws_factory() as ws:
+                try:                                     # ФАКТИЧЕСКИЙ адрес, а не самоотчёт
+                    _sn = ws.transport.get_extra_info("sockname")
+                    log.info("hot path ws connected src=%s", _sn[0] if _sn else "?")
+                except Exception:
+                    pass
                 _fb_backoff_n = 0            # коннект установлен -> сброс backoff
                 while not stop.is_set():
                     # слепой старт (feeds ИЛИ meta пусты) ре-резолвится ускоренно (120с), не через 6ч rescan
