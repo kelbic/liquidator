@@ -133,6 +133,28 @@ if _MISSING:
 _real_make = ex._make_session
 _real_bindable = ex.egress_bindable
 _real_ips = list(ex.VOLLEY_EGRESS_IPS)
+
+# =========================================================================================
+# 0. НАСТОЯЩАЯ ФАБРИКА — ДО подмены. Всё остальное в этом файле гоняет ФЕЙК, значит боевая
+# привязка нигде бы не исполнилась: ошибись мы в имени kwarg'а или в super(), 141 стенд
+# остался бы зелёным, а прод молча слал бы с одного адреса. Это ровно «шов подменён выше
+# дефекта», и ловится он только исполнением настоящего кода. Сети здесь нет: создание
+# сессии и разбор пула — офлайн, connect не делается.
+# =========================================================================================
+_s_bound = _real_make("https://x.example", "127.0.0.1")
+if _s_bound is None:
+    check("requests доступен (иначе привязка невозможна в принципе)", False, "нет requests")
+else:
+    _kw = _s_bound.get_adapter("https://x.example").poolmanager.connection_pool_kw
+    check("НАСТОЯЩАЯ фабрика: source_address доехал до PoolManager",
+          _kw.get("source_address") == ("127.0.0.1", 0), _kw.get("source_address"))
+    check("НАСТОЯЩАЯ фабрика: размеры пула сохранены (32 — пик каскада)",
+          _kw.get("maxsize") == 32, _kw.get("maxsize"))
+    _kw0 = _real_make("https://x.example").get_adapter("https://x.example") \
+        .poolmanager.connection_pool_kw
+    check("НАСТОЯЩАЯ фабрика без ip: привязки НЕТ (сегодняшний транспорт не тронут)",
+          "source_address" not in _kw0, _kw0.get("source_address"))
+
 ex._make_session = fake_make_session
 # Keepalive-тред в стенде не нужен (он бы слал в сеть раз в 15с).
 ex._seq_keepalive = lambda url, s, interval=15.0: None
