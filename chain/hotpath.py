@@ -59,6 +59,14 @@ CU_ALERT_PROJ_M = float(os.environ.get("CU_ALERT_PROJ_M", "26"))   # проек�
 # Сколько ПОДРЯД окон превышения нужно, чтобы будить ЧЕЛОВЕКА (20.08: три ложных
 # пейджа за утро на спайках рестарта/прогрева — журнальный маркер остаётся на 1 окне).
 CU_ALERT_STREAK_N = int(os.environ.get("CU_ALERT_STREAK_N", "3"))
+# Сколько СЕКУНД накопленных замеров нужно ДЛЯ ПЕЙДЖА (журнальному маркеру хватает
+# CU_ALERT_MIN_SPAN_SEC=900). Окно проекции — час (CU_ROLL_WINDOW_SEC), и на 15 минутах
+# число описывает не месяц, а ПЕРВЫЕ 15 МИНУТ ПОСЛЕ РЕСТАРТА: подпись 220 лестниц,
+# прогрев балансов флота, резолв фидов. 20.08 таких рестартов было восемь, и человек
+# получил пять ложных пейджей (60M/24M против факта 19.3M/16.1M). Требуем ~полный час:
+# «сторож, слепнущий от рестарта, сторожит рестарты» — поэтому гейт на СПАНЕ ДАННЫХ,
+# а не на аптайме процесса.
+CU_ALERT_PAGE_MIN_SPAN_SEC = float(os.environ.get("CU_ALERT_PAGE_MIN_SPAN_SEC", "3000"))
 # Порог эскалации бэкоффа, при котором обрывы hot-path будят ЧЕЛОВЕКА (#4 = ~24с ожидания,
 # то есть три подряд неудачных возврата). Быстрые удачные реконнекты остаются в журнале.
 HOT_WS_PAGE_BACKOFF_N = int(os.environ.get("HOT_WS_PAGE_BACKOFF_N", "4"))
@@ -2883,7 +2891,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                          and _roll[1] >= CU_ALERT_MIN_SPAN_SEC)
                                 _streak = _CU_OVER_STREAK.get(_host, 0) + 1 if _over else 0
                                 _CU_OVER_STREAK[_host] = _streak
-                                _page_worthy = _over and _streak >= CU_ALERT_STREAK_N
+                                _page_worthy = (_over and _streak >= CU_ALERT_STREAK_N
+                                                and _roll[1] >= CU_ALERT_PAGE_MIN_SPAN_SEC)
                                 _now_cu = time.monotonic()
                                 _top3 = " ".join("%s×%d" % (m, n) for m, n in _top[:3])
                                 if _over and _now_cu - _CU_MARK_TS.get(_host, -1e9) > CU_MARK_SEC:
