@@ -124,6 +124,7 @@ _, _MOD = rc.routes()
 _CBDOGE = _MOD._CBDOGE
 _CBBTC = _MOD._CBBTC
 _USDC = _MOD._UNIV3_USDC
+_CBLTC = _MOD._CBLTC
 _WSTETH = _MOD._WSTETH
 _WETH = _MOD._UNIV3_WETH
 
@@ -367,6 +368,57 @@ check("блок замера" not in alert_nb,
       "на latest про блок НЕ обещается ничего: %r" % alert_nb[:160])
 check(w.at_block({"block": "мусор"}) == "" and w.at_block({}) == "" and w.at_block(None) == "",
       "мусор/отсутствие блока -> пусто, а не исключение")
+
+# --- 20.08: СПРАВКА О БОЕВОМ КАПЕ. Разбор CBLTC 20.08: канарейка кричала «impact 29.03%
+# при бонусе 12.68%», а бот в ту же минуту держал роут на 105 cbLTC вместо 280 (live-cap
+# уже срезал). Тревога была права про ПУЛ и молчала про то, покрыт ли он; выяснение стоило
+# захода в чужой журнал. Теперь вердикт боевой политики едет в тексте.
+print("\n=== 13. Тревога говорит, режет ли боевой live-cap этот размер ===")
+
+_probs13 = [{"kind": "deep", "name": "CBLTC→USDC", "text": "CBLTC→USDC AERO impact 29.03%",
+             "row": {"coll": _CBLTC, "loan": _USDC}, "th": 12.68, "src": "LIF"}]
+
+# (а) политика режет кап втрое -> тревога обязана это СКАЗАТЬ
+w.annotate_policy(_probs13, measure=lambda *a, **k: 10_500_000_000)
+check("политика капа на сегодня: 10500000000" in _probs13[0]["text"],
+      "вердикт политики есть в тексте: %r" % _probs13[0]["text"])
+check("живой слой" not in _probs13[0]["text"] or "режет размер сам" in _probs13[0]["text"],
+      "срез назван срезом: %r" % _probs13[0]["text"])
+
+# (б) политика НЕ режет -> сказано, что судимый размер и есть боевой
+_probs13b = [dict(_probs13[0], text="CBLTC→USDC AERO impact 29.03%")]
+w.annotate_policy(_probs13b, measure=lambda *a, **k: 28_000_000_000)
+check("НЕ режет" in _probs13b[0]["text"],
+      "равный кап назван равным: %r" % _probs13b[0]["text"])
+
+# (в) ЛИМИТ УЗЛА НЕ ИМЕЕТ ПРАВА СТАТЬ ЧИСЛОМ. Ступень, которую узел не обслужил, в бою
+# читается как «пул ревертит -> обрыв -> режем». Здесь это было бы фабрикацией: мы не
+# мерили. Незнание обязано закрывать гард — справки просто нет.
+_probs13c = [dict(_probs13[0], text="CBLTC→USDC AERO impact 29.03%")]
+_limit_call = lambda to, data, **kw: (None, "429 (НЕ ОПРОШЕН)", rc.UNPOLLED)
+w.annotate_policy(_probs13c, call=_limit_call)
+check("НЕ ПОСЧИТАНА" in _probs13c[0]["text"],
+      "лимит узла -> «не посчитана», а не выдуманный кап: %r" % _probs13c[0]["text"])
+for _bad in ("политика капа на сегодня", "НЕ режет"):
+    check(_bad not in _probs13c[0]["text"],
+          "при лимите узла НЕ печатается вердикт %r: %r" % (_bad, _probs13c[0]["text"]))
+
+# (г) СПРАВКА НЕ УПРАВЛЯЕТ ТРЕВОГОЙ. Что бы ни случилось с замером политики, состав
+# проблем и решение «звонить» обязаны остаться прежними.
+_probs13d = [dict(_probs13[0], text="X"), {"kind": "dead", "name": "Y", "text": "Y",
+                                            "row": {"coll": _CBLTC, "loan": _USDC}}]
+_before = [(x["kind"], x["name"]) for x in _probs13d]
+_fp_before = w.fingerprint(_probs13d)
+w.annotate_policy(_probs13d, measure=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("бум")))
+check([(x["kind"], x["name"]) for x in _probs13d] == _before,
+      "падение замера политики не меняет состав проблем")
+check(w.fingerprint(_probs13d) == _fp_before,
+      "справка не сдвигает отпечаток состояния (ключ дедупа)")
+check("МЁРТВ" not in _probs13d[1]["text"] and _probs13d[1]["text"] == "Y",
+      "к мёртвому маршруту справка о капе не дописывается")
+
+print("UNIT_OK: справка о боевом капе есть, лимит узла числом не притворяется, "
+      "тревога от справки не зависит")
 
 print("\n=== САМОКОНТРОЛЬ (тест обязан уметь падать) ===")
 ctrl = []

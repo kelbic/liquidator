@@ -210,6 +210,95 @@ def evaluate(rows, thresholds, symbols=None):
     return probs
 
 
+def policy_cap(coll, loan, *, call=None, measure=None, **kw):
+    """Что БОЕВАЯ политика капа (chain.route_depth) назначит этому роуту на СЕГОДНЯШНЕМ пуле.
+
+    Зачем это в тексте тревоги (разбор 20.08, CBLTC). Канарейка судит СТАТИЧЕСКИЙ max_in —
+    это её честно объявленная граница. Но у бота поверх статика живёт слой live-cap, и он
+    режет размер сам: 20.08 канарейка кричала «impact 29.03% при бонусе 12.68%», а боевой
+    бот в этот момент УЖЕ держал роут на 105 cbLTC вместо 280 (журнал Шарлотт 17:18-17:33) —
+    то есть на импакте ~1.9%. Тревога была права про ПУЛ и молчала про то, покрыт ли он.
+    Разбирающему пришлось выяснять это ссылкой в чужой журнал; теперь ответ едет в тексте.
+
+    Считает ТА ЖЕ функция, что и в бою (measure_route_cap), а не второй расчёт по мотивам:
+    вторая реализация разъехалась бы с боевой ровно тогда, когда это важнее всего. Подменён
+    только ТРАНСПОРТ — квоты идут через rc._call на публичный узел канарейки.
+
+    Побочный эффект set_live_cap остаётся ВНУТРИ процесса канарейки (агентская машина,
+    отдельный процесс, живёт минуту) — боевого бота он не касается.
+
+    Возвращает (cap, static) либо (None, static/None): незнание не выдаёт себя за диагноз.
+    """
+    try:
+        from eth_abi import encode  # noqa: F401,PLC0415 — нужен самому measure_route_cap
+        from chain import route_depth as rd  # noqa: PLC0415
+        from chain.execute import _SWAP_ROUTES  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None, None
+    static = (_SWAP_ROUTES.get((coll.lower(), loan.lower())) or {}).get("max_in")
+    if static is None:
+        return None, None
+
+    _call_fn = call or rc._call        # инъекция транспорта — тем же контрактом, что у rc.quote
+    # Лестница из 10 ступеней просится у публичного узла ОДНОЙ пачкой, и на дефолтном
+    # ретрае (4) один 429 стирает всю справку («НЕ ПОСЧИТАНА» на живом прогоне 20.08).
+    # Терпения тут не жалко: путь работает только на пробитом роуте, то есть редко.
+    kw.setdefault("tries", 6)
+    kw.setdefault("pause", 1.2)
+
+    class _NodeLimit(Exception):
+        """Узел не обслужил ступень лестницы."""
+
+    def _batch(_rpc, calls):
+        """Пачка квот -> [(ok, raw32)] в форме, которую ждёт measure_route_cap.
+
+        РАЗНИЦА, КОТОРУЮ НЕЛЬЗЯ СТИРАТЬ. Боевая политика читает (False, b"") как ДАННЫЕ —
+        «ступень ревертит, дальше обрыв, режем кап». В бою это верно: там aggregate3, и
+        транспортный отказ выбрасывает исключение (fail-open, статик остаётся). Здесь
+        транспорт другой, и молчание узла (429) пришло бы в ту же ячейку — политика вернула
+        бы ЗАНИЖЕННЫЙ кап, а тревога напечатала бы его как факт. Незнание обязано закрывать
+        гард, а не выдавать себя за диагноз: любой UNPOLLED рвёт замер, справки просто не
+        будет. DEAD (положительное свидетельство реверта) — это данные, он проходит.
+        """
+        out = []
+        for to, data in calls:
+            hexdata = "0x" + data.hex() if isinstance(data, (bytes, bytearray)) else data
+            res, _err, kind = _call_fn(to, hexdata, **kw)
+            if kind == rc.UNPOLLED:
+                raise _NodeLimit(str(_err)[:80])
+            out.append((True, bytes.fromhex(res[2:])) if (kind == rc.ALIVE and res)
+                       else (False, b""))
+        return out
+
+    try:
+        cap = (measure or rd.measure_route_cap)(None, coll, loan, batch_fn=_batch,
+                                                log_fn=lambda _m: None)
+    except Exception:  # noqa: BLE001 — справка НЕ ИМЕЕТ ПРАВА гасить тревогу
+        return None, static
+    return cap, static
+
+
+def annotate_policy(probs, *, call=None, measure=None, **kw):
+    """Дописывает к «глубоким» проблемам вердикт боевой политики капа. Только справка:
+    состав probs и решение «тревожить» не меняются ни при каком исходе."""
+    for p in probs:
+        if p.get("kind") != "deep":
+            continue
+        r = p.get("row") or {}
+        cap, static = policy_cap(r.get("coll", ""), r.get("loan", ""), call=call,
+                                 measure=measure, **kw)
+        if cap is None or not static:
+            p["text"] += "\n    политика капа: НЕ ПОСЧИТАНА (замер не удался) — размер судить по статику"
+        elif cap >= static:
+            p["text"] += ("\n    политика капа: %d (=статик %d) — живой слой НЕ режет, "
+                          "размер боя равен судимому" % (cap, static))
+        else:
+            p["text"] += ("\n    политика капа на сегодня: %d вместо статика %d (x%.2f) — "
+                          "боевой live-cap режет размер сам; тревога про ПУЛ, не про бой"
+                          % (cap, static, cap / static))
+    return probs
+
+
 def fingerprint(probs, blind=False):
     """Отпечаток СОСТОЯНИЯ (какие маршруты и чем плохи), без числового шума: тревога по
     осциллирующей величине обязана звонить на смену состояния, а не на каждый тик."""
@@ -281,6 +370,10 @@ def run(*, passes=None, repass_sleep=None, call=None, notify_fn=None, markets=No
     th = thresholds_for_rows(rows, markets=markets, symbols=symbols,
                              default_pct=default_pct, margin=margin)
     probs = evaluate(rows, th, symbols)
+    # Справка о боевом капе — ТОЛЬКО когда есть что разбирать (10 квот на пробитый роут,
+    # ноль на спокойном проходе): бюджет узла тратится на разбор, а не на рутину.
+    if probs:
+        annotate_policy(probs, call=call, **kw)
     polled = sum(1 for r in rows if r["status"] != rc.UNPOLLED)
     blind = bool(rows) and polled == 0
 
