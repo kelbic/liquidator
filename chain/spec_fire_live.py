@@ -3051,9 +3051,9 @@ class SpecFireLive:
                 return
             self._pos_alert_ts = now
             if won:
-                al("\U0001F3C6 ПОБЕДА в судимой гонке: %s" % rep, "race-win")
+                al("\U0001F3C6 ПОБЕДА в гонке: %s" % rep, "race-win")
             else:
-                al("\U0001F3C1 гонка судима (первый блок эпизода): %s" % rep, "race-verdict")
+                al("\U0001F3C1 вердикт гонки (первый блок эпизода): %s" % rep, "race-verdict")
         except Exception:
             pass
 
