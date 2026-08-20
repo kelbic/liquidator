@@ -193,6 +193,63 @@ finally:
     _fo._ACTIVE = None
 
 
+# ---- 6. px_confirmed: гард НЕ должен возвращаться на ДЕНЕЖНЫЙ путь ----
+# px_confirmed_rpc() строит хэндл лениво ПОД ЛОКОМ, и туда добавлен chainId-гард = сетевой
+# вызов с таймаутом 8с. Зовут её из read_price_hedged — реактивного пути. Поэтому: (1) прогрев
+# делается на старте (main.py), (2) синглтон ОБЯЗАН быть выставлен после любого исхода прогрева.
+# Если он останется None, горячий путь будет ПОВТОРЯТЬ восьмисекундную пробу на каждом чтении
+# цены — то есть дефект воскреснет ровно в деградацию, когда он дороже всего.
+import os as _os  # noqa: E402
+import chain.hotpath as _hp  # noqa: E402
+import chain.rpc as _rp  # noqa: E402
+
+_prev_url = _os.environ.get("PX_CONFIRMED_RPC_URL")
+_os.environ["PX_CONFIRMED_RPC_URL"] = "https://reserve.example/BKEY"
+_combat = types.SimpleNamespace(rpc_url="https://combat.example")
+_orig_BR = _rp.BaseRpc
+try:
+    for _label, _cid, _ctor_bad in (("узел здоров", 8453, False),
+                                    ("узел на ЧУЖОЙ цепи", 10, False),
+                                    ("узел МОЛЧИТ на буте", None, False),
+                                    ("конструктор упал", 8453, True)):
+        _net = []
+
+        class _FakeBR(_orig_BR):
+            def __init__(s, u, c, request_timeout=None):
+                if _ctor_bad:
+                    raise ValueError("bad url")
+                _orig_BR.__init__(s, u, c, request_timeout)
+
+            def _web3(s, _c=_cid):
+                _net.append(1)
+                if _c is None:
+                    raise RuntimeError("узел лежит")
+                return types.SimpleNamespace(eth=types.SimpleNamespace(chain_id=_c))
+
+        _rp.BaseRpc = _FakeBR
+        _hp._PX_CONFIRMED_RPC = None
+        _hp.px_confirmed_rpc(_combat)                      # прогрев на старте
+        _warm, _sent = len(_net), _hp._PX_CONFIRMED_RPC
+        for _ in range(3):
+            _hp.px_confirmed_rpc(_combat)                  # горячий путь
+        check("px_confirmed [%s]: синглтон выставлен (не None => нет повтора пробы)" % _label,
+              _sent is not None, _sent)
+        check("px_confirmed [%s]: горячий путь БЕЗ сети" % _label, len(_net) - _warm == 0,
+              len(_net) - _warm)
+        # Какой ИМЕННО сентинел ожидаем, зависит от исхода — проверяем его, а не «что-нибудь».
+        # False = вечный откат на боевой; хэндл = резервный ключ принят (в т.ч. непроверенным,
+        # когда узел молчал: незнание не хоронит резерв вечным решением).
+        _want_false = (_cid == 10) or _ctor_bad
+        check("px_confirmed [%s]: сентинел = %s" % (_label, "False" if _want_false else "хэндл"),
+              (_sent is False) if _want_false else (_sent is not False), _sent)
+finally:
+    _rp.BaseRpc = _orig_BR
+    _hp._PX_CONFIRMED_RPC = None
+    _os.environ.pop("PX_CONFIRMED_RPC_URL", None)
+    if _prev_url is not None:
+        _os.environ["PX_CONFIRMED_RPC_URL"] = _prev_url
+
+
 print()
 if FAILS:
     print("ПРОВАЛЕНО: %d — %s" % (len(FAILS), ", ".join(FAILS)))
