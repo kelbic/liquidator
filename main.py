@@ -614,6 +614,10 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                          _u.split("//")[-1].split("/")[0])
     except Exception:
         _bg_read_rpc = rpc
+    # #117: ТРЕТИЙ КЛЮЧ для окно-массы (PREARM ниже + буст-циклы кэша в hot_loop). Пусто/отказ =>
+    # боевой rpc, поведение бит-в-бит. Гард сети и названный предел — в build_combat_read_rpc.
+    from chain.rpc import build_combat_read_rpc
+    _combat_read_rpc = build_combat_read_rpc(cfg, rpc, log=log)
     shared = _Shared(markets)
     _snap = _load_candidates_snapshot(cfg.candidates_snapshot_path)      # P0-1: закрыть слепое окно рестарта
     if _snap:
@@ -754,7 +758,10 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     # мега-сайз). Ноль отправок; потребление — прозрачный кэш в kyber_swap.
                     try:
                         from chain.prearm import PreArmWorker, PREARM_MIN_DEBT_USD, PREARM_TOP_K
-                        _pa = PreArmWorker(rpc, cfg, shared)
+                        # #117: чтения прогрева (_read_target = ДВА aggregate3 на цель, >=16 930
+                        # вызовов/сут) — на ключ C. Горизонт слоя ~2 мин (окно), не один блок,
+                        # поэтому RTT-джиттер третьего ключа ему ничего не стоит. Без C = боевой.
+                        _pa = PreArmWorker(_combat_read_rpc, cfg, shared)
                         _handlers.append(_pa.handle_event)
                         log.warning("PRE-ARM ENABLED — Kyber-прогрев в окнах (top-%d, debt>=$%.0fk), ноль отправок",
                                     PREARM_TOP_K, PREARM_MIN_DEBT_USD / 1e3)

@@ -2644,6 +2644,14 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                      _bg_url.split("//")[-1].split("/")[0])
     except Exception:
         _bg_rpc = rpc
+    # #117: буст-циклы кэша позиций (<=10 560 eth_call/сут) — на ТРЕТИЙ ключ. Слой по построению
+    # резервный (в штиль это stale-фолбэк, потребитель при промахе дочитывает живьём), поэтому
+    # 429 на C стоит нам refresh-fail, а не блока. Пусто/отказ => боевой rpc, бит-в-бит как было.
+    try:
+        from chain.rpc import build_combat_read_rpc
+        _c_rpc = build_combat_read_rpc(cfg, rpc, log=log)
+    except Exception:
+        _c_rpc = rpc
 
     def _default_ws():
         return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
@@ -2943,7 +2951,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         # logs refresh-miss/cycle timing. Does NOT touch reads_fn — read_positions_cached
                         # is not wired into _process_transmit yet, so this has zero effect on hot-path behavior.
                         _spawn_cache_refresh(cache_rpc=_bg_rpc, shared=shared, bn=bn,   # штиль -> bg-RPC (CU-замер 25.07);
-                                             combat_rpc=rpc)                            # буст-окно -> боевой (ревью 05.08 (а))
+                                             combat_rpc=_c_rpc)                         # буст-окно -> ключ C (#117; без C = боевой)
                     idx = d.get("index"); txs = extract_txs(d); now = time.time()
                     for _raw, _to in txs:                        # SHADOW слоя 1: декод transmit из фида (log-only)
                         if _raw and FORWARD_SEL in _raw:

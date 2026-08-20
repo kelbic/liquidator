@@ -91,6 +91,22 @@ class Config:
     # ключ-квота массы больше не топит детект. Пусто => всё на bg_rpc_url (прежнее поведение).
     # Откат: BG_RPC_URL_2= (пусто).
     bg_rpc_url2: str = ""
+    # #117 (19.08) ТРЕТИЙ КЛЮЧ — ОКНО-МАССА. Замер боевого ключа A: 1.4M CU/сутки = 42M/мес при
+    # квоте 30M (скользящая проекция самого бота показывала 67-73M/мес на пике). Разложение массы
+    # eth_call: PREARM-прогрев (>=16 930 вызовов/сут: `_read_target` жжёт ДВА aggregate3 на цель)
+    # и буст-циклы кэша позиций (<=10 560/сут) — вместе ~2/3 всех eth_call ключа A. Оба слоя
+    # обслуживают predict-ОКНО (~2 мин), а не гонку одного блока: RTT-джиттер третьего ключа им
+    # ничего не стоит, а 429 на боевом ключе стоил бы блока. Поэтому именно они уезжают на C.
+    #
+    # Сюда НЕ уходят: подпись/отправка/nonce, head_fn арма доски, реактивные чтения
+    # `_process_transmit`, аудит лестниц и патрон флота — это денежный путь, он остаётся на A.
+    # Сюда НЕ уходит и резервный ключ B (PX_CONFIRMED_RPC_URL / COMBAT_FAILOVER_URLS): его ноль
+    # обращений за сутки — не простой, а КОНСТРУКЦИЯ (confirmed-нога цены зовётся только при
+    # `px_hedge_degraded`, health-check щупает лишь активный указатель). Нагрузив B массой, мы
+    # связали бы здоровье резерва с квотой читателя ровно в тот момент, когда A задохнулся.
+    #
+    # Пусто => боевой rpc (прежнее поведение БИТ-В-БИТ). Откат: COMBAT_READ_RPC_URL= (пусто).
+    combat_read_rpc_url: str = ""
     preconf_rpc: str = "https://mainnet-preconf.base.org"   # pre-confirmed price source for the hot path
     sequencer_rpc: str = "https://mainnet-sequencer.base.org"  # SEND-3: параллельный raw-broadcast; "off" = выкл
     candidates_snapshot_path: str = "candidates_snapshot.json"  # warm-start: последний candidate set (P0-1)
@@ -171,6 +187,7 @@ class Config:
             canary_max_gas_usd=f("CANARY_MAX_GAS_USD", d.canary_max_gas_usd),
             bg_rpc_url=s("BG_RPC_URL", d.bg_rpc_url),
             bg_rpc_url2=s("BG_RPC_URL_2", d.bg_rpc_url2),
+            combat_read_rpc_url=s("COMBAT_READ_RPC_URL", d.combat_read_rpc_url),
             preconf_rpc=s("PRECONF_RPC", d.preconf_rpc),
             sequencer_rpc=s("SEQUENCER_RPC", d.sequencer_rpc),
             candidates_snapshot_path=s("CANDIDATES_SNAPSHOT_PATH", d.candidates_snapshot_path),
