@@ -58,8 +58,16 @@ def reset_pacer():
     for d in ("_PACER_BUCKETS", "_PACER_DRY", "_PACER_SPILL_SENT"):
         if hasattr(ex, d):
             getattr(ex, d).clear()
+    # 20.08: transport_reject стал ПЕР-КАНАЛЬНЫМ словарём (был суммарный int) — вместе со
+    # вторым egress-IP суммарное число перестало отвечать на вопрос «умер адрес или режет
+    # секвенсер». Сбрасываем как словарь; прежняя величина = сумма значений (см. rej_total).
     if hasattr(ex, "_PACER_TRANSPORT_REJECT"):
-        ex._PACER_TRANSPORT_REJECT = 0
+        ex._PACER_TRANSPORT_REJECT = {}
+
+
+def rej_total(rej):
+    """Прежняя скалярная семантика transport_reject, восстановленная из пер-канального словаря."""
+    return sum(rej.values()) if isinstance(rej, dict) else rej
 
 
 def arm(addr, nonce=500):
@@ -81,8 +89,9 @@ SCRIPT = {}
 CALLS = []
 
 
-def scripted_sync(url, raw_hex, timeout=5, paced=True, rate=None, burst=None):
-    CALLS.append(url)
+def scripted_sync(url, raw_hex, timeout=5, paced=True, rate=None, burst=None, source_ip=None):
+    # source_ip — канал рассылки (20.08). Стенд сети не касается, поэтому просто фиксируем.
+    CALLS.append(url if source_ip is None else "%s|%s" % (url, source_ip))
     seq = SCRIPT.get(url)
     if isinstance(seq, list):
         return seq.pop(0) if seq else (False, "over rate limit")
@@ -150,7 +159,7 @@ try:
     dry, spill, rej = ex.volley_pacer_stats()
     check("B1 spill(pacer_dry): доставлено вторым каналом", out == h and CALLS == [U1, U2], (out, CALLS))
     check("B1 spill(pacer_dry): pacer_dry[U1]=1, spill_sent[U2]=1, reject=0",
-          dry.get(U1) == 1 and spill.get(U2) == 1 and rej == 0, (dry, spill, rej))
+          dry.get(U1) == 1 and spill.get(U2) == 1 and rej_total(rej) == 0, (dry, spill, rej))
     check("B1 spill(pacer_dry): nonce ноги продвинут", ex._VOLLEY_NONCE[ADDR] == n + 1,
           ex._VOLLEY_NONCE[ADDR])
 except Exception as e:
@@ -168,7 +177,7 @@ try:
     dry, spill, rej = ex.volley_pacer_stats()
     check("B2 spill(over-rate-limit): доставлено вторым каналом", out == h and CALLS == [U1, U2], (out, CALLS))
     check("B2 spill(over-rate-limit): transport_reject=1, pacer_dry пуст, spill_sent[U2]=1",
-          rej == 1 and not dry and spill.get(U2) == 1, (dry, spill, rej))
+          rej_total(rej) == 1 and not dry and spill.get(U2) == 1, (dry, spill, rej))
 except Exception as e:
     check("B2 spill(over-rate-limit): доставлено вторым каналом", False, "%s: %s" % (type(e).__name__, e))
 
@@ -190,7 +199,7 @@ try:
           q0 == (n, raw, h), q0)
     check("B3 exhaustion: nonce НЕ продвинут (инвариант подряд)", ex._VOLLEY_NONCE[ADDR] == n, ex._VOLLEY_NONCE[ADDR])
     check("B3 exhaustion: причины разведены (pacer_dry[U1]=1, reject=1)",
-          dry.get(U1) == 1 and rej == 1, (dry, rej))
+          dry.get(U1) == 1 and rej_total(rej) == 1, (dry, rej))
     check("B3 exhaustion: лог #104 с контекстом сохранён", "запись возвращена" in _fmt and "nonce" in _fmt, _fmt[:120])
 except Exception as e:
     check("B3 exhaustion: возврат None, оба канала опрошены по разу", False, "%s: %s" % (type(e).__name__, e))
@@ -209,7 +218,7 @@ try:
     check("B4 already-known: терминальный успех (возврат h, запись НЕ возвращена)",
           out == h and not q, (out, q))
     check("B4 already-known: nonce продвинут, already-known НЕ считается reject'ом",
-          ex._VOLLEY_NONCE[ADDR] == n + 1 and rej == 1 and not spill, (ex._VOLLEY_NONCE[ADDR], rej, spill))
+          ex._VOLLEY_NONCE[ADDR] == n + 1 and rej_total(rej) == 1 and not spill, (ex._VOLLEY_NONCE[ADDR], rej, spill))
 except Exception as e:
     check("B4 already-known: терминальный успех (возврат h, запись НЕ возвращена)", False, "%s: %s" % (type(e).__name__, e))
 
@@ -231,7 +240,7 @@ try:
     out = ex.send_presigned_probe(None, CFG, ADDR, log=LogRec(), broadcast_raw_urls=[U1, U2])
     dry, spill, rej = ex.volley_pacer_stats()
     check("C off: РОВНО одна отправка на первый url (spill не активен)", out == h and CALLS == [U1], (out, CALLS))
-    check("C off: счётчики пейсера не двигаются", not dry and not spill and rej == 0, (dry, spill, rej))
+    check("C off: счётчики пейсера не двигаются", not dry and not spill and rej_total(rej) == 0, (dry, spill, rej))
     ex._VOLLEY_PACER_ON = True
     ex._post_raw_sync = _real_post_raw_sync
 except Exception as e:

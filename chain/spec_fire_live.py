@@ -3625,7 +3625,7 @@ class SpecFireLive:
                 _fs = _us = _mm = -1
                 _rs = _ifs = -1
                 _pdry = _pspill = {}
-                _prej = -1
+                _prej = {}          # 20.08: пер-канальный словарь (был суммарный int)
             if _mm > 0 and self._alert is not None:
                 # У2 (решение kelbic 09.08): немота ног по комиссии = состояние, которое
                 # само не рассосётся (долив или ручка MAXFEE_RESERVE_MULT) и которое иначе
@@ -3663,11 +3663,14 @@ class SpecFireLive:
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
                       "budget_reserve_skips=%d budget_inflight_skips=%d "
-                      "pacer_dry=%s spill_sent=%s transport_reject=%d "
+                      # 20.08: все три — ПО КАНАЛАМ (url|ip). transport_reject был суммарным
+                      # int; с двумя egress-адресами суммарное число не отвечает на вопрос
+                      # «умер адрес или режет секвенсер», а именно он теперь и стоит.
+                      "pacer_dry=%s spill_sent=%s transport_reject=%s "
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej,
+                          _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej or "—",
                           _es or "—", _cs or "—", _is,
                           ("%s/%s" % (_wkey[0][:10], _wkey[1][:10])) if _wkey else "НЕТ",
                           _pw, self.stats))
