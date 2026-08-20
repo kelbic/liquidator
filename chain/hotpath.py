@@ -1633,14 +1633,34 @@ def _shave_ask(borrow_shares, bps=None):
     return max(1, bs - max(1, bs * b // 10_000))
 
 
-def _cap_repaid_shares(borrow_shares, collateral, price, lif_wad, tba, tbs):
+def _cap_repaid_shares(borrow_shares, collateral, price, lif_wad, tba, tbs, shave_bps=None):
     """P1-7: max repaidShares, при котором seized <= collateral в арифметике канона — глубокая
     позиция (залог не покрывает долг+бонус) раньше давала Panic 0x11 (collateral -= seized) ->
     sim-revert -> skip, и главные призы каскадов терялись. Кап ДО сайзинга свопа (запрет STATE
     «НЕ капаем» относился к пост-хок капу ПОСЛЕ расчёта свопа — там mismatch). При капе забирается
     весь залог -> Morpho сам списывает остаток долга (bad-debt socialization). Это НЕ закрытый
     seizedAssets-режим: вход контракта прежний (repaidShares). Floor-инверсия + верификация вперёд
-    точной формулой; чистая (юнит)."""
+    точной формулой; чистая (юнит).
+
+    #121 НА ЗАЛОГОВОЙ ГРАНИЦЕ (20.08, форк-репро в test_fork_route_cbbtc_weth П5): целиться в
+    `seized <= collateral` ЗНАЧИТ СТАВИТЬ ЗАЯВКУ НА ГРАНИЦУ — ровно тот класс, что #121 закрыл на
+    долговой стороне. Замер: залог 3 000 000, наш seized 2 999 999 (запас 1 единица = 0.0033 bps),
+    БОЕВАЯ tx -> Panic 0x11; та же ветка с заявкой −1% -> ликвидация проходит.
+    ПОЧЕМУ ГРАНИЦА НЕ ДЕРЖИТСЯ, хотя формула у нас ТОЧНАЯ (та же, что в Morpho): расходятся не
+    формулы, а ВХОДЫ. `Morpho.liquidate` первым делом делает `_accrueInterest`, и toAssetsDown
+    считается уже по ВЫРОСШЕМУ totalBorrowAssets — seized выходит больше нашего на долю
+    начисления за время между снимком и исполнением. Плюс до трёх единиц floor-округления на
+    цепочке toAssetsDown -> wMulDown -> mulDivDown.
+    СКОЛЬКО НУЖНО (вывод, а не «−1% с потолка»): seized ∝ tba, а tba растёт как r·Δt. Худший
+    случай нашего тракта: план доски живёт TTL 900с, потолок ставки адаптивной кривой Morpho
+    ~800% годовых => дрейф 800% × 900/31 536 000 = 0.0228% = 2.28 bps. Округление добавляет
+    <=3 единицы. Берём ГОТОВУЮ ручку класса #121 — ASK_SHAVE_BPS (дефолт 10 bps): она покрывает
+    худший дрейф с запасом 4.4x, уже проверена боем на долговой стороне и снимается тем же
+    HOT_ASK_SHAVE_BPS=0. Цена — недобор пыли на дне залога (0.1% от seized), и он ВСЕГДА дешевле
+    паники: паника это ноль денег плюс счёт в глобальный брейкер fast-lane.
+    ВЕТКА БЕЗ КАПА (весь долг помещается) — БИТ-В-БИТ прежняя: шейв применяется ТОЛЬКО к
+    залоговой границе внутри cap-ветки, ранний выход сравнивается с ПОЛНЫМ collateral.
+    """
     from chain.simulate import to_shares_down
     from chain.execute import ORACLE_PRICE_SCALE, WAD
     bs = int(borrow_shares)
@@ -1648,12 +1668,17 @@ def _cap_repaid_shares(borrow_shares, collateral, price, lif_wad, tba, tbs):
         return 0
     if _seized_exact(bs, lif_wad, price, tba, tbs) <= collateral:
         return bs                                            # весь долг помещается — кап не нужен
-    cap_assets = (collateral * price // ORACLE_PRICE_SCALE) * WAD // lif_wad
+    # --- ниже ТОЛЬКО cap-ветка: граница отодвигается от залога на запас #121 ---
+    b = ASK_SHAVE_BPS if shave_bps is None else int(shave_bps)
+    col = int(collateral)
+    if b > 0 and col > 1:
+        col = max(1, col - max(1, col * b // 10_000))
+    cap_assets = (col * price // ORACLE_PRICE_SCALE) * WAD // lif_wad
     rs = min(to_shares_down(cap_assets, tba, tbs), bs)
     for _ in range(4):                                       # floor-инверсия может промахнуться на wei
         if rs <= 0:
             return 0
-        if _seized_exact(rs, lif_wad, price, tba, tbs) <= collateral:
+        if _seized_exact(rs, lif_wad, price, tba, tbs) <= col:
             return rs
         rs -= max(1, rs // 10**6)
     return 0

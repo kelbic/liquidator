@@ -110,3 +110,108 @@ assert _shave_ask(BS, 0) == BS, "HOT_ASK_SHAVE_BPS=0 обязан возвращ
 print("UNIT_OK: HOT_ASK_SHAVE_BPS=0 снимает механизм целиком")
 
 print("=== ДРЕЛЬ #121 ЗЕЛЁНАЯ: заявка строго ниже долга, дрейф кэша больше не отдаёт приз ===")
+
+# ==================================================================================================
+# #121 НА ЗАЛОГОВОЙ ГРАНИЦЕ (20.08). Форк-репро: test_fork_route_cbbtc_weth П5 — рынок 0x5dffffc7
+# (cbBTC/WETH, lltv 0.915), залог урезан до 3 000 000, полная заявка не влезает, `_cap_repaid_shares`
+# её урезает — и БОЕВАЯ tx падает Panic 0x11, потому что кап целился в collateral−1 (запас 1
+# единица = 0.0033 bps), а Morpho считает seized уже ПОСЛЕ _accrueInterest, по выросшему tba.
+# ==================================================================================================
+print()
+CAP_BS = 1773455292033251489375494        # borrowShares жертвы 0x1a1e7a3b на блоке 50191666
+CAP_COL = 3_000_000                       # залог, подкрученный стендом (полный сейз не влезает)
+CAP_TBA = 4_512_206_780_060_186_855_119   # market(0x5dffffc7) на том же блоке
+CAP_TBS = 4_350_845_318_692_506_419_524_477
+CAP_PRICE = 313141147717123148067449096879623662857680012047
+CAP_LIF = 1026167404351114682              # lltv 0.915 -> LIF 1.0261674
+
+
+def cap_ask(bps=None):
+    return _cap_repaid_shares(_shave_ask(CAP_BS, bps), CAP_COL, CAP_PRICE, CAP_LIF,
+                              CAP_TBA, CAP_TBS, shave_bps=bps)
+
+
+# 1. КРАСНЫЙ-НА-БАЗЕ: откат (bps=0) обязан воспроизводить ГРАНИЦУ — сейз впритык к залогу.
+_old = cap_ask(0)
+_old_seized = _seized_exact(_old, CAP_LIF, CAP_PRICE, CAP_TBA, CAP_TBS)
+assert _old > 0 and _old < CAP_BS, "репро обязано попадать в cap-ветку: %d" % _old
+assert CAP_COL - _old_seized <= 2, (
+    "откат обязан оставлять заявку НА ГРАНИЦЕ (запас %d единиц) — иначе дрель слепа"
+    % (CAP_COL - _old_seized))
+print("UNIT_OK: откат воспроизводит залоговую границу — сейз %d при залоге %d (запас %d ед. = "
+      "%.4f bps), на цепи это Panic 0x11"
+      % (_old_seized, CAP_COL, CAP_COL - _old_seized,
+         (CAP_COL - _old_seized) * 10_000.0 / CAP_COL))
+
+# 2. ЗЕЛЁНЫЙ: боевой дефолт отодвигает заявку от границы на замеренный запас.
+_new = cap_ask(None)
+_new_seized = _seized_exact(_new, CAP_LIF, CAP_PRICE, CAP_TBA, CAP_TBS)
+_margin_bps = (CAP_COL - _new_seized) * 10_000.0 / CAP_COL
+assert _new < _old, "боевой дефолт обязан просить МЕНЬШЕ границы: %d >= %d" % (_new, _old)
+assert _margin_bps >= 9.0, "запас %.2f bps меньше ручки %d bps" % (_margin_bps, ASK_SHAVE_BPS)
+# ХУДШИЙ ДРЕЙФ ТРАКТА: план доски живёт TTL 900с, потолок ставки Morpho ~800%/год =>
+# tba растёт на 2.28 bps, seized ∝ tba. Запас обязан ЭТО покрывать.
+_worst_drift_bps = 800.0 * 900.0 / 31_536_000.0 * 100.0
+assert _margin_bps > _worst_drift_bps, (
+    "запас %.2f bps не покрывает худший дрейф начисления %.2f bps" % (_margin_bps, _worst_drift_bps))
+print("UNIT_OK: с боевым запасом сейз %d при залоге %d — отступ %.2f bps против худшего дрейфа "
+      "начисления %.2f bps (покрытие %.1fx); недобор пыли %d ед."
+      % (_new_seized, CAP_COL, _margin_bps, _worst_drift_bps, _margin_bps / _worst_drift_bps,
+         _old_seized - _new_seized))
+
+# 3. ДРЕЙФ tba: то, что на цепи делает _accrueInterest. Заявка, посчитанная по СТАРОМУ tba,
+#    обязана пережить рост tba в пределах запаса — и это ровно то, чего не было до фикса.
+def _seized_after_accrual(rs, growth_bps):
+    return _seized_exact(rs, CAP_LIF, CAP_PRICE, CAP_TBA + CAP_TBA * growth_bps // 10_000, CAP_TBS)
+
+
+for _g in (1, 2, 5, 8):
+    assert _seized_after_accrual(_old, _g) > CAP_COL, (
+        "откат обязан переполнять залог уже при дрейфе %d bps" % _g)
+    assert _seized_after_accrual(_new, _g) <= CAP_COL, (
+        "боевой запас обязан переживать дрейф %d bps" % _g)
+print("UNIT_OK: дрейф tba 1..8 bps — откат переполняет залог, боевой запас держит")
+
+# 4. ВНЕ CAP-ВЕТКИ — БИТ-В-БИТ. Эталон считается ПРЕЖНЕЙ формулой (граница = полный collateral),
+#    выписанной здесь заново: сравнение с самим собой доказательством не является.
+def _legacy_cap(borrow_shares, collateral, price, lif_wad, tba, tbs):
+    from chain.simulate import to_shares_down
+    from chain.execute import ORACLE_PRICE_SCALE, WAD
+    bs2 = int(borrow_shares)
+    if bs2 <= 0:
+        return 0
+    if _seized_exact(bs2, lif_wad, price, tba, tbs) <= collateral:
+        return bs2
+    cap_assets = (collateral * price // ORACLE_PRICE_SCALE) * WAD // lif_wad
+    rs = min(to_shares_down(cap_assets, tba, tbs), bs2)
+    for _ in range(4):
+        if rs <= 0:
+            return 0
+        if _seized_exact(rs, lif_wad, price, tba, tbs) <= collateral:
+            return rs
+        rs -= max(1, rs // 10 ** 6)
+    return 0
+
+
+import hashlib
+
+_table = []
+for _bs in (BS, BS // 2, BS // 7, 10 ** 9, 12345, 2, 1, 0):
+    for _col in (COLL, COLL * 4, COLL * 100, CAP_COL * 1000):
+        _a = _cap_repaid_shares(_bs, _col, PRICE, LIF_WAD, TBA, TBS)
+        _b = _legacy_cap(_bs, _col, PRICE, LIF_WAD, TBA, TBS)
+        _seized_now = _seized_exact(_bs, LIF_WAD, PRICE, TBA, TBS)
+        if _seized_now <= _col:                    # ВНЕ cap-ветки — обязан совпасть до бита
+            assert _a == _b == _bs, ("вне cap-ветки поведение изменилось: %d != %d (bs=%d col=%d)"
+                                     % (_a, _b, _bs, _col))
+            _table.append("%d:%d:%d" % (_bs, _col, _a))
+_digest = hashlib.sha256("|".join(_table).encode()).hexdigest()[:16]
+assert _table, "контрольная таблица пуста — тест ничего не сравнил"
+print("UNIT_OK: вне cap-ветки поведение БИТ-В-БИТ прежнее (%d входов, отпечаток заявок %s)"
+      % (len(_table), _digest))
+
+# 5. ОТКАТ РУЧКИ снимает механизм целиком и в этой ветке тоже.
+assert cap_ask(0) == _legacy_cap(_shave_ask(CAP_BS, 0), CAP_COL, CAP_PRICE, CAP_LIF,
+                                 CAP_TBA, CAP_TBS), "HOT_ASK_SHAVE_BPS=0 обязан вернуть прежнее"
+print("UNIT_OK: HOT_ASK_SHAVE_BPS=0 возвращает прежнюю cap-ветку бит-в-бит")
+
