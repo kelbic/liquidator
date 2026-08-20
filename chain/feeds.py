@@ -8,12 +8,43 @@ Import-clean: websockets/brotli/Morpho ABIs imported lazily.
 """
 from __future__ import annotations
 import logging
+import os
 import time
 from collections import defaultdict
 
 log = logging.getLogger("liquidator")
 
 FB_URL = "wss://mainnet.flashblocks.base.org/ws"
+
+# --- 20.08: ЧТЕНИЯ WS С ВЫДЕЛЕННОГО ИСХОДЯЩЕГО АДРЕСА ------------------------------------------
+# Замер трёх точек (13:13-13:18, вотчеры Шарлотт-IP1 / Шарлотт-IP2 / Вена) поймал троттлинг
+# flashblocks ПО АДРЕСУ: с основного IP 26-78 сообщений/мин и 1-2 обрыва КАЖДУЮ минуту, со
+# ВТОРОГО адреса ТОЙ ЖЕ МАШИНЫ в те же минуты — ровно 330/мин и ноль обрывов (Вена так же 330).
+# Значит ключ — не машина и не маршрут, а вход. Лечение: держать ЧТЕНИЯ суб-блоков на чистом
+# адресе, отдельном от того, с которого летят пробы (пробы = 110/с в секвенсер той же
+# инфраструктуры base.org, и это самый вероятный источник репутации адреса).
+# Пусто -> прежнее поведение бит-в-бит (адрес выбирает ядро).
+WS_READ_SRC_IP = (os.environ.get("WS_READ_SRC_IP", "") or "").strip()
+
+
+def ws_bound_socket(url: str, src_ip: str = None, timeout: float = 20.0):
+    """TCP-сокет к хосту url, привязанный к src_ip. None/пусто -> None (обычный путь)."""
+    ip = (src_ip if src_ip is not None else WS_READ_SRC_IP) or ""
+    if not ip:
+        return None
+    import socket
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    host, port = u.hostname, (u.port or (443 if u.scheme in ("wss", "https") else 80))
+    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    fam, typ, proto, _c, sa = infos[0]
+    s = socket.socket(fam, typ, proto)
+    s.bind((ip, 0))                      # ошибка привязки НЕ глотается: канал чтения обязан
+    s.settimeout(timeout)                # быть предсказуемым, а тихий откат на грязный адрес
+    s.connect(sa)                        # вернул бы нас в троттлинг молча
+    s.settimeout(None)
+    return s
+
 ZERO = "0x0000000000000000000000000000000000000000"
 
 
@@ -349,7 +380,13 @@ async def watch_feeds(rpc, markets_loader, on_update, *, duration=None,
     import brotli
 
     def _default_ws():
-        return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
+        import ssl as _ssl
+        _sock = ws_bound_socket(FB_URL)
+        if _sock is None:
+            return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
+        return websockets.connect(FB_URL, sock=_sock, ssl=_ssl.create_default_context(),
+                                  server_hostname="mainnet.flashblocks.base.org",
+                                  open_timeout=20, ping_interval=20, max_size=None)
 
     ws_factory = ws_factory or _default_ws
     feeds = resolve_feeds(rpc, markets_loader())

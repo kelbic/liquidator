@@ -994,6 +994,20 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
             log.info("flashblocks auto-return: проба возврата (при неудаче следующая через %.0fс)",
                      fbret.delay)
         url, conn_kw, gen = _source_params(cfg, active)
+        # 20.08: чтения суб-блоков — с выделенного адреса (WS_READ_SRC_IP). Троттлинг
+        # flashblocks доказан ПО АДРЕСУ трёхточечным замером; фолбэк newHeads идёт своим
+        # путём (другой хост, другая репутация) — его не привязываем.
+        if active == "flashblocks":
+            try:
+                from chain.feeds import ws_bound_socket as _wbs
+                _rsock = _wbs(url)
+                if _rsock is not None:
+                    import ssl as _ssl
+                    conn_kw = dict(conn_kw, sock=_rsock, ssl=_ssl.create_default_context(),
+                                   server_hostname="mainnet.flashblocks.base.org")
+            except Exception as _e:
+                log.error("WS-READ bind: адрес %s не привязался (%s) — идём обычным путём",
+                          os.environ.get("WS_READ_SRC_IP", ""), type(_e).__name__)
         try:
             async with websockets.connect(url, **conn_kw) as ws:
                 log.info("block source=%s connected — loop (mode=%s)", active, cfg.mode)

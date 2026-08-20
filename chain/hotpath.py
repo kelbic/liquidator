@@ -2700,7 +2700,17 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
         _c_rpc = rpc
 
     def _default_ws():
-        return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
+        # 20.08: чтения суб-блоков — с ВЫДЕЛЕННОГО адреса (WS_READ_SRC_IP). Замер трёх точек
+        # доказал троттлинг flashblocks ПО АДРЕСУ: основной IP 26-78 сообщений/мин с обрывами,
+        # второй адрес той же машины в те же минуты — 330/мин без единого. Пусто = как было.
+        import ssl as _ssl
+        from chain.feeds import ws_bound_socket as _wbs
+        _sock = _wbs(FB_URL)
+        if _sock is None:
+            return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
+        return websockets.connect(FB_URL, sock=_sock, ssl=_ssl.create_default_context(),
+                                  server_hostname="mainnet.flashblocks.base.org",
+                                  open_timeout=20, ping_interval=20, max_size=None)
     ws_factory = ws_factory or _default_ws
 
     from chain.rpc import BaseRpc
