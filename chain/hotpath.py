@@ -2791,7 +2791,14 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             _win = max(1e-9, time.monotonic() - last_stats)
                             for _host, _ms in sorted(_snap.items()):
                                 _cu = rpc_usage_cu({_host: _ms})
-                                _top = sorted(_ms.items(), key=lambda kv: -CU_TOP_KEY(kv))[:6]
+                                # #117: 6 -> 10. Ключ учёта становится `метод@вызыватель`, когда
+                                # включён CU_ATTRIBUTION=1 (env, кода не требует — см. rpc.py
+                                # _caller_tag). Тогда один метод дробится на СТОЛЬКО строк,
+                                # сколько у него вызывателей, и шестёрка вытесняла хвост: на
+                                # ключе A один eth_call даёт минимум четыре разных вызывателя
+                                # (PREARM, буст кэша, confirmed-нога read_positions, патрон
+                                # флота). Ради чего заводится атрибуция, тем срез её и глушил.
+                                _top = sorted(_ms.items(), key=lambda kv: -CU_TOP_KEY(kv))[:10]
                                 _proj = _cu / _win * 86400 * 30 / 1e6
                                 _roll = cu_rolling_add(_host, _cu, _win)
                                 log.info("CU %s: %d CU/окно = %.0f CU/s (проекция %.1fM/мес, "
