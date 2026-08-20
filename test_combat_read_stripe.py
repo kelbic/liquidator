@@ -71,6 +71,19 @@ def cfg_with(url, rpc_url="https://combat.example/AKEY"):
 
 COMBAT = _Rpc()
 
+# ---- 0. ВЫКЛЮЧЕННЫЙ СТРАЙП СЛЫШЕН. Ключ C заведён на машине под своим именем
+# (ALCHEMY_C_URL); если его не переложить в COMBAT_READ_RPC_URL, бот молча работает
+# по-старому. Молчание неотличимо от исправной работы -> «всё хорошо» требует строки.
+import chain.rpc as _rpcmod0  # noqa: E402
+_rpcmod0._COMBAT_READ_LOGGED = False
+_lg0 = _Log()
+build_combat_read_rpc(cfg_with(""), COMBAT, log=_lg0)
+check("страйп выключен -> ГРОМКО в журнал (а не тихий no-op)",
+      any("страйп ВЫКЛЮЧЕН" in s for s in _lg0.lines), _lg0.lines)
+_lg0b = _Log()
+build_combat_read_rpc(cfg_with(""), COMBAT, log=_lg0b)
+check("...но ровно один раз на процесс (журнал не засоряется)", _lg0b.lines == [], _lg0b.lines)
+
 # ---- 1. Все сомнительные случаи -> боевой (одно прежнее поведение, не третий режим) ----
 check("пусто -> боевой", build_combat_read_rpc(cfg_with(""), COMBAT, log=_Log()) is COMBAT)
 check("тот же URL, что боевой -> боевой",

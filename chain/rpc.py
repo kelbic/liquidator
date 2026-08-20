@@ -475,7 +475,17 @@ def build_combat_read_rpc(cfg, combat_rpc, log=None):
     try:
         url = str(getattr(cfg, "combat_read_rpc_url", "") or "").strip()
         if not url or url == str(getattr(cfg, "rpc_url", "") or ""):
-            return combat_rpc                     # ручка пуста / тот же узел -> прежнее поведение
+            # ВЫКЛЮЧЕННЫЙ СТРАЙП ОБЯЗАН БЫТЬ СЛЫШЕН. Молчаливый no-op здесь — ловушка: ключ C
+            # заведён на машине под СВОИМ именем (ALCHEMY_C_URL), и если его не переложить в
+            # COMBAT_READ_RPC_URL, бот молча работает по-старому, а мы читаем это как «страйп
+            # раскатан». Канон: «всё хорошо» требует ПОЛОЖИТЕЛЬНОГО доказательства, а молчание
+            # неотличимо от исправной работы. Строка одна на процесс — журнал не засоряется.
+            if not _COMBAT_READ_LOGGED:                # global объявлен в начале функции
+                _COMBAT_READ_LOGGED = True
+                _log.warning("#117 страйп ВЫКЛЮЧЕН: COMBAT_READ_RPC_URL %s — PREARM и буст-циклы "
+                             "кэша остаются на боевом ключе (+21-24M CU/мес на нём)",
+                             "пуста" if not url else "совпала с RPC_URL")
+            return combat_rpc
         h = BaseRpc(url, int(getattr(cfg, "chain_id", 8453)), request_timeout=10)
         # У ключа C политика СТРОЖЕ общей: не подтвердил сеть по ЛЮБОЙ причине -> не берём.
         # Здесь незнание закрывает гард без оговорок, потому что цена отказа мала и известна:
