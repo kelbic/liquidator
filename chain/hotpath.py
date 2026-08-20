@@ -1633,14 +1633,46 @@ def _shave_ask(borrow_shares, bps=None):
     return max(1, bs - max(1, bs * b // 10_000))
 
 
-def _cap_repaid_shares(borrow_shares, collateral, price, lif_wad, tba, tbs):
+CAP_SHAVE_MAX_BPS = float(os.environ.get("HOT_CAP_SHAVE_MAX_BPS", "100"))
+CAP_DRIFT_SAFETY = float(os.environ.get("HOT_CAP_DRIFT_SAFETY", "1.5"))
+
+
+def _cap_repaid_shares(borrow_shares, collateral, price, lif_wad, tba, tbs, shave_bps=None,
+                       drift_fn=None):
     """P1-7: max repaidShares, при котором seized <= collateral в арифметике канона — глубокая
     позиция (залог не покрывает долг+бонус) раньше давала Panic 0x11 (collateral -= seized) ->
     sim-revert -> skip, и главные призы каскадов терялись. Кап ДО сайзинга свопа (запрет STATE
     «НЕ капаем» относился к пост-хок капу ПОСЛЕ расчёта свопа — там mismatch). При капе забирается
-    весь залог -> Morpho сам списывает остаток долга (bad-debt socialization). Это НЕ закрытый
+    ПОЧТИ весь залог: остаток пыли остаётся у заёмщика, позиция переживает выстрел. (Прежняя
+    формулировка «забирается весь залог -> Morpho списывает остаток долга (socialization)» БЫЛА
+    ЛОЖНОЙ: обнуления залога не случалось никогда — и до правки остаток был >=1 единица в 100%
+    из 6000 прогонов линзы. Огрызок позиции — НАЗВАННЫЙ ХВОСТ, отдельная задача.) Это НЕ закрытый
     seizedAssets-режим: вход контракта прежний (repaidShares). Floor-инверсия + верификация вперёд
-    точной формулой; чистая (юнит)."""
+    точной формулой; чистая (юнит).
+
+    #121 НА ЗАЛОГОВОЙ ГРАНИЦЕ (20.08, форк-репро в test_fork_route_cbbtc_weth П5): целиться в
+    `seized <= collateral` ЗНАЧИТ СТАВИТЬ ЗАЯВКУ НА ГРАНИЦУ — ровно тот класс, что #121 закрыл на
+    долговой стороне. Замер: залог 3 000 000, наш seized 2 999 999 (запас 1 единица = 0.0033 bps),
+    БОЕВАЯ tx -> Panic 0x11; с запасом -> ликвидация проходит.
+    ПОЧЕМУ ГРАНИЦА НЕ ДЕРЖИТСЯ, хотя формула у нас ТОЧНАЯ (та же, что в Morpho): расходятся не
+    формулы, а ВХОДЫ. `Morpho.liquidate` первым делом делает `_accrueInterest`, и toAssetsDown
+    считается уже по ВЫРОСШЕМУ totalBorrowAssets. Плюс до трёх единиц floor-округления на цепочке
+    toAssetsDown -> wMulDown -> mulDivDown.
+    ОКНО НАЧИСЛЕНИЯ — НЕ НАШ TTL, А СВОЙСТВО РЫНКА: `block.timestamp - market.lastUpdate`. Его
+    никто не обязан обновлять, и на тихих рынках оно огромно (замер 20.08: целевой 0x5dffffc7 —
+    4714с без accrual, LBTC/cbBTC — 9.8 СУТОК). Хуже того, худший случай КОРРЕЛИРУЕТ с самой
+    кап-веткой: подводный рынок = утилизация под 100% = ставка у потолка кривой И никто не
+    трогает accrual. Поэтому запас берётся ОТ ЖИВОГО ОКНА, а не от константы:
+        shave_bps = max(ASK_SHAVE_BPS, 10000 * rate_per_sec * elapsed / 1e18 * CAP_DRIFT_SAFETY)
+    `drift_fn()` -> (elapsed_sec, rate_per_sec_wad) читается ЛЕНИВО и только в кап-ветке (на
+    нормальном пути RTT не появляется вовсе; в пачке доски он бесплатен).
+    НЕЗНАНИЕ ЗАКРЫВАЕТ ГАРД: drift_fn нет / чтение упало / посчитанный запас > CAP_SHAVE_MAX_BPS
+    (дефолт 100 bps) — кап-ветка НЕ СТРОИТСЯ (возврат 0, вызывающий уходит прежним путём). Дрейф,
+    который не покрывается разумным недобором, это не «рискнём», а «мы не знаем цены заявки».
+    Явный `shave_bps` (стенд/откат) заменяет фиксированную часть и снимает требование живого окна.
+    ВЕТКА БЕЗ КАПА (весь долг помещается) — БИТ-В-БИТ прежняя: запас применяется ТОЛЬКО к
+    залоговой границе внутри кап-ветки, ранний выход сравнивается с ПОЛНЫМ collateral.
+    """
     from chain.simulate import to_shares_down
     from chain.execute import ORACLE_PRICE_SCALE, WAD
     bs = int(borrow_shares)
@@ -1648,12 +1680,34 @@ def _cap_repaid_shares(borrow_shares, collateral, price, lif_wad, tba, tbs):
         return 0
     if _seized_exact(bs, lif_wad, price, tba, tbs) <= collateral:
         return bs                                            # весь долг помещается — кап не нужен
-    cap_assets = (collateral * price // ORACLE_PRICE_SCALE) * WAD // lif_wad
+    # --- ниже ТОЛЬКО cap-ветка: граница отодвигается от залога на запас #121 ---
+    b = float(ASK_SHAVE_BPS if shave_bps is None else int(shave_bps))
+    drift_bps = None
+    if drift_fn is not None:
+        try:
+            _d = drift_fn()
+            if _d is not None:
+                _el, _rate = int(_d[0]), int(_d[1])
+                if _el >= 0 and _rate >= 0:
+                    drift_bps = 10_000.0 * _rate * _el / 1e18 * CAP_DRIFT_SAFETY
+        except Exception:                                    # noqa: BLE001
+            drift_bps = None
+    if drift_bps is None:
+        if shave_bps is None:
+            return 0            # живого окна начисления нет и ручка не задана — ветку не строим
+    else:
+        b = max(b, drift_bps)
+    if b > CAP_SHAVE_MAX_BPS:
+        return 0                # дрейф не укладывается в разумный недобор — ветку не строим
+    col = int(collateral)
+    if b > 0 and col > 1:
+        col = max(1, col - max(1, int(col * b / 10_000.0)))
+    cap_assets = (col * price // ORACLE_PRICE_SCALE) * WAD // lif_wad
     rs = min(to_shares_down(cap_assets, tba, tbs), bs)
     for _ in range(4):                                       # floor-инверсия может промахнуться на wei
         if rs <= 0:
             return 0
-        if _seized_exact(rs, lif_wad, price, tba, tbs) <= collateral:
+        if _seized_exact(rs, lif_wad, price, tba, tbs) <= col:
             return rs
         rs -= max(1, rs // 10**6)
     return 0
@@ -1741,10 +1795,25 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
         _lif_wad = int(round(_lif * 10**18))
         # P1-7: кап на глубокой позиции (seized>collateral был Panic 0x11 -> skip); seized ТОЧНО
         # по канону (toAssetsDown), а не оценкой сверху — amount_in свопа = реальный приход залога.
+        def _drift_hot():
+            """ЖИВОЕ окно начисления рынка. ЛЕНИВО: зовётся только если кап-ветка реально нужна
+            (глубокая позиция), поэтому на нормальном пути RTT не появляется. Один aggregate3 на
+            обе величины: market (lastUpdate) и IRM.borrowRateView."""
+            from chain.multicall import (encode_borrow_rate_view_call, decode_borrow_rate_view)
+            _mp5 = (loan, coll, oracle, irm, int(lltv_wad))
+            _r = aggregate3(rpc, [(MORPHO_BLUE, encode_market_call(mid))])
+            _mk = decode_market(_r[0][1])
+            _r2 = aggregate3(rpc, [(irm, encode_borrow_rate_view_call(_mp5, _mk))])
+            if not _r2[0][0]:
+                return None
+            _now = int(time.time())
+            return (max(0, _now - int(_mk[4])), decode_borrow_rate_view(_r2[0][1]))
+
         repaid_shares = _cap_repaid_shares(_shave_ask(int(borrow_shares)), int(collateral_dbg), int(price),
-                                           _lif_wad, tba, tbs)
+                                           _lif_wad, tba, tbs, drift_fn=_drift_hot)
         if repaid_shares <= 0:
-            return {"ok": False, "reason": "cap: no repayable shares (collateral~0)"}
+            return {"ok": False, "reason": "cap: no repayable shares (collateral~0 либо окно "
+                                           "начисления рынка не читается/слишком велико)"}
         if repaid_shares < int(borrow_shares):
             log.info("DIAG cap %s/%s bs=%d -> repaid_shares=%d (deep position: весь залог, остаток долга спишет Morpho)",
                      market_id[:10], borrower[:10], int(borrow_shares), repaid_shares)
@@ -1876,10 +1945,15 @@ def prepare_fast(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asse
             return {"ok": False, "reason": "fast: no debt"}
         _lif = lif_from_lltv(lltv_wad / 10**18)
         _lif_wad = int(round(_lif * 10**18))
+        # fast-lane — путь БЕЗ RTT по построению, поэтому живое окно начисления здесь не читается:
+        # drift_fn не даётся, и кап-ветка НЕ строится (возврат 0) -> уходим в prepare_hot, где и
+        # sim есть, и один лишний aggregate3 допустим. Глубокая позиция теряет fast-lane, но не
+        # получает заявку с непосчитанным запасом.
         repaid_shares = _cap_repaid_shares(_shave_ask(int(borrow_shares)), int(collateral), int(price),
                                            _lif_wad, tba, tbs)
         if repaid_shares <= 0:
-            return {"ok": False, "reason": "fast: cap=0"}
+            return {"ok": False, "reason": "fast: cap=0 (кап-ветка требует живого окна "
+                                           "начисления — уходим в prepare_hot)"}
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)
         seized = _seized_exact(repaid_shares, _lif_wad, int(price), tba, tbs)
         if seized == 0:

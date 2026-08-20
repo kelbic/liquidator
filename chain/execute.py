@@ -428,43 +428,238 @@ _PROBE_TIP_TIERS = tuple(int(x) for x in os.environ.get(
 # (незнание закрывает гард). Границы здравого смысла как у _DOM: вне [0.5e6, 2e7] отбрасываем.
 # Откат SPEC_FIRE_PROBE_TIP_MIRROR=0. Ограничение v1 (названо): мода ГЛОБАЛЬНАЯ по всем
 # агрегаторам цепи, не пер-фидная — гард доли защищает от разброда операторов.
+# Ш24b v2 (19.08, вскрытие потери 50191667 — $3905): МОДА СТАЛА ПЕР-АГГРЕГАТОРНОЙ.
+#
+# ЧТО СЛОМАЛОСЬ В v1. Мода считалась ГЛОБАЛЬНО по всем агрегаторам цепи. Транзиты cbADA идут с
+# полом 1.0-1.2 mgwei и их МНОГО; транзиты 0x1e0b2c38/0x0e3dc8a6 в режиме затора несут 31-33
+# mgwei и их МАЛО. Глобальная выборка топится полами: доля 50% не собирается ЛИБО собирается на
+# поле — и в блоке 50191666 наши 22 пробы стояли с tip 1.0-3.0 против транзита 31.2, tip-match=0.
+# Приз ушёл целиком. Кольцо ПЕР-АГГ разводит эти два распределения, и каждое даёт свой слот.
+#
+# ВРЕМЯЗАВИСИМОСТЬ. Высокий tip — не свойство оператора, а РЕЖИМ ЗАТОРА: 19.08 в 20:51 ОБА
+# агрегатора несли 31-33 mgwei три судимых блока подряд, а в моде того же оператора за неделю
+# стоит 1.0-1.15. Поэтому кольцо по СВЕЖЕСТИ (K последних + TTL) адаптивно само — если его
+# кормить. Кормить и чинится: разводка main.py передавала только tip, а "agg" в транзит-дикте
+# индекса лежал с самого начала (chain_index.py:645,1060).
+#
+# ГРАНИЦЫ ВХОДА. Верх поднят 2e7 -> 3.5e7. Прежние 2e7 отбрасывали ВЕСЬ режим 21.2-34.6 mgwei
+# ПРЯМО НА ВХОДЕ — то есть первичная слепота была не в статистике, а в фильтре. Граница здесь
+# не «здравый смысл», а ЭКОНОМИЧЕСКИЙ КЭП: это максимальная цена пробы, которую чужая мода
+# вправе нам навязать. 3.5e7 — чуть выше максимума, НАБЛЮДЁННОГО за 7 суток (34 597 197 wei);
+# 5e7 (первая редакция) — это уже 10x базы и 8.2x дневного бакета проб $150 на одно окно, то
+# есть класс «в такой гонке не участвуем», а не «платим сколько скажут».
 PROBE_TIP_MIRROR = os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR", "1").lower() not in ("0", "false", "no")
 _MIRROR_K = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_K", "12"))
-_MIRROR_TTL_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_TTL_SEC", "21600"))
+# TTL 15 МИНУТ, а не 6 часов (замер линзы). Одна пачка затора из 4 сэмплов при TTL=6ч диктует
+# повышенный тариф четверти флота на 99.8% следующих шести часов, тогда как польза зеркала —
+# только ПОВТОРНЫЕ заторы в ближайшие минуты. Цена определённая, польза условная: короткий TTL
+# режет хвост цены, не трогая полезную часть (в самом заторе сэмплы идут блок за блоком).
+_MIRROR_TTL_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_TTL_SEC", "900"))
 _MIRROR_MIN_SHARE = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MIN_SHARE", "0.5"))
 _MIRROR_MIN_N = 4
-_TRANSIT_TIPS: list = []                 # [(ts, tip_wei)] — кольцо K, под локом
+_MIRROR_TIP_MIN = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MIN", "500000"))
+_MIRROR_TIP_MAX = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MAX", "35000000"))
+_MIRROR_SLOTS = 4                        # слотов портфеля = длине статического портфеля
+# СКЛЕЙКА: два tip в пределах ±10% — ОДИН класс, а не два кандидата в слоты. 10.0 и 10.1 mgwei
+# у одного оператора это дрейф, а не два режима; 1.0/1.1/1.15/1.2 — один пол (склейка цепная,
+# по возрастанию: каждый следующий в пределах шага от предыдущего). Без склейки «четыре
+# различные моды» набираются из соседних значений одного и того же класса.
+_MIRROR_GLUE_STEP = 1.0 + float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_GLUE_PCT", "10")) / 100.0
+# ПОЛ — ПРИЗОВОЙ КЛАСС, И ЕМУ ГАРАНТИРОВАН СЛОТ. Замер вскрытия 49834406: 20 призовых tx все
+# на tip РОВНО 1 000 000. Отбор по цене (v2 ред.1: sorted(modes)[:4]) выбрасывал пол из
+# портфеля, как только набиралось 4 различные дорогие моды — то есть ровно в штиле, где пол и
+# выигрывает. Гарантия ниже стоит ОТДЕЛЬНОЙ строкой кода, а не подразумевается комментарием.
+_MIRROR_FLOOR_MAX = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_FLOOR_MAX", "1200000"))
+# ГИСТЕРЕЗИС ВХОДА: новый класс занимает слот только когда он ПОДТВЕРЖДЁН — 8 свежих сэмплов
+# либо возраст первого >= 60с. Пачка из 4 транзитов затора не имеет права дёрнуть пересборку
+# 110 лестниц: приз живёт в transit+1 (~2с), а сходимость аудита — 22 прохода (~24с в окне).
+# То есть на ПЕРВОЙ пачке зеркало физически не успевает, и платить за неё пересборкой нечем.
+_MIRROR_ENTRY_N = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_ENTRY_N", "8"))
+_MIRROR_ENTRY_AGE_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_ENTRY_AGE_SEC", "60"))
+# ЗАМЕР 7 СУТОК ЖУРНАЛА (analysis/transit_tips_7d.txt, 129 транзитов, 5.7 суток) — числа,
+# ради которых поднят верх и введена склейка:
+#   0x0e3dc8a6 (74 сэмпла): мода 1.0-1.15 mgwei, режимные выбросы 21.2 и 33.4;
+#   0x9491aedf (21): мода 1.0-1.2, выброс 10.1;   0x1e0b2c38 (21): 10.0-10.1, 19.08 — 31.2;
+#   0x92a7c3a5 (7) / 0x5bf848b4 (4) / 0xf0f5eebe (2): полы 1.0-2.5, выбросы до 10.5;
+#   максимум наблюдённый — 34 597 197 wei. Приёмка потока: analysis/mirror_v2_replay.py.
+_TRANSIT_TIPS: dict = {}                 # agg -> [(ts, tip_wei)]: кольцо K НА КАЖДЫЙ агрегатор
 _TRANSIT_TIPS_LOCK = threading.Lock()
+_MIRROR_UNKNOWN = "unknown"              # agg не назван -> СВОЁ кольцо, не подмешивать к чужим
+_MIRROR_LAST_SLOTS: tuple = ()           # прошлый состав портфеля (только для строки журнала)
+_MIRROR_APPLIED: tuple = ()              # состав, ДЕЙСТВУЮЩИЙ сейчас (пустой = статика)
+_MIRROR_APPLIED_MODES: frozenset = frozenset()   # какие классы в нём заняли слоты (гистерезис)
+_MIRROR_HOT_UNTIL = 0.0                  # до этого момента состав ЗАМОРОЖЕН (горячая фаза)
 
 
-def note_transit_tip(tip_wei, now=None) -> bool:
-    """#104: записать tip живого транзита (кормит индекс через main). Вне границ — отброс."""
+def note_transit_tip(tip_wei, agg=None, now=None) -> bool:
+    """#104/Ш24b v2: записать tip живого транзита В КОЛЬЦО ЕГО АГРЕГАТОРА.
+
+    agg=None не смешивается с именованными: неизвестное происхождение — это отдельное
+    распределение, а не «чьё-то». Вне границ [_MIRROR_TIP_MIN, _MIRROR_TIP_MAX] — отброс.
+    """
     try:
         w = int(tip_wei)
     except Exception:                                   # noqa: BLE001
         return False
-    if not (500_000 <= w <= 20_000_000):
+    if not (_MIRROR_TIP_MIN <= w <= _MIRROR_TIP_MAX):
         return False
+    key = str(agg).lower() if agg else _MIRROR_UNKNOWN
     n = float(now if now is not None else time.time())
     with _TRANSIT_TIPS_LOCK:
-        _TRANSIT_TIPS.append((n, w))
-        del _TRANSIT_TIPS[:-_MIRROR_K]
+        ring = _TRANSIT_TIPS.setdefault(key, [])
+        ring.append((n, w))
+        del ring[:-_MIRROR_K]
     return True
 
 
-def transit_tip_mirror(now=None):
-    """(мода, вторая_мода) | None. None = данных мало/протухли/разброд -> статический портфель."""
-    n = float(now if now is not None else time.time())
-    with _TRANSIT_TIPS_LOCK:
-        fresh = [w for ts, w in _TRANSIT_TIPS if n - ts <= _MIRROR_TTL_SEC]
+def _agg_mode(fresh):
+    """(мода, вес, ts первого сэмпла моды) ОДНОГО кольца при доле >= MIN_SHARE и n >= MIN_N.
+    None = мало данных либо разброд. Разброд внутри агрегатора — законное «не знаю»: у
+    оператора либо есть tip-класс, либо он меняет его от блока к блоку, и угадывать нечего.
+
+    ВЕС — число свежих сэмплов ИМЕННО этой моды. Это «улика», и по ней (а не по величине tip)
+    идёт отбор в слоты: иначе отбор смещён в дорогое по построению."""
     if len(fresh) < _MIRROR_MIN_N:
         return None
     from collections import Counter
-    mc = Counter(fresh).most_common(2)
-    m, cnt = mc[0]
-    if cnt / len(fresh) < _MIRROR_MIN_SHARE:
+    vals = [w for _ts, w in fresh]
+    m, cnt = Counter(vals).most_common(1)[0]
+    if cnt / len(vals) < _MIRROR_MIN_SHARE:
         return None
-    return (m, mc[1][0] if len(mc) > 1 else m)
+    return m, cnt, min(ts for ts, w in fresh if w == m)
+
+
+def _glue_modes(cands):
+    """Склейка кандидатов в КЛАССЫ: цепная, по возрастанию, шаг <= _MIRROR_GLUE_STEP.
+
+    Вход: [(мода, вес, ts первого)]. Выход: [(представитель, суммарный вес, ранний ts)].
+    Представитель класса — мода с НАИБОЛЬШИМ весом улики (а не средняя и не крайняя): именно
+    её несут ноги, и она обязана быть значением, реально виденным в цепи.
+    """
+    out = []
+    for m, w, ts in sorted(cands):
+        if out and m <= out[-1]["last"] * _MIRROR_GLUE_STEP:
+            g = out[-1]
+            g["last"] = m
+            g["w"] += w
+            g["ts"] = min(g["ts"], ts)
+            g["members"].append((m, w))
+        else:
+            out.append({"last": m, "w": w, "ts": ts, "members": [(m, w)]})
+    return [(max(g["members"], key=lambda mw: (mw[1], -mw[0]))[0], g["w"], g["ts"]) for g in out]
+
+
+def transit_tip_portfolio(now=None) -> tuple:
+    """ПОРТФЕЛЬ ИЗ 4 СЛОТОВ или () при полном незнании (-> статические тиры бит-в-бит).
+
+    ТРИ РЕШЕНИЯ, каждое оплачено разбором:
+      * ОТБОР — ПО ВЕСУ УЛИКИ, НЕ ПО ЦЕНЕ. Первая редакция v2 брала `sorted(модy)[:4]`, и это
+        был не порядок, а ОТБОР: при четырёх живых классах статика не добавлялась вовсе, а
+        выживали четыре САМЫЕ ДОРОГИЕ — то есть призовой пол 1.0 mgwei вылетал из портфеля
+        ровно в штиле, где он и выигрывает (замер: 20 призовых tx вскрытия 49834406 все на
+        tip ровно 1 000 000). Отбор по весу этого не делает по построению.
+      * ПОЛУ СЛОТ ГАРАНТИРОВАН ЯВНО (см. _MIRROR_FLOOR_MAX): живой класс <= 1.2 mgwei
+        вытесняет худший по весу из дорогих. Комментарий больше не обещает того, чего нет.
+      * ПОРЯДОК ОТОБРАННЫХ — по величине убыв., и только он. Порядок решает, какая нога какой
+        tip несёт (h%4), а смена tip ноги = пересборка её лестницы (#127, 28-32с на флот);
+        сортировка по свежести переставляла бы слоты на каждом транзите.
+
+    ЗАМОРОЗКА В ГОРЯЧЕЙ ФАЗЕ: пока движок в окне (см. note_hot_phase), возвращается ДЕЙСТВУЮЩИЙ
+    состав, каким бы ни был свежий расчёт — пересигнация 110 лестниц в горячей фазе стоит
+    дороже любого выигрыша от смены тарифа, а успеть к призу (transit+1, ~2с) она не может.
+    """
+    global _MIRROR_APPLIED, _MIRROR_APPLIED_MODES
+    n = float(now if now is not None else time.time())
+    if n < _MIRROR_HOT_UNTIL:
+        return _MIRROR_APPLIED
+    with _TRANSIT_TIPS_LOCK:
+        # п.7: кольцо, где ВСЕ сэмплы протухли, удаляется целиком — иначе словарь растёт
+        # именами агрегаторов, которых давно нет, и каждый проход платит за их фильтрацию.
+        for k in [k for k, v in _TRANSIT_TIPS.items()
+                  if not any(n - ts <= _MIRROR_TTL_SEC for ts, _w in v)]:
+            del _TRANSIT_TIPS[k]
+        rings = {k: [(ts, w) for ts, w in v if n - ts <= _MIRROR_TTL_SEC]
+                 for k, v in _TRANSIT_TIPS.items()}
+    cands = [c for c in (_agg_mode(f) for f in rings.values()) if c is not None]
+    glued = _glue_modes(cands)
+    # ГИСТЕРЕЗИС ВХОДА: класс, которого в действующем составе НЕТ, обязан быть подтверждён.
+    # Класс, УЖЕ занимающий слот, переподтверждать не надо — иначе портфель дёргался бы туда-сюда.
+    ready = [g for g in glued
+             if g[0] in _MIRROR_APPLIED_MODES or g[1] >= _MIRROR_ENTRY_N
+             or (n - g[2]) >= _MIRROR_ENTRY_AGE_SEC]
+    sel = sorted(ready, key=lambda g: (-g[1], -g[0]))[:_MIRROR_SLOTS]
+    floors = [g for g in ready if g[0] <= _MIRROR_FLOOR_MAX]
+    if floors and not any(g[0] <= _MIRROR_FLOOR_MAX for g in sel):
+        # ГАРАНТИЯ ПОЛА: худший по весу из отобранных уступает место лучшему по весу полу.
+        sel = sel[:_MIRROR_SLOTS - 1] + [max(floors, key=lambda g: g[1])]
+    if not sel:
+        _MIRROR_APPLIED, _MIRROR_APPLIED_MODES = (), frozenset()
+        return ()
+    modes = sorted({g[0] for g in sel}, reverse=True)
+    slots = list(modes)
+    for t in _PROBE_TIP_TIERS:                          # добивка статикой, без дублей
+        if len(slots) >= _MIRROR_SLOTS:
+            break
+        if t not in slots:
+            slots.append(int(t))
+    while len(slots) < _MIRROR_SLOTS:                   # вырожденный список тиров
+        slots.append(slots[-1])
+    _MIRROR_APPLIED, _MIRROR_APPLIED_MODES = tuple(slots), frozenset(modes)
+    return _MIRROR_APPLIED
+
+
+def note_hot_phase(in_window, now=None, hold_sec=5.0) -> None:
+    """Движок сообщает, что он В ОКНЕ (armed/удержание). Прибор СБОКУ от денежного пути: он
+    ничего не считает и ничего не гасит, а лишь замораживает СОСТАВ портфеля до угасания окна.
+    Пересигнации по СТАТИЧЕСКИМ причинам (полоса maxFee, байт пробы) не затронуты — они живут
+    в ladder_resign_needed и от состава не зависят.
+
+    hold_sec — переживание одного каденса аудита (в окне ~1с): без него заморозка снималась бы
+    в промежутке между проходами и состав менялся бы посреди окна.
+    """
+    global _MIRROR_HOT_UNTIL
+    if not in_window:
+        return
+    _MIRROR_HOT_UNTIL = float(now if now is not None else time.time()) + float(hold_sec)
+
+
+# ЗАМЕР ГАЗА ПРОБЫ — С ЦЕПИ (STATE:652), а не «примерно 52k»: 1-байтовая проба в промах стоит
+# 54 710. Число входит в оценку цены портфеля напрямую, поэтому берётся замеренное.
+_PROBE_GAS_MEASURED = 54_710
+_MIRROR_WINDOW_SEC = 90.0                 # верхняя оценка длины окна (spec-fire), для объёма проб
+
+
+def mirror_window_probes() -> float:
+    """Верхняя оценка числа проб окна ИЗ ЖИВОГО КОНФИГА: темп пейсера × длина окна. Константа
+    здесь врала бы при любой смене VOLLEY_PACER_RATE — а именно она и определяет счёт."""
+    return max(1.0, float(_PACER_RATE) * _MIRROR_WINDOW_SEC)
+
+
+def _mirror_cost_usd(slots, eth_usd, probes=None) -> float:
+    """Ожидаемая цена tip-проб ОДНОГО окна при этом составе, $. ОЦЕНКА ДЛЯ ЖУРНАЛА, не гейт.
+
+    Ноги делятся по слотам поровну (h%4), поэтому цена = средний tip слотов × объём проб × газ.
+    МАСШТАБ ПО ЭТОЙ ЖЕ ФОРМУЛЕ (ETH $1730, газ 54 710, прогон analysis/mirror_v2_replay.py):
+    на боевом темпе 110/с (9 900 проб окна) статика ≈ $1.61, затор-портфель [33.4|1.0|1.1|1.775]
+    ≈ $8.74; на дефолте пейсера 200/с — $2.93 и $15.89. То есть дневной бакет проб $150 это
+    ~93 жирных окна на статике против ~17 на заторе. Цена зеркала не в разах, но она ЕСТЬ, и
+    решение «поднять тариф» обязано печататься с ней рядом. (Оценка линзы $8.2/$13.7 считалась
+    по иному объёму проб; сюда переносится не число, а формула — считать умеет код.)
+    """
+    if not slots:
+        return 0.0
+    v = mirror_window_probes() if probes is None else float(probes)
+    return sum((v / len(slots)) * int(t) * _PROBE_GAS_MEASURED * float(eth_usd) / 1e18
+               for t in slots)
+
+
+def transit_tip_mirror(now=None):
+    """СОВМЕСТИМОСТЬ v1: (мода, вторая_мода) | None. Читатели-наблюдатели (стенды, rev-скрипты)
+    смотрят сюда; денежный путь ходит через `transit_tip_portfolio`."""
+    slots = transit_tip_portfolio(now=now)
+    if not slots:
+        return None
+    return (slots[0], slots[1] if len(slots) > 1 else slots[0])
 
 
 def probe_tip_for(addr) -> int:
@@ -476,8 +671,10 @@ def probe_tip_for(addr) -> int:
 
     Пустой список тиров возвращает прежнюю константу — откат одной переменной окружения.
 
-    #104: при живом зеркале транзита (см. transit_tip_mirror) 3 ноги из 4 несут МОДУ tip
-    транзитов, 4-я — вторую моду (хедж); зеркало мертво/выключено -> портфель бит-в-бит."""
+    Ш24b v2: при живом зеркале слоты — РАЗЛИЧНЫЕ пер-агг моды плюс статические тиры
+    (transit_tip_portfolio); зеркало мертво/выключено -> статический портфель БИТ-В-БИТ.
+    Контекста окна здесь нет и быть не может: лестницы подписываются ЗАРАНЕЕ, а тир обязан
+    быть функцией одного адреса — иначе подписанная лестница и «свежий тир» разъедутся (#127)."""
     if not _PROBE_TIP_TIERS:
         return _PROBE_TIP_WEI
     try:
@@ -485,11 +682,24 @@ def probe_tip_for(addr) -> int:
     except Exception:                                   # noqa: BLE001
         return _PROBE_TIP_TIERS[0]
     if PROBE_TIP_MIRROR:
-        mm = transit_tip_mirror()
-        if mm is not None:
-            m, second = mm
-            return (m, m, m, second)[h % 4]
+        slots = transit_tip_portfolio()
+        if slots:
+            return slots[h % len(slots)]
     return _PROBE_TIP_TIERS[h % len(_PROBE_TIP_TIERS)]
+
+
+def mirror_slots_changed(now=None):
+    """СМЕНА СОСТАВА портфеля (для строки журнала экономики). Возврат: (слоты, было) либо None,
+    если состав тот же. Прибор стоит СБОКУ от денежного пути: probe_tip_for сюда не заходит,
+    а зовёт эту функцию наблюдатель (аудит цены), и её отказ огня не касается."""
+    global _MIRROR_LAST_SLOTS
+    slots = transit_tip_portfolio(now=now) if PROBE_TIP_MIRROR else ()
+    with _TRANSIT_TIPS_LOCK:
+        prev = _MIRROR_LAST_SLOTS
+        if slots == prev:
+            return None
+        _MIRROR_LAST_SLOTS = slots
+    return slots, prev
 
 
 def send_canary(rpc, cfg, log=None, max_fee=None, tip=None, broadcast_raw_urls=None,
@@ -2464,6 +2674,41 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     (_CBBTC, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_CBBTC, 100, _UNIV3_USDC),
                             "max_in": 30 * 10**8},
+    # cbBTC/WETH 19.08 — ЦЕНА ОТСУТСТВИЯ РОУТА ИЗМЕРЕНА ПОТЕРЕЙ: блок 50191667, рынок
+    # 0x5dffffc7 (cbBTC залог / WETH долг, lltv 0.915), приз $3905 забрал 0x218172c1 с idx 1
+    # головы блока. Пары в карте НЕ БЫЛО ВООБЩЕ: fast-lane невозможен, план жил на Kyber, и
+    # эта цель была НЕДОСТУПНА группе §9 (#133) по построению — пул Kyber-плана неизвестен,
+    # запас худшего порядка считать не из чего. Прямой роут закрывает обе дыры разом.
+    # РАЗВЕДКА 19.08 (analysis/cbbtc_weth_route_probe.py): живых пулов шесть, ГОДНЫХ два.
+    #   UniV3 fee=100 и fee=10000 — пыль (разрыв 50% на 0.1 cbBTC), Slipstream ts=1 тонкий.
+    #   Спор идёт между UniV3 fee=500 (0x7aea2e8a) и Slipstream ts=100 (0x70acdf2a).
+    # ДВА ЗАМЕРА В ДВУХ РЕЖИМАХ ГЛУБИНЫ — и они разошлись ВДЕСЯТЕРО. Это не разброс прибора,
+    # это свойство пары, и кап обязан считаться по ТОНКОМУ режиму (живой слой поднимет сам,
+    # потолок 2x статики; поднять статику с одного снимка = поставить кап под обрыв).
+    #   ГОЛОВА цепи (20.08, разрыв к базе 0.05 cbBTC): uni500 плоский до 14 cbBTC (0.32%),
+    #     ломается 15->0.48%, 18->1.73%, 20->3.23%; на классе целей дороже Slipstream на 0.214%.
+    #   БЛОК ЭПИЗОДА 50191666 (разрыв к ОРАКУЛУ рынка 0x10b95702, price/1e46 = 31.3141 —
+    #     честная база, а не собственная малая ступень): uni500 0.06->0.0925%, 0.35->0.374%,
+    #     1.0->1.05%, 2.0->2.17%, 3.0->3.36%, 4.5->5.29%, 9.0->12.80%(!);
+    #     Slipstream 0.06->0.525%, 1.0->0.640%, 3.0->0.884%, 4.5->1.067%.
+    #   То есть в тонком режиме uni500 выигрывает ТОЛЬКО до ~0.6 cbBTC, а на 9 cbBTC (кап,
+    #   посчитанный по голове) он отдал бы 12.8% — реверт по minOut с гарантией.
+    # ВЫБОР ВЕНЬЮ: uni500. Не потому что глубже (он мельче), а потому что на РАЗМЕРЕ ЦЕЛЕЙ
+    #   ЭТОГО РЫНКА (0.06-0.35 cbBTC, максимум замеренной позиции $21k) он дешевле в ОБОИХ
+    #   режимах: 0.374% против 0.561% в тонком, −0.214% в глубоком. Кап ниже точки разворота.
+    # КАП по правилу карты (24.07), ПО ТОНКОМУ РЕЖИМУ: бонус пары 2.6167% (lif_bonus_pct(0.915),
+    #   рынок ровно один) -> S_обрыв (разрыв = весь бонус) = 2.38 cbBTC -> min(S_budget 30,
+    #   S_обрыв/2 1.19) = 1 cbBTC (~$69k). Запас на капе: разрыв 1.05% против порога реверта.
+    #   Порог считается ЧЕСТНО из minProfit-гарда контракта: profit>=0.003*repaid и
+    #   seized*oracle = repaid*LIF дают допустимый разрыв g <= 1 - 1.003/1.026167 = 2.257%,
+    #   то есть на капе запас 2.15x, на классе целей (0.374%) — 6.0x. По консервативной
+    #   половинной полке линзы (1.2751%) те же числа дают 1.21x и 3.4x.
+    #   ДРЕЙФ ГЛУБИНЫ ЭТОЙ ПАРЫ — САМЫЙ БЫСТРЫЙ ВО ФЛОТЕ (x10 за сутки против x2 у wstETH),
+    #   и он же причина, по которой статика стоит по тонкому замеру: в глубоком режиме
+    #   live-cap поднимет кап сам до 2 cbBTC. Сверх капа — Kyber, как и везде.
+    (_CBBTC, _UNIV3_WETH): {"router": UNIV3_SWAP_ROUTER, "style": "02",
+                            "path": _pack_path(_CBBTC, 500, _UNIV3_WETH),
+                            "max_in": 1 * 10**8},
     # LBTC/cbBTC 07-12 (нож $350.8k долга, BTC-пег пара — профиль «мгновенный флип на ноже»):
     # UniV3 ПУСТ на всех тирах (QuoterV2-проба impact~99.6%, analysis/lbtc_route_probe.py);
     # Slipstream ts=1 ЖИВОЙ (router.factory()->getPool, liquidity=125.6B, 07-12); Kyber-глубина

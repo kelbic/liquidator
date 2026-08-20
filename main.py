@@ -1064,10 +1064,30 @@ def main():
     # Осечка арма = зеркало мертво = статические тиры (незнание закрывает гард), огонь не тронут.
     try:
         from chain.execute import note_transit_tip as _ntt104
+        from chain.execute import _mirror_cost_usd as _mcost104
+        from chain.execute import mirror_slots_changed as _msc104
         _idx104 = chain_index.get_index()
+
+        def _on_transit_104(_bn, _tr):
+            # Ш24b v2: АГРЕГАТОР ПЕРЕДАЁТСЯ ВМЕСТЕ С tip. Поле "agg" лежало в транзит-дикте
+            # индекса с самого начала, а разводка брала только tip — из-за чего мода была
+            # глобальной и топилась полами cbADA (вскрытие потери 50191667, tip-match=0).
+            for t in (_tr or []):
+                _ntt104(t.get("tip"), t.get("agg"))
+            # ЭКОНОМИКА СБОКУ ОТ ОГНЯ: строка печатается только при СМЕНЕ СОСТАВА портфеля,
+            # а не на каждый транзит — иначе журнал перестанет быть событийным.
+            ch = _msc104()
+            if ch is not None:
+                slots, prev = ch
+                # Цена считается по ЖИВОЙ цене ETH из конфига (константа в модуле execute
+                # соврала бы на любом движении рынка) и по замеренному газу пробы.
+                log.info("#104 зеркало v2: слоты %s (было %s), ожидаемая цена tip проб "
+                         "~$%.2f/окно", list(slots) or "статика", list(prev) or "статика",
+                         _mcost104(slots, cfg.eth_price_usd) if slots else 0.0)
+
         if _idx104 is not None:
-            _idx104.set_on_transit(lambda _bn, _tr: [_ntt104(t.get("tip")) for t in (_tr or [])])
-            log.info("#104 зеркало tip транзита АРМИРОВАНО (тиры проб от моды живых транзитов)")
+            _idx104.set_on_transit(_on_transit_104)
+            log.info("#104 зеркало tip транзита АРМИРОВАНО (тиры проб от ПЕР-АГГ мод транзитов)")
     except Exception:
         log.exception("#104 зеркало: арм не удался — тиры статические, огонь не тронут")
 

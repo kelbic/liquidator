@@ -854,7 +854,28 @@ class SpecFireLive:
             # пересборка по быстрому каденсу _arm_retry, а на вершине _top_fat (k=1) она ещё и
             # глушила прогрев склада. Семантика та же, что у разобранной позиции, — LOSS-стоп.
             return "gone"
-        price = decode_price(aggregate3(self.rpc, [(oracle, encode_price_call())])[0][1])
+        # ЖИВОЕ ОКНО НАЧИСЛЕНИЯ — В ТУ ЖЕ ПАЧКУ, ЧТО И ЦЕНА (лишнего RTT нет). Кап-ветка
+        # `_cap_repaid_shares` обязана считать запас от `block.timestamp - market.lastUpdate` и
+        # живой ставки IRM: окно — свойство РЫНКА, а не нашего TTL (замер 20.08: у этого рынка
+        # 4714с без accrual, у LBTC/cbBTC — 9.8 суток), и худший случай коррелирует с самой
+        # веткой (подводный рынок = утилизация под потолок = ставка максимальна).
+        # Осечка ставки НЕ ломает сборку плана: цена читается своим вызовом, а незнание окна
+        # закрывает ровно кап-ветку (её гард внутри `_cap_repaid_shares`), а не весь план.
+        _rate_ps = None
+        try:
+            from chain.multicall import encode_borrow_rate_view_call, decode_borrow_rate_view
+            _r2 = aggregate3(self.rpc, [(oracle, encode_price_call()),
+                                        (irm, encode_borrow_rate_view_call(
+                                            (loan, coll, oracle, irm, int(lltv_wad)), mk))])
+            price = decode_price(_r2[0][1])
+            _rate_ps = decode_borrow_rate_view(_r2[1][1]) if _r2[1][0] else None
+        except Exception:                         # noqa: BLE001
+            price = decode_price(aggregate3(self.rpc, [(oracle, encode_price_call())])[0][1])
+        # lastUpdate — пятое поле market(); если снимок его не несёт (усечённый стенд/старый
+        # декодер), окно НЕИЗВЕСТНО, и это закрывает кап-ветку, а не сборку плана.
+        _last_upd = int(mk[4]) if len(mk) > 4 else None
+        _elapsed = None if _last_upd is None else max(0, int(time.time()) - _last_upd)
+        _drift = (lambda: None if (_rate_ps is None or _elapsed is None) else (_elapsed, _rate_ps))
         # #74 (09.08, находка ревьюера): путь ДОСКИ считал amount_in оценкой СВЕРХУ
         # (полные шеры + to_assets_up + expected_seized), тогда как горячий путь после фикса
         # P1-7 считает ТОЧНО по канону Morpho. Контракт аппрувит РОВНО фактический баланс
@@ -865,7 +886,8 @@ class SpecFireLive:
         from chain.hotpath import _seized_exact, _cap_repaid_shares, _shave_ask
         _lif_wad = int(round(lif_from_lltv(lltv_wad / 10**18) * 10**18))
         # #121: запас вниз ДО капа — заявка строго меньше долга (граница underflow Morpho)
-        repaid_shares = _cap_repaid_shares(_shave_ask(int(bs)), int(coll_amt), int(price), _lif_wad, tba, tbs)
+        repaid_shares = _cap_repaid_shares(_shave_ask(int(bs)), int(coll_amt), int(price), _lif_wad,
+                                           tba, tbs, drift_fn=_drift)
         if repaid_shares <= 0:
             return None
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)   # репэй-сторона: вверх, как и было

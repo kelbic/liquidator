@@ -666,6 +666,16 @@ class FireEngine:
                 # Вне окна — редкий 120с (квота get_block в боевой ключ). _audit_ts затравлен
                 # так, что ПЕРВЫЙ проход аудирует всегда (см. __init__).
                 _in_window = self._now() < max(self._until, self._hold_until)
+                # Ш24b v2: движок — ЕДИНСТВЕННЫЙ, кто знает про окно, и он же зовёт аудит.
+                # Пока окно живо, СОСТАВ зеркального портфеля заморожен: смена тарифа означает
+                # пересигнацию 110 лестниц (28-32с), а приз живёт в transit+1 (~2с) — успеть
+                # нельзя, заплатить можно. Статические причины пересборки (полоса maxFee, байт
+                # пробы) не затронуты: они не зависят от состава.
+                try:
+                    from chain.execute import note_hot_phase as _nhp
+                    _nhp(_in_window, now=self._now(), hold_sec=max(2.0, ENGINE_PRICE_AUDIT_SEC * 3))
+                except Exception:
+                    pass
                 _audit_cadence = ENGINE_PRICE_AUDIT_SEC if _in_window else ENGINE_AUDIT_SEC
                 if self._audit_fn is not None and (
                         self._now() - self._audit_ts) >= _audit_cadence:
