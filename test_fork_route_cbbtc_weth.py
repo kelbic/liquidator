@@ -363,15 +363,51 @@ if _slot is not None:
                                  _res["profit"] / 1e18, _res["gas"]))
         return bool(_liq), _res, _pl
 
-    # --- КРАСНЫЙ-НА-БАЗЕ: откат ручки #121 (HOT_ASK_SHAVE_BPS=0) = поведение ДО фикса ---------
+    # --- ЖИВОЕ ОКНО НАЧИСЛЕНИЯ ЭТОГО РЫНКА — С ЦЕПИ (эталон ассерта, а не константа стенда) ---
+    _mk_raw = call(MORPHO, sel("market(bytes32)") + MID[2:])
+    _last_update = int.from_bytes(_mk_raw[128:160], "big")
+    _blk_ts = int(rpc("eth_getBlockByNumber", [hex(FORK_BLOCK), False])["timestamp"], 16)
+    _elapsed = _blk_ts - _last_update
+    _mp5 = (WETH, CBBTC, ORACLE, "0x46415998764c29ab2a25cbea6254146d50d22687", LLTV)
+    from chain.multicall import encode_borrow_rate_view_call, decode_borrow_rate_view
+    _mk6 = tuple(int.from_bytes(_mk_raw[i * 32:(i + 1) * 32], "big") for i in range(6))
+    _rate_ps = decode_borrow_rate_view(call(_mp5[3], "0x" + encode_borrow_rate_view_call(
+        _mp5, _mk6).hex()))
+    _drift_bps_live = 10_000.0 * _rate_ps * _elapsed / 1e18
+    verdict("П5.3", "ЖИВОЕ окно начисления рынка снято С ЦЕПИ: elapsed=%dс (lastUpdate=%d), "
+            "ставка %.3f%% годовых => дрейф tba %.4f bps"
+            % (_elapsed, _last_update, _rate_ps * 31_536_000 / 1e18 * 100, _drift_bps_live),
+            _elapsed > 0 and _rate_ps > 0,
+            "окно — свойство РЫНКА, а не нашего TTL")
+
+    # --- КРАСНЫЙ-НА-БАЗЕ: ПРЕЖНЯЯ формула кэпа (граница = полный залог) ------------------------
     import chain.hotpath as _hp
-    _saved_bps = _hp.ASK_SHAVE_BPS
-    _hp.ASK_SHAVE_BPS = 0
+    _saved_cap = _hp._cap_repaid_shares
+
+    def _legacy_cap(borrow_shares, collateral, price, lif_wad, tba, tbs, **_kw):
+        from chain.simulate import to_shares_down
+        from chain.execute import ORACLE_PRICE_SCALE, WAD
+        _bs = int(borrow_shares)
+        if _bs <= 0:
+            return 0
+        if _hp._seized_exact(_bs, lif_wad, price, tba, tbs) <= collateral:
+            return _bs
+        _ca = (collateral * price // ORACLE_PRICE_SCALE) * WAD // lif_wad
+        _rs = min(to_shares_down(_ca, tba, tbs), _bs)
+        for _ in range(4):
+            if _rs <= 0:
+                return 0
+            if _hp._seized_exact(_rs, lif_wad, price, tba, tbs) <= collateral:
+                return _rs
+            _rs -= max(1, _rs // 10 ** 6)
+        return 0
+
+    _hp._cap_repaid_shares = _legacy_cap
     try:
         _ok_red, _res_red, _pl_red = _fire_cap("до фикса")
     finally:
-        _hp.ASK_SHAVE_BPS = _saved_bps
-    verdict("П5.3", "КРАСНЫЙ-НА-БАЗЕ: на откате ручки заявка встаёт НА ГРАНИЦУ залога (сейз %d "
+        _hp._cap_repaid_shares = _saved_cap
+    verdict("П5.3b", "КРАСНЫЙ-НА-БАЗЕ: ПРЕЖНЯЯ формула ставит заявку НА ГРАНИЦУ залога (сейз %d "
             "при залоге %d) и боевая tx падает Panic 0x11"
             % (_pl_red.get("seized", 0), _col2),
             _ok_red is False and _res_red.get("sel") == "0x4e487b71",
@@ -396,10 +432,16 @@ if _slot is not None:
     verdict("П5.7", "позиция РАЗОБРАНА капом: shares %d -> %d, залог %d -> %d"
             % (SH, _sh_after2, _col3, _col_after2),
             _sh_after2 < SH and _col_after2 < _col3)
+    _applied_bps = _undershoot * 10_000.0 / _col3
     verdict("П5.8", "ЦЕНА ЗАПАСА НАЗВАНА ЧИСЛОМ: недобор пыли на дне залога %d единиц (%.2f bps "
-            "залога, %.9f WETH по цене оракула) — против ноля при панике"
-            % (_undershoot, _undershoot * 10_000.0 / _col3, _undershoot * PX / 1e46 / 1e18),
-            _undershoot > 0 and _undershoot * 10_000.0 / _col3 < 20.0)
+            "залога) — против ноля при панике"
+            % (_undershoot, _applied_bps),
+            _undershoot > 0 and _applied_bps < 20.0)
+    verdict("П5.9", "ПРИМЕНЁННЫЙ ЗАПАС ПОКРЫВАЕТ ЖИВОЕ ОКНО ЭТОГО РЫНКА: %.2f bps против дрейфа "
+            "%.4f bps (покрытие %.0fx при требуемых 1.5x)"
+            % (_applied_bps, _drift_bps_live,
+               _applied_bps / max(_drift_bps_live, 1e-9)),
+            _applied_bps >= _drift_bps_live * 1.5)
 
 print("\n" + "=" * 100)
 for p, what, ok in RESULTS:

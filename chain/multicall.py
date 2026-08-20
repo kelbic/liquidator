@@ -65,6 +65,30 @@ def decode_market(data: bytes):
     return decode(["uint128", "uint128", "uint128", "uint128", "uint128", "uint128"], data)
 
 
+_IRM_MP_T = "(address,address,address,address,uint256)"
+_IRM_MK_T = "(uint128,uint128,uint128,uint128,uint128,uint128)"
+
+
+def encode_borrow_rate_view_call(mp, market) -> bytes:
+    """IRM.borrowRateView(MarketParams, Market) -> ставка ЗА СЕКУНДУ в WAD (view, состояние не
+    трогает). Нужна кап-ветке `_cap_repaid_shares`: `Morpho.liquidate` делает `_accrueInterest`
+    ПЕРЕД расчётом seized, и запас заявки обязан покрывать начисление за ЖИВОЕ окно рынка
+    (`block.timestamp - market.lastUpdate`), а не за наш TTL.
+
+    mp: dict либо 5-кортеж MarketParams; market: 6-кортеж как отдаёт decode_market."""
+    from eth_abi import encode
+    if isinstance(mp, dict):
+        mp = (mp["loanToken"], mp["collateralToken"], mp["oracle"], mp["irm"], int(mp["lltv"]))
+    return _selector("borrowRateView(%s,%s)" % (_IRM_MP_T, _IRM_MK_T)) + encode(
+        [_IRM_MP_T, _IRM_MK_T],
+        [(mp[0], mp[1], mp[2], mp[3], int(mp[4])), tuple(int(x) for x in market)])
+
+
+def decode_borrow_rate_view(data: bytes) -> int:
+    """Ставка за секунду в WAD (1e18 = 100%/сек). 0 — законный ответ (IRM выключен)."""
+    return int.from_bytes(bytes(data)[:32], "big")
+
+
 def encode_id_to_market_params_call(mid: bytes) -> bytes:
     from eth_abi import encode
     return _selector("idToMarketParams(bytes32)") + encode(["bytes32"], [mid])
