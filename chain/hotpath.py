@@ -2891,8 +2891,16 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                          and _roll[1] >= CU_ALERT_MIN_SPAN_SEC)
                                 _streak = _CU_OVER_STREAK.get(_host, 0) + 1 if _over else 0
                                 _CU_OVER_STREAK[_host] = _streak
+                                # 20.08 (2-й заход): ПЕЙДЖ судит по скользящей БЕЗ бут-прогрева
+                                # (cu_rolling_ex_boot) — спан-гейт откладывал пейдж ровно до
+                                # тика, где окно ЕЩЁ содержало прогрев (16:27:53 — оба ключа
+                                # ложно, устойчивый темп был вдвое ниже). Насыщенный числитель
+                                # чинится числителем (Ш23а). Журнальный маркер — по полной.
+                                from chain.rpc import cu_rolling_ex_boot as _cu_exb
+                                _roll_pg = _cu_exb(_host)
                                 _page_worthy = (_over and _streak >= CU_ALERT_STREAK_N
-                                                and _roll[1] >= CU_ALERT_PAGE_MIN_SPAN_SEC)
+                                                and _roll_pg[0] >= CU_ALERT_PROJ_M
+                                                and _roll_pg[1] >= CU_ALERT_PAGE_MIN_SPAN_SEC)
                                 _now_cu = time.monotonic()
                                 _top3 = " ".join("%s×%d" % (m, n) for m, n in _top[:3])
                                 if _over and _now_cu - _CU_MARK_TS.get(_host, -1e9) > CU_MARK_SEC:
@@ -2913,7 +2921,8 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                         and _now_cu - _CU_PAGE_TS.get(_host, -1e9) > CU_ALERT_PAGE_SEC):
                                     _CU_PAGE_TS[_host] = _now_cu
                                     try:
-                                        _days = (CU_QUOTA_M / _roll[0] * 30.0) if _roll[0] > 0 else 0.0
+                                        # число в пейдже — то же, по которому решали (без прогрева)
+                                        _days = (CU_QUOTA_M / _roll_pg[0] * 30.0) if _roll_pg[0] > 0 else 0.0
                                         alerter.send_async(
                                             "\U0001F4B8 КВОТА RPC: %s жжёт %.0fM CU/мес при квоте "
                                             "%.0fM — при таком темпе ключ кончится за ~%.0f сут.\n"
@@ -2921,7 +2930,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                             "Нужен ЧЕЛОВЕК: ротация/страйп/докупка ключа. Порядок "
                                             "эвакуации: 1) ассессмент+кэш на dRPC, 2) predict-полл, "
                                             "3) диагностика. Отправки/sim НЕ трогать."
-                                            % (_host, _roll[0], CU_QUOTA_M, _days, _top3),
+                                            % (_host, _roll_pg[0], CU_QUOTA_M, _days, _top3),
                                             key="cu-quota-%s" % _host)
                                         log.info("CU-квота: пейдж человеку отправлен (%s), "
                                                  "следующий не раньше чем через %.0fч",

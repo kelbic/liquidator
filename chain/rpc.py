@@ -216,6 +216,32 @@ def cu_rolling_add(host: str, cu: float, win_sec: float):
     return (total_cu / span * 86400 * 30 / 1e6, span)
 
 
+# 20.08 (2-й заход по ложным пейджам квоты). Спан-гейт (CU_ALERT_PAGE_MIN_SPAN_SEC) отложил
+# пейдж ровно до первого тика с достаточным спаном — но окно в этот момент всё ещё СОДЕРЖИТ
+# бут-прогрев (подпись 220 лестниц, балансы флота, резолв фидов), и пейдж стрелял через
+# ~50 мин после КАЖДОГО рестарта (16:27:53 — оба ключа, при устойчивом темпе А 7-17M).
+# Канон Ш23а: насыщенный числитель чинится ЧИСЛИТЕЛЕМ, не порогом. Аптайм-защёлка отвергнута
+# ещё 07.08 (21 рестарт глушил сторожа в самые дорогие сутки) — здесь рестарт выкидывает
+# ТОЛЬКО замеры своего прогрева, устойчивый расход виден уже с 16-й минуты аптайма.
+_CU_PROC_T0 = time.monotonic()
+CU_BOOT_BURST_SEC = 900.0
+
+
+def cu_rolling_ex_boot(host: str):
+    """(проекция M CU/мес, спан) по скользящей БЕЗ замеров бут-прогрева — для ПЕЙДЖА человеку.
+    Журнальный маркер продолжает читать полную скользящую (cu_rolling_add)."""
+    import os as _os
+    burst = float(_os.environ.get("CU_BOOT_BURST_SEC", str(CU_BOOT_BURST_SEC)))
+    cut_boot = _CU_PROC_T0 + burst
+    with _CU_ROLL_LOCK:
+        q = [x for x in _CU_ROLL.get(host, ()) if x[0] >= cut_boot]
+    total_cu = sum(x[1] for x in q)
+    span = sum(x[2] for x in q)
+    if span <= 0:
+        return (0.0, 0.0)
+    return (total_cu / span * 86400 * 30 / 1e6, span)
+
+
 def _caller_tag() -> str:
     """Первый кадр ВНЕ транспортных модулей — кто заказал вызов. Только под CU_ATTRIBUTION=1."""
     import sys as _sys
