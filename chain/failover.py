@@ -236,12 +236,20 @@ class FailoverRpc(BaseRpc):
 
 
 def _short(url: str) -> str:
+    # 20.08: различаем узлы на одном хосте CRC-ТЕГОМ ПУТИ, как это давно делает CU-строка
+    # (chain/rpc.py). Прежняя форма печатала ХВОСТ КЛЮЧА (последние 4 символа) — символов мало,
+    # но это материал ключа в журнале, а журнал уезжает в отчёты и тикеты; цена этого класса
+    # уже заплачена 07.08 (четыре боевых приватника ушли в вывод). Тег стабилен, коллизий на
+    # горстке наших узлов нет, а ключ не восстанавливается из него вовсе.
     try:
         host = url.split("://", 1)[1].split("/", 1)[0]
-        tail = url.rstrip("/").rsplit("/", 1)[-1]
-        return "%s/…%s" % (host, tail[-4:]) if tail and tail != host else host
+        tail = url.rstrip("/").split("://", 1)[-1].split("/", 1)
+        if len(tail) > 1 and tail[1].strip("/"):
+            import zlib as _zlib
+            return "%s#%04x" % (host, _zlib.crc32(tail[1].encode()) & 0xffff)
+        return host
     except Exception:
-        return url[:40]
+        return (url.split("://", 1)[-1].split("/", 1)[0] or "?")[:40]
 
 
 def build_failover(primary: BaseRpc, cfg, alerter=None):
