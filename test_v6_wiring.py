@@ -170,7 +170,9 @@ def _base_ref():
     Ищется по дереву, а не задаётся числом — иначе эталон протухает от каждого коммита."""
     if os.environ.get("V6_BASE_REF"):
         return os.environ["V6_BASE_REF"]
-    shas = subprocess.run(["git", "rev-list", "-n", "40", "HEAD"], capture_output=True,
+    # 20.08: окно 40 коммитов протухло за одну плотную ночь (#133+пакет 50191667 вытолкали
+    # до-v6 базу за горизонт) — 400 хватит надолго, а эталон по-прежнему ищется по дереву.
+    shas = subprocess.run(["git", "rev-list", "-n", "400", "HEAD"], capture_output=True,
                           text=True).stdout.split()
     for sha in shas:
         src = subprocess.run(["git", "show", "%s:chain/spec_fire_live.py" % sha],
