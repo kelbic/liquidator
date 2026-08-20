@@ -56,6 +56,12 @@ _STAGE_LOCK = threading.Lock()
 _STAGES: dict = {}
 STAGE_WINDOW_SEC = float(os.environ.get("STAGE_WINDOW_SEC", "3600"))
 CU_ALERT_PROJ_M = float(os.environ.get("CU_ALERT_PROJ_M", "26"))   # проекция M CU/мес -> TG-будильник
+# Сколько ПОДРЯД окон превышения нужно, чтобы будить ЧЕЛОВЕКА (20.08: три ложных
+# пейджа за утро на спайках рестарта/прогрева — журнальный маркер остаётся на 1 окне).
+CU_ALERT_STREAK_N = int(os.environ.get("CU_ALERT_STREAK_N", "3"))
+# Порог эскалации бэкоффа, при котором обрывы hot-path будят ЧЕЛОВЕКА (#4 = ~24с ожидания,
+# то есть три подряд неудачных возврата). Быстрые удачные реконнекты остаются в журнале.
+HOT_WS_PAGE_BACKOFF_N = int(os.environ.get("HOT_WS_PAGE_BACKOFF_N", "4"))
 # Сколько измеренного времени должно накопиться, прежде чем порогу можно верить. Это замена
 # защёлке «не раньше 6ч аптайма»: та глушила сторожа рестартами (07.08 — 21 рестарт, 0 тревог
 # в сутки максимального расхода), а требование span глушится только отсутствием ИЗМЕРЕНИЙ.
@@ -79,6 +85,7 @@ CU_QUOTA_M = float(os.environ.get("CU_QUOTA_M", "30"))                    # кв
 #   (б) он был ОДИН НА ВСЕ ХОСТЫ => с тремя ключами шумный ключ глушил маркер соседнего на 6ч.
 _CU_MARK_TS: dict = {}    # host -> monotonic последней ЖУРНАЛЬНОЙ строки маркера
 _CU_PAGE_TS: dict = {}    # host -> monotonic последнего ПЕЙДЖА человеку
+_CU_OVER_STREAK: dict = {}  # host -> сколько ПОДРЯД окон превышения (гейт пейджа)
 CU_MARK_SEC = float(os.environ.get("CU_MARK_SEC", "21600"))               # прежние 6ч, теперь на ключ
 
 
@@ -2854,8 +2861,19 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                 # Порог берём со СКОЛЬЗЯЩЕЙ величины, а не с одного окна: замер
                                 # 07.08 — max проекции расходится с фактом в 6.7-40 раз (одиночное
                                 # окно спайкует), а СРЕДНЕЕ проекций совпадает с фактом на 0.1-1.5%.
+                                # 20.08: скользящей ОДНОГО момента мало для ПЕЙДЖА ЧЕЛОВЕКУ.
+                                # За утро тревога по квоте пришла kelbic ТРИЖДЫ (37M, 25M, 50M),
+                                # а факт по сумме окон был 24M/14.6M — спайки давали рестарт,
+                                # прогрев балансов 220 ног и волна пересборки лестниц. Журнальный
+                                # МАРКЕР остаётся на прежнем пороге (он ничего не будит), а
+                                # человека будим только когда превышение ДЕРЖИТСЯ: K подряд окон.
+                                # Канон «алерты только там, где нужен человек»: разовый всплеск
+                                # решается сам, устойчивый расход — нет.
                                 _over = ("alchemy" in _host and _roll[0] >= CU_ALERT_PROJ_M
                                          and _roll[1] >= CU_ALERT_MIN_SPAN_SEC)
+                                _streak = _CU_OVER_STREAK.get(_host, 0) + 1 if _over else 0
+                                _CU_OVER_STREAK[_host] = _streak
+                                _page_worthy = _over and _streak >= CU_ALERT_STREAK_N
                                 _now_cu = time.monotonic()
                                 _top3 = " ".join("%s×%d" % (m, n) for m, n in _top[:3])
                                 if _over and _now_cu - _CU_MARK_TS.get(_host, -1e9) > CU_MARK_SEC:
@@ -2872,7 +2890,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                 # Канал — тот же alerter, что у refusal-loss/kill-switch; он
                                 # ПЕРЕДАН в hot_loop явно, происхождение не угадывается (канон
                                 # notify_fn: забыл прокинуть -> молчание, а не самодельный канал).
-                                if (_over and CU_ALERT_TG and alerter is not None
+                                if (_page_worthy and CU_ALERT_TG and alerter is not None
                                         and _now_cu - _CU_PAGE_TS.get(_host, -1e9) > CU_ALERT_PAGE_SEC):
                                     _CU_PAGE_TS[_host] = _now_cu
                                     try:
@@ -3072,8 +3090,16 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
             log.warning("hot path ws error (%s) — reconnecting in %.0fs (backoff #%d)", type(e).__name__, _wait, _fb_backoff_n)
             _now = time.monotonic()
             recon_ts = [t for t in recon_ts if _now - t <= 180.0] + [_now]   # окно 180с
-            if len(recon_ts) >= 3 and _now - last_recon_alert > 600.0:       # серия -> реальная проблема
+            # 20.08: гейт пейджа перенесён с ЧИСЛА попыток на ИХ БЕЗУСПЕШНОСТЬ. Серия быстрых
+            # реконнектов, каждый из которых УДАЛСЯ, человеку не адресована: 20.08 апстрим
+            # flashblocks сам замолкал на 30-60с (независимый ws-клиент с той же машины: 46
+            # сообщений за 60с вместо ~250), бот переподключался, hot-path работал. Настоящая
+            # беда — когда вернуться НЕ ВЫХОДИТ, и это видно по эскалации бэкоффа: #4 = ждём
+            # 24с, то есть три подряд неудачных захода. Журнал пишет каждую попытку, как и был.
+            if (_fb_backoff_n >= HOT_WS_PAGE_BACKOFF_N and len(recon_ts) >= 3
+                    and _now - last_recon_alert > 600.0):
                 last_recon_alert = _now
-                alerter.send_async("\U0001F6A8 hot-path %d реконнектов за 3 мин — check journalctl" % len(recon_ts),
-                             key="hot-wsserr")
+                alerter.send_async("\U0001F6A8 hot-path НЕ ВОССТАНАВЛИВАЕТСЯ: %d обрывов за 3 мин, "
+                                   "бэкофф #%d (ждём %.0fс) — поток суб-блоков потерян"
+                                   % (len(recon_ts), _fb_backoff_n, _wait), key="hot-wsserr")
             await asyncio.sleep(_wait)

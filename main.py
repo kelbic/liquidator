@@ -1029,9 +1029,14 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
             log.warning("block source=%s error (%s) — reconnecting in 3s", active, type(e).__name__)
             _now = time.monotonic()
             recon_ts[:] = [t for t in recon_ts if _now - t < _RECON_SERIES_WINDOW_SEC] + [_now]
-            if len(recon_ts) >= _RECON_SERIES_N:     # одиночный блип — только журнал (TG-гигиена 07-10)
-                alerter.send_async("\U0001F6A8 block-loop: %d reconnects/%dm — flapping, check journalctl"
-                                   % (len(recon_ts), _RECON_SERIES_WINDOW_SEC // 60), key="wsserr")
+            # 20.08: ПЕЙДЖ ПО СЕРИИ РЕКОННЕКТОВ СНЯТ — это предвестник, и он дублировал исход.
+            # Утром он позвал человека трижды на деградации САМОГО апстрима flashblocks:
+            # независимый ws-клиент с той же машины рвался так же (46 сообщений за 60с вместо
+            # ~250, обрыв на 48-60с), индекс при этом оставался СВЕЖИМ (возраст 0.0с, голова =
+            # потолок), то есть делать человеку было нечего. Настоящий исход — падение на
+            # newHeads — уже будит своей строкой ниже (key="fbfallback"), а серия попыток
+            # остаётся в ЖУРНАЛЕ (log.warning выше): диагностика не потеряна, сон не потерян.
+            # recon_ts ведём дальше — он нужен строке журнала и возможным будущим гейтам.
             if active == "flashblocks":
                 fails += 1
                 if fails >= _FLASHBLOCK_FALLBACK_AFTER:
