@@ -399,6 +399,15 @@ def _refresh_worker(shared, markets, cfg, ctx_cache, log, stop, alerter=None):
                 shared.groups_history.append(                          # snapshot per fetch (monotonic ts)
                     (time.monotonic(), {mid: frozenset(bs) for mid, bs in g.items()}))
             _save_candidates_snapshot(cfg.candidates_snapshot_path, g, db, dab, hb, n)   # P0-1 warm-start
+            # #140: ПЕРВЫЙ УСПЕШНЫЙ refresh — сигнал сеятелю склада. Не t=0 намеренно: старт
+            # идёт под 429-штормом прогрева кэшей, и подпись 4400 ECDSA на общем ядре в тот же
+            # момент — эффект наблюдателя. Здесь прогрев позади, а до первого окна ещё часы.
+            # Прибор сбоку: своя обёртка, чтобы отказ сеятеля не трогал refresh-воркер.
+            try:
+                from chain.spec_fire_live import note_candidates_ready
+                note_candidates_ready()
+            except Exception:
+                log.info("#140 посев склада: сигнал не прошёл — движок поднимется первым окном")
         except Exception:
             log.exception("candidate refresh error")
         stop.wait(cfg.candidate_refresh_sec)
@@ -765,6 +774,16 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                         _sfl._alert = lambda _t, _k: alerter.send_async(_t, key=_k)
                         from chain.execute import set_combat_win_hook
                         set_combat_win_hook(_sfl.note_combat_win_by_market)   # #58
+                        # #140: ПОСЕВ СКЛАДА. Арм ЯВНЫЙ и только здесь (канон notify_fn).
+                        # Сеятель сработает, когда сойдутся ДВА условия — «кандидаты готовы»
+                        # (первый успешный refresh) и «есть кого сеять» (этот объект); порядок
+                        # любой, refresh-воркер стартует раньше. Осечка = лог, не падение.
+                        try:
+                            from chain.spec_fire_live import set_seed_hook
+                            set_seed_hook(_sfl.seed_on_start)
+                        except Exception:
+                            log.exception("#140 посев склада: арм не удался — движок поднимется "
+                                          "первым окном, как раньше")
                         # #54: выручка побед проб — в kill-switch. Арм ЯВНЫЙ и только здесь;
                         # строка actions: status 'submitted:1 probe-win' попадает в фильтр
                         # realized_today (LIKE 'submitted:%'), газ пробы уже в specfire_gas_today.

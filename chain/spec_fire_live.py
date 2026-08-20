@@ -67,6 +67,55 @@ SPEC_FIRE_WINDOW_COST_USD = float(os.environ.get("SPEC_FIRE_WINDOW_COST_USD", "2
 # имеет права открывать мелочь: это ровно тот класс, где ошибка стоит дороже пропуска.
 SPEC_FIRE_MIN_REPAID_NOBONUS_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_NOBONUS_USD", "1000"))
 
+# #140: ПОСЕВ СКЛАДА НА СТАРТЕ. Дефолт включён; откат SPEC_FIRE_SEED_ON_START=0 возвращает
+# прежний подъём движка (только из окна/арма) бит-в-бит.
+SPEC_FIRE_SEED_ON_START = os.environ.get("SPEC_FIRE_SEED_ON_START", "1").lower() not in (
+    "0", "false", "no")
+# ПОЧЕМУ НЕ НА t=0. Старт идёт под 429-штормом прогрева кэшей, и подпись 4400 ECDSA на общем
+# ядре в тот же момент — это эффект наблюдателя, которым мы уже платили (канон одноядерной VPS).
+# Сеем ПОСЛЕ первого УСПЕШНОГО candidate refresh: к этому моменту прогрев кэшей позади, а до
+# первого окна spec-fire ещё часы.
+# ДВА УСЛОВИЯ СХОДЯТСЯ В ЛЮБОМ ПОРЯДКЕ: refresh-воркер стартует РАНЬШЕ, чем создаётся
+# SpecFireLive, поэтому «кандидаты готовы» и «есть кого сеять» приходят порознь, и посев
+# запускает тот, кто пришёл вторым. Одноразово (`done`).
+_SEED_LOCK = threading.Lock()
+_SEED_STATE = {"hook": None, "ready": False, "done": False}
+
+
+def set_seed_hook(fn) -> None:
+    """Точка, куда main отдаёт сеятеля (метод живого SpecFireLive). Арм ЯВНЫЙ, канон notify_fn."""
+    with _SEED_LOCK:
+        _SEED_STATE["hook"] = fn
+    _maybe_seed()
+
+
+def note_candidates_ready() -> None:
+    """Первый успешный candidate refresh состоялся (зовёт refresh-воркер main)."""
+    with _SEED_LOCK:
+        if _SEED_STATE["ready"]:
+            return
+        _SEED_STATE["ready"] = True
+    _maybe_seed()
+
+
+def _maybe_seed() -> bool:
+    """Оба условия сошлись -> посев В ФОНЕ (тред), чтобы не задерживать ни refresh-воркер, ни
+    старт. Прибор сбоку: исключение сеятеля не выходит за этот тред."""
+    with _SEED_LOCK:
+        if _SEED_STATE["done"] or not _SEED_STATE["ready"] or _SEED_STATE["hook"] is None:
+            return False
+        _SEED_STATE["done"] = True
+        fn = _SEED_STATE["hook"]
+
+    def _run():
+        try:
+            fn()
+        except Exception:                         # noqa: BLE001
+            log.info("SPECFIRE посев склада: сеятель упал — старт не затронут")
+
+    threading.Thread(target=_run, daemon=True, name="spec-seed").start()
+    return True
+
 
 def _market_min_repaid_usd(bonus) -> float:
     """Порог кандидата ДЛЯ ЭТОГО РЫНКА = max(пол, цена окна / бонус). bonus — доля (LIF−1),
@@ -2248,6 +2297,46 @@ class SpecFireLive:
         return _ask
 
     # ---- движок огня (#32, 07.08): постоянный пул вместо порождения залпа на тик ----
+    def seed_on_start(self) -> bool:
+        """#140: ПОСЕВ СКЛАДА — поднять движок ДО первого окна, а не в нём.
+
+        ЗАМЕР, ради которого это делается: с рестарта 22:16 движок не поднимался НИ РАЗУ —
+        8 часов склад пуст при 445 армах предикта и 2502 прогревах PREARM, потому что окно
+        spec-fire не армилось («ближ. жир dist > потолок»). Немота длится не «50 минут после
+        рестарта», а ДО ПЕРВОГО ОКНА, и детонатор-класс (мгновенный флип cbADA-типа) встречает
+        пустой склад плюс 28-32с подписи ровно в горячий момент.
+
+        ЭТО НЕ НОВЫЙ ПУТЬ ПОДПИСИ. Весь посев — «поднять движок раньше»: дальше работает тот
+        же фоновый `_refill_loop`, который уступает огню и капнут ENGINE_SIGN_BUDGET за проход.
+        Ни одной строки подписи здесь нет и быть не должно.
+
+        ПРАВА ОГНЯ ПОСЕВ НЕ ДАЁТ. Единственный источник права — keepalive горячего тика
+        (см. коммент склада в `_prearm_board` и гарды движка): поднятый движок без keepalive
+        молчит по построению. Посев трогает СКЛАД, не спусковой крючок.
+
+        ПРИБОР СБОКУ: любая осечка = строка в журнале и деградация к сегодняшней лени (движок
+        поднимется первым окном, как и сейчас), но НЕ падение старта.
+        """
+        if not SPEC_FIRE_SEED_ON_START:
+            return False
+        try:
+            if getattr(self, "_fire_engine", None) is not None:
+                return False                      # уже поднят окном/армом — сеять нечего
+            eng = self._engine()
+            if eng is None:
+                self._log("SPECFIRE посев склада: движок выключен (SPEC_FIRE_ENGINE=0) — "
+                          "склад остаётся пуст, путь залпа прежний")
+                return False
+            self._log("SPECFIRE посев склада: движок поднят ПОСЛЕ первого candidate refresh, "
+                      "не дожидаясь окна — лестницы подписываются статическими тирами "
+                      "(кольца зеркала на старте пусты). Права огня это НЕ даёт: спусковой "
+                      "крючок — keepalive горячего тика")
+            return True
+        except Exception as e:                    # noqa: BLE001
+            self._log("SPECFIRE посев склада НЕ УДАЛСЯ (%s) — деградация к прежнему подъёму "
+                      "первым окном, старт не затронут" % _diag(e))
+            return False
+
     def _engine(self):
         """Ленивый подъём движка. Выключен -> None, и путь залпа идёт как прежде бит-в-бит."""
         from chain import fire_engine as _fe
