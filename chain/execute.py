@@ -1537,6 +1537,37 @@ _MC3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 _MC3_GETBAL_SEL = "0x4d2301cc"           # getEthBalance(address)
 
 
+# 20.08 (раскидка квот, решение kelbic «раскидай уже как-нибудь»): фоновые чтения патрона и
+# аудита лестниц — на ОТДЕЛЬНЫЙ ключ (VOLLEY_BAL_RPC_URL). Замер 8ч без бут-окон: боевой ключ
+# нёс ~7M/мес фоновых чтений (bal_warm 879+357 вызовов, аудит 666) при свободном B (11.4M/30M).
+# ПОЧЕМУ НЕ BG_RPC_URL (доктрина 25.07 «фоновое -> бесплатный публичный»): патрон кормит
+# FAIL-CLOSED гейт огня — осечка чтения = немая нога; nodies отдаёт 403/429 ~350 раз/час
+# (замер 20.08), для этого класса чтений нужен НАДЁЖНЫЙ ключ. Потому они и жили на боевом.
+# НАЗВАННОЕ СВЯЗЫВАНИЕ: на B уже сидит confirmed-нога цены (px-hedge). Теперь отказ B бьёт
+# сразу по двум fail-close механизмам (страховка цены + гейт патрона). Принято сознательно:
+# запас B ~12M/мес, а альтернативы хуже (A — деньги, C — 21M, nodies — решето).
+# Паттерн #117: гард сети, пусто/отказ => боевой rpc БИТ-В-БИТ. Путь огня не трогается.
+_VOLLEY_BAL_RPC = None      # None=не строили; False=строить нечего/нельзя (форевер боевой)
+
+
+def volley_bal_read_rpc(rpc):
+    """RPC для ФОНОВЫХ чтений патрона/аудита: env-ключ с гардом сети либо переданный боевой."""
+    global _VOLLEY_BAL_RPC
+    if _VOLLEY_BAL_RPC is None:
+        url = (os.environ.get("VOLLEY_BAL_RPC_URL") or "").strip()
+        if not url or url == getattr(rpc, "rpc_url", None):
+            _VOLLEY_BAL_RPC = False
+        else:
+            try:
+                from chain.rpc import BaseRpc, guard_chain_id
+                h = guard_chain_id(BaseRpc(url, rpc.chain_id, request_timeout=10),
+                                   rpc.chain_id, "ключ фоновых чтений патрона", fallback=rpc)
+                _VOLLEY_BAL_RPC = False if h is rpc else h
+            except Exception:
+                _VOLLEY_BAL_RPC = False
+    return _VOLLEY_BAL_RPC or rpc
+
+
 def volley_bal_warm_fleet(rpc, addrs, log=None) -> int:
     """Освежить патрон ВСЕГО флота ОДНИМ мультиколлом. Возврат: сколько ног обновлено.
 
@@ -1548,6 +1579,7 @@ def volley_bal_warm_fleet(rpc, addrs, log=None) -> int:
     addrs = [a for a in (addrs or []) if a]
     if not addrs:
         return 0
+    rpc = volley_bal_read_rpc(rpc)          # фоновое чтение -> отдельный ключ (см. выше)
     try:
         from chain.multicall import aggregate3
         # aggregate3 принимает (target, calldata) и сам ставит allowFailure — трёхкортежи
@@ -1587,7 +1619,7 @@ def volley_bal_warm(rpc, addr: str, log=None) -> bool:
     """Синхронно засеять кэш патрона ВНЕ пути огня (пресайн лестницы, прогрев доски).
     Возврат True, если кэш теперь живой. Здесь RTT допустим — путь холодный."""
     try:
-        w3 = rpc._web3()
+        w3 = volley_bal_read_rpc(rpc)._web3()   # фоновое чтение -> отдельный ключ
         b = int(w3.eth.get_balance(addr))
     except Exception as e:
         # Молчаливая осечка = лестница на 40 проб при пустом кэше, то есть нога, немая до

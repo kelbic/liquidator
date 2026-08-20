@@ -2407,7 +2407,9 @@ class SpecFireLive:
                 нынешней базы (tx не включаема). Обе формы САМИ останавливают огонь, поэтому
                 триггер по глубине склада тут не срабатывает никогда."""
                 try:
-                    bf = int(self.rpc._web3().eth.get_block("latest").get("baseFeePerGas") or 0)
+                    # 20.08 раскидка квот: аудит — фоновое чтение, уходит с боевого ключа
+                    bf = int(_ex.volley_bal_read_rpc(self.rpc)._web3()
+                             .eth.get_block("latest").get("baseFeePerGas") or 0)
                 except Exception as e:
                     self._log("SPECFIRE аудит лестниц: база не прочитана (%s)" % _diag(e))
                     return
