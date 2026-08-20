@@ -60,6 +60,26 @@ CU_ALERT_PROJ_M = float(os.environ.get("CU_ALERT_PROJ_M", "26"))   # проек�
 # защёлке «не раньше 6ч аптайма»: та глушила сторожа рестартами (07.08 — 21 рестарт, 0 тревог
 # в сутки максимального расхода), а требование span глушится только отсутствием ИЗМЕРЕНИЙ.
 CU_ALERT_MIN_SPAN_SEC = float(os.environ.get("CU_ALERT_MIN_SPAN_SEC", "900"))
+# #117 (19.08) КАНАЛ ТРЕВОГИ КВОТЫ. Замер владельца: маркер сработал 44 раза за 7 суток и НИ
+# РАЗУ не дошёл до человека — прибор исправен, сломан канал «журнал→человек». Это ровно класс
+# «мёртвый сторож хуже отсутствующего»: строка в журнале, которую никто не читает, неотличима
+# от молчания. Решение 02.08 («CU — в журнал, не в TG») принималось против ПРЕДВЕСТНИКА, и
+# тогда было верным; здесь другое: исчерпание квоты требует ДЕЙСТВИЯ ЧЕЛОВЕКА (ротация ключа,
+# страйп, докупка) и попадает в четыре законных случая канона «алерты только там, где нужен
+# человек». Бот сам эту беду не отрабатывает.
+# Против флапа, которого боялись 02.08: латч НА КЛЮЧ и на СУТКИ (один пейдж в сутки на ключ),
+# плюс прежние два условия — скользящая проекция (не спайк одного окна) и накопленный span
+# (не бут-спайк). Откат: CU_ALERT_TG=0 (остаётся прежняя журнальная строка).
+CU_ALERT_TG = (os.environ.get("CU_ALERT_TG", "1") or "1").lower() not in ("0", "false", "no", "off")
+CU_ALERT_PAGE_SEC = float(os.environ.get("CU_ALERT_PAGE_SEC", "86400"))   # 1 пейдж/сутки на ключ
+CU_QUOTA_M = float(os.environ.get("CU_QUOTA_M", "30"))                    # квота ключа, M CU/мес
+# Латчи — МОДУЛЬНЫЕ и ПЕР-ХОСТОВЫЕ, и то и другое исправляет дефекты прежнего `last_cu_alert`:
+#   (а) он был ЛОКАЛЬНОЙ переменной hot_loop => self-heal-перезапуск обнулял защёлку (тот же
+#       класс, что защёлка «6ч аптайма» 07.08: сторож глохнет ровно от рестартов);
+#   (б) он был ОДИН НА ВСЕ ХОСТЫ => с тремя ключами шумный ключ глушил маркер соседнего на 6ч.
+_CU_MARK_TS: dict = {}    # host -> monotonic последней ЖУРНАЛЬНОЙ строки маркера
+_CU_PAGE_TS: dict = {}    # host -> monotonic последнего ПЕЙДЖА человеку
+CU_MARK_SEC = float(os.environ.get("CU_MARK_SEC", "21600"))               # прежние 6ч, теперь на ключ
 
 
 def stage_note(name: str, ms: float, now=None):
@@ -1003,9 +1023,16 @@ def px_confirmed_rpc(rpc):
     with _PX_CONFIRMED_LOCK:
         if _PX_CONFIRMED_RPC is None:
             try:
-                from chain.rpc import BaseRpc
-                _PX_CONFIRMED_RPC = BaseRpc(url, int(os.environ.get("CHAIN_ID", "8453")),
-                                            request_timeout=8)
+                from chain.rpc import BaseRpc, assert_chain_id
+                _cid = int(os.environ.get("CHAIN_ID", "8453"))
+                _h = BaseRpc(url, _cid, request_timeout=8)
+                # #117 гард сети. Ложится на уже существующий сентинел False («навсегда откат на
+                # боевой»): цена confirmed-ноги с ЧУЖОЙ цепи — не лишний расход, а неверная цена
+                # на денежном пути. None (узел молчит) кандидата НЕ хоронит: сентинел вечный, а
+                # молчание на буте временно — вечное решение по временному признаку было бы
+                # хуже самой болезни.
+                _PX_CONFIRMED_RPC = False if assert_chain_id(
+                    _h, _cid, what="PX_CONFIRMED (резервный ключ)") is False else _h
             except Exception:
                 _PX_CONFIRMED_RPC = False          # не смогли -> навсегда откат на боевой
     return _PX_CONFIRMED_RPC or rpc
@@ -1097,6 +1124,18 @@ def read_positions(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
                 _box.append(_e)                              # исключение в бокс: отличать fail от «ещё летит»
             finally:
                 _ev.set()
+        # #117: ГЕЙТ ВТОРОЙ НОГИ ЗДЕСЬ НЕ СТАВИТСЯ — ЗАМЕР ЗАПРЕТИЛ (20.08). Соблазн очевиден:
+        # у соседа `read_price_hedged` такой гейт стоит и экономит, а здесь confirmed-нога
+        # тоже выбрасывается ветвью `res = _rp`. Но экономия живёт ровно на тех чтениях, где
+        # preconf ПОБЕЖДАЕТ, а по ПОЗИЦИЯМ он побеждает почти никогда: 129 чтений из 4500 за
+        # сутки (2.9%), 5680 из 48700 за всю историю hotset.log (11.7%) — остальное `src=
+        # confirmed`, то есть тяжёлый multicall в preconf не укладывается в 0.5с (тот же
+        # компьют-кап, что описан на ~1290: 6 промахов из 7 в канарейке 23.07). Гейт дал бы
+        # ~0.1-0.4M CU/мес экономии и +70..+500мс латентности на 88-97% РЕАКТИВНЫХ чтений:
+        # где экономия — там налога нет, где налог — там экономии нет. Второе: признак
+        # `px_hedge_degraded()` меряет здоровье preconf на ЛЁГКОМ ценовом вызове и о промахах
+        # позиций не узнаёт никогда (`px_hedge_note_miss` зовёт только ценовой путь) —
+        # чужой сигнал не самокорректируется. Обе ноги стартуют параллельно, как и было.
         preconf_mark_reactive()              # см. read_price_hedged: реактив главнее фонового полла
         threading.Thread(target=_leg, args=(preconf_rpc, "pending", _ev_p, _box_p), daemon=True).start()
         threading.Thread(target=_leg, args=(rpc, None, _ev_c, _box_c), daemon=True).start()
@@ -2636,21 +2675,33 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     try:
         _bg_url = str(getattr(cfg, "bg_rpc_url", "") or "")
         if _bg_url and _bg_url != cfg.rpc_url:
-            from chain.rpc import BaseRpc as _BR
-            _bg_rpc = _BR(_bg_url, cfg.chain_id, request_timeout=10)
+            from chain.rpc import BaseRpc as _BR, guard_chain_id as _gci
+            _bg_rpc = _gci(_BR(_bg_url, cfg.chain_id, request_timeout=10), cfg.chain_id,
+                           "bg-ключ фоновых чтений", fallback=rpc, log=log)   # #117 гард сети
             # 05.08: только хост — полный URL нёс ключ в журнал (гигиена ключей, как crc-тег CU)
             log.info("фоновые чтения -> %s… (Alchemy остаётся денежному пути)",
                      _bg_url.split("//")[-1].split("/")[0])
     except Exception:
         _bg_rpc = rpc
+    # #117: буст-циклы кэша позиций (<=10 560 eth_call/сут) — на ТРЕТИЙ ключ. Слой по построению
+    # резервный (в штиль это stale-фолбэк, потребитель при промахе дочитывает живьём), поэтому
+    # 429 на C стоит нам refresh-fail, а не блока. Пусто/отказ => боевой rpc, бит-в-бит как было.
+    try:
+        from chain.rpc import build_combat_read_rpc
+        _c_rpc = build_combat_read_rpc(cfg, rpc, log=log)
+    except Exception:
+        _c_rpc = rpc
 
     def _default_ws():
         return websockets.connect(FB_URL, open_timeout=20, ping_interval=20, max_size=None)
     ws_factory = ws_factory or _default_ws
 
     from chain.rpc import BaseRpc
-    _fb_resolve_rpc = BaseRpc(os.environ.get("FEEDS_FALLBACK_RPC", "https://mainnet.base.org"),
-                              getattr(rpc, "chain_id", 8453), request_timeout=8.0)
+    from chain.rpc import guard_chain_id as _gci_fb                              # #117 гард сети
+    _fb_resolve_rpc = _gci_fb(
+        BaseRpc(os.environ.get("FEEDS_FALLBACK_RPC", "https://mainnet.base.org"),
+                getattr(rpc, "chain_id", 8453), request_timeout=8.0),
+        getattr(rpc, "chain_id", 8453), "FEEDS_FALLBACK_RPC", fallback=rpc, log=log)
     # #139: поблочный опрос — на КЛОНАХ с жёстким таймаутом (боевой preconf_rpc и _bg_rpc свой
     # таймаут сохраняют: цикл кэша штатно живёт 1.9-2.4с на _bg_rpc, ему тесная граница вредна).
     _poll_preconf_rpc = _poll_rpc(preconf_rpc)
@@ -2699,8 +2750,10 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                  # per-IP лимит на ЧАСТОТУ коннектов: фикс-3с реконнект при транзиентном сбое
                                  # Base превращал его в самоподдерживающийся 429-шторм на час (инцидент 07-21).
     last_fb_alert = 0.0          # monotonic of last degradation alert (anti-flood)
-    last_cu_alert = 0.0          # бут-спайк отсекает CU_ALERT_MIN_SPAN_SEC, а не аптайм: сторож,
-                                 # слепнущий от рестарта, сторожит рестарты, а не квоту (07.08)
+    # #117: защёлки CU переехали в МОДУЛЬНЫЕ пер-хостовые _CU_MARK_TS/_CU_PAGE_TS. Здесь их
+    # держать было нельзя: локальная переменная обнулялась при self-heal-перезапуске hot_loop,
+    # то есть сторож слеп ровно от рестартов — та самая ошибка 07.08, от которой ушли, заменив
+    # «6ч аптайма» на накопленный span, и которая тихо вернулась через область видимости.
     recon_ts = []                # monotonic'ы реконнектов hot-path ws; одиночный разрыв публичного
     last_recon_alert = 0.0       # Flashblocks-WS = НОРМА (роняет соединение раз в час-два) -> TG молчит,
                                  # алерт ТОЛЬКО на серию (3+ за 180с = реальная нестабильность фида/сети)
@@ -2779,7 +2832,14 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             _win = max(1e-9, time.monotonic() - last_stats)
                             for _host, _ms in sorted(_snap.items()):
                                 _cu = rpc_usage_cu({_host: _ms})
-                                _top = sorted(_ms.items(), key=lambda kv: -CU_TOP_KEY(kv))[:6]
+                                # #117: 6 -> 10. Ключ учёта становится `метод@вызыватель`, когда
+                                # включён CU_ATTRIBUTION=1 (env, кода не требует — см. rpc.py
+                                # _caller_tag). Тогда один метод дробится на СТОЛЬКО строк,
+                                # сколько у него вызывателей, и шестёрка вытесняла хвост: на
+                                # ключе A один eth_call даёт минимум четыре разных вызывателя
+                                # (PREARM, буст кэша, confirmed-нога read_positions, патрон
+                                # флота). Ради чего заводится атрибуция, тем срез её и глушил.
+                                _top = sorted(_ms.items(), key=lambda kv: -CU_TOP_KEY(kv))[:10]
                                 _proj = _cu / _win * 86400 * 30 / 1e6
                                 _roll = cu_rolling_add(_host, _cu, _win)
                                 log.info("CU %s: %d CU/окно = %.0f CU/s (проекция %.1fM/мес, "
@@ -2794,17 +2854,44 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                 # Порог берём со СКОЛЬЗЯЩЕЙ величины, а не с одного окна: замер
                                 # 07.08 — max проекции расходится с фактом в 6.7-40 раз (одиночное
                                 # окно спайкует), а СРЕДНЕЕ проекций совпадает с фактом на 0.1-1.5%.
-                                if ("alchemy" in _host and _roll[0] >= CU_ALERT_PROJ_M
-                                        and _roll[1] >= CU_ALERT_MIN_SPAN_SEC
-                                        and time.monotonic() - last_cu_alert > 21600):
-                                    last_cu_alert = time.monotonic()
+                                _over = ("alchemy" in _host and _roll[0] >= CU_ALERT_PROJ_M
+                                         and _roll[1] >= CU_ALERT_MIN_SPAN_SEC)
+                                _now_cu = time.monotonic()
+                                _top3 = " ".join("%s×%d" % (m, n) for m, n in _top[:3])
+                                if _over and _now_cu - _CU_MARK_TS.get(_host, -1e9) > CU_MARK_SEC:
+                                    _CU_MARK_TS[_host] = _now_cu
                                     _proj = _roll[0]
                                     log.warning(
                                         "CU-квота (журнальный маркер): %s проекция %.0fM/мес >= %.0fM — "
                                         "порядок эвакуации: 1) ассессмент+кэш на dRPC, 2) predict-полл, "
                                         "3) диагностика; отправки/sim НЕ трогать. Топ: %s",
-                                        _host, _proj, CU_ALERT_PROJ_M,
-                                        " ".join("%s×%d" % (m, n) for m, n in _top[:3]))
+                                        _host, _proj, CU_ALERT_PROJ_M, _top3)
+                                # #117: ПЕЙДЖ ЧЕЛОВЕКУ. Отдельная защёлка (сутки на ключ), потому
+                                # что журнальный маркер и вызов человека — разные по цене вещи:
+                                # маркер полезен часто, будильник обязан звонить редко и по делу.
+                                # Канал — тот же alerter, что у refusal-loss/kill-switch; он
+                                # ПЕРЕДАН в hot_loop явно, происхождение не угадывается (канон
+                                # notify_fn: забыл прокинуть -> молчание, а не самодельный канал).
+                                if (_over and CU_ALERT_TG and alerter is not None
+                                        and _now_cu - _CU_PAGE_TS.get(_host, -1e9) > CU_ALERT_PAGE_SEC):
+                                    _CU_PAGE_TS[_host] = _now_cu
+                                    try:
+                                        _days = (CU_QUOTA_M / _roll[0] * 30.0) if _roll[0] > 0 else 0.0
+                                        alerter.send_async(
+                                            "\U0001F4B8 КВОТА RPC: %s жжёт %.0fM CU/мес при квоте "
+                                            "%.0fM — при таком темпе ключ кончится за ~%.0f сут.\n"
+                                            "Топ: %s\n"
+                                            "Нужен ЧЕЛОВЕК: ротация/страйп/докупка ключа. Порядок "
+                                            "эвакуации: 1) ассессмент+кэш на dRPC, 2) predict-полл, "
+                                            "3) диагностика. Отправки/sim НЕ трогать."
+                                            % (_host, _roll[0], CU_QUOTA_M, _days, _top3),
+                                            key="cu-quota-%s" % _host)
+                                        log.info("CU-квота: пейдж человеку отправлен (%s), "
+                                                 "следующий не раньше чем через %.0fч",
+                                                 _host, CU_ALERT_PAGE_SEC / 3600.0)
+                                    except Exception:
+                                        log.exception("CU-квота: пейдж НЕ ушёл — маркер остаётся "
+                                                      "только в журнале")
                         except Exception:
                             pass
                         # #110: индекс цепи — ЕДИНИЦЫ РАЗНЫЕ и разделены намеренно. blocks —
@@ -2939,7 +3026,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         # logs refresh-miss/cycle timing. Does NOT touch reads_fn — read_positions_cached
                         # is not wired into _process_transmit yet, so this has zero effect on hot-path behavior.
                         _spawn_cache_refresh(cache_rpc=_bg_rpc, shared=shared, bn=bn,   # штиль -> bg-RPC (CU-замер 25.07);
-                                             combat_rpc=rpc)                            # буст-окно -> боевой (ревью 05.08 (а))
+                                             combat_rpc=_c_rpc)                         # буст-окно -> ключ C (#117; без C = боевой)
                     idx = d.get("index"); txs = extract_txs(d); now = time.time()
                     for _raw, _to in txs:                        # SHADOW слоя 1: декод transmit из фида (log-only)
                         if _raw and FORWARD_SEL in _raw:

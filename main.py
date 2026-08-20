@@ -606,12 +606,18 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
         # Пусто => ключ №1 (прежнее поведение). Откат: BG_RPC_URL_2= (пусто).
         _u = str(getattr(cfg, "bg_rpc_url2", "") or "") or str(getattr(cfg, "bg_rpc_url", "") or "")
         if _u and _u != cfg.rpc_url:
-            _bg_read_rpc = BaseRpc(_u, cfg.chain_id, request_timeout=10)
+            from chain.rpc import guard_chain_id as _gci
+            _bg_read_rpc = _gci(BaseRpc(_u, cfg.chain_id, request_timeout=10), cfg.chain_id,
+                                "bg-ключ ассессмента", fallback=rpc, log=log)   # #117 гард сети
             if getattr(cfg, "bg_rpc_url2", ""):
                 log.info("bg-страйп: ассессмент+route-depth -> ключ №2 (%s…)",
                          _u.split("//")[-1].split("/")[0])
     except Exception:
         _bg_read_rpc = rpc
+    # #117: ТРЕТИЙ КЛЮЧ для окно-массы (PREARM ниже + буст-циклы кэша в hot_loop). Пусто/отказ =>
+    # боевой rpc, поведение бит-в-бит. Гард сети и названный предел — в build_combat_read_rpc.
+    from chain.rpc import build_combat_read_rpc
+    _combat_read_rpc = build_combat_read_rpc(cfg, rpc, log=log)
     shared = _Shared(markets)
     _snap = _load_candidates_snapshot(cfg.candidates_snapshot_path)      # P0-1: закрыть слепое окно рестарта
     if _snap:
@@ -626,7 +632,9 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                      daemon=True).start()
     if getattr(cfg, "hot_path", False):                      # preconf-triggered hot path (OFF until ARM)
         from chain.hotpath import hot_loop
-        preconf_rpc = BaseRpc(cfg.preconf_rpc or "https://mainnet-preconf.base.org", cfg.chain_id)
+        from chain.rpc import guard_chain_id as _gci_pc                          # #117 гард сети
+        preconf_rpc = _gci_pc(BaseRpc(cfg.preconf_rpc or "https://mainnet-preconf.base.org",
+                                      cfg.chain_id), cfg.chain_id, "preconf-узел", log=log)
 
         def _run_hot():
             import asyncio as _a
@@ -750,7 +758,10 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                     # мега-сайз). Ноль отправок; потребление — прозрачный кэш в kyber_swap.
                     try:
                         from chain.prearm import PreArmWorker, PREARM_MIN_DEBT_USD, PREARM_TOP_K
-                        _pa = PreArmWorker(rpc, cfg, shared)
+                        # #117: чтения прогрева (_read_target = ДВА aggregate3 на цель, >=16 930
+                        # вызовов/сут) — на ключ C. Горизонт слоя ~2 мин (окно), не один блок,
+                        # поэтому RTT-джиттер третьего ключа ему ничего не стоит. Без C = боевой.
+                        _pa = PreArmWorker(_combat_read_rpc, cfg, shared)
                         _handlers.append(_pa.handle_event)
                         log.warning("PRE-ARM ENABLED — Kyber-прогрев в окнах (top-%d, debt>=$%.0fk), ноль отправок",
                                     PREARM_TOP_K, PREARM_MIN_DEBT_USD / 1e3)
@@ -1057,8 +1068,27 @@ def main():
     markets = load_covered_markets(cfg.covered_markets_path)
     rpc = BaseRpc(cfg.rpc_url, cfg.chain_id) if cfg.rpc_url else None
     if rpc is not None:
+        # #117 гард сети на БОЕВОМ узле. Подменить его нечем, поэтому здесь гард — это только
+        # громкая строка на старте (форма check_gas_budget_sane / sign_backend_probe выше):
+        # ключ, выданный не на ту сеть, до этой правки принимался МОЛЧА — валидация web3,
+        # единственный потребитель eth_chainId, снята ради -45мс (см. strip_validation_middleware).
+        from chain.rpc import guard_chain_id as _gci_combat
+        rpc = _gci_combat(rpc, cfg.chain_id, "боевой ключ", log=log)
         from chain.failover import build_failover
         rpc = build_failover(rpc, cfg, alerter)   # без COMBAT_FAILOVER_URLS вернёт rpc как был
+        # #117: ПРОГРЕВ СИНГЛТОНА px_confirmed НА СТАРТЕ, а не на первом чтении цены.
+        # px_confirmed_rpc() строит резервный хэндл лениво ПОД ЛОКОМ, и туда добавился
+        # chainId-гард — то есть сетевой вызов с таймаутом 8с. Зовут эту функцию из
+        # read_price_hedged, а это РЕАКТИВНЫЙ денежный путь: первое чтение цены после старта
+        # (в т.ч. после self-heal посреди каскада) заплатило бы до 8с, и параллельные чтения
+        # встали бы на локе. Прибор обязан висеть СБОКУ от денежного пути — платим здесь,
+        # рядом с sign_backend_probe, где стоимость старта уместна и ожидаема.
+        try:
+            from chain.hotpath import px_confirmed_rpc as _pxc
+            _pxc(rpc)
+        except Exception:
+            log.exception("#117: прогрев px_confirmed не удался — хэндл построится лениво "
+                          "(как раньше), огонь не затронут")
     ctx_cache: dict = {}   # immutable per-market params (oracle, lltv_wad), filled on first sight
 
     # #110 ФОНОВЫЙ ИНДЕКС ЦЕПИ. Поднимается ДО петель, на СВОЁМ (не боевом) узле. Он не в
