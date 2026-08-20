@@ -890,6 +890,11 @@ class SpecFireLive:
                                            tba, tbs, drift_fn=_drift)
         if repaid_shares <= 0:
             return None
+        if repaid_shares < int(bs):
+            # КАП-ВЕТКА (тот же учёт, что в горячем пути): запоминаем ПРЕДВЫСТРЕЛЬНЫЙ залог,
+            # иначе огрызок после нашего же выстрела неотличим от живой цели и жжёт подготовку.
+            from chain.hotpath import note_cap_plan
+            note_cap_plan(mid, borrower, coll_amt)
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)   # репэй-сторона: вверх, как и было
         seized = _seized_exact(repaid_shares, _lif_wad, int(price), tba, tbs)
         if seized == 0:
@@ -1791,6 +1796,14 @@ class SpecFireLive:
                 if _is_ours(caller, caller, self.cfg):
                     # Взяли САМИ. Цель контракт уже погасил сам (`delete ts[i]` в fallback) —
                     # тратить owner-tx не на что, но из раскладки её убрать надо.
+                    # ОГРЫЗОК: это ЛОГ ПРОТОКОЛА с нашим caller — доказательство сильнее
+                    # квитанции. Если цель была кап-планом, с этого момента её остаток пыли
+                    # читается как труп (chain.hotpath.cap_corpse).
+                    try:
+                        from chain.hotpath import note_cap_shot_confirmed
+                        note_cap_shot_confirmed(key[0], key[1])
+                    except Exception:                       # noqa: BLE001
+                        pass
                     slots.pop(key, None)
                     continue
                 g, i = gi
