@@ -4205,6 +4205,15 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                         if _key in wins:                      # Liquidated(borrower,loan,profit) = взято
                             n_win += 1
                             _note_combat_win(mid, borrower, proven=True, log=log)
+                            # ОГРЫЗОК: КАСКАДНЫЙ путь тоже стреляет кап-планами, и без этой
+                            # точки правило было бы мертво ровно там, где кап-ветка встречается
+                            # чаще всего. Факт здесь СИЛЬНЫЙ: Liquidated нашего контракта в
+                            # квитанции нашей же tx.
+                            try:
+                                from chain.hotpath import note_cap_shot_confirmed
+                                note_cap_shot_confirmed(mid, borrower)
+                            except Exception:                 # noqa: BLE001
+                                pass
                             profit_usd_i = (wins[_key] * prep["debt_usd"] / prep["debt_assets"]
                                             if prep.get("debt_assets") else 0.0)   # арифметика _net_gate
                             results.append({"market_id": mid, "borrower": borrower, "sent": True, "hash": h,

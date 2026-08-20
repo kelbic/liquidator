@@ -133,6 +133,46 @@ check("регистрация кап-плана в пути доски", "note_c
 check("горячий фильтр спрашивает вердикт с ключом и живым залогом",
       "corpse_verdict(_row, _bc[0] if _bc else None, key=_ckey, collateral=_ccol)" in _hp)
 
+# --- 9. ГЛАВНЫЙ РИСК ЛИНЗЫ: ПРОТУХШЕЕ НАМЕРЕНИЕ + ПОЗДНИЙ ВЫСТРЕЛ != ТРУП -------------------
+# Механизм ложного трупа: кап-план пишется при КАЖДОЙ сборке, гонки мы в основном ПРОИГРЫВАЕМ,
+# значит намерения копятся. Без срока годности любой поздний подтверждённый выстрел по той же
+# цели превратил бы многодневный снимок залога в «факт» — и живая цель, чей залог с тех пор
+# вырос на порядок, похоронилась бы по ЧУЖОМУ масштабу.
+reset()
+hp.note_cap_plan(MID, B1, COLL_BEFORE, now=1000.0)
+_late = 1000.0 + hp.CAP_PLAN_FRESH_SEC + 1
+check("протухшее намерение НЕ конвертируется поздним выстрелом",
+      hp.note_cap_shot_confirmed(MID, B1, now=_late) is False)
+check("...и цель остаётся ЖИВОЙ (ложного трупа нет)",
+      hp.corpse_verdict(None, 10 ** 24, key=(MID, B1), collateral=COLL_STUB, ) is False)
+# ПОЗИТИВНЫЙ КОНТРОЛЬ НА ТОМ ЖЕ ОБЪЕКТЕ: свежее намерение тот же выстрел конвертирует
+reset()
+hp.note_cap_plan(MID, B1, COLL_BEFORE, now=1000.0)
+check("свежее намерение (в пределах %.0fс) конвертируется" % hp.CAP_PLAN_FRESH_SEC,
+      hp.note_cap_shot_confirmed(MID, B1, now=1000.0 + hp.CAP_PLAN_FRESH_SEC - 1) is True)
+
+# --- 10. ЧИСТКА РЕЕСТРА НАМЕРЕНИЙ ------------------------------------------------------------
+# Непочищенный _CAP_PLANS и был механизмом: он копится тем быстрее, чем чаще мы проигрываем.
+reset()
+for i in range(50):
+    hp.note_cap_plan(MID, "0x%040x" % i, COLL_BEFORE, now=1000.0)
+with hp._CAP_LOCK:
+    _before_n = len(hp._CAP_PLANS)
+hp.note_cap_shot_confirmed(MID, "0x%040x" % 999, now=1000.0 + hp.CAP_PLAN_FRESH_SEC + 5)
+with hp._CAP_LOCK:
+    _after_n = len(hp._CAP_PLANS)
+check("реестр намерений чистится тем же проходом (%d -> %d)" % (_before_n, _after_n),
+      _before_n == 50 and _after_n == 0)
+
+# --- 11. БАТЧЕВАЯ ТОЧКА ПОДТВЕРЖДЕНИЯ --------------------------------------------------------
+# Каскадный путь стреляет кап-планами чаще всех; без этой точки правило мертво именно там.
+_ex2 = open(pathlib.Path(__file__).parent / "chain" / "execute.py").read()
+check("подтверждение в БАТЧЕВОЙ ветке (разбор Liquidated юнита)",
+      _ex2.count("note_cap_shot_confirmed") >= 3)
+_batch_blk = _ex2[_ex2.index("status==1: разбор по Liquidated"):]
+check("...и оно стоит именно в ветке ВЗЯТО (_key in wins)",
+      "note_cap_shot_confirmed" in _batch_blk[:_batch_blk.index("_batch_record(n_win")])
+
 if FAILS:
     print("=== ОГРЫЗОК: %d ПРОВАЛОВ ===" % len(FAILS))
     sys.exit(1)

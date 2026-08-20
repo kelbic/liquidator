@@ -335,6 +335,13 @@ def corpse_pairs(stats=None, log=None):
 # знаем её предвыстрельный залог; (2) наш выстрел ПОДТВЕРЖДЁН (квитанция/лог протокола).
 CAP_CORPSE_MAX_BPS = float(os.environ.get("HOT_CAP_CORPSE_MAX_BPS", "20"))
 CAP_CORPSE_TTL_SEC = float(os.environ.get("HOT_CAP_CORPSE_TTL_SEC", "86400"))
+# СВЕЖЕСТЬ НАМЕРЕНИЯ (блокер линзы, 20.08). Кап-план строится при КАЖДОЙ сборке, а гонки мы в
+# основном проигрываем — значит намерения копятся, и без срока годности ЛЮБОЙ поздний выстрел по
+# той же цели превратил бы многодневный снимок залога в «факт». Тогда живая цель, чей залог с тех
+# пор изменился на порядок, хоронится по ЧУЖОМУ масштабу — ровно тот ложный труп, которого мы
+# боимся больше лишней подготовки. 300с: снимок и выстрел в одном окне (окно spec-fire ~90с,
+# реактивный путь — секунды), всё, что старше, — не про этот выстрел.
+CAP_PLAN_FRESH_SEC = float(os.environ.get("HOT_CAP_PLAN_FRESH_SEC", "300"))
 _CAP_PLANS: dict = {}      # (mid,borrower) -> (coll_before, ts): кап-план ПОСТРОЕН
 _CAP_SHOTS: dict = {}      # (mid,borrower) -> (coll_before, ts): наш кап-выстрел ПОДТВЕРЖДЁН
 _CAP_LOCK = threading.Lock()
@@ -363,12 +370,18 @@ def note_cap_shot_confirmed(mid, borrower, now=None) -> bool:
     k = _cap_key(mid, borrower)
     n = float(now if now is not None else time.time())
     with _CAP_LOCK:
+        # ЧИСТКА ОБОИХ РЕЕСТРОВ. Намерения копятся быстрее фактов (гонки мы в основном
+        # проигрываем), и именно непочищенный `_CAP_PLANS` был механизмом ложного трупа.
+        for _k in [x for x, v in _CAP_PLANS.items() if n - v[1] > CAP_PLAN_FRESH_SEC]:
+            del _CAP_PLANS[_k]
+        for _k in [x for x, v in _CAP_SHOTS.items() if n - v[1] > CAP_CORPSE_TTL_SEC]:
+            del _CAP_SHOTS[_k]
         rec = _CAP_PLANS.pop(k, None)
         if rec is None:
             return False
+        if n - rec[1] > CAP_PLAN_FRESH_SEC:
+            return False        # намерение протухло: этот выстрел — не про тот снимок залога
         _CAP_SHOTS[k] = (rec[0], n)
-        for _k in [x for x, v in _CAP_SHOTS.items() if n - v[1] > CAP_CORPSE_TTL_SEC]:
-            del _CAP_SHOTS[_k]                     # чистка: реестр не растёт вечно
         return True
 
 
