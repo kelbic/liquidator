@@ -85,6 +85,24 @@ sent.clear()
 rc = w.run(fetch=lambda: _journal(A, [12.0] * 30), notify_fn=_nf, out=lambda *_: None)
 check("run: ниже порога -> тишина", rc == 0 and sent == [])
 
+# ---- 6b. Порог, по которому вынесен приговор, едет В ТЕКСТЕ тревоги ----
+# Разбор 20.08: тревоги «жжёт 16M/20M» при боевом пороге 26 были позитивным контролем с
+# заниженным CU_WATCH_PROJ_M. По тексту они не отличались от настоящих, и происхождение
+# доказывалось археологией по времени коммита. Проверяем НЕ «26 в строке» (совпало бы с
+# захардкоженной константой), а что печатается ИМЕННО ДЕЙСТВУЮЩИЙ порог: гоняем два
+# прогона с разными порогами и требуем разные числа.
+sent.clear()
+os.environ["CU_WATCH_PROJ_M"] = "14"
+w.run(fetch=lambda: _journal(A, [16.0] * 30), notify_fn=_nf, out=lambda *_: None)
+low = sent[0][3] if sent else ""
+sent.clear()
+os.environ["CU_WATCH_PROJ_M"] = "15"
+w.run(fetch=lambda: _journal(A, [16.0] * 30), notify_fn=_nf, out=lambda *_: None)
+mid = sent[0][3] if sent else ""
+os.environ.pop("CU_WATCH_PROJ_M", None)
+check("тревога называет порог, по которому судила", "порог 14M" in low, low[:160])
+check("порог в тексте — действующий, а не константа", "порог 15M" in mid and low != mid, mid[:160])
+
 # ---- 7. Слепота: одиночный фейл терпим, серия будит (о САМОМ стороже) ----
 sent.clear()
 
