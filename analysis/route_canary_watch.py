@@ -278,11 +278,26 @@ def policy_cap(coll, loan, *, call=None, measure=None, **kw):
     return cap, static
 
 
-def annotate_policy(probs, *, call=None, measure=None, **kw):
+def annotate_policy(probs, *, call=None, measure=None, budget_sec=None, clock=None, **kw):
     """Дописывает к «глубоким» проблемам вердикт боевой политики капа. Только справка:
-    состав probs и решение «тревожить» не меняются ни при каком исходе."""
+    состав probs и решение «тревожить» не меняются ни при каком исходе.
+
+    БЮДЖЕТ ВРЕМЕНИ — не украшение. Справка считается ДО отправки тревоги, а весь прогон
+    живёт под `timeout 600` в кроне. Лестница из 10 ступеней на терпеливом ретрае (tries=6)
+    у деградировавшего узла способна съесть остаток бюджета, и SIGTERM убил бы САМУ ТРЕВОГУ —
+    ровно в тот прогон, когда с пулом хуже всего. Справка, стоящая тревоги, дороже своей
+    пользы: за порогом бюджета остальные роуты честно получают «НЕ ПОСЧИТАНА».
+    """
+    budget = _env_float("ROUTE_CANARY_POLICY_BUDGET_SEC", 120.0) if budget_sec is None \
+        else float(budget_sec)
+    now = clock or time.monotonic
+    t0 = now()
     for p in probs:
         if p.get("kind") != "deep":
+            continue
+        if now() - t0 >= budget:
+            p["text"] += ("\n    политика капа: НЕ ПОСЧИТАНА (бюджет времени %ds исчерпан) — "
+                          "справка не имеет права стоить самой тревоги" % int(budget))
             continue
         r = p.get("row") or {}
         cap, static = policy_cap(r.get("coll", ""), r.get("loan", ""), call=call,
