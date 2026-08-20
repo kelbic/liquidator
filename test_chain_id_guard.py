@@ -44,6 +44,7 @@ class _Rpc:
     def __init__(self, cid, url="https://node.example/KEYKEYKEYKEY"):
         self._cid = cid                      # None => узел бросает (не ответил)
         self.rpc_url = url
+        self.chain_id = 8453                 # ОЖИДАЕМАЯ цепь (как у BaseRpc: только память)
 
     def _web3(self):
         if self._cid is None:
@@ -154,6 +155,42 @@ try:
     check("KeyboardInterrupt НЕ проглочен гардом", False, "вернулся вместо проброса")
 except KeyboardInterrupt:
     check("KeyboardInterrupt НЕ проглочен гардом", True)
+
+
+# ---- 5. FAILOVER-КАНДИДАТЫ: здесь гард нужнее всего ----
+# head-guard failover'а (`bn >= self._last_head`) кандидата с ЧУЖОЙ цепи НЕ отсеет: у OP
+# (~130M) и Arbitrum (~260M) головы ВЫШЕ, чем у Base (~34M). Без гарда бой переключился бы на
+# чужую цепь ровно в отказ боевого узла — когда смотреть некому.
+import chain.failover as _fo  # noqa: E402
+
+_sv = {k: getattr(_fo, k) for k in ("COMBAT_FAILOVER", "COMBAT_FAILOVER_URLS", "BaseRpc")}
+_chains = {"https://good.example": 8453, "https://wrongnet.example": 10,
+           "https://dead.example": None}
+try:
+    _fo.COMBAT_FAILOVER = True
+    _fo.BaseRpc = lambda u, cid, request_timeout=None: _Rpc(_chains[u], u)
+    _primary = _Rpc(8453, "https://primary.example")
+
+    _fo.COMBAT_FAILOVER_URLS = ["https://good.example", "https://wrongnet.example"]
+    _res = _fo.build_failover(_primary, types.SimpleNamespace(bg_rpc_url=""), alerter=None)
+    _urls = [p.rpc_url for p in getattr(_res, "providers", [])][1:]
+    check("failover: кандидат с ЧУЖОЙ цепи исключён, годный остался",
+          _urls == ["https://good.example"], _urls)
+
+    _fo.COMBAT_FAILOVER_URLS = ["https://good.example", "https://dead.example"]
+    _res = _fo.build_failover(_primary, types.SimpleNamespace(bg_rpc_url=""), alerter=None)
+    _urls = [p.rpc_url for p in getattr(_res, "providers", [])][1:]
+    check("failover: МОЛЧАЩИЙ кандидат сохранён (резерв, выброшенный на буте, — не резерв)",
+          len(_urls) == 2, _urls)
+
+    _fo.COMBAT_FAILOVER_URLS = ["https://wrongnet.example"]
+    _res = _fo.build_failover(_primary, types.SimpleNamespace(bg_rpc_url=""), alerter=None)
+    check("failover: годных не осталось -> указатель прибит к primary (не к чужой цепи)",
+          _res is _primary, _res)
+finally:
+    for k, v in _sv.items():
+        setattr(_fo, k, v)
+    _fo._ACTIVE = None
 
 
 print()

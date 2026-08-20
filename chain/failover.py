@@ -248,6 +248,29 @@ def build_failover(primary: BaseRpc, cfg, alerter=None):
     """Обёртка боевого rpc. Пустой COMBAT_FAILOVER_URLS или откат-флаг = primary как был."""
     if primary is None or not COMBAT_FAILOVER or not COMBAT_FAILOVER_URLS:
         return primary
-    alts = [BaseRpc(u, primary.chain_id, request_timeout=5) for u in COMBAT_FAILOVER_URLS]
+    # #117 ГАРД СЕТИ НА КАНДИДАТАХ. Здесь он нужнее, чем где-либо ещё, и вот почему: head-guard
+    # ниже (`bn >= self._last_head`) кандидата с ЧУЖОЙ цепи НЕ ОТСЕЕТ. У OP (~130M) и Arbitrum
+    # (~260M) головы ВЫШЕ, чем у Base (~34M), то есть проверка «голова покрывает виденное»
+    # проходит с запасом — и бой переключится на чужую цепь ровно в отказ боевого узла, когда
+    # смотреть некому. eth_chainId стоит 0 CU, кандидаты строятся один раз на старте.
+    #
+    # Политика — ФИЛЬТР, а не подмена (форма guard_chain_id «хэндл или фолбэк» к списку не
+    # применима): False (чужая цепь) выбрасывает кандидата, None (узел молчит на буте) его
+    # ОСТАВЛЯЕТ — резерв, выброшенный из-за 429-шторма прогрева, это резерв, которого не будет
+    # в тот единственный момент, ради которого он заведён.
+    from chain.rpc import assert_chain_id
+    alts = []
+    for u in COMBAT_FAILOVER_URLS:
+        _a = BaseRpc(u, primary.chain_id, request_timeout=5)
+        if assert_chain_id(_a, primary.chain_id, what="failover-кандидат %s" % _short(u),
+                           log=log) is False:
+            log.error("COMBAT-FAILOVER: кандидат %s ИСКЛЮЧЁН — чужая цепь. head-guard его бы "
+                      "пропустил (у соседних цепей головы ВЫШЕ, чем у Base)", _short(u))
+            continue
+        alts.append(_a)
+    if not alts:
+        log.error("COMBAT-FAILOVER: годных кандидатов не осталось — указатель прибит к primary "
+                  "(это ЛУЧШЕ, чем переключиться на чужую цепь)")
+        return primary
     return FailoverRpc(primary, alts, bg_url=str(getattr(cfg, "bg_rpc_url", "") or ""),
                        alerter=alerter, cfg=cfg).start()
