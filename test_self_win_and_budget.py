@@ -45,13 +45,13 @@ ex._FL_CONSEC_REVERTS = 0
 ex._FL_DISABLED = False
 for _ in range(10):
     ex._fl_record(True, 0, 3, xray="self-win")
-assert not ex.fast_lane_disabled() and ex._FL_CONSEC_REVERTS == 0, ex._FL_CONSEC_REVERTS
+assert not ex.fl_global_disabled() and ex._FL_CONSEC_REVERTS == 0, ex._FL_CONSEC_REVERTS
 # КОНТРОЛЬ: настоящий шторм по-прежнему выключает
 ex._FL_CONSEC_REVERTS = 0
 ex._FL_DISABLED = False
 for _ in range(3):
     ex._fl_record(True, 0, 3, xray="not-race")
-assert ex.fast_lane_disabled(), "брейкер сломан — настоящий шторм обязан выключать"
+assert ex.fl_global_disabled(), "брейкер сломан — настоящий шторм обязан выключать"
 ex._FL_CONSEC_REVERTS = 0
 ex._FL_DISABLED = False
 

@@ -215,16 +215,31 @@ def _fl_pair_key(pair):
         return None
 
 
+def fl_global_disabled() -> bool:
+    """ТОЛЬКО глобальный рубеж. Отдельная дверь для наблюдателей (стенды, отчёты): вопрос
+    «выключен ли путь вообще» и вопрос «можно ли стрелять по этой паре» — разные, и мешать их
+    в одной функции значит однажды ответить не на тот."""
+    with _INFLIGHT_LOCK:
+        return _FL_DISABLED
+
+
 def fast_lane_disabled(pair=None) -> bool:
-    """Погашен ли fast-lane. Без аргумента — вопрос о ГЛОБАЛЬНОМ рубеже (обратная совместимость).
-    С парой — «погашен ли он ДЛЯ ЭТОЙ ПАРЫ»: глобальный рубеж перекрывает всё, пер-парный
-    гасит только свою пару."""
+    """Можно ли идти fast-lane. True = НЕЛЬЗЯ.
+
+    ПАРА ОБЯЗАТЕЛЬНА в pair-режиме: спрашивать «выключен ли путь вообще», не назвав пару,
+    значит проверять не тот гард — погашенная пара при пустом кэше параметров не проверялась
+    бы ВОВСЕ, и защита держалась бы на чужом предусловии (что кэш всегда полон), а не на себе.
+    Незнание пары = закрытый гард. Боевой путь этим не задет: там, где fast-lane вообще
+    применим, параметры рынка уже в кэше (иначе prepare_fast сам отказывает «params not
+    cached»). Глобальный флаг спрашивают через `fl_global_disabled`."""
     k = _fl_pair_key(pair) if pair is not None else None
     with _INFLIGHT_LOCK:
         if _FL_DISABLED:
             return True
-        if FL_BREAKER_SCOPE != "pair" or k is None:
+        if FL_BREAKER_SCOPE != "pair":
             return False
+        if k is None:
+            return True                    # пара не названа -> считаем путь закрытым
         return k in _FL_PAIR_OFF
 
 
@@ -365,10 +380,21 @@ def _fl_record(is_fast: bool, status, threshold: int, log=None, xray=None, pair=
             if log:
                 log.error("II.6 breaker: fast-lane DISABLED after %d consecutive reverts -> sim fallback",
                           _FL_CONSEC_REVERTS)
-    if _pair_tripped and log:
-        log.error("II.6 breaker: fast-lane выключен ДЛЯ ПАРЫ %s->%s (%d ревертов подряд); "
-                  "остальные пары работают", _pair_tripped[0][0][:10], _pair_tripped[0][1][:10],
-                  _pair_tripped[1])
+    if _pair_tripped:
+        if log:
+            log.error("II.6 breaker: fast-lane выключен ДЛЯ ПАРЫ %s->%s (%d ревертов подряд); "
+                      "остальные пары работают", _pair_tripped[0][0][:10],
+                      _pair_tripped[0][1][:10], _pair_tripped[1])
+        # ЗАЩЁЛКА ДО РЕСТАРТА БЕЗ КАНАЛА ТРЕВОГИ = состояние, о котором узнать НЕОТКУДА.
+        # Кладём в тот же one-shot, что и глобальный трип (его забирает горячий путь и уводит
+        # в TG). Глобальное сообщение важнее и перезаписывает; пер-парное занимает пустой слот.
+        with _INFLIGHT_LOCK:
+            if _FL_TRIP_MSG is None:
+                _FL_TRIP_MSG = (
+                    "\U0001F6D1 CIRCUIT BREAKER (ПАРА): fast-lane выключен для %s->%s после %d "
+                    "ревертов подряд. Остальные пары работают. Снятие — ТОЛЬКО рестарт: "
+                    "разобрать причину (пул/роут/оракул этой пары)."
+                    % (_pair_tripped[0][0][:12], _pair_tripped[0][1][:12], _pair_tripped[1]))
 
 
 # Мультибатч-предохранитель: батч с nOk=0 (ВСЕ items провалились) — tx УСПЕШНА (status==1), потому
