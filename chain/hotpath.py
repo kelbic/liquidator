@@ -984,6 +984,20 @@ def px_hedge_note_miss(now=None):
     n = time.monotonic() if now is None else now
     _PX_HEDGE_DEGRADED_UNTIL = n + _PX_HEDGE_DEGRADE_SEC
 _POS_HEDGE_SEC = float(os.environ.get("POS_HEDGE_TIMEOUT_SEC", "0.5"))
+# #117 (19.08): СИММЕТРИЯ С read_price_hedged, которой не было. Ценовой хедж получил гейт
+# «пока preconf здоров — одна нога» с прямым комментарием «мы больше не платим за
+# неиспользуемую страховку». read_positions ту же правку НЕ получил и стартовал обе ноги
+# БЕЗУСЛОВНО, хотя confirmed-результат при живом preconf выбрасывается. Цена замерена:
+# 4 428 чтений/сут (= числу hotset-строк) = 115K CU/сут ≈ 3.5M CU/мес на БОЕВОМ ключе.
+# Что страховка выбрасывается практически всегда — видно независимо: резервный ключ B, который
+# живёт на том же признаке px_hedge_degraded, за сутки дал НОЛЬ обращений.
+# Гейт ЧИТАЕТ общий признак деградации, но НЕ ПИШЕТ его: писать значит менять момент входа
+# в деградацию для ЦЕНОВОГО пути, а это чужой денежный путь и чужой пакет. Сигнал и так течёт
+# в нужную сторону — px_hedge_note_miss() ставит read_price_hedged на каждом промахе цены,
+# а цены опрашиваются каждый блок, поэтому positions узнают о деградации практически сразу.
+# Откат: POS_HEDGE_ALWAYS_BOTH=1 (обе ноги безусловно, как до правки).
+POS_HEDGE_ALWAYS_BOTH = (os.environ.get("POS_HEDGE_ALWAYS_BOTH", "0") or "0").lower() in (
+    "1", "true", "yes", "on")
 
 
 def _leg_once(price_fn, r, oracle, ev, box):
@@ -1117,14 +1131,25 @@ def read_positions(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
                 _box.append(_e)                              # исключение в бокс: отличать fail от «ещё летит»
             finally:
                 _ev.set()
+        # #117: ДВЕ НОГИ — только когда страховка реально нужна (деградация preconf) либо когда
+        # её потребовали ручкой отката. При здоровом preconf вторая нога стартовала впустую:
+        # её результат ниже выбрасывается ветвью `res = _rp`.
+        _two_legs = POS_HEDGE_ALWAYS_BOTH or px_hedge_degraded()
         preconf_mark_reactive()              # см. read_price_hedged: реактив главнее фонового полла
         threading.Thread(target=_leg, args=(preconf_rpc, "pending", _ev_p, _box_p), daemon=True).start()
-        threading.Thread(target=_leg, args=(rpc, None, _ev_c, _box_c), daemon=True).start()
+        if _two_legs:
+            threading.Thread(target=_leg, args=(rpc, None, _ev_c, _box_c), daemon=True).start()
         _ev_p.wait(timeout=_POS_HEDGE_SEC)
         _rp = _box_p[0] if _box_p else None
         if isinstance(_rp, list) and _rp and _rp[0][0] and _rp[0][1]:
             res = _rp; _src = "preconf"
         else:
+            # Одноногий режим и preconf не дал годного ответа -> страховка стартует ЗДЕСЬ.
+            # Размен назван прямо (тот же, что принят у read_price_hedged): промах в одноногом
+            # режиме дороже, потому что confirmed стартует ПОСЛЕ таймаута, а не параллельно.
+            # Платим за него только на промахах, а не на каждом чтении.
+            if not _two_legs:
+                threading.Thread(target=_leg, args=(rpc, None, _ev_c, _box_c), daemon=True).start()
             _ev_c.wait(timeout=10.0)
             _rc = _box_c[0] if _box_c else None
             if not isinstance(_rc, list):                    # A': confirmed-нога упала/молчит -> как fallback-fail
