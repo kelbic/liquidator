@@ -120,8 +120,94 @@ try:
 except Exception:               # requests нет -> фолбэк на старый urllib-путь (холодный, но рабочий)
     _requests = None
 
-_SEQ_SESSIONS: dict = {}        # url -> requests.Session (тёплый keep-alive)
+_SEQ_SESSIONS: dict = {}        # ключ канала -> requests.Session (тёплый keep-alive)
 _SEQ_LOCK = threading.Lock()
+
+# ---- ВТОРОЙ EGRESS-IP (20.08). Канал рассылки = ПАРА (url, source_ip), а не просто url.
+#
+# ЗАЧЕМ. Замер: pacer_dry 8758 проб/сутки при transport_reject=0 — то есть нас связывает НАШ
+# ЖЕ пейсер на 110/с (замеренная квота приёма секвенсера НА ОДИН IP), а не отказы секвенсера.
+# Флот удвоен до 220 ног, значит давление вырастет вдвое в тот же потолок. Второй адрес на том
+# же интерфейсе net0 Шарлотт даёт ВТОРУЮ КОРЗИНУ лимита.
+#
+# Почему именно второй IP, а не Вена/прокси: замер с машины — connect к mainnet-sequencer
+# 0.0157/0.0146/0.0158с с нового адреса против 0.0158/0.0149с с основного, то есть канал
+# БЕСПЛАТЕН ПО ВРЕМЕНИ. Вена (RTT 107мс) и proxy6 закрыты именно замером RTT, а не вкусом.
+#
+# ГИПОТЕЗА, НА КОТОРОЙ ВСЁ ДЕРЖИТСЯ (named limit, приёмка боем): вторая корзина существует
+# ТОЛЬКО если секвенсер лимитирует ПО IP. Это вывод из формы отказов (110/с на адрес), а не
+# документированный контракт. Если он режет по ключу/подсети/аккаунту — второй канал не даст
+# ничего, и это будет видно: pacer_dry обязан УПАСТЬ при том же боезапасе. Не упал => гипотеза
+# неверна, ручку в пусто.
+#
+# ЦЕНА (named limit): по TLS-сессии и по keepalive-треду НА КАНАЛ. Число каналов задаётся
+# КОНФИГОМ (len(ips) на первичный url + прочие url), не трафиком, поэтому потолок известен
+# заранее и мал — но помнить про cgroup-кап стоит: тред-на-вызов мы уже однажды пробили.
+# Плюс DNS резолвится отдельно на каждый пул (тот же хост, лишний резолв на старте).
+VOLLEY_EGRESS_IPS = [x.strip() for x in
+                     (os.environ.get("VOLLEY_EGRESS_IPS", "") or "").split(",") if x.strip()]
+
+
+def _chan_key(url: str, ip: str = None) -> str:
+    """Имя канала для сессий/вёдер/счётчиков. IP печатать МОЖНО — это не секрет (в отличие от
+    ключа в пути URL, который режет фильтр журнала).
+
+    ПУСТОЙ ip ДАЁТ РОВНО url — и это не косметика, а способ получить поведение HEAD бит-в-бит:
+    при пустой ручке все ключи вёдер, счётчиков и сессий совпадают с прежними посимвольно, то
+    есть ни одно ведро не делится, ни один счётчик не переименовывается."""
+    return url if not ip else "%s|%s" % (url, ip)
+
+
+def egress_bindable(ip: str) -> bool:
+    """Можно ли ПРИВЯЗАТЬСЯ к адресу. Локальная операция: bind без connect, сети не касается.
+
+    Ловит ошибку КОНФИГА (адрес снят с интерфейса / опечатка / чужой адрес) на старте, где она
+    стоит одну строку в журнале. Ошибку ВРЕМЕНИ БОЯ (адрес убрали на живой машине) не ловит —
+    её ловит spill: отказ канала уводит пробу на следующий, как и «over rate limit»."""
+    import socket
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind((ip, 0))
+        return True
+    except OSError:
+        return False                # EADDRNOTAVAIL и родня
+    finally:
+        try:
+            if s is not None:
+                s.close()
+        except Exception:
+            pass
+
+
+def _make_session(url: str, ip: str = None):
+    """Фабрика тёплой сессии канала. Единственное место, где рождается транспорт рассылки —
+    и единственный шов, который подменяют стенды (сети в тестах быть не должно).
+
+    ip=None -> сессия РОВНО как раньше (тот же адаптер, те же размеры пула).
+    ip задан -> тот же адаптер, но PoolManager с source_address=(ip, 0): расширяем существующий
+    транспорт, а не заводим второй."""
+    if _requests is None:
+        return None
+    # Дефолтный пул urllib3 = 10 коннектов, block=False: сверх десятого одновременного
+    # поста соединение создаётся ХОЛОДНЫМ и выбрасывается. Пик каскада: 8 тредов движка
+    # + до 3 боевых _post_raw_tx + канарейка/keepalive > 10 — и холод падал бы ровно на
+    # боевой броадкаст. 32 держит пик с запасом.
+    s = _requests.Session()
+    if ip:
+        class _BoundAdapter(_requests.adapters.HTTPAdapter):
+            """HTTPAdapter, чей PoolManager открывает сокеты с ЗАДАННОГО адреса."""
+
+            def init_poolmanager(self, connections, maxsize, block=False, **kw):
+                kw["source_address"] = (ip, 0)
+                return super().init_poolmanager(connections, maxsize, block=block, **kw)
+
+        _ad = _BoundAdapter(pool_connections=4, pool_maxsize=32)
+    else:
+        _ad = _requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=32)
+    s.mount("https://", _ad)
+    s.mount("http://", _ad)
+    return s
 
 
 def _seq_keepalive(url: str, s, interval: float = 15.0):
@@ -134,29 +220,83 @@ def _seq_keepalive(url: str, s, interval: float = 15.0):
         time.sleep(interval)
 
 
-def _seq_session(url: str):
+def _seq_session(url: str, ip: str = None):
+    """Тёплая сессия КАНАЛА (url, ip). ip=None -> прежняя сессия по url, ключ прежний (см.
+    _chan_key), поведение бит-в-бит."""
     if _requests is None:
         return None
+    _k = _chan_key(url, ip)
     with _SEQ_LOCK:
-        s = _SEQ_SESSIONS.get(url)
+        s = _SEQ_SESSIONS.get(_k)
         if s is None:
-            s = _requests.Session()
-            # Дефолтный пул urllib3 = 10 коннектов, block=False: сверх десятого одновременного
-            # поста соединение создаётся ХОЛОДНЫМ и выбрасывается. Пик каскада: 8 тредов движка
-            # + до 3 боевых _post_raw_tx + канарейка/keepalive > 10 — и холод падал бы ровно на
-            # боевой броадкаст. 32 держит пик с запасом.
-            _ad = _requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=32)
-            s.mount("https://", _ad)
-            s.mount("http://", _ad)
-            _SEQ_SESSIONS[url] = s
+            s = _make_session(url, ip)
+            if s is None:
+                return None
+            _SEQ_SESSIONS[_k] = s
+            # Один keepalive-тред НА КАНАЛ (15с). Число каналов задаётся конфигом, не трафиком.
             threading.Thread(target=_seq_keepalive, args=(url, s), daemon=True).start()
         return s
 
 
+_CHANNELS_CACHE: dict = {}         # tuple(urls) -> [(url, ip|None), ...]
+_CHANNELS_LOCK = threading.Lock()
+
+
+def broadcast_channels(urls: list) -> list:
+    """[(url, ip|None), ...] в порядке обхода рассылки. РЕЗУЛЬТАТ КЭШИРУЕТСЯ.
+
+    Кэш здесь не оптимизация, а требование горячего пути: функция зовётся на КАЖДУЮ пробу
+    (8/с в окне), а проверка привязки — это syscall bind. Держать сисколл на денежном пути
+    ради статической конфигурации незачем; список каналов не меняется без рестарта, ровно как
+    и сама ручка. Сброс — очистка _CHANNELS_CACHE (стенды так и делают).
+
+    Пустая VOLLEY_EGRESS_IPS -> [(u, None) для каждого url] = СЕГОДНЯШНЕЕ ПОВЕДЕНИЕ: ни одной
+    привязки, ни одного лишнего пула, ключи каналов совпадают с url.
+
+    Ручка задана -> ПЕРВИЧНЫЙ url размножается по адресам (это и есть вторая корзина лимита:
+    тот же эндпоинт, другой источник), прочие url остаются одним непривязанным каналом каждый.
+    Порядок: (url0, ip0) -> (url0, ip1) -> ... -> прочие url.
+
+    Непривязываемый адрес выпадает ЗДЕСЬ и ГРОМКО (egress_bindable): канал, который не может
+    открыть сокет, не имеет права молча съедать место в обходе."""
+    _u = [u for u in (urls or []) if u]
+    if not _u or not VOLLEY_EGRESS_IPS:
+        return [(u, None) for u in _u]
+    _ckey = tuple(_u)
+    with _CHANNELS_LOCK:
+        _hit = _CHANNELS_CACHE.get(_ckey)
+    if _hit is not None:
+        return list(_hit)
+    _ok = []
+    for ip in VOLLEY_EGRESS_IPS:
+        if egress_bindable(ip):
+            _ok.append(ip)
+        else:
+            log.error("EGRESS: адрес %s НЕ привязывается (снят с интерфейса?) — канал исключён "
+                      "из рассылки. Отправка идёт остальными каналами, огонь не затронут", ip)
+    if not _ok:
+        log.error("EGRESS: ни один адрес из VOLLEY_EGRESS_IPS не привязывается — рассылка идёт "
+                  "БЕЗ привязки (сегодняшнее поведение). Незнание не закрывает основной путь")
+        _res = [(u, None) for u in _u]
+    else:
+        _res = [(_u[0], ip) for ip in _ok] + [(u, None) for u in _u[1:]]
+        log.warning("EGRESS: каналов рассылки %d — %s (второй адрес = вторая корзина лимита "
+                    "секвенсера; гипотеза «лимит по IP», приёмка — падение pacer_dry)",
+                    len(_res), ", ".join(_chan_key(u, i) for u, i in _res))
+    with _CHANNELS_LOCK:
+        _CHANNELS_CACHE[_ckey] = list(_res)
+    return list(_res)
+
+
 def warm_broadcast(urls: list):
-    """Прогреть keep-alive сессии broadcast-endpoints на старте (до первого выстрела/канарейки)."""
-    for u in urls or []:
-        _seq_session(u)
+    """Прогреть keep-alive сессии КАНАЛОВ на старте (до первого выстрела/канарейки).
+
+    Сессии обязаны быть тёплыми ЗАРАНЕЕ: путь замерен в 32.5мс на тред, и лишний холодный
+    коннект (TCP+TLS ~2-3 RTT) в горячем окне недопустим. Ручку читаем здесь, а не у
+    вызывателя, — call-site в hotpath не меняется, и при пустой ручке греется ровно то же,
+    что грелось раньше."""
+    for u, ip in broadcast_channels(list(urls or [])):
+        _seq_session(u, ip)
 
 # Дедуп двойной отправки (страховка под FAST_LANE): один и тот же (mid, borrower) может прийти в
 # dispatch из нескольких параллельных _process_transmit (feed×feed / feed×bare / feed×poll на одном
@@ -2176,6 +2316,10 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
     # канал пробуется максимум один раз. Все отказали -> запись В НАЧАЛО очереди (как HEAD).
     if not _VOLLEY_PACER_ON:
         # ---- ОТКАТ (VOLLEY_PACER=off): путь HEAD БИТ-В-БИТ (первый url, одна попытка, без вёдер).
+        # СЦЕПКА РУЧЕК, названная вслух (20.08): здесь рассылка идёт НЕПРИВЯЗАННОЙ, то есть
+        # VOLLEY_PACER=off отключает и второй egress-IP. Это не упущение: второй адрес нужен
+        # ровно ради ВТОРОГО ВЕДРА, а вёдер в этой ветке нет — облегчать нечего. Помнить об
+        # этом надо при откате пейсера: он молча снимает и выигрыш второго канала.
         try:
             _seq = None
             for _u in (broadcast_raw_urls or []):
@@ -2211,34 +2355,42 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
             # запись потрачена по назначению, возвращать её нельзя.
     else:
         # ---- ПЕЙСЕР+SPILL: каждый канал ровно раз; первый — первичное ведро, остальные — запасное.
-        _urls = list(broadcast_raw_urls or [])
+        # 20.08: обходим КАНАЛЫ (url, ip), а не url. Первичный эндпоинт размножен по egress-
+        # адресам — у каждого СВОЁ ведро, потому что квота секвенсера меряется на IP.
+        _chans = broadcast_channels(list(broadcast_raw_urls or []))
         _sent = False
         _terminal = False           # байты уже у ордерера (already known/nonce too low): потрачено
         _last_err = None
-        if _urls:
-            for _i, _u in enumerate(_urls):
-                if _i == 0:
-                    # первичный канал (секвенсер): дефолты пейсера (_PACER_RATE/_PACER_BURST) —
-                    # вызов БИТ-В-БИТ как в HEAD (_post_raw_sync(url, raw_hex)), чтобы транспортные
-                    # стенды с сигнатурой (url, raw_hex, timeout) не ломались, а spill (idx>0)
-                    # шёл своей полосой.
+        if _chans:
+            _head_url = _chans[0][0]
+            for _i, (_u, _ip) in enumerate(_chans):
+                _ck = _chan_key(_u, _ip)
+                if _i == 0 and _ip is None:
+                    # первичный канал БЕЗ привязки: вызов БИТ-В-БИТ как в HEAD
+                    # (_post_raw_sync(url, raw_hex)), чтобы транспортные стенды с сигнатурой
+                    # (url, raw_hex, timeout) не ломались.
                     ok, err = _post_raw_sync(_u, raw_hex)
+                elif _u == _head_url:
+                    # ТОТ ЖЕ эндпоинт с другого адреса — это НЕ запасной канал, а вторая полоса
+                    # первичного: полоса определяется эндпоинтом, а не позицией в списке.
+                    ok, err = _post_raw_sync(_u, raw_hex, paced=True, rate=_PACER_RATE,
+                                             burst=_PACER_BURST, source_ip=_ip)
                 else:
                     ok, err = _post_raw_sync(_u, raw_hex, paced=True,
-                                             rate=_SPILL_RATE, burst=_SPILL_BURST)
+                                             rate=_SPILL_RATE, burst=_SPILL_BURST, source_ip=_ip)
                 if ok:
                     _sent = True
                     if _i > 0:
-                        _pacer_note_spill(_u)      # доставлено ЗАПАСНЫМ каналом
+                        _pacer_note_spill(_ck)     # доставлено НЕ первым каналом
                     break
                 _e = (err or "").lower()
                 if "already known" in _e or "nonce too low" in _e:
                     _terminal = True               # потрачено по назначению — не возвращаем
                     break
                 if err == "pacer_dry":
-                    _pacer_note_dry(_u)            # сухо: спилл без сети (причина РАЗДЕЛЬНО от reject)
+                    _pacer_note_dry(_ck)           # сухо: спилл без сети (причина РАЗДЕЛЬНО от reject)
                 else:
-                    _pacer_note_reject()          # «over rate limit» и пр. — сетевой отказ
+                    _pacer_note_reject(_ck)        # «over rate limit» / мёртвый адрес — сетевой отказ
                 _last_err = err
                 # spill на следующий канал (та же подписанная tx идемпотентна)
         else:
@@ -2299,10 +2451,15 @@ _PACER_BURST = float(os.environ.get("VOLLEY_PACER_BURST", "50"))
 _SPILL_RATE = float(os.environ.get("VOLLEY_SPILL_RATE", "50"))      # запасные каналы
 _SPILL_BURST = float(os.environ.get("VOLLEY_SPILL_BURST", "10"))
 _PACER_LOCK = threading.Lock()
-_PACER_BUCKETS: dict = {}          # url -> [tokens, last_monotonic]
-_PACER_DRY: dict = {}              # url -> сколько раз ведро было сухим (спилл без сети)
-_PACER_SPILL_SENT: dict = {}       # url -> сколько проб доставлено ЗАПАСНЫМ каналом
-_PACER_TRANSPORT_REJECT = 0        # суммарно сетевых отказов (over rate limit и пр.)
+# 20.08: ключ — КАНАЛ (url|ip), а не url. Иначе оба адреса делили бы одно ведро и второй
+# egress-IP не дал бы ничего: смысл второй корзины ровно в том, что она ОТДЕЛЬНАЯ.
+# Без VOLLEY_EGRESS_IPS ключ канала == url (см. _chan_key) => ключи прежние посимвольно.
+_PACER_BUCKETS: dict = {}          # канал -> [tokens, last_monotonic]
+_PACER_DRY: dict = {}              # канал -> сколько раз ведро было сухим (спилл без сети)
+_PACER_SPILL_SENT: dict = {}       # канал -> сколько проб доставлено ЗАПАСНЫМ каналом
+# transport_reject тоже ПЕР-КАНАЛЬНЫЙ: суммарное число не отвечало на вопрос «какой канал
+# отказывает». С двумя IP это тот самый вопрос — умер ли адрес или режет секвенсер.
+_PACER_TRANSPORT_REJECT: dict = {}  # канал -> сетевых отказов (over rate limit и пр.)
 
 
 def _pacer_take(url: str, rate: float, burst: float) -> bool:
@@ -2328,22 +2485,26 @@ def _pacer_note_spill(url: str):
         _PACER_SPILL_SENT[url] = _PACER_SPILL_SENT.get(url, 0) + 1
 
 
-def _pacer_note_reject():
-    global _PACER_TRANSPORT_REJECT
+def _pacer_note_reject(chan: str = ""):
     with _PACER_LOCK:
-        _PACER_TRANSPORT_REJECT += 1
+        _PACER_TRANSPORT_REJECT[chan or "?"] = _PACER_TRANSPORT_REJECT.get(chan or "?", 0) + 1
 
 
 def volley_pacer_stats():
-    """#136: (pacer_dry по каналам, spill_sent по каналам, transport_reject суммарно) с момента
-    старта. Как volley_budget_skips (#132): без числа спилл и немота эндпоинта неотличимы от
-    «склад пуст». Причины РАЗДЕЛЬНО — pacer_dry (без сети) vs transport_reject (сетевой отказ)."""
+    """#136: (pacer_dry, spill_sent, transport_reject) — ВСЕ ТРИ по каналам, с момента старта.
+    Как volley_budget_skips (#132): без числа спилл и немота эндпоинта неотличимы от «склад
+    пуст». Причины РАЗДЕЛЬНО — pacer_dry (без сети) vs transport_reject (сетевой отказ).
+
+    20.08: третий элемент стал СЛОВАРЁМ (был int). Суммарное число не отвечало на вопрос,
+    который появляется вместе со вторым egress-IP: отказывает КАНАЛ (адрес умер) или режет
+    секвенсер. sum(значений) даёт прежнюю величину, если она понадобится."""
     with _PACER_LOCK:
-        return (dict(_PACER_DRY), dict(_PACER_SPILL_SENT), _PACER_TRANSPORT_REJECT)
+        return (dict(_PACER_DRY), dict(_PACER_SPILL_SENT), dict(_PACER_TRANSPORT_REJECT))
 
 
 def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5,
-                   paced: bool = True, rate: float = None, burst: float = None):
+                   paced: bool = True, rate: float = None, burst: float = None,
+                   source_ip: str = None):
     """Синхронная рассылка raw в секвенсер тёплой сессией. Возврат (ok, err_msg).
     В отличие от _post_raw_tx (best-effort в треде, глотает всё) ЗДЕСЬ исход нужен вызывающему:
     от него зависит, вернуть ли запись лестницы на место или считать её потраченной.
@@ -2352,15 +2513,18 @@ def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5,
     (False, 'pacer_dry') БЕЗ сетевого похода, вызывающий мгновенно спиллит на следующий канал.
     paced=False — ПРИОРИТЕТНАЯ ПОЛОСА: боевая tx не пейсится НИКОГДА (в этот чокпоинт она и не
     приходит — бой идёт через _post_raw_tx, — но флаг делает инвариант явным и проверяемым)."""
+    _ck = _chan_key(url, source_ip)            # ведро/счётчики — НА КАНАЛ; без ip ключ == url
     if paced and _VOLLEY_PACER_ON:
         _r = _PACER_RATE if rate is None else rate
         _b = _PACER_BURST if burst is None else burst
-        if not _pacer_take(url, _r, _b):
+        if not _pacer_take(_ck, _r, _b):
             return False, "pacer_dry"          # сухо: отдельный сигнал вызывающему, без RTT
     try:
         payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
                    "params": [raw_hex]}
-        s = _seq_session(url)
+        # Непривязанный канал зовёт шов ОДНИМ аргументом — ровно как раньше: стенды подменяют
+        # _seq_session лямбдой от одного url, и расширение сигнатуры не имеет права их ломать.
+        s = _seq_session(url) if source_ip is None else _seq_session(url, source_ip)
         if s is None:
             return False, "no session"
         resp = s.post(url, json=payload, timeout=timeout).json()
