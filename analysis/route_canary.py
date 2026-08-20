@@ -70,17 +70,21 @@ def _fetch(url, body, timeout=45):
     return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
 
 
-def _call(to, data, *, rpc=None, fetch=None, tries=4, pause=0.6):
+def _call(to, data, *, rpc=None, fetch=None, tries=4, pause=0.6, block="latest"):
     """eth_call с ретраем. Возвращает (result, err, kind), kind ∈ {ALIVE, DEAD, UNPOLLED}.
 
     Публичный узел режет по ставке. Без ретрая канарейка объявляла бы МЁРТВЫМ то, что просто
     не доспросили — а «не знаю» и «мёртв» это разные вещи (канон: незнание закрывает гард,
     но не выдаёт себя за диагноз).
+
+    block — номер блока (hex) либо "latest". Пин нужен затем, что impact сравнивает ДВЕ
+    котировки: на «latest» они уезжают в РАЗНЫЕ блоки, и любой чужой своп между ними
+    приезжает в наш impact как «глубина пула».
     """
     fetch = fetch or _fetch
     url = rpc or RPC
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                       "params": [{"to": to, "data": data}, "latest"]}).encode()
+                       "params": [{"to": to, "data": data}, block]}).encode()
     last = "нет ответа"
     for i in range(max(1, int(tries))):
         if pause:
@@ -124,6 +128,21 @@ def quote(quoter, path_bytes, amount_in, *, call=None, **kw):
     return int(res[2:66], 16), None, ALIVE
 
 
+def block_number(*, rpc=None, fetch=None, timeout=45):
+    """Текущий блок узла (hex-строка) либо None. None — НЕ отказ: замер продолжится на
+    «latest», просто без пина (см. _call). Своё исключение канарейка тут глотает намеренно:
+    неумение узла отдать номер блока не является фактом о маршрутах."""
+    fetch = fetch or _fetch
+    body = json.dumps({"jsonrpc": "2.0", "id": 1,
+                       "method": "eth_blockNumber", "params": []}).encode()
+    try:
+        r = fetch(rpc or RPC, body)
+        res = r.get("result") if isinstance(r, dict) else None
+        return res if isinstance(res, str) and res.startswith("0x") else None
+    except Exception:  # noqa: BLE001 — транспорт/чужая заглушка: пин необязателен
+        return None
+
+
 def routes(module=None):
     """Боевая карта маршрутов (chain.execute._SWAP_ROUTES) как список пар."""
     if module is None:
@@ -144,6 +163,15 @@ def scan(items=None, *, module=None, call=None, **kw):
     elif module is None:
         sys.path.insert(0, _repo_root())
         import chain.execute as module  # noqa: PLC0415
+    # ПИН БЛОКА (19.08). impact = отношение двух котировок, и на «latest» они попадают в
+    # РАЗНЫЕ блоки: у мерцающего пула (cbADA/WETH ts=200 сегодня: L 8.4e16 -> 1.1e16 -> 5.9e16
+    # за 40 минут) чужой своп между ними приезжает в наш impact как «форма пула», а по этому
+    # числу режут капы. Один eth_blockNumber на проход; узел без архива честно уронит квоты
+    # на пине — тогда пара перезапрашивается на «latest» (ниже), то есть хуже прежнего не
+    # становится. Отсутствие номера блока = просто «latest», это не отказ сторожа.
+    blk = kw.pop("block", None)
+    if blk is None:
+        blk = block_number(rpc=kw.get("rpc"), fetch=kw.get("fetch")) or "latest"
     out = []
     for (coll, loan), r in items:
         quoter = AERO_QUOTER if r["router"] == module.AERO_CL_ROUTER else UNIV3_QUOTER
@@ -151,9 +179,14 @@ def scan(items=None, *, module=None, call=None, **kw):
         cap = r.get("max_in")
         work = cap if cap else 10 ** 8            # рабочий объём: кап либо номинал
         ref = max(1, work // 100)                 # референс: 1% от рабочего
-        q_ref, e1, k1 = quote(quoter, r["path"], ref, call=call, **kw)
-        q_work, e2, k2 = quote(quoter, r["path"], work, call=call, **kw)
-        row = {"coll": coll, "loan": loan, "router": who, "cap": cap,
+        q_ref, e1, k1 = quote(quoter, r["path"], ref, call=call, block=blk, **kw)
+        q_work, e2, k2 = quote(quoter, r["path"], work, call=call, block=blk, **kw)
+        if blk != "latest" and ALIVE not in (k1, k2):
+            # на пине не ответили ОБА — вероятнее всего у узла нет состояния этого блока
+            # (не архив). Это факт о УЗЛЕ, а не о маршруте: перезапрашиваем без пина.
+            q_ref, e1, k1 = quote(quoter, r["path"], ref, call=call, block="latest", **kw)
+            q_work, e2, k2 = quote(quoter, r["path"], work, call=call, block="latest", **kw)
+        row = {"coll": coll, "loan": loan, "router": who, "cap": cap, "block": blk,
                "work": work, "ref": ref, "out": None, "impact": None, "err": None}
         if DEAD in (k1, k2):
             row["status"], row["err"] = DEAD, (e1 if k1 == DEAD else e2)

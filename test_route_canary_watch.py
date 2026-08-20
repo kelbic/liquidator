@@ -178,7 +178,12 @@ check(ok["problems"] == 0 and ok["alert"] == "нет",
       "здоровые роуты: проблем=%d alert=%s" % (ok["problems"], ok["alert"]))
 check(len(ok["spy"].calls) == 0, "здоровые роуты: канал молчит")
 check(ok["node"].bad_sel == 0, "калдата собрана настоящим селектором quoteExactInput")
-check(ok["node"].calls == 4, "два маршрута опрошены на двух объёмах: %d" % ok["node"].calls)
+# 5 = 2 маршрута x 2 объёма + ОДИН eth_blockNumber на проход (пин блока, 19.08). Заглушка
+# узла номер блока не отдаёт (её __call__ разбирает только eth_call) — канарейка обязана
+# продолжить на «latest», а не ослепнуть: неумение узла назвать блок не факт о маршруте.
+check(ok["node"].calls == 5, "два маршрута опрошены на двух объёмах + пин: %d" % ok["node"].calls)
+check(all(r["block"] == "latest" for r in ok["rows"]),
+      "узел без eth_blockNumber -> замер на latest, а не отказ")
 
 stale, module = routes_subset([((_CBDOGE, _USDC), 100_000 * 10 ** 8), BTC])
 bad = run_case(stale, module, Node({_CBDOGE: 0.4350, _CBBTC: 0.0168}))
@@ -293,6 +298,51 @@ except ImportError:
     print("SKIP: ~/.fleet-watch/notify.py недоступен в этой среде")
 
 # ── САМОКОНТРОЛЬ: те же проверки на сломанных вариантах ОБЯЗАНЫ провалиться ────────
+# --- 19.08: ПИН БЛОКА. impact — отношение ДВУХ котировок, и на «latest» они уезжают в разные
+# блоки: чужой своп между ними приезжает в impact как «форма пула», а по этому числу режут капы.
+print("\n=== 11. Обе котировки маршрута берутся на ОДНОМ блоке (пин) ===")
+
+
+class BlockNode(Node):
+    """Узел, который умеет eth_blockNumber. no_state=блок, на котором состояния нет (не архив)."""
+
+    def __init__(self, *a, blk="0x2fdef60", no_state=False, **kw):
+        super().__init__(*a, **kw)
+        self.blk = blk
+        self.no_state = no_state
+        self.seen_blocks = []
+
+    def __call__(self, url, body):
+        req = json.loads(body)
+        if req.get("method") == "eth_blockNumber":
+            self.calls += 1
+            return {"jsonrpc": "2.0", "id": 1, "result": self.blk}
+        self.seen_blocks.append(req["params"][1])
+        if self.no_state and req["params"][1] != "latest":
+            return {"jsonrpc": "2.0", "id": 1,
+                    "error": {"code": -32000, "message": "missing trie node"}}
+        return super().__call__(url, body)
+
+
+items, module = routes_subset([DOGE, BTC])
+pinned = run_case(items, module, BlockNode({_CBDOGE: 0.0094, _CBBTC: 0.0168}))
+check(all(b == "0x2fdef60" for b in pinned["node"].seen_blocks),
+      "все котировки ушли на пине: %s" % sorted(set(pinned["node"].seen_blocks)))
+check(len(pinned["node"].seen_blocks) == 4 and pinned["problems"] == 0,
+      "пин не добавил лишних квот и не создал проблем: %d квот, проблем %d"
+      % (len(pinned["node"].seen_blocks), pinned["problems"]))
+check(all(r["block"] == "0x2fdef60" for r in pinned["rows"]), "блок замера записан в строку")
+
+# Узел БЕЗ архива обязан дать тот же вердикт, что и раньше: пин — оптимизация точности,
+# а не новое условие живости. Иначе канарейка объявила бы МЁРТВЫМ живой роут на не-архивном
+# узле — ровно тот класс, из-за которого «НЕ ОПРОШЕН» когда-то отделили от «МЁРТВ».
+noarch = run_case(items, module, BlockNode({_CBDOGE: 0.0094, _CBBTC: 0.0168}, no_state=True))
+check([r["status"] for r in noarch["rows"]] == [rc.ALIVE, rc.ALIVE],
+      "узел без состояния на пине -> перезапрос на latest, роуты живы: %s"
+      % [r["status"] for r in noarch["rows"]])
+check(noarch["problems"] == 0 and noarch["alert"] == "нет",
+      "и никакой ложной тревоги: проблем=%d alert=%s" % (noarch["problems"], noarch["alert"]))
+
 print("\n=== САМОКОНТРОЛЬ (тест обязан уметь падать) ===")
 ctrl = []
 

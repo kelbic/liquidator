@@ -11,15 +11,20 @@ LIQ = "0x00000000000000000000000000000000000000ff"
 # #75 (09.08): кап 160 -> 140. Замер на трёх блоках (49753974/49754165/49754310): обрыв пула
 # ts=1 сегодня на 287 weETH (281 -> imp 0.02%, 292 -> 3.21%, 302 -> 6.42%), бонус пары 1.6777%
 # (тесный рынок lltv 0.945) достигается на 286.9 -> S_обрыв/2 = 143.5 -> кап 140.
+# 19.08 (разбор тревоги канарейки #72): кап 140 -> 55. Обрыв УЕХАЛ ПОД КАП и держится вторые
+# сутки: лестница в одном блоке на трёх блоках подряд (50196398/50196414/50196429) — плоско до
+# 105 weETH (<=0.05%), колено 110 (1.25/2.90/0.08%), 140 -> 21.06-23.70% при бонусе 1.6777%.
+# Архив-квоты за 4.5ч (9 точек, шаг 30 мин): на 140 разорительно 9/9, на 55 — 0/9.
+# S_обрыв ~110 -> S_обрыв/2 = 55. Значение ЖЁСТКОЕ: менять только с новым замером.
 assert (_WEETH, _UNIV3_WETH) in _SWAP_ROUTES, "weETH-роут отсутствует"
 assert _WEETH in ROUTE_COLLATERALS, "weETH не в ROUTE_COLLATERALS"
-assert _SWAP_ROUTES[(_WEETH, _UNIV3_WETH)]["max_in"] == 140 * 10**18
-print("UNIT_OK: weETH->WETH роут добавлен, в ROUTE_COLLATERALS, кап 140")
+assert _SWAP_ROUTES[(_WEETH, _UNIV3_WETH)]["max_in"] == 55 * 10**18
+print("UNIT_OK: weETH->WETH роут добавлен, в ROUTE_COLLATERALS, кап 55")
 
 # 2) под капом — валидный direct calldata; над капом — None (-> caller Kyber)
-under = direct_swap(_WEETH, _UNIV3_WETH, 130 * 10**18, LIQ, LIQ, repaid_assets=1)
+under = direct_swap(_WEETH, _UNIV3_WETH, 50 * 10**18, LIQ, LIQ, repaid_assets=1)
 assert under is not None and under["calldata"].startswith("0x") and under["router"], under
-over = direct_swap(_WEETH, _UNIV3_WETH, 200 * 10**18, LIQ, LIQ, repaid_assets=1)
+over = direct_swap(_WEETH, _UNIV3_WETH, 140 * 10**18, LIQ, LIQ, repaid_assets=1)
 assert over is None, "над капом должен быть None (Kyber-фолбэк)"
 print("UNIT_OK: weETH под капом -> direct; над капом -> None")
 
@@ -98,11 +103,16 @@ print("UNIT_OK: cbETH-роут (кап 300) + EURC-кап 1.5; пег-семан
 # то есть кап стоял в 1.3x от размера-разорителя. Кап 32k = S_обрыв/2 (делитель — замеренный
 # дрейф обрыва: у этого же пула 135k 25.07 -> 65k 09.08).
 assert _SWAP_ROUTES[(_CBDOGE, _UNIV3_USDC)]["max_in"] == 32_000 * 10**8
-assert _SWAP_ROUTES[(_CBADA, _UNIV3_USDC)]["max_in"] == 60_000 * 10**6
+# 19.08 (тревога канарейки imp 16.03% на капе): cbADA 60k -> 15k. У пула ts=200 нет ОДНОГО
+# обрыва — он мерцает: 30 архив-выборок за 14.5ч дали разорительный выход на капе 60k в 5/30
+# (в здоровом состоянии обрыв на ~190k, в осушенном даже 6k стоит 3.66%). Статик выбран по
+# РАСПРЕДЕЛЕНИЮ (15k безопасен в 29/30), быстрая динамика — на живом слое route_depth.
+assert _SWAP_ROUTES[(_CBADA, _UNIV3_USDC)]["max_in"] == 15_000 * 10**6
 # границы двигаются ВМЕСТЕ с капом: 30k под ним (директ), 40k сверх (Kyber)
 assert direct_swap(_CBDOGE, _UNIV3_USDC, 30_000 * 10**8, LIQ, LIQ, repaid_assets=1) is not None
 assert direct_swap(_CBDOGE, _UNIV3_USDC, 40_000 * 10**8, LIQ, LIQ, repaid_assets=1) is None
-assert direct_swap(_CBADA, _UNIV3_USDC, 120_000 * 10**6, LIQ, LIQ, repaid_assets=1) is None
+assert direct_swap(_CBADA, _UNIV3_USDC, 15_000 * 10**6, LIQ, LIQ, repaid_assets=1) is not None
+assert direct_swap(_CBADA, _UNIV3_USDC, 60_000 * 10**6, LIQ, LIQ, repaid_assets=1) is None
 print("UNIT_OK: капы cbDOGE/cbADA — под обрывом директ, сверх — Kyber")
 
 # 8b) #75: роутов БЕЗ капа больше нет. cbLTC/USDC и LBTC/cbBTC жили без max_in, а значит

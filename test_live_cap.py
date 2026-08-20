@@ -17,7 +17,9 @@ from chain.execute import (direct_swap, route_max_in, set_live_cap, partial_shar
 from chain.route_depth import measure_route_cap, maybe_refresh, RouteDepthWatcher
 
 KEY = (_WEETH, _UNIV3_WETH.lower())
-STATIC = 140 * 10**18          # #75 (09.08): 160 -> 140 по замеру обрыва (287 weETH) / 2
+STATIC = 55 * 10**18           # 19.08: 140 -> 55 (обрыв ts=1 уехал на ~110 weETH, S_обрыв/2)
+# Ступени ниже выражены В ДОЛЯХ СТАТИКА намеренно: этот файл проверяет МЕХАНИЗМ живого капа,
+# а не величину статика — абсолютные weETH здесь ломались бы на каждом пере-замере пула.
 NOW = {"t": 1000.0}
 
 
@@ -28,9 +30,10 @@ def enc_out(amount_out):
 # ---- 1) set_live_cap: переопределение, TTL-протухание, кап роста, откат ----
 _LIVE_CAPS.clear()
 assert route_max_in(_WEETH, _UNIV3_WETH) == STATIC
-got = set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18, now=NOW["t"])
-assert got == 240 * 10**18
-assert ex._effective_cap(KEY, now=NOW["t"] + 1) == 240 * 10**18       # живой кап в силе
+LIVE = int(STATIC * 1.5)                                              # под потолком роста (2x)
+got = set_live_cap(_WEETH, _UNIV3_WETH, LIVE, now=NOW["t"])
+assert got == LIVE
+assert ex._effective_cap(KEY, now=NOW["t"] + 1) == LIVE               # живой кап в силе
 assert ex._effective_cap(KEY, now=NOW["t"] + ex.LIVE_CAP_TTL_SEC + 1) == STATIC   # протух -> статик
 got = set_live_cap(_WEETH, _UNIV3_WETH, 10_000 * 10**18, now=NOW["t"])
 assert got == int(STATIC * ex.LIVE_CAP_GROW_MAX)                      # рост капнут x2
@@ -44,17 +47,18 @@ print("OK 1: set_live_cap/TTL/рост-кап/откат ROUTE_LIVE_CAP=0")
 #         суженный кап отдаёт None (Kyber) на сайзе < статик ----
 _LIVE_CAPS.clear()
 SND, RCP = "0x" + "11" * 20, "0x" + "22" * 20
-seize_today = 168 * 10**18                                            # жертва 04.08: 167.9 weETH
+seize_today = int(STATIC * 1.2)                                       # сейз ВЫШЕ статика (04.08: 167.9 при статике 140)
 assert direct_swap(_WEETH, _UNIV3_WETH, seize_today, SND, RCP, repaid_assets=1) is None
-set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18)
+set_live_cap(_WEETH, _UNIV3_WETH, int(STATIC * 1.7))                  # пул сегодня глубже статика
 sw = direct_swap(_WEETH, _UNIV3_WETH, seize_today, SND, RCP, repaid_assets=1)
-assert sw is not None and sw["router"] == ex.AERO_CL_ROUTER           # прямой пул взял 168
-set_live_cap(_WEETH, _UNIV3_WETH, 40 * 10**18)                        # пул осушен
-assert direct_swap(_WEETH, _UNIV3_WETH, 100 * 10**18, SND, RCP, repaid_assets=1) is None
-assert route_max_in(_WEETH, _UNIV3_WETH) == 40 * 10**18               # слайс-гейт видит живой кап
-sp = partial_shares_for_cap(1000, 100 * 10**18, route_max_in(_WEETH, _UNIV3_WETH))
+assert sw is not None and sw["router"] == ex.AERO_CL_ROUTER           # прямой пул взял сейз целиком
+DRAINED = int(STATIC * 0.3)
+set_live_cap(_WEETH, _UNIV3_WETH, DRAINED)                            # пул осушен
+assert direct_swap(_WEETH, _UNIV3_WETH, int(STATIC * 0.7), SND, RCP, repaid_assets=1) is None
+assert route_max_in(_WEETH, _UNIV3_WETH) == DRAINED                   # слайс-гейт видит живой кап
+sp = partial_shares_for_cap(1000, int(STATIC * 0.7), route_max_in(_WEETH, _UNIV3_WETH))
 assert 0 < sp < 1000                                                  # дробим до живого капа
-print("OK 2: direct_swap/слайс-гейт по живому капу (168 в прямой пул при live 240)")
+print("OK 2: direct_swap/слайс-гейт по живому капу (сейз 1.2x статика при живом 1.7x)")
 
 # ---- 3) measure_route_cap: кривая -> кап = min(верхняя проходная ступень, обрыв/2) ----
 # #75 (09.08): порог импакта больше НЕ плоские 0.5%, а доля бонуса рынка (weETH/WETH: бонус
@@ -168,17 +172,18 @@ assert w2.stats["errors"] >= 1                                         # пет�
 rd.LIVE_CAP_WATCH_POLL_SEC = _pl
 print("OK 6: гейт вотчера ($25k, только капнутые) + петля переживает ошибки")
 
-# ---- 7) prearm cap-aware на ЖИВОМ капе: сегодняшний кейс — seize 168 при статик 160 ----
+# ---- 7) prearm cap-aware на ЖИВОМ капе: кейс 04.08 — seize ВЫШЕ статика, но внутри живого ----
 _LIVE_CAPS.clear()
-assert pa.routed_at_size(_WEETH, _UNIV3_WETH, 168 * 10**18) is False   # статик: Kyber-прогрев
-set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18)
-assert pa.routed_at_size(_WEETH, _UNIV3_WETH, 168 * 10**18) is True    # живой: прямой пул, греть нечего
-assert pa.routed_at_size(_WEETH, _UNIV3_WETH, 250 * 10**18) is False   # сверх живого — греем
+SEIZE = int(STATIC * 1.2)
+assert pa.routed_at_size(_WEETH, _UNIV3_WETH, SEIZE) is False          # статик: Kyber-прогрев
+set_live_cap(_WEETH, _UNIV3_WETH, int(STATIC * 1.7))
+assert pa.routed_at_size(_WEETH, _UNIV3_WETH, SEIZE) is True           # живой: прямой пул, греть нечего
+assert pa.routed_at_size(_WEETH, _UNIV3_WETH, int(STATIC * 2.5)) is False   # сверх живого — греем
 _pca = pa.PREARM_CAP_AWARE
 pa.PREARM_CAP_AWARE = False
 assert pa.routed_at_size(_WEETH, _UNIV3_WETH, 10**30) is True          # откат: бинарная семантика
 pa.PREARM_CAP_AWARE = _pca
-print("OK 7: prearm cap-aware по живому капу (168>160-статик -> прямой пул при live 240)")
+print("OK 7: prearm cap-aware по живому капу (сейз 1.2x статика -> прямой пул при live 1.7x)")
 
 # ---- 8) горячий замер в prearm-окне: maybe_refresh дёргается и routed пересчитывается ----
 _LIVE_CAPS.clear(); rd._LAST_TS.clear()
@@ -186,7 +191,7 @@ rd_measured = {"n": 0}
 _orig_mr = rd.maybe_refresh
 def fake_mr(rpc, tin, tout, **kw):
     rd_measured["n"] += 1
-    return set_live_cap(tin, tout, 240 * 10**18)
+    return set_live_cap(tin, tout, int(STATIC * 1.7))
 rd.maybe_refresh = fake_mr
 try:
     cfgp = types.SimpleNamespace(liquidator_address="0xLIQ", fast_lane_max_repaid_usd=5e5)
@@ -194,9 +199,9 @@ try:
     warmed = []
     pw = pa.PreArmWorker(None, cfgp, sh,
                          read_fn=lambda mid, b: {"coll": _WEETH, "loan": _UNIV3_WETH,
-                                                 "seized": 168 * 10**18,
+                                                 "seized": SEIZE,
                                                  "routed": pa.routed_at_size(_WEETH, _UNIV3_WETH,
-                                                                             168 * 10**18)},
+                                                                             SEIZE)},
                          quote_fn=lambda c, l, s: warmed.append(s) or {"amount_in": s},
                          log_fn=lambda m: None)
     pw._pick = lambda feed, direction: [("0xmid", "0xb", 339_000.0)]
@@ -211,18 +216,20 @@ print("OK 8: prearm-окно перемеряет кап и НЕ греет Kybe
 
 # ---- 9) consume/release (05.08): списание на отправке, возврат своего резерва, границы ----
 _LIVE_CAPS.clear()
-set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18, now=1000.0)
-c = ex.consume_live_cap(_WEETH, _UNIV3_WETH, 168 * 10**18, now=1001.0)
-assert c == 72 * 10**18, c                                            # сим 04.08: A ушёл — B видит остаток
-assert ex._effective_cap(KEY, now=1002.0) == 72 * 10**18
-assert ex.consume_live_cap(_WEETH, _UNIV3_WETH, 100 * 10**18, now=1003.0) == 0   # пол = 0
-r = ex.release_live_cap(_WEETH, _UNIV3_WETH, 168 * 10**18, now=1004.0)
-assert r == 168 * 10**18, r                                           # свой резерв вернулся
-assert ex.release_live_cap(_WEETH, _UNIV3_WETH, 10**24, now=1005.0) == int(STATIC * ex.LIVE_CAP_GROW_MAX)
+CAP2 = int(STATIC * ex.LIVE_CAP_GROW_MAX)                             # потолок роста = 2x статика
+A = int(CAP2 * 0.7)                                                   # сим 04.08: A ушёл первым
+set_live_cap(_WEETH, _UNIV3_WETH, 10**24, now=1000.0)                 # запрос выше потолка -> потолок
+c = ex.consume_live_cap(_WEETH, _UNIV3_WETH, A, now=1001.0)
+assert c == CAP2 - A, c                                               # B видит ОСТАТОК, а не полный кап
+assert ex._effective_cap(KEY, now=1002.0) == CAP2 - A
+assert ex.consume_live_cap(_WEETH, _UNIV3_WETH, CAP2, now=1003.0) == 0           # пол = 0
+r = ex.release_live_cap(_WEETH, _UNIV3_WETH, A, now=1004.0)
+assert r == A, r                                                      # свой резерв вернулся
+assert ex.release_live_cap(_WEETH, _UNIV3_WETH, 10**24, now=1005.0) == CAP2
 assert ex._effective_cap(KEY, now=1000.0 + ex.LIVE_CAP_TTL_SEC + 1) == STATIC    # TTL записи сохранён
 _LIVE_CAPS.clear()
-c = ex.consume_live_cap(_WEETH, _UNIV3_WETH, 60 * 10**18, now=2000.0)
-assert c == STATIC - 60 * 10**18, c                                   # база без живой записи = статик
+c = ex.consume_live_cap(_WEETH, _UNIV3_WETH, STATIC // 3, now=2000.0)
+assert c == STATIC - STATIC // 3, c                                   # база без живой записи = статик
 assert ex.release_live_cap(_WEETH, _UNIV3_WETH, 1, now=2000.0 + ex.LIVE_CAP_TTL_SEC + 1) is None  # протухла
 assert ex.consume_live_cap("0x" + "ab" * 20, _UNIV3_WETH, 1) is None  # нет роута — no-op
 ex.LIVE_CAP_CONSUME = False
@@ -234,7 +241,7 @@ print("OK 9: consume/release — списание/возврат/границы/
 from eth_account import Account
 _LIVE_CAPS.clear()
 ex._RECENT_SENDS.clear()
-set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18)
+set_live_cap(_WEETH, _UNIV3_WETH, int(STATIC * 1.7))
 _key10 = "0x" + "11" * 32
 _bot10 = Account.from_key(_key10).address
 ex._LOCAL_NONCE[_bot10] = 7
@@ -248,15 +255,15 @@ def _send10(rpc, key, tx, **kw):
     _sent10.append(tx)
     return {"hash": "0x" + "aa" * 32}
 _prep10 = {"ok": True, "calldata": "0x", "net_usd": 1.0,
-           "swap_meta": (_WEETH, _UNIV3_WETH, 168 * 10**18)}
+           "swap_meta": (_WEETH, _UNIV3_WETH, SEIZE)}
 res10 = ex.dispatch_liquidations(_rpc10, _cfg10, [("0xm1", "0xb1", _prep10)],
                                  send_fn=_send10, wait_receipts=False)
 assert len(_sent10) == 1 and res10 and res10[0]["sent"]
-assert ex._effective_cap(KEY) == 72 * 10**18                          # расход на отправке
+assert ex._effective_cap(KEY) == int(STATIC * 1.7) - SEIZE            # расход на отправке
 res10b = ex.dispatch_liquidations(_rpc10, _cfg10, [("0xm1", "0xb1", _prep10)],
                                   send_fn=_send10, wait_receipts=False)
 assert len(_sent10) == 1 and not res10b[0]["sent"]                    # dedup: без второй отправки
-assert ex._effective_cap(KEY) == 72 * 10**18                          # и без второго списания
+assert ex._effective_cap(KEY) == int(STATIC * 1.7) - SEIZE            # и без второго списания
 ex._RECENT_SENDS.clear()
 print("OK 10: dispatch — consume отправленного юнита, dedup не двоит")
 
@@ -268,7 +275,7 @@ sfl_mod.SPEC_FIRE_PEAK_OWED = False
 _rb = sfl_mod.SPEC_FIRE_REBUILD_SEC
 sfl_mod.SPEC_FIRE_REBUILD_SEC = 0.0            # пересборка каждый тик => release+consume каждый раз
 _LIVE_CAPS.clear()
-set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18)
+set_live_cap(_WEETH, _UNIV3_WETH, int(STATIC * 1.7))
 _logs11: list = []
 _sent11: list = []
 _shared11 = types.SimpleNamespace(
@@ -280,7 +287,7 @@ _cfg11 = types.SimpleNamespace(liquidator_address="0xLIQ", gas_limit_est=500_000
                                fast_lane_max_repaid_usd=500_000.0)
 def _build11(mid, b, d):
     return {"calldata": "0xdead", "gas": 625_000,
-            "swap_meta": (_WEETH, _UNIV3_WETH, 168 * 10**18)}
+            "swap_meta": (_WEETH, _UNIV3_WETH, SEIZE)}
 def _send11(calldata, gas):
     _sent11.append(calldata)
     return "0xh%d" % len(_sent11)
@@ -294,9 +301,9 @@ time.sleep(0.3)
 _ncons = sum(1 for m in _logs11 if "LIVECAP consume" in m)
 assert len(_sent11) >= 2, _sent11                                     # плотный каденс: >=2 пробы
 assert _ncons == len(_sent11), (_ncons, len(_sent11), _logs11)        # release перед КАЖДОЙ пересборкой
-assert ex._effective_cap(KEY) == 72 * 10**18                          # ...а списание нетто ОДНО
+assert ex._effective_cap(KEY) == int(STATIC * 1.7) - SEIZE                          # ...а списание нетто ОДНО
 _LIVE_CAPS.clear()
-set_live_cap(_WEETH, _UNIV3_WETH, 240 * 10**18)
+set_live_cap(_WEETH, _UNIV3_WETH, int(STATIC * 1.7))
 _sent11.clear()
 sf11b = SpecFireLive(rpc=None, cfg=_cfg11, shared=_shared11, ret_fn=lambda lbl: -0.0011,
                      dev_by={"BTC": 0.0010},
@@ -306,7 +313,7 @@ sf11b.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
 time.sleep(0.9)
 sf11b.handle_event({"event": "disarm", "feed": "BTC"})
 time.sleep(0.3)
-assert _sent11 and ex._effective_cap(KEY) == 240 * 10**18             # без меты кап не тронут
+assert _sent11 and ex._effective_cap(KEY) == int(STATIC * 1.7)             # без меты кап не тронут
 sfl_mod.SPEC_FIRE_REBUILD_SEC = _rb
 print("OK 11: spec-fire — резерв один раз на жертву, release при пересборке, Kyber без списания")
 
