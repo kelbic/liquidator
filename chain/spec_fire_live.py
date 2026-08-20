@@ -3020,6 +3020,40 @@ class SpecFireLive:
                 rep = ci.our_position_report(bn, agg=agg)
                 if rep:
                     self._log("SPECFIRE %s" % rep)
+                    self._pos_alert(rep, blind)
+        except Exception:
+            pass
+
+    # 20.08 (запрос kelbic): вердикт судимой гонки — В TG, не только в журнал. Это исход,
+    # по которому человек принимает решение п.15 плана (tip-режим), — законный алерт по
+    # канону «алерты только там, где нужен человек». Прибор ВИСИТ СБОКУ от денежного пути:
+    # вызов стоит ЗА _log в ветке отчёта, канал _alert армится явно из main (канон
+    # notify_fn: забыли армировать — молчание, не выстрел), собственный отказ глотается.
+    # Слепой суд (транзит выбран эвристикой, скорее всего ЧУЖОЙ) не шлём — шум; форма
+    # «судить не о чем» (нет транзита) — тоже. Кулдаун свой и явный: судимые блоки идут
+    # пачкой ~10 за эпизод, человеку нужна ПЕРВАЯ строка эпизода. Победа кулдаун ПРОБИВАЕТ
+    # всегда. Откат: SPEC_FIRE_RACE_ALERT=0 (снимает ПРИБОР, денежный путь не трогает).
+    def _pos_alert(self, rep, blind):
+        try:
+            if blind or not rep or "транзит idx=" not in rep:
+                return
+            if os.environ.get("SPEC_FIRE_RACE_ALERT", "1").lower() in ("0", "false", "no"):
+                return
+            al = self._alert
+            if al is None:
+                return
+            import re as _re
+            _m = _re.search(r"побед=(\d+)", rep)
+            won = bool(_m and int(_m.group(1)) > 0)
+            now = time.monotonic()
+            cd = float(os.environ.get("SPEC_FIRE_RACE_ALERT_COOLDOWN_SEC", "900"))
+            if not won and (now - float(getattr(self, "_pos_alert_ts", 0.0))) < cd:
+                return
+            self._pos_alert_ts = now
+            if won:
+                al("\U0001F3C6 ПОБЕДА в судимой гонке: %s" % rep, "race-win")
+            else:
+                al("\U0001F3C1 гонка судима (первый блок эпизода): %s" % rep, "race-verdict")
         except Exception:
             pass
 
