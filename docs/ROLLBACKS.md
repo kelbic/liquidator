@@ -343,3 +343,7 @@ REVIEW_2026-08-13_ROUND3 п.230б): rebuild БОЛЬШЕ НЕ переякоря
 - Агентская машина: крон `7 * * * * … cu-quota.sh` + реестр cronwatch `cu-quota|3600` +
   `analysis/cu_quota_watch.py` (ручки CU_WATCH_PROJ_M/MIN_WINDOWS/FAIL_STREAK). Снятие:
   строку из crontab и реестра убрать, .env-флаг вернуть.
+
+## 20.08 (4) — потолок tip хвоста поднят (п.15)
+- `REACTIVE_TAIL_TIP_GWEI` 4.0 -> 30 (.env Шарлотт): экономику держит REACTIVE_TAIL_TIP_FRAC
+  =0.25 (гейт net тем же числом) + MAX_DAILY_GAS_USD. Откат: =4 (или =0) + рестарт.
