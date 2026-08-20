@@ -23,6 +23,9 @@ def reset():
     ex._FL_CONSEC_REVERTS = 0
     ex._FL_DISABLED = False
     ex._FL_TRIP_MSG = None
+    ex._FL_PAIR_REVERTS.clear()
+    ex._FL_PAIR_OFF.clear()
+    ex.FL_BREAKER_SCOPE = "pair"
 
 
 # --- 1. проигранные гонки НЕ выключают fast-lane ------------------------------------------
@@ -90,3 +93,89 @@ reset()
 
 reset()
 print("OK: проигранная гонка не выключает fast-lane, настоящий шторм выключает")
+
+# ==================================================================================================
+# ПЕР-ПАРНЫЙ БРЕЙКЕР (20.08). Тот же инцидент 07.08 говорит и второе: дефект ОДНОЙ пары гасил
+# fast-lane для ВСЕХ. Пара — естественная единица дефекта (пул, роут, оракул), ею и гасим.
+# ==================================================================================================
+A = ("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "0x1111111111111111111111111111111111111111")
+B = ("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "0x1111111111111111111111111111111111111111")
+C = ("0xcccccccccccccccccccccccccccccccccccccccc", "0x1111111111111111111111111111111111111111")
+
+# --- П1. пара A гаснет, пара B ЖИВЁТ --------------------------------------------------------
+reset()
+for _ in range(3):
+    ex._fl_record(True, 0, 3, xray="not-race", pair=A)
+assert ex.fast_lane_disabled(A), "пара с тремя не-race ревертами обязана погаснуть"
+assert not ex.fast_lane_disabled(B), "ЦЕНА ДЕФЕКТА 07.08: соседняя пара гаснуть НЕ обязана"
+assert not ex.fast_lane_disabled(), "глобальный рубеж (6) тремя ревертами одной пары не берётся"
+print("UNIT_OK: пара A погашена, пара B и глобальный путь живы")
+
+# --- П2. ГЛОБАЛЬНЫЙ РУБЕЖ: деградация каскада размазана по парам ---------------------------
+# Без него выключение требовало бы 3×числа_пар ревертов — то есть не наступало бы никогда.
+reset()
+for _pair in (A, B):
+    for _ in range(3):
+        ex._fl_record(True, 0, 3, xray="not-race", pair=_pair)
+assert ex.fast_lane_disabled(), "6 не-race ревертов РАЗНЫХ пар обязаны взять глобальный рубеж"
+assert ex.fast_lane_disabled(C), "глобальный рубеж перекрывает и нетронутые пары"
+assert ex.pop_fast_lane_trip(), "глобальное срабатывание обязано дать сообщение владельцу"
+print("UNIT_OK: глобальный рубеж %d берёт деградацию, размазанную по парам" % ex.FL_BREAKER_GLOBAL_N)
+
+# --- П3. race/self-win не считаются НИ В ОДНОМ слое ----------------------------------------
+reset()
+for _ in range(10):
+    ex._fl_record(True, 0, 3, xray="race", pair=A)
+    ex._fl_record(True, 0, 3, xray="self-win", pair=A)
+assert not ex.fast_lane_disabled(A) and not ex.fast_lane_disabled(), "гонки/свои победы не шторм"
+assert ex._FL_PAIR_REVERTS.get(("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                               "0x1111111111111111111111111111111111111111")) in (None, 0)
+print("UNIT_OK: race/self-win не растят ни пер-парную серию, ни глобальную")
+
+# --- П4. успех сбрасывает серию ПАРЫ (и глобальную) ---------------------------------------
+reset()
+ex._fl_record(True, 0, 3, xray="not-race", pair=A)
+ex._fl_record(True, 0, 3, xray="not-race", pair=A)
+ex._fl_record(True, 1, 3, pair=A)                      # успешный fast-lane выстрел
+ex._fl_record(True, 0, 3, xray="not-race", pair=A)
+ex._fl_record(True, 0, 3, xray="not-race", pair=A)
+assert not ex.fast_lane_disabled(A), "успех обязан обрывать серию ПОДРЯД, а не только глобальную"
+ex._fl_record(True, 0, 3, xray="not-race", pair=A)
+assert ex.fast_lane_disabled(A), "после сброса третий реверт подряд обязан гасить пару"
+print("UNIT_OK: успех сбрасывает пер-парную серию; погашенную пару успех НЕ воскрешает")
+
+# --- П5. погашенная пара не воскресает успехом (шторм разбирают, а не переармливают) -------
+ex._fl_record(True, 1, 3, pair=A)
+assert ex.fast_lane_disabled(A), "погашенная пара обязана оставаться погашенной до рестарта"
+print("UNIT_OK: погашенная пара переживает успех (семантика прежняя, как у глобального флага)")
+
+# --- П6. ОТКАТ РУЧКОЙ: FL_BREAKER_SCOPE=global — прежнее поведение бит-в-бит ---------------
+reset()
+ex.FL_BREAKER_SCOPE = "global"
+try:
+    for _ in range(3):
+        ex._fl_record(True, 0, 3, xray="not-race", pair=A)
+    assert ex.fast_lane_disabled(), "в global-режиме три реверта ЛЮБОЙ пары гасят ВСЁ (как было)"
+    assert ex.fast_lane_disabled(B), "в global-режиме гаснут и нетронутые пары"
+    assert not ex._FL_PAIR_OFF, "в global-режиме пер-парный слой обязан быть мёртв"
+finally:
+    ex.FL_BREAKER_SCOPE = "pair"
+print("UNIT_OK: FL_BREAKER_SCOPE=global возвращает прежнее поведение целиком")
+
+# --- П7. РЕВЕРТ БЕЗ ПАРЫ (батч/старый вызыватель) — прежний строгий порог ------------------
+# Пер-парный слой его не покрывает, значит поднимать планку до глобальной нельзя: незнание
+# обязано оставлять защиту НЕ СЛАБЕЕ прежней.
+reset()
+for _ in range(3):
+    ex._fl_record(True, 0, 3, xray="not-race")
+assert ex.fast_lane_disabled(), "реверт без пары обязан считаться по ПРЕЖНЕМУ порогу"
+print("UNIT_OK: реверт без пары не ослабляет брейкер (порог остаётся прежним)")
+
+# --- П8. ПРОВОДКА: горячий путь спрашивает про СВОЮ пару -----------------------------------
+_hp = open(pathlib.Path(__file__).parent / "chain" / "hotpath.py").read()
+assert "fast_lane_disabled(_fl_pair)" in _hp, "горячий путь спрашивает брейкер без пары"
+_ex_src = open(pathlib.Path(__file__).parent / "chain" / "execute.py").read()
+assert 'pair=((prep.get("mp") or {}).get("collateralToken")' in _ex_src, \
+    "одиночный send не передаёт пару в брейкер"
+print("UNIT_OK: проводка — гейт и учёт ходят через пару")
+

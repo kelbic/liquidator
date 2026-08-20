@@ -319,8 +319,85 @@ def corpse_pairs(stats=None, log=None):
     return None
 
 
-def corpse_verdict(row, borrow_shares):
-    """PURE. True = ДОКАЗАННЫЙ труп. row = (repaid_shares, bad_debt_shares) из индекса либо None."""
+# ОГРЫЗОК ПОСЛЕ НАШЕГО CAP-ВЫСТРЕЛА (20.08). Кап-ветка забирает почти весь залог и оставляет
+# пыль: позиция ПЕРЕЖИВАЕТ выстрел (долг остаётся, залога нет) и дальше вечно жжёт подготовку —
+# греется, готовится, ревертит. Прежние два признака трупа её не берут: bad_debt=0 (Morpho
+# ничего не списал), repaid < borrow_shares (мы просили меньше долга ПО ПОСТРОЕНИЮ кап-ветки).
+#
+# ПОРОГ — ИЗ РАСПРЕДЕЛЕНИЯ НАШЕГО ЖЕ ШЕЙВА, а не с потолка: кап целится в collateral минус
+# max(ASK_SHAVE_BPS, живой дрейф) плюс 1-3 единицы округления => остаток НАШЕГО выстрела
+# заведомо <= ~10 bps исходного залога. Берём вдвое (20 bps) — и это на порядки ниже остатка
+# ЧУЖОЙ частичной ликвидации (88.7% ликвидаций частичные, типичный остаток — десятки процентов).
+#
+# ПРАВИЛО ПРИМЕНЯЕТСЯ ТОЛЬКО К НАШИМ ПОДТВЕРЖДЁННЫМ CAP-ВЫСТРЕЛАМ. Чужая частичная ликвидация
+# с малым остатком трупом НЕ объявляется: ложный труп = отдать живую цель без боя, и это
+# дороже лишней подготовки. Поэтому нужны ОБА факта: (1) мы строили кап-план на эту цель и
+# знаем её предвыстрельный залог; (2) наш выстрел ПОДТВЕРЖДЁН (квитанция/лог протокола).
+CAP_CORPSE_MAX_BPS = float(os.environ.get("HOT_CAP_CORPSE_MAX_BPS", "20"))
+CAP_CORPSE_TTL_SEC = float(os.environ.get("HOT_CAP_CORPSE_TTL_SEC", "86400"))
+_CAP_PLANS: dict = {}      # (mid,borrower) -> (coll_before, ts): кап-план ПОСТРОЕН
+_CAP_SHOTS: dict = {}      # (mid,borrower) -> (coll_before, ts): наш кап-выстрел ПОДТВЕРЖДЁН
+_CAP_LOCK = threading.Lock()
+
+
+def _cap_key(mid, borrower):
+    return (str(mid).lower(), str(borrower).lower())
+
+
+def note_cap_plan(mid, borrower, coll_before, now=None):
+    """Кап-план ПОСТРОЕН: запоминаем предвыстрельный залог. Ещё не выстрел — только намерение."""
+    try:
+        c = int(coll_before)
+    except Exception:                                        # noqa: BLE001
+        return
+    if c <= 0:
+        return
+    with _CAP_LOCK:
+        _CAP_PLANS[_cap_key(mid, borrower)] = (c, float(now if now is not None else time.time()))
+
+
+def note_cap_shot_confirmed(mid, borrower, now=None) -> bool:
+    """НАШ выстрел по этой цели подтверждён (квитанция/лог Morpho с нашим caller). Переводит
+    намерение в факт. Возврат True = цель была кап-планом (иначе ничего не делаем: обычный
+    выстрел огрызка не оставляет)."""
+    k = _cap_key(mid, borrower)
+    n = float(now if now is not None else time.time())
+    with _CAP_LOCK:
+        rec = _CAP_PLANS.pop(k, None)
+        if rec is None:
+            return False
+        _CAP_SHOTS[k] = (rec[0], n)
+        for _k in [x for x, v in _CAP_SHOTS.items() if n - v[1] > CAP_CORPSE_TTL_SEC]:
+            del _CAP_SHOTS[_k]                     # чистка: реестр не растёт вечно
+        return True
+
+
+def cap_corpse(key, collateral, now=None):
+    """Огрызок ПОСЛЕ НАШЕГО подтверждённого кап-выстрела? PURE относительно цепи (только память).
+
+    Возврат (труп?, доля остатка в bps | None)."""
+    if key is None or collateral is None:
+        return False, None
+    n = float(now if now is not None else time.time())
+    with _CAP_LOCK:
+        rec = _CAP_SHOTS.get(_cap_key(key[0], key[1]))
+    if rec is None or n - rec[1] > CAP_CORPSE_TTL_SEC:
+        return False, None
+    before = int(rec[0])
+    if before <= 0:
+        return False, None
+    left_bps = int(collateral) * 10_000.0 / before
+    return (left_bps <= CAP_CORPSE_MAX_BPS), left_bps
+
+
+def corpse_verdict(row, borrow_shares, key=None, collateral=None):
+    """PURE. True = ДОКАЗАННЫЙ труп. row = (repaid_shares, bad_debt_shares) из индекса либо None.
+
+    Третий признак (20.08): огрызок ПОСЛЕ НАШЕГО кап-выстрела — см. `cap_corpse`. Он не
+    требует row вовсе: индекс о нём ничего особенного не знает (bad_debt=0, repaid<bs), факт
+    целиком наш."""
+    if key is not None and collateral is not None and cap_corpse(key, collateral)[0]:
+        return True
     if not row:
         return False
     try:
@@ -1815,7 +1892,11 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
             return {"ok": False, "reason": "cap: no repayable shares (collateral~0 либо окно "
                                            "начисления рынка не читается/слишком велико)"}
         if repaid_shares < int(borrow_shares):
-            log.info("DIAG cap %s/%s bs=%d -> repaid_shares=%d (deep position: весь залог, остаток долга спишет Morpho)",
+            # КАП-ВЕТКА: запоминаем ПРЕДВЫСТРЕЛЬНЫЙ залог. Огрызок после нашего выстрела иначе
+            # неотличим от живой цели (bad_debt=0, repaid<bs) и жёг бы подготовку вечно.
+            note_cap_plan(market_id, borrower, collateral_dbg)
+            log.info("DIAG cap %s/%s bs=%d -> repaid_shares=%d (deep position: почти весь залог, "
+                     "остаток пыли остаётся у заёмщика)",
                      market_id[:10], borrower[:10], int(borrow_shares), repaid_shares)
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)
         seized = _seized_exact(repaid_shares, _lif_wad, int(price), tba, tbs)   # (1) preconf price, канон-точно
@@ -2364,12 +2445,23 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                 _asked = True                                # без сети, и только когда есть ЗА ЧТО
                 _corpses = corpse_pairs(stats=stats, log=log)   # платить (транзит без флипов не платит)
             _row = _corpses.get((str(mid).lower(), str(b).lower())) if _corpses is not None else None
-            if _row is not None and corpse_verdict(_row, _bc[0] if _bc else None):
+            # Третий признак трупа (огрызок нашего кап-выстрела) индекса НЕ ТРЕБУЕТ: факт целиком
+            # наш, поэтому вердикт спрашивается и при _row=None. Ключ и живой залог — отсюда.
+            _ckey = (mid, b)
+            _ccol = _bc[1] if _bc else None
+            if corpse_verdict(_row, _bc[0] if _bc else None, key=_ckey, collateral=_ccol):
                 if stats is not None:
                     stats["f_corpse"] = stats.get("f_corpse", 0) + 1
-                log.info("HOT corpse-skip %s/%s: индекс видел добой (repaid=%s bad_debt=%s, "
-                         "наш borrow_shares=%s) — 632мс подготовки не платим",
-                         mid[:10], b[:10], _row[0], _row[1], _bc[0] if _bc else "?")
+                _stub, _left = cap_corpse(_ckey, _ccol)
+                if _stub:
+                    log.info("HOT corpse-skip %s/%s: ОГРЫЗОК нашего кап-выстрела (залога осталось "
+                             "%.2f bps от предвыстрельного, порог %.0f) — подготовку не платим",
+                             mid[:10], b[:10], _left, CAP_CORPSE_MAX_BPS)
+                else:
+                    log.info("HOT corpse-skip %s/%s: индекс видел добой (repaid=%s bad_debt=%s, "
+                             "наш borrow_shares=%s) — 632мс подготовки не платим",
+                             mid[:10], b[:10], _row[0] if _row else "?",
+                             _row[1] if _row else "?", _bc[0] if _bc else "?")
                 continue
             if stats is not None: stats["f_prep"] += 1
             _cand.append((b, hr, du, _bc))
@@ -2389,7 +2481,12 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
                          _mid[:10], b[:10])
                 return
             try:
-                if (getattr(cfg, "fast_lane", False) and not fast_lane_disabled()   # II.6: breaker -> фолбэк sim
+                # II.6 пер-парный брейкер: спрашиваем про СВОЮ пару, а не «выключен ли путь
+                # вообще». Глобальный рубеж внутри всё равно перекрывает всё; параметры рынка
+                # берём из того же кэша, что и prepare_fast (RTT не добавляется).
+                _fl_pm = _FULL_PARAMS_CACHE.get(_mid)
+                _fl_pair = (_fl_pm[1], _fl_pm[0]) if _fl_pm else None   # (coll, loan)
+                if (getattr(cfg, "fast_lane", False) and not fast_lane_disabled(_fl_pair)   # II.6: breaker -> фолбэк sim
                         and _bc and du >= getattr(cfg, "fast_lane_min_repaid_usd", 1000.0)
                         and du <= getattr(cfg, "fast_lane_max_repaid_usd", 500000.0)):  # мега-сайз -> sim
                     _fs = time.perf_counter()                # P1-9: fast-lane БЕЗ sim; при ok обычный

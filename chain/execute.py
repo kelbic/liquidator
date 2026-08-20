@@ -194,11 +194,38 @@ def _inflight_add(n: int):
 _FL_CONSEC_REVERTS = 0
 _FL_DISABLED = False
 _FL_TRIP_MSG = None        # one-shot TG-сообщение в момент срабатывания (забирает caller с alerter'ом)
+# ПЕР-ПАРНЫЙ БРЕЙКЕР (20.08). Глобальный счётчик гасил fast-lane ЦЕЛИКОМ от трёх ревертов ОДНОЙ
+# пары: 07.08 три проигранные гонки по $0.01-0.11 выключили путь, когда в том же блоке стояли
+# цели на $30 890 и $16 489. Дефект пары (тонкий пул, битый роут, сломанный оракул) — свойство
+# ПАРЫ, и гасить он обязан пару. Глобальный рубеж остаётся страховкой сверху: деградация
+# каскада не должна требовать 3×числа пар ревертов, чтобы быть замеченной.
+# Откат: FL_BREAKER_SCOPE=global возвращает прежнее поведение БИТ-В-БИТ (пер-парный слой мёртв,
+# глобальный порог = тот же threshold вызывающего).
+FL_BREAKER_SCOPE = (os.environ.get("FL_BREAKER_SCOPE", "pair") or "pair").strip().lower()
+FL_BREAKER_GLOBAL_N = int(os.environ.get("FL_BREAKER_GLOBAL_N", "6"))
+_FL_PAIR_REVERTS: dict = {}    # (coll,loan) -> серия ПОДРЯД не-race ревертов этой пары
+_FL_PAIR_OFF: set = set()      # пары, для которых fast-lane погашен (до рестарта, как и глобально)
 
 
-def fast_lane_disabled() -> bool:
+def _fl_pair_key(pair):
+    """(coll, loan) -> нормализованный ключ либо None (пара неизвестна -> только глобальный слой)."""
+    try:
+        return (str(pair[0]).lower(), str(pair[1]).lower())
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def fast_lane_disabled(pair=None) -> bool:
+    """Погашен ли fast-lane. Без аргумента — вопрос о ГЛОБАЛЬНОМ рубеже (обратная совместимость).
+    С парой — «погашен ли он ДЛЯ ЭТОЙ ПАРЫ»: глобальный рубеж перекрывает всё, пер-парный
+    гасит только свою пару."""
+    k = _fl_pair_key(pair) if pair is not None else None
     with _INFLIGHT_LOCK:
-        return _FL_DISABLED
+        if _FL_DISABLED:
+            return True
+        if FL_BREAKER_SCOPE != "pair" or k is None:
+            return False
+        return k in _FL_PAIR_OFF
 
 
 # Ш16: ДЕНЬГИ ПРОШЛИ МИМО — проигранная гонка обязана СООБЩАТЬ О СЕБЕ.
@@ -276,7 +303,7 @@ def pop_fast_lane_trip() -> str | None:
         return m
 
 
-def _fl_record(is_fast: bool, status, threshold: int, log=None, xray=None):
+def _fl_record(is_fast: bool, status, threshold: int, log=None, xray=None, pair=None):
     """Учёт исхода ЗАМАЙНЕННОЙ fast-lane tx для breaker'а. status==1 -> сброс серии; status!=1 (реверт)
     -> инкремент; при достижении порога -> disable + one-shot TG-msg. status is None (timeout, исход
     неизвестен) НЕ считаем. Idempotent после disable (флаг уже стоит).
@@ -296,6 +323,7 @@ def _fl_record(is_fast: bool, status, threshold: int, log=None, xray=None):
     global _FL_CONSEC_REVERTS, _FL_DISABLED, _FL_TRIP_MSG
     if not is_fast or status is None:
         return
+    _pk = _fl_pair_key(pair) if pair is not None else None
     if status != 1 and xray in ("race", "self-win"):
         # #44: self-win — жертву взял НАШ ЖЕ тракт (проба доски/движка/ноги). Для брейкера это
         # тот же класс «не шторм», но называем вещи своими именами: иначе собственная победа
@@ -306,12 +334,30 @@ def _fl_record(is_fast: bool, status, threshold: int, log=None, xray=None):
                      else "проигранная гонка (xray нашёл победителя)",
                      _FL_CONSEC_REVERTS, threshold)
         return
+    _pair_tripped = None
     with _INFLIGHT_LOCK:
         if status == 1:
+            # УСПЕХ СБРАСЫВАЕТ ОБА СЛОЯ: серия — это «подряд», и удачный выстрел её обрывает.
+            # Погашенную пару успех НЕ воскрешает (как и глобальный флаг): шторм разбирают, а
+            # не переармливают автоматически.
             _FL_CONSEC_REVERTS = 0
+            if _pk is not None:
+                _FL_PAIR_REVERTS.pop(_pk, None)
             return
         _FL_CONSEC_REVERTS += 1
-        if _FL_CONSEC_REVERTS >= threshold and not _FL_DISABLED:
+        # ПЕР-ПАРНЫЙ СЛОЙ: свой счётчик, ТОТ ЖЕ порог, гасит ТОЛЬКО свою пару.
+        if FL_BREAKER_SCOPE == "pair" and _pk is not None:
+            _n = _FL_PAIR_REVERTS.get(_pk, 0) + 1
+            _FL_PAIR_REVERTS[_pk] = _n
+            if _n >= threshold and _pk not in _FL_PAIR_OFF:
+                _FL_PAIR_OFF.add(_pk)
+                _pair_tripped = (_pk, _n)
+        # ГЛОБАЛЬНЫЙ РУБЕЖ: в pair-режиме он выше (FL_BREAKER_GLOBAL_N) и ловит ДЕГРАДАЦИЮ
+        # КАСКАДА, размазанную по парам. НО ТОЛЬКО ЕСЛИ ПАРА ИЗВЕСТНА: реверт без пары (батч,
+        # старый вызыватель) пер-парным слоем не покрыт вовсе, и поднимать для него планку
+        # значило бы ОСЛАБИТЬ защиту — незнание обязано оставлять прежний, более строгий порог.
+        _gth = FL_BREAKER_GLOBAL_N if (FL_BREAKER_SCOPE == "pair" and _pk is not None) else threshold
+        if _FL_CONSEC_REVERTS >= _gth and not _FL_DISABLED:
             _FL_DISABLED = True
             _FL_TRIP_MSG = ("\U0001F6D1 CIRCUIT BREAKER: fast-lane ОТКЛЮЧЁН после %d подряд ревертов "
                             "-> фолбэк в sim-путь (бот жив). Разобрать причину, вернуть рестартом."
@@ -319,6 +365,10 @@ def _fl_record(is_fast: bool, status, threshold: int, log=None, xray=None):
             if log:
                 log.error("II.6 breaker: fast-lane DISABLED after %d consecutive reverts -> sim fallback",
                           _FL_CONSEC_REVERTS)
+    if _pair_tripped and log:
+        log.error("II.6 breaker: fast-lane выключен ДЛЯ ПАРЫ %s->%s (%d ревертов подряд); "
+                  "остальные пары работают", _pair_tripped[0][0][:10], _pair_tripped[0][1][:10],
+                  _pair_tripped[1])
 
 
 # Мультибатч-предохранитель: батч с nOk=0 (ВСЕ items провалились) — tx УСПЕШНА (status==1), потому
@@ -4079,6 +4129,14 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                     # #58: победа боевой tx подтверждена КВИТАНЦИЕЙ (не «uncertain») — только
                     # она взводит WIN-паузу, и только на своём фиде (решение владельца #46)
                     _note_combat_win(mid, borrower, proven=True, log=log)
+                    # ОГРЫЗОК: наш кап-выстрел ПОДТВЕРЖДЁН квитанцией — переводим намерение в
+                    # факт, и с этого момента остаток залога <=20 bps читается как труп. Только
+                    # НАШ выстрел: чужая частичная ликвидация сюда не попадает по построению.
+                    try:
+                        from chain.hotpath import note_cap_shot_confirmed
+                        note_cap_shot_confirmed(mid, borrower)
+                    except Exception:                       # noqa: BLE001
+                        pass
                 if status != 1:
                     reason = _revert_reason(rpc, h, _blk)
                     row["revert_reason"] = reason
@@ -4088,7 +4146,9 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                                        our_debt_usd=prep.get("debt_usd"))
                     row["xray"] = _xr
                 _fl_record(prep.get("fast"), status, getattr(cfg, "fast_lane_max_consec_reverts", 3),
-                           log, xray=row.get("xray"))
+                           log, xray=row.get("xray"),
+                           pair=((prep.get("mp") or {}).get("collateralToken"),
+                                 (prep.get("mp") or {}).get("loanToken")))
                 results.append(row)
             else:                                             # --- батч: per-item ТОЛЬКО из событий ---
                 gas_total = int(rcpt.get("gasUsed") or 0) * int(rcpt.get("effectiveGasPrice") or 0) * cfg.eth_price_usd / 1e18
@@ -4103,6 +4163,9 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                                         "net_usd": (-gas_total if j == 0 else 0.0),
                                         "gas_usd": (gas_total if j == 0 else 0.0),
                                         "revert_reason": reason, "tx_index": _txi})
+                    # БАТЧ: пара НЕ передаётся намеренно — в юните могут быть РАЗНЫЕ пары, и
+                    # приписать один top-level реверт какой-то одной значило бы гасить невиновную.
+                    # Батчевый шторм ловит свой механизм (_batch_record), здесь только глобальный слой.
                     _fl_record(all(p.get("fast") for _, _, p in unit), 0,
                                getattr(cfg, "fast_lane_max_consec_reverts", 3), log)
                     _batch_record(0, len(unit), h, log)
