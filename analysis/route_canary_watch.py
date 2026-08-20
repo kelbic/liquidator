@@ -171,6 +171,21 @@ def thresholds_for_rows(rows, markets=None, symbols=None, default_pct=DEFAULT_PC
     return out
 
 
+def at_block(row):
+    """«, блок замера N» либо пусто. Тревога обязана быть ВОСПРОИЗВОДИМОЙ: разбор начинается
+    с реквоты на ТОМ ЖЕ блоке (канон «факт по цепи, а не по тексту тревоги»), а без номера
+    блока разбирающий его восстанавливает руками по времени — 19.08 именно так и вышло.
+    Пусто, когда замер шёл на «latest» (узел не назвал блок): врать про воспроизводимость
+    хуже, чем её не обещать."""
+    b = (row or {}).get("block")
+    if not isinstance(b, str) or not b.startswith("0x"):
+        return ""
+    try:
+        return ", блок замера %d" % int(b, 16)
+    except ValueError:
+        return ""
+
+
 def evaluate(rows, thresholds, symbols=None):
     """Проблемные маршруты. НЕ ОПРОШЕН сюда не попадает НИКОГДА — это лимит узла."""
     symbols = symbols or {}
@@ -182,14 +197,16 @@ def evaluate(rows, thresholds, symbols=None):
         if r["status"] == rc.DEAD:
             probs.append({"kind": "dead", "name": name, "row": r,
                           "th": th, "src": src,
-                          "text": "%s %s МЁРТВ: %s" % (name, r["router"], r["err"])})
+                          "text": "%s %s МЁРТВ: %s%s" % (name, r["router"], r["err"],
+                                                              at_block(r))})
         elif r["status"] == rc.ALIVE and r["impact"] >= th:
             probs.append({"kind": "deep", "name": name, "row": r,
                           "th": th, "src": src,
                           "text": "%s %s impact %.2f%% ≥ порога %.2f%% [%s], "
-                                  "max_in=%s (ед. token_in)" % (
+                                  "max_in=%s (ед. token_in)%s" % (
                               name, r["router"], r["impact"], th, src,
-                              r["cap"] if r["cap"] is not None else "нет")})
+                              r["cap"] if r["cap"] is not None else "нет",
+                              at_block(r))})
     return probs
 
 

@@ -343,6 +343,31 @@ check([r["status"] for r in noarch["rows"]] == [rc.ALIVE, rc.ALIVE],
 check(noarch["problems"] == 0 and noarch["alert"] == "нет",
       "и никакой ложной тревоги: проблем=%d alert=%s" % (noarch["problems"], noarch["alert"]))
 
+# --- 20.08: НОМЕР БЛОКА В ТЕКСТЕ ТРЕВОГИ. Разбор тревоги начинается с реквоты на том же
+# блоке; без номера разбирающий восстанавливает его руками по времени (так и вышло 19.08).
+print("\n=== 12. Тревога называет блок замера (воспроизводимость) ===")
+
+items12, module12 = routes_subset([((_CBDOGE, _USDC), 100_000 * 10 ** 8), BTC])
+pin = run_case(items12, module12, BlockNode({_CBDOGE: 0.4350, _CBBTC: 0.0168},
+                                            blk="0x2fdef60"))
+alert12 = "\n".join(p["text"] for p in w.evaluate(pin["rows"], pin["thresholds"],
+                                                  symbols=w.token_symbols(module=module12,
+                                                                          markets=MARKETS)))
+check(pin["problems"] >= 1, "стенд обязан дать хотя бы одну проблему: %d" % pin["problems"])
+check("блок замера 50196320" in alert12,
+      "номер блока (десятичный) есть в тексте тревоги: %r" % alert12[:160])
+
+# Замер на «latest» НЕ обещает воспроизводимости — и обязан молчать о блоке, а не врать.
+noblk = run_case(items12, module12, Node({_CBDOGE: 0.4350, _CBBTC: 0.0168}))
+alert_nb = "\n".join(p["text"] for p in w.evaluate(noblk["rows"], noblk["thresholds"],
+                                                   symbols=w.token_symbols(module=module12,
+                                                                           markets=MARKETS)))
+check(noblk["problems"] >= 1, "стенд latest обязан дать проблему: %d" % noblk["problems"])
+check("блок замера" not in alert_nb,
+      "на latest про блок НЕ обещается ничего: %r" % alert_nb[:160])
+check(w.at_block({"block": "мусор"}) == "" and w.at_block({}) == "" and w.at_block(None) == "",
+      "мусор/отсутствие блока -> пусто, а не исключение")
+
 print("\n=== САМОКОНТРОЛЬ (тест обязан уметь падать) ===")
 ctrl = []
 
