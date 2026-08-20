@@ -49,7 +49,37 @@ def _diag(e) -> str:
     tag = " ДЕФЕКТ КОДА" if isinstance(e, _CODE_BUGS) else ""
     return "%s%s: %s" % (type(e).__name__, tag, redact(e)[:200])
 
-SPEC_FIRE_MIN_REPAID_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_USD", "1000"))
+# ПОРОГ КАНДИДАТА — ПЕР-РЫНОЧНЫЙ (#138, 20.08). Плоское число здесь неверно ПО ПОСТРОЕНИЮ:
+# в тракте доски нет ни одного долларового пола прибыли (SPEC_FIRE_FAT_PRIZE_USD=0,
+# min_profit_usd не используется), то есть MIN_REPAID — ЕДИНСТВЕННЫЙ экономический гейт, и он
+# обязан считаться от БЕЗУБЫТКА СВОЕГО РЫНКА: приз = долг × бонус, значит порог = цена окна /
+# бонус. На карте это разброс в 12 раз:
+#     12.68% -> $17.7 | 4.38% -> $51 | 2.62% -> $86 | 1.68% -> $134 | 1.06% -> $212
+# Плоские $50 на половине карты стоят ниже безубытка ДАЖЕ ПРИ p=1.
+# Замер #138 (30 суток, analysis/liq_class_histogram.py) даёт вторую половину ответа: класса
+# $50k+ на покрытых рынках нет вовсе, весь поток в $1k-50k, а бакет $0-50 — это 1487 позиций
+# ради $225/мес (в 50 раз хуже соседнего по выходу на кандидата). Отсюда пол $50 у самых
+# жирнобонусных рынков и отказ опускаться ниже.
+SPEC_FIRE_MIN_REPAID_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_USD", "50"))
+# Цена ОДНОГО окна подготовки (замер: кап 150 проб × ~$0.015 главного кошелька).
+SPEC_FIRE_WINDOW_COST_USD = float(os.environ.get("SPEC_FIRE_WINDOW_COST_USD", "2.25"))
+# Бонус рынка НЕИЗВЕСТЕН -> безубыток не посчитать -> держим ПРЕЖНИЙ порог. Незнание бонуса не
+# имеет права открывать мелочь: это ровно тот класс, где ошибка стоит дороже пропуска.
+SPEC_FIRE_MIN_REPAID_NOBONUS_USD = float(os.environ.get("SPEC_FIRE_MIN_REPAID_NOBONUS_USD", "1000"))
+
+
+def _market_min_repaid_usd(bonus) -> float:
+    """Порог кандидата ДЛЯ ЭТОГО РЫНКА = max(пол, цена окна / бонус). bonus — доля (LIF−1),
+    как её отдаёт covered-снапшот (`_bonus_of`); 0/None = неизвестен -> прежний порог."""
+    try:
+        b = float(bonus or 0.0)
+    except (TypeError, ValueError):
+        b = 0.0
+    if b <= 0.0:
+        # НИКОГДА не ослабляем явно поднятый пол: если владелец поставил MIN_REPAID выше
+        # «прежнего порога», незнание бонуса обязано оставить ЕГО, а не откатить к $1000.
+        return max(SPEC_FIRE_MIN_REPAID_USD, SPEC_FIRE_MIN_REPAID_NOBONUS_USD)
+    return max(SPEC_FIRE_MIN_REPAID_USD, SPEC_FIRE_WINDOW_COST_USD / b)
 SPEC_FIRE_INTERVAL_SEC = float(os.environ.get("SPEC_FIRE_INTERVAL_SEC", "0.7"))
 # ПЛОТНЫЙ РЕЖИМ (31.07: первая боевая гонка cbBTC 14:07 проиграна ДЕНЬГАМИ — победитель сидел
 # в предочереди блока транзита idx 2928 с tip 0.0034, наша реакция 106мс легла блоком позже с
@@ -1066,9 +1096,13 @@ class SpecFireLive:
             ll = _label_of(getattr(m, "loan_token", ""))
             if cl == ll or not ((direction == "down" and cl == feed) or (direction == "up" and ll == feed)):
                 continue
+            # Порог считается ОДИН раз на рынок: бонус — свойство рынка, не цели. Источник тот
+            # же, что у гейта жира (_bonus_of/covered-снапшот), но берётся из уже снятого by_id —
+            # лишнего захвата лока на каждый рынок не делаем.
+            _min_usd = _market_min_repaid_usd(getattr(m, "bonus", 0.0))
             for b in borrowers:
                 d = float(debt_by.get((mid, b), 0.0) or 0.0)
-                if d < SPEC_FIRE_MIN_REPAID_USD:
+                if d < _min_usd:
                     continue
                 dist = None
                 if max_dist is not None:
@@ -1495,12 +1529,13 @@ class SpecFireLive:
                 borrowers = list(self.shared.groups.get(mid) or [])
                 debt_by = dict(self.shared.debt_by)
                 hf_by = dict(getattr(self.shared, "hf_by", {}) or {})
+            _min_usd = _market_min_repaid_usd(self._bonus_of(mid))
             cands = []
             for b2 in borrowers:
                 if b2 == b:
                     continue
                 d2 = float(debt_by.get((mid, b2), 0.0) or 0.0)
-                if d2 < SPEC_FIRE_MIN_REPAID_USD:
+                if d2 < _min_usd:                 # тот же пер-рыночный безубыток, что и в _top_fat
                     continue
                 ev2 = _plan_ev_val(d2, hf_by.get((mid, b2)), direction)
                 # None-EV (HF нечитаем) — в НИЖНИЙ бакет, а не в отказ: незнание близости не
@@ -2030,6 +2065,18 @@ class SpecFireLive:
                     return
                 # кэша нет (рестарт под живым планом) — НЕ выходим: собираем пробу ради
                 # публикации; повторного setPlan не будет, дедуп стоит внутри _arm_board.
+            # ВИДИМОСТЬ ПОРОГА (#138): применённый порог — величина ПЕР-РЫНОЧНАЯ, и если её не
+            # печатать, «почему цель не взяли» будет неотличимо от «цели не было». Одна строка
+            # на арм, не на цель. ПРИБОР ВИСИТ СБОКУ: свой try, потому что цена ошибки здесь —
+            # не строка в журнале, а весь прогрев (урок 13.08: учёт внутри _prearm_board молча
+            # гасил арм; стенды без by_id ловят это первым же прогоном).
+            try:
+                _bn = self._bonus_of(mid)
+                self._log("SPECFIRE порог рынка %s: бонус %s -> кандидат от $%.0f (цель $%.0f)"
+                          % (mid[:10], ("%.2f%%" % (_bn * 100)) if _bn else "НЕИЗВЕСТЕН",
+                             _market_min_repaid_usd(_bn), d))
+            except Exception:                     # noqa: BLE001
+                pass
             probe = (self._build_fn or self._build)(mid, b, d)
             # §9/#133: СТЭШ ГРУППЫ СНИМАЕТСЯ ЗДЕСЬ — ДО развилки «проба собралась», а не внутри
             # неё. Иначе есть живой путь протухания: проход N собрал группу, арм придержал слот
