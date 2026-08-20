@@ -606,7 +606,9 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
         # Пусто => ключ №1 (прежнее поведение). Откат: BG_RPC_URL_2= (пусто).
         _u = str(getattr(cfg, "bg_rpc_url2", "") or "") or str(getattr(cfg, "bg_rpc_url", "") or "")
         if _u and _u != cfg.rpc_url:
-            _bg_read_rpc = BaseRpc(_u, cfg.chain_id, request_timeout=10)
+            from chain.rpc import guard_chain_id as _gci
+            _bg_read_rpc = _gci(BaseRpc(_u, cfg.chain_id, request_timeout=10), cfg.chain_id,
+                                "bg-ключ ассессмента", fallback=rpc, log=log)   # #117 гард сети
             if getattr(cfg, "bg_rpc_url2", ""):
                 log.info("bg-страйп: ассессмент+route-depth -> ключ №2 (%s…)",
                          _u.split("//")[-1].split("/")[0])
@@ -626,7 +628,9 @@ async def block_driven_loop(rpc, markets, store, cfg, guard, alerter, log, ctx_c
                      daemon=True).start()
     if getattr(cfg, "hot_path", False):                      # preconf-triggered hot path (OFF until ARM)
         from chain.hotpath import hot_loop
-        preconf_rpc = BaseRpc(cfg.preconf_rpc or "https://mainnet-preconf.base.org", cfg.chain_id)
+        from chain.rpc import guard_chain_id as _gci_pc                          # #117 гард сети
+        preconf_rpc = _gci_pc(BaseRpc(cfg.preconf_rpc or "https://mainnet-preconf.base.org",
+                                      cfg.chain_id), cfg.chain_id, "preconf-узел", log=log)
 
         def _run_hot():
             import asyncio as _a
@@ -1057,6 +1061,12 @@ def main():
     markets = load_covered_markets(cfg.covered_markets_path)
     rpc = BaseRpc(cfg.rpc_url, cfg.chain_id) if cfg.rpc_url else None
     if rpc is not None:
+        # #117 гард сети на БОЕВОМ узле. Подменить его нечем, поэтому здесь гард — это только
+        # громкая строка на старте (форма check_gas_budget_sane / sign_backend_probe выше):
+        # ключ, выданный не на ту сеть, до этой правки принимался МОЛЧА — валидация web3,
+        # единственный потребитель eth_chainId, снята ради -45мс (см. strip_validation_middleware).
+        from chain.rpc import guard_chain_id as _gci_combat
+        rpc = _gci_combat(rpc, cfg.chain_id, "боевой ключ", log=log)
         from chain.failover import build_failover
         rpc = build_failover(rpc, cfg, alerter)   # без COMBAT_FAILOVER_URLS вернёт rpc как был
     ctx_cache: dict = {}   # immutable per-market params (oracle, lltv_wad), filled on first sight

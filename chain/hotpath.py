@@ -2636,8 +2636,9 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     try:
         _bg_url = str(getattr(cfg, "bg_rpc_url", "") or "")
         if _bg_url and _bg_url != cfg.rpc_url:
-            from chain.rpc import BaseRpc as _BR
-            _bg_rpc = _BR(_bg_url, cfg.chain_id, request_timeout=10)
+            from chain.rpc import BaseRpc as _BR, guard_chain_id as _gci
+            _bg_rpc = _gci(_BR(_bg_url, cfg.chain_id, request_timeout=10), cfg.chain_id,
+                           "bg-ключ фоновых чтений", fallback=rpc, log=log)   # #117 гард сети
             # 05.08: только хост — полный URL нёс ключ в журнал (гигиена ключей, как crc-тег CU)
             log.info("фоновые чтения -> %s… (Alchemy остаётся денежному пути)",
                      _bg_url.split("//")[-1].split("/")[0])
@@ -2649,8 +2650,11 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     ws_factory = ws_factory or _default_ws
 
     from chain.rpc import BaseRpc
-    _fb_resolve_rpc = BaseRpc(os.environ.get("FEEDS_FALLBACK_RPC", "https://mainnet.base.org"),
-                              getattr(rpc, "chain_id", 8453), request_timeout=8.0)
+    from chain.rpc import guard_chain_id as _gci_fb                              # #117 гард сети
+    _fb_resolve_rpc = _gci_fb(
+        BaseRpc(os.environ.get("FEEDS_FALLBACK_RPC", "https://mainnet.base.org"),
+                getattr(rpc, "chain_id", 8453), request_timeout=8.0),
+        getattr(rpc, "chain_id", 8453), "FEEDS_FALLBACK_RPC", fallback=rpc, log=log)
     # #139: поблочный опрос — на КЛОНАХ с жёстким таймаутом (боевой preconf_rpc и _bg_rpc свой
     # таймаут сохраняют: цикл кэша штатно живёт 1.9-2.4с на _bg_rpc, ему тесная граница вредна).
     _poll_preconf_rpc = _poll_rpc(preconf_rpc)
