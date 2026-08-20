@@ -1076,6 +1076,19 @@ def main():
         rpc = _gci_combat(rpc, cfg.chain_id, "боевой ключ", log=log)
         from chain.failover import build_failover
         rpc = build_failover(rpc, cfg, alerter)   # без COMBAT_FAILOVER_URLS вернёт rpc как был
+        # #117: ПРОГРЕВ СИНГЛТОНА px_confirmed НА СТАРТЕ, а не на первом чтении цены.
+        # px_confirmed_rpc() строит резервный хэндл лениво ПОД ЛОКОМ, и туда добавился
+        # chainId-гард — то есть сетевой вызов с таймаутом 8с. Зовут эту функцию из
+        # read_price_hedged, а это РЕАКТИВНЫЙ денежный путь: первое чтение цены после старта
+        # (в т.ч. после self-heal посреди каскада) заплатило бы до 8с, и параллельные чтения
+        # встали бы на локе. Прибор обязан висеть СБОКУ от денежного пути — платим здесь,
+        # рядом с sign_backend_probe, где стоимость старта уместна и ожидаема.
+        try:
+            from chain.hotpath import px_confirmed_rpc as _pxc
+            _pxc(rpc)
+        except Exception:
+            log.exception("#117: прогрев px_confirmed не удался — хэндл построится лениво "
+                          "(как раньше), огонь не затронут")
     ctx_cache: dict = {}   # immutable per-market params (oracle, lltv_wad), filled on first sight
 
     # #110 ФОНОВЫЙ ИНДЕКС ЦЕПИ. Поднимается ДО петель, на СВОЁМ (не боевом) узле. Он не в
