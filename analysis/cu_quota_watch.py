@@ -86,6 +86,8 @@ LEDGER_PATH = os.path.join(WATCH_DIR, "cu-quota.ledger.json")   # остаток
 SOURCE = "cu-quota"
 HOST = os.environ.get("CU_WATCH_SSH", "root@185.173.146.134")
 QUOTA_M = 30.0
+# Сколько книге надо накопить, чтобы ЕЮ судить срок до нуля (см. balance_verdicts).
+MIN_BOOK_SEC = float(os.environ.get("CU_WATCH_MIN_BOOK_H", "6")) * 3600.0
 SEC_MONTH = 30 * 24 * 3600.0
 WINDOW_SEC_FALLBACK = 120.0   # каденс CU-строки бота, если длительность не выводится из строки
 
@@ -346,6 +348,15 @@ def ledger_add(per_host, anchor, path=None, *, now=None):
     то есть окна, не посчитанные прошлым прогоном. Двойного счёта нет ровно по той же
     причине, по которой его нет в истории, и проверяется тем же тестом перекрытия.
     Ведём книгу ТОЛЬКО по хостам, у которых есть якорь: остальным её не с чем складывать.
+
+    ПЕРЕАНКЕРОВКА ОБНУЛЯЕТ КНИГУ САМА (21.08). Книга по смыслу — «расход ПОСЛЕ момента
+    якоря», поэтому её начало обязано быть привязано к as_of, а не поставлено один раз при
+    рождении записи. Было: setdefault ставил since при создании и больше не смотрел на
+    якорь — переставив mtd_cu/as_of вперёд, оператор получал ДВОЙНОЙ СЧЁТ расхода между
+    старым и новым якорем, и единственной защитой была строчка в тексте тревоги «книга
+    обнуляется вместе с ним», то есть ПАМЯТЬ ЧЕЛОВЕКА. Это ровно тот гард на дисциплине
+    вызывающего, против которого написан докстринг _beside_history: его забудут. Теперь
+    сдвиг as_of сам начинает книгу заново — руками трогать нечего.
     """
     path = path or LEDGER_PATH
     led = load_ledger(path)
@@ -354,7 +365,10 @@ def ledger_add(per_host, anchor, path=None, *, now=None):
         a = (anchor.get("hosts") or {}).get(host)
         if not a:
             continue
-        e = hosts.setdefault(host, {"cu": 0.0, "since": float(a.get("as_of", 0))})
+        as_of = float(a.get("as_of", 0))
+        e = hosts.get(host)
+        if e is None or float(e.get("since", 0)) != as_of:
+            e = hosts[host] = {"cu": 0.0, "since": as_of}
         e["cu"] = float(e.get("cu", 0.0)) + float(d.get("cu", 0))
     if not hosts:
         # Ни одного якорного хоста -> писать нечего. ВТОРОЙ, НЕЗАВИСИМЫЙ ГАРД к
@@ -393,8 +407,8 @@ def next_reset(epoch, spec="calendar"):
     return calendar.timegm((y, m, day, 0, 0, 0, 0, 1, 0))
 
 
-def balance_verdicts(anchor, ledger, burn_cu_per_day, *, now=None):
-    """[(host, mtd, remaining, days_zero, days_reset, burn, stale)] по хостам С ЯКОРЕМ.
+def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, now=None):
+    """[(host, mtd, remaining, days_zero, days_reset, burn, stale, basis)] по хостам С ЯКОРЕМ.
 
     Тревожим, когда КОНЧИТСЯ РАНЬШЕ, ЧЕМ НАЛЬЁТСЯ: days_zero < days_reset. Именно это, а
     не «темп выше квоты», и есть связывающий предел — 21.08 темп был 27M против квоты 30M
@@ -402,22 +416,62 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, now=None):
 
     stale=True — с момента якоря прошёл сброс: приговор НЕ выносится, но и молчать нельзя,
     поэтому запись возвращается с пометкой и разбирается вызывающим отдельной веткой.
+
+    ТЕМП ДЛЯ СРОКА ДО НУЛЯ — ПО ВРЕМЕННОЙ АТРИБУЦИИ (21.08, разбор своей же тревоги 19:07).
+    Первая версия брала темп ТОТ ЖЕ, которым судится квота (интеграл 24ч-хвоста), «чтобы
+    два приговора не разъехались основанием». Это унаследовало в новую ветку ровно ту
+    слепоту, которая уже описана в каноне про интеграл: ХВОСТ СЛЕП К ПЕРЕСТРАЙПУ. 21.08
+    в 18:53 потребители были уведены с #5735, в 19:07 сторож всё равно объявил «остатка
+    на 4.0 суток» — потому что 927k CU/сут были посчитаны по хвосту, 5 часов которого
+    описывали конфигурацию, которой уже нет. Приговор о БУДУЩЕМ нельзя строить на темпе,
+    измеренном ДО манёвра.
+
+    Поэтому основание выбирается по тому, где лежит окно замера относительно якоря
+    (якорь ставится при манёвре, значит он и есть граница режима):
+      * хвост целиком ПОСЛЕ якоря -> он не загрязнён, берём max(книга, хвост): хвост
+        свежее и ловит разгон, книга ловит устойчивый расход;
+      * хвост ПЕРЕСЕКАЕТ якорь -> берём КНИГУ (она пост-якорная по построению), но лишь
+        когда книге есть чем судить (>= MIN_BOOK_H); молодая книга усредняет почти-ноль
+        и врёт в успокаивающую сторону;
+      * книга ещё молода -> отступаем к хвосту, НО загрязнение обязано быть ПРОИЗНЕСЕНО
+        в тексте тревоги (канон 29ae77e: приговор везёт основание, по которому судил).
+    basis — строка этого выбора, она уезжает в тревогу.
     """
     now = float(now if now is not None else time.time())
     quota = float(anchor.get("quota_cu", QUOTA_M * 1e6))
     spec = anchor.get("reset", "calendar")
     led = (ledger or {}).get("hosts") or {}
+    span = burn_span or {}
     out = []
     for host, a in sorted((anchor.get("hosts") or {}).items()):
         as_of = float(a.get("as_of", 0))
         stale = as_of > 0 and now >= next_reset(as_of, spec)
-        mtd = float(a.get("mtd_cu", 0)) + float((led.get(host) or {}).get("cu", 0.0))
+        book = led.get(host) or {}
+        book_cu = float(book.get("cu", 0.0))
+        book_sec = max(0.0, now - float(book.get("since", as_of) or as_of))
+        mtd = float(a.get("mtd_cu", 0)) + book_cu
         remaining = quota - mtd
-        burn = float(burn_cu_per_day.get(host, 0.0))
+
+        tail = float(burn_cu_per_day.get(host, 0.0))
+        tail_sec = float(span.get(host, 0.0))
+        book_rate = (book_cu * 86400.0 / book_sec) if book_sec > 0 else 0.0
+        if tail_sec > 0 and (now - tail_sec) >= as_of:
+            burn, basis = max(book_rate, tail), "хвост целиком после якоря"
+        elif book_sec >= MIN_BOOK_SEC:
+            burn = book_rate
+            basis = "книга за %.1fч после якоря (хвост пересекает якорь — отброшен)" % (
+                book_sec / 3600.0)
+        else:
+            burn = tail
+            basis = ("ХВОСТ, ЗАГРЯЗНЁННЫЙ ПЕРЕСТРАЙПОМ: книге всего %.1fч (нужно %.0fч), "
+                     "судим по хвосту, а он захватывает время ДО якоря — срок до нуля "
+                     "может описывать конфигурацию, которой уже нет" % (
+                         book_sec / 3600.0, MIN_BOOK_SEC / 3600.0))
+
         days_reset = max(0.0, (next_reset(now, spec) - now) / 86400.0)
         days_zero = (remaining / burn) if burn > 0 else float("inf")
         if stale or days_zero < days_reset:
-            out.append((host, mtd, remaining, days_zero, days_reset, burn, stale))
+            out.append((host, mtd, remaining, days_zero, days_reset, burn, stale, basis))
     return out
 
 
@@ -511,12 +565,14 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
     trail = trail_summary(recs, trail_sec=trail_sec, now=now_s)
     alarms = quota_verdicts(recs, threshold=threshold, trail_sec=trail_sec,
                             min_trail_sec=min_trail_sec, now=now_s)
-    # ОСТАТОК — вторая, независимая величина (ПРЕДЕЛ 3). Темп берём тот же, которым судим
-    # квоту (интеграл хвоста), чтобы два приговора не разъехались основанием.
+    # ОСТАТОК — вторая, независимая величина (ПРЕДЕЛ 3). Темп хвоста отдаём ВМЕСТЕ С ЕГО
+    # ОКНОМ: без окна нельзя понять, лежит ли замер после якоря, а без этого приговор о
+    # будущем строится на конфигурации, которой уже нет (разбор 21.08, см. balance_verdicts).
     anchor = load_anchor(anchor_path)
     ledger = ledger_add(per_host, anchor, ledger_path, now=now_s)
     burn_day = {h: r * 1e6 / 30.0 for h, (r, _sec) in trail.items()}
-    bal = balance_verdicts(anchor, ledger, burn_day, now=now_s)
+    burn_span = {h: sec for h, (_r, sec) in trail.items()}
+    bal = balance_verdicts(anchor, ledger, burn_day, burn_span=burn_span, now=now_s)
 
     for host, rate, sec, cu_total in alarms:
         days = QUOTA_M / rate * 30.0 if rate > 0 else 0.0
@@ -549,7 +605,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
                                 key="cu-quota:%s" % host, dedup_sec=21600)
             out("cu-quota: %s интеграл %.1fM за %.1fч (n=%d рестартов) -> %s"
                 % (host, rate, sec / 3600.0, restarts, verdict))
-    for host, mtd, remaining, days_zero, days_reset, burn, stale in bal:
+    for host, mtd, remaining, days_zero, days_reset, burn, stale, basis in bal:
         a = (anchor.get("hosts") or {}).get(host, {})
         if stale:
             # Протухший якорь = гард остатка ВЫКЛЮЧЕН. Молчать нельзя: молчание сторожа об
@@ -568,6 +624,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
                    "ОСНОВАНИЕ (обязано ехать вместе с приговором): якорь снят %s, "
                    "месяц-к-дате на тот момент %.1fM; с тех пор насчитано книгой %.1fM. "
                    "Источник якоря: %s\n"
+                   "ЧЕМ ИЗМЕРЕН ТЕМП: %s.\n"
                    "ЯКОРЬ — ЧИСЛО, ВВЕДЁННОЕ РУКАМИ с владельческого дашборда, агентом он не "
                    "перепроверяется: если он неверен, неверен и этот вывод.\n"
                    "РАЗБОР АГЕНТУ: это НЕ то же самое, что тревога по темпу — темп может быть "
@@ -578,7 +635,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
                       a.get("as_of_iso", a.get("as_of", "?")),
                       float(a.get("mtd_cu", 0)) / 1e6,
                       (mtd - float(a.get("mtd_cu", 0))) / 1e6,
-                      a.get("source", "?")))
+                      a.get("source", "?"), basis))
             key = "cu-quota:balance:%s" % host
         if notify_fn is None:
             out("cu-quota: КАНАЛ НЕДОСТУПЕН, текст ниже"); out(msg)

@@ -283,8 +283,11 @@ def _anchor(mtd_m, *, as_of, quota_m=30.0, reset="calendar", host=B5735):
                              "source": "дашборд владельца 14.08 + замер журнала"}}}
 
 
-def _led(cu, host=B5735):
-    return {"hosts": {host: {"cu": cu, "since": MID - DAY}}}
+def _led(cu, host=B5735, since=None):
+    # since ПО УМОЛЧАНИЮ = as_of якоря этих фикстур (MID - HOUR): книга по определению
+    # начинается в момент якоря, и ledger_add иного состояния не порождает. Прежнее
+    # MID - DAY при якоре MID - HOUR было внутренне противоречивым входом.
+    return {"hosts": {host: {"cu": cu, "since": MID - HOUR if since is None else since}}}
 
 
 # ---- 19. ГЛАВНАЯ РЕГРЕССИЯ 21.08: темп ПОД порогом, а остаток кончается ----
@@ -292,7 +295,7 @@ burn = {B5735: 1.10e6}                       # замеренный эпизод
 bal = w.balance_verdicts(_anchor(26.3, as_of=MID - HOUR), _led(0.0), burn, now=MID)
 check("остаток 3.7M при 1.10M/сут -> будит, хотя ТЕМП (27M) ниже квоты 30M", len(bal) == 1, bal)
 if bal:
-    _h, mtd, rem, dz, dr, _b, stale = bal[0]
+    _h, mtd, rem, dz, dr, _b, stale, _basis = bal[0]
     check("...месяц-к-дате и остаток посчитаны верно",
           abs(mtd - 26.3e6) < 1 and abs(rem - 3.7e6) < 1, (mtd, rem))
     check("...до нуля ~3.4 сут, а до сброса ~10.2 сут (кончится раньше, чем нальётся)",
@@ -323,6 +326,52 @@ bal = w.balance_verdicts(stale_anchor, _led(0.0), {B5735: 1.0}, now=MID)
 check("якорь снят в ПРОШЛОМ месяце -> помечен протухшим (молчать нельзя)",
       len(bal) == 1 and bal[0][6] is True, bal)
 
+# ---- 23b. РЕГРЕССИЯ 21.08 19:07: ХВОСТ СЛЕП К ПЕРЕСТРАЙПУ, а судил СРОК ДО НУЛЯ ----
+# Живой случай: 18:53 потребители уведены с #5735, в 19:07 сторож объявил «остатка на 4.0
+# суток» по темпу 927k CU/сут, посчитанному хвостом, 5 часов которого описывали уже снятую
+# конфигурацию. После манёвра ключ не жёг ВООБЩЕ (в журнале исчез в 18:58).
+post = MID - 8 * HOUR                                   # якорь снят при манёвре 8ч назад
+led_quiet = _led(20e3, since=post)                      # книга: 20k CU за 8 часов = штиль
+anc_post = _anchor(26.3, as_of=post)
+fat = {B5735: 927e3}                                    # тот самый темп из тревоги 19:07
+span_cross = {B5735: 24 * HOUR}                         # хвост 24ч ПЕРЕСЕКАЕТ якорь (8ч)
+bal = w.balance_verdicts(anc_post, led_quiet, fat, burn_span=span_cross, now=MID)
+check("хвост пересекает якорь -> судим КНИГОЙ (пост-манёвренный штиль) -> тишина",
+      bal == [], bal)
+
+# ПОЗИТИВНЫЙ КОНТРОЛЬ НА ТОМ ЖЕ ВХОДЕ (канон test-that-can-only-return-zero): те же данные
+# при НЕзагрязнённом хвосте обязаны будить — иначе «тишина» выше могла быть тишиной прибора.
+span_clean = {B5735: 4 * HOUR}                          # хвост целиком ПОСЛЕ якоря
+bal_c = w.balance_verdicts(anc_post, led_quiet, fat, burn_span=span_clean, now=MID)
+check("...а тот же вход с хвостом ЦЕЛИКОМ после якоря — будит (тишина выше не от прибора)",
+      len(bal_c) == 1, bal_c)
+
+# ---- 23в. МОЛОДАЯ КНИГА: отступаем к хвосту, но ЗАГРЯЗНЕНИЕ ПРОИЗНЕСЕНО ----
+young = _led(0.0, since=MID - HOUR)
+bal_y = w.balance_verdicts(_anchor(26.3, as_of=MID - HOUR), young, fat,
+                           burn_span=span_cross, now=MID)
+check("книге 1ч (<6ч) -> судим хвостом, НО основание названо загрязнённым",
+      len(bal_y) == 1 and "ЗАГРЯЗН" in bal_y[0][7], bal_y)
+
+# ---- 23г. Книга старше порога и ПУСТАЯ -> срок до нуля бесконечен, тревоги нет ----
+check("книга 8ч со штилём -> темп судится ею, а не хвостом",
+      w.balance_verdicts(anc_post, _led(0.0, since=post), fat,
+                         burn_span=span_cross, now=MID) == [], "должно молчать")
+
+# ---- 23д. ПЕРЕАНКЕРОВКА ОБНУЛЯЕТ КНИГУ САМА (гард на транспорте, не на памяти человека) ----
+lp_re = os.path.join(_tmp, "ledger_reanchor.json")
+a_old = _anchor(20.0, as_of=MID - DAY)
+w.ledger_add({B5735: {"cu": 5000}}, a_old, lp_re, now=MID)
+a_new = _anchor(25.0, as_of=MID - HOUR)                 # владелец переставил якорь вперёд
+w.ledger_add({B5735: {"cu": 300}}, a_new, lp_re, now=MID)
+e = w.load_ledger(lp_re)["hosts"][B5735]
+check("сдвиг as_of обнуляет книгу (5000 до якоря НЕ едут в новый месяц-к-дате)",
+      e["cu"] == 300 and e["since"] == MID - HOUR, e)
+# НЕГАТИВНЫЙ КОНТРОЛЬ К ЭТОЙ ЖЕ ПОЛОВИНЕ: без сдвига as_of книга обязана ПРОДОЛЖАТЬ копиться.
+w.ledger_add({B5735: {"cu": 700}}, a_new, lp_re, now=MID)
+check("...но при ТОМ ЖЕ as_of книга копится дальше (обнуление не стало тотальным)",
+      w.load_ledger(lp_re)["hosts"][B5735]["cu"] == 1000, w.load_ledger(lp_re))
+
 # ---- 24. next_reset: календарный месяц ----
 check("next_reset: с 21.08 -> 01.09", w.next_reset(MID) == calendar.timegm((2026, 9, 1, 0, 0, 0, 0, 1, 0)))
 check("next_reset: с 31.12 -> 01.01 следующего года",
@@ -346,12 +395,22 @@ _fresh_hist(27.0, path=hp_bal)
 json.dump(_anchor(26.3, as_of=MID - 30 * HOUR),
           open(os.path.join(_tmp, "cu-quota.anchor.json"), "w", encoding="utf-8"))
 os.environ["CU_WATCH_PROJ_M"] = "30"          # темп 27M ПОД порогом -> темповых тревог нет
+_prod_led_pre = os.path.expanduser("~/.fleet-watch/cu-quota.ledger.json")
+_snap = (os.path.getmtime(_prod_led_pre), open(_prod_led_pre, "rb").read()) \
+    if os.path.exists(_prod_led_pre) else None
 rc = w.run(fetch=lambda: _journal(B5735, [27.0] * 30, pid=9), notify_fn=_nf,
            out=lambda *_: None, now=MID, history_path=hp_bal)
 os.environ["CU_WATCH_PROJ_M"] = "26"
+# ПРОВЕРЯЕМ «НЕ ТРОНУЛ», А НЕ «НЕ СУЩЕСТВУЕТ» (починка стенда 21.08). Прежняя редакция
+# требовала ОТСУТСТВИЯ боевой книги — то есть была зелена ровно до первого боевого прогона
+# ветки остатка. Крон создал ~/.fleet-watch/cu-quota.ledger.json в 19:07 21.08, и стенд стал
+# КРАСНЫМ НАВСЕГДА при полностью исправном продукте (канон red-bench-is-not-a-diagnosis).
+# Утверждение, которое гард на самом деле несёт: ЭТОТ прогон боевой файл не писал.
+_prod_led, _prod_before = _prod_led_pre, _snap
 check("run: книга/якорь легли РЯДОМ С ИСТОРИЕЙ, боевой каталог не тронут",
       os.path.exists(os.path.join(_tmp, "cu-quota.ledger.json"))
-      and not os.path.exists(os.path.expanduser("~/.fleet-watch/cu-quota.ledger.json")))
+      and (((os.path.getmtime(_prod_led), open(_prod_led, "rb").read()) == _prod_before)
+           if _prod_before is not None else not os.path.exists(_prod_led)))
 check("run: при темпе ПОД порогом ушла ровно одна тревога — по ОСТАТКУ",
       rc == 0 and len(sent) == 1 and sent[0][2] == "cu-quota:balance:%s" % B5735, sent)
 if sent:
