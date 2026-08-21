@@ -1657,15 +1657,44 @@ def volley_bal_refresh_async(rpc, addr: str):
     threading.Thread(target=_run, daemon=True).start()
 
 
+# П.4 (kelbic 21.08): ДВОЙНОЕ списание патрона закрыто. Раньше send_volley_probe списывал
+# ОЦЕНКУ при отправке, а volley_bal_charge — ФАКТ по квитанции ЕЩЁ РАЗ: нога беднела в кэше
+# вдвое быстрее цепи и немела раньше времени (floor-гейт по кэшу). Единый источник правды —
+# коллектор: факт ЗАМЕЩАЕТ оценку (FIFO оценок на ногу; пробы ноги садятся в nonce-порядке,
+# поэтому старейшая оценка соответствует пришедшей квитанции). Оценки нерасчитанных проб
+# (nonce перекрыт — квитанции не будет) висят до рефреша баланса: рефреш (TTL 60с) остаётся
+# ВЕРХОВНЫМ согласователем с цепью, как и был. Красный тест: дрель 20/20 на базе расходилась
+# с цепью ровно на 20 оценок.
+_VOLLEY_EST_Q: dict = {}          # addr -> [оценки отправленных, ещё не расчитанных проб]
+_VOLLEY_EST_Q_CAP = 512           # кап памяти на ногу (лестница 40, кап с запасом)
+
+
+def volley_bal_note_sent(addr: str, est_wei: int):
+    """Списать ОЦЕНКУ при отправке и запомнить её для замещения фактом (единый шов send-пути)."""
+    if not addr or est_wei <= 0:
+        return
+    with _INFLIGHT_LOCK:
+        bal = _VOLLEY_BAL.get(addr)
+        if bal is not None:
+            bal[0] = max(0, int(bal[0]) - int(est_wei))
+        q = _VOLLEY_EST_Q.setdefault(addr, [])
+        q.append(int(est_wei))
+        del q[:-_VOLLEY_EST_Q_CAP]
+
+
 def volley_bal_charge(addr: str, wei: int):
-    """Списать с кэша патрона ФАКТИЧЕСКИЙ расход по квитанции (#45). Эстимейт на пути огня
-    завышал расход в ~250 раз и глушил ногу за ~135 проб; истина приходит от коллектора."""
+    """Списать ФАКТ по квитанции (#45), ЗАМЕСТИВ им старейшую оценку этой ноги (П.4)."""
     if not addr or wei <= 0:
         return
-    bal = _VOLLEY_BAL.get(addr)
-    if bal is None:
-        return
-    bal[0] = max(0, int(bal[0]) - int(wei))
+    with _INFLIGHT_LOCK:
+        bal = _VOLLEY_BAL.get(addr)
+        if bal is None:
+            return
+        est = 0
+        q = _VOLLEY_EST_Q.get(addr)
+        if q:
+            est = q.pop(0)
+        bal[0] = max(0, int(bal[0]) - int(wei) + int(est))
 
 
 def volley_accounts():
@@ -1898,7 +1927,7 @@ def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, lo
                 log.info("VOLLEY send fail %s: %s", addr[:10], type(e).__name__)
             return None
         _VOLLEY_NONCE[addr] = nonce + 1
-        bal[0] -= _spend                 # по ФАКТУ no-op'а, не по лимиту; истину вернёт refresh
+        volley_bal_note_sent(addr, _spend)   # П.4: единый шов — факт квитанции ЗАМЕСТИТ оценку
         with _INFLIGHT_LOCK:
             _VOLLEY_PROBES += 1
         return res["hash"]
