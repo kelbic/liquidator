@@ -98,6 +98,28 @@ bad = {"status": 1, "logs": [{"address": LIQ, "topics": [SIG], "data": "0x"}]}  
 o3._engine_result_verdict(meta2, "0xhash3", bad, gas_usd=0.0)
 check("жертва неизвестна: окно НЕ гасится по ярлыку", "B" in o3._windows and not stopB3.is_set())
 
+# ---- 4. HIL-шаблон первой победы (ритуал, п.2): уходит человеку, деньги не трогает ----
+o4 = _mk()
+sent = []
+o4._alert = lambda text, key: sent.append((key, text))
+o4._windows["B"] = threading.Event()
+o4._engine_result_verdict(meta2, "0xhash4", _receipt(B_B), gas_usd=0.02)
+check("HIL-шаблон ушёл с ключом first-win", len(sent) == 1 and sent[0][0] == "first-win", sent)
+_t = sent[0][1] if sent else ""
+for _frag in ("tx:", "рынок/жертва:", "РЕШЕНИЕ:", "Профит УЖЕ у owner"):
+    check("шаблон несёт %r" % _frag, _frag in _t)
+o5 = _mk()                                   # канал не армирован
+o5._alert = None
+o5._windows["B"] = threading.Event()
+o5._engine_result_verdict(meta2, "0xhash5", _receipt(B_B), gas_usd=0.02)
+check("неармированный канал: молчание, не падение", o5.stats.get("wins") == 1)
+o6 = _mk()                                   # канал бросает
+o6._alert = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("TG упал"))
+o6._windows["B"] = threading.Event()
+o6._engine_result_verdict(meta2, "0xhash6", _receipt(B_B), gas_usd=0.02)
+check("отказ канала не отменяет победу и гашение окна",
+      o6.stats.get("wins") == 1 and "B" not in o6._windows)
+
 print("\n%s" % ("FAIL: %d" % len(FAILS) if FAILS
                 else "OK: победа гасит только окно ВЗЯТОЙ жертвы; лживый ярлык не глушит чужой фид"))
 sys.exit(1 if FAILS else 0)
