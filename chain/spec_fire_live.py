@@ -3108,6 +3108,23 @@ class SpecFireLive:
                          _prof_s,
                          _worst[0] or "—",
                          (" %.0fмс" % _worst[1]) if _worst[1] is not None else ""))
+            # ТЕНЕВОЙ ЗАМЕР СЛОТА А1в3 (ревьюер 21.08, БЕЗ расконсервации — только журнал):
+            # p50 feeHistory блока B-1 против фактического tip транзита. К моменту «го» kelbic
+            # даёт готовую приёмочную выборку «слот угадал бы класс в N% блоков» вместо нуля
+            # наблюдений; заодно последовательность строк показывает ФОРМУ затухания
+            # эскалации (кандидат на второй слот). Вердикты редкие — один feeHistory на
+            # вердикт, на узле индекса (не боевой ключ). Прибор сбоку: отказ глотается.
+            try:
+                _fh = ci._rpc("eth_feeHistory", [1, hex(int(bn) - 1), [50]])
+                _rw = (_fh.get("reward") or [[None]])[0]
+                _p50 = int(_rw[0], 16) if isinstance(_rw[0], str) else (int(_rw[0]) if _rw[0] is not None else None)
+                if _p50 is not None and t_tip:
+                    _ratio = _p50 / float(t_tip)
+                    self._log("SPECFIRE ТЕНЬ-СЛОТ blk=%d p50(B-1)=%d факт=%d ratio=%.2f "
+                              "hit10=%s hit25=%s" % (bn, _p50, t_tip, _ratio,
+                                                     0.9 <= _ratio <= 1.1, 0.75 <= _ratio <= 1.25))
+            except Exception:                                # noqa: BLE001
+                pass
             self._log("SPECFIRE ПЕРЕСЕЧЕНИЕ blk=%d транзит=%d@%d: полоса∩класс=%d "
                       "(вердикт «формула» пишет ТОЛЬКО это число), match=%d delta p50=%s "
                       "p90=%s | %s%s"

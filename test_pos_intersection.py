@@ -63,6 +63,25 @@ check("нет блока -> None", idx.our_position_table(1) is None)
 idx.transit_report = lambda bn, agg=None: ("no_transit", None)
 check("нет транзита -> None", idx.our_position_table(50262420) is None)
 
+# ---- Тень-слот А1в3 (ревьюер 21.08): строка p50(B-1) против факта, отказ глотается ----
+idx.transit_report = lambda bn, agg=None: ("transit", {"index": T_IDX, "tip": T_TIP})
+import chain.spec_fire_live as _sfl_mod
+_o = _sfl_mod.SpecFireLive.__new__(_sfl_mod.SpecFireLive)
+_o.stats = {}
+_logs = []
+_o._log = lambda m: _logs.append(m)
+idx._rpc = lambda m, p: {"reward": [["0x%x" % 1_800_000]]}   # p50(B-1)=1.8 мгвей
+_o._pos_table(idx, 50262420, None)
+_shadow = [l for l in _logs if "ТЕНЬ-СЛОТ" in l]
+check("тень-слот пишет строку с ratio и hit-флагами",
+      len(_shadow) == 1 and "ratio=1.01" in _shadow[0] and "hit10=True" in _shadow[0], _shadow)
+_logs.clear()
+idx._rpc = lambda m, p: (_ for _ in ()).throw(RuntimeError("узел упал"))
+_o._pos_table(idx, 50262420, None)
+check("отказ feeHistory глотается (вердикт и пересечение живут)",
+      any("ПЕРЕСЕЧЕНИЕ" in l for l in _logs) and not any("ТЕНЬ" in l for l in _logs), _logs[:1])
+idx._rpc = None
+
 # ---- Гарды дрейфа боевого потребителя (spec_fire_live) ----
 import chain.spec_fire_live as sfl  # noqa: E402
 _SRC = open(sfl.__file__.replace(".pyc", ".py")).read()
