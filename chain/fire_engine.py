@@ -546,6 +546,17 @@ class FireEngine:
             if self._burst_tokens >= 1.0:
                 self._burst_tokens -= 1.0
                 self.stats["sent_burst"] = self.stats.get("sent_burst", 0) + 1
+                # БЁРСТ-В-ЩЕЛЬ (20.08): помечаем ЭТОТ тред — ниже стоит ВТОРОЕ ведро (пейсер
+                # эндпоинта), и к транзиту оно пусто по построению. Без пометки залп движка
+                # упирался в капельницу 110/с и размазывался на весь суб-блок (замер: жетоны
+                # тратились все, а первый наш tx приходил на медиану +12 от транзита).
+                # Тред тот же, что позовёт send_fn (один воркер = одна проба). Отказ пометки
+                # = обычная отправка: незнание НЕ открывает резерв.
+                try:
+                    from chain.execute import pacer_mark_urgent
+                    pacer_mark_urgent()
+                except Exception:                        # noqa: BLE001
+                    pass
                 return True
             n = self._now()
             hot = n < self._until

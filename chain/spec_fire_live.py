@@ -3657,11 +3657,15 @@ class SpecFireLive:
                 # transport_reject («over rate limit») РАЗДЕЛЬНО — без числа немота эндпоинта
                 # неотличима от «склад пуст», ровно как бюджетная (#132).
                 _pdry, _pspill, _prej = volley_pacer_stats()
+                # бёрст-в-щель: отправки ИЗ РЕЗЕРВА ведра — приёмка пакета в той же строке
+                from chain.execute import pacer_urgent_stats
+                _purg = pacer_urgent_stats()
             except Exception:
                 _fs = _us = _mm = -1
                 _rs = _ifs = -1
                 _pdry = _pspill = {}
                 _prej = {}          # 20.08: пер-канальный словарь (был суммарный int)
+                _purg = {}
             if _mm > 0 and self._alert is not None:
                 # У2 (решение kelbic 09.08): немота ног по комиссии = состояние, которое
                 # само не рассосётся (долив или ручка MAXFEE_RESERVE_MULT) и которое иначе
@@ -3702,11 +3706,12 @@ class SpecFireLive:
                       # 20.08: все три — ПО КАНАЛАМ (url|ip). transport_reject был суммарным
                       # int; с двумя egress-адресами суммарное число не отвечает на вопрос
                       # «умер адрес или режет секвенсер», а именно он теперь и стоит.
-                      "pacer_dry=%s spill_sent=%s transport_reject=%s "
+                      "pacer_dry=%s spill_sent=%s transport_reject=%s urgent_sent=%s "
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
                           _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej or "—",
+                          _purg or "—",
                           _es or "—", _cs or "—", _is,
                           ("%s/%s" % (_wkey[0][:10], _wkey[1][:10])) if _wkey else "НЕТ",
                           _pw, self.stats))

@@ -2390,6 +2390,11 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
         # 20.08: обходим КАНАЛЫ (url, ip), а не url. Первичный эндпоинт размножен по egress-
         # адресам — у каждого СВОЁ ведро, потому что квота секвенсера меряется на IP.
         _chans = broadcast_channels(list(broadcast_raw_urls or []))
+        # бёрст-в-щель: пометку треда снимаем ОДИН раз НА ПРОБУ и держим на ВЕСЬ обход каналов.
+        # Иначе (первая редакция, поймано до стенда) залповая проба, не влезшая в резерв
+        # первого канала, теряла право на резервы соседей — и пакет работал бы на треть:
+        # мгновенная ёмкость 1×RESERVE вместо 3×RESERVE при залпе движка в 24 жетона.
+        _urg = _urgent_take_flag()
         _sent = False
         _terminal = False           # байты уже у ордерера (already known/nonce too low): потрачено
         _last_err = None
@@ -2401,15 +2406,16 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
                     # первичный канал БЕЗ привязки: вызов БИТ-В-БИТ как в HEAD
                     # (_post_raw_sync(url, raw_hex)), чтобы транспортные стенды с сигнатурой
                     # (url, raw_hex, timeout) не ломались.
-                    ok, err = _post_raw_sync(_u, raw_hex)
+                    ok, err = _post_raw_sync(_u, raw_hex) if not _urg else _post_raw_sync(
+                        _u, raw_hex, urgent=True)
                 elif _u == _head_url:
                     # ТОТ ЖЕ эндпоинт с другого адреса — это НЕ запасной канал, а вторая полоса
                     # первичного: полоса определяется эндпоинтом, а не позицией в списке.
                     ok, err = _post_raw_sync(_u, raw_hex, paced=True, rate=_PACER_RATE,
-                                             burst=_PACER_BURST, source_ip=_ip)
+                                             burst=_PACER_BURST, source_ip=_ip, urgent=_urg)
                 else:
-                    ok, err = _post_raw_sync(_u, raw_hex, paced=True,
-                                             rate=_SPILL_RATE, burst=_SPILL_BURST, source_ip=_ip)
+                    ok, err = _post_raw_sync(_u, raw_hex, paced=True, rate=_SPILL_RATE,
+                                             burst=_SPILL_BURST, source_ip=_ip, urgent=_urg)
                 if ok:
                     _sent = True
                     if _i > 0:
@@ -2493,15 +2499,81 @@ _PACER_SPILL_SENT: dict = {}       # канал -> сколько проб до�
 # отказывает». С двумя IP это тот самый вопрос — умер ли адрес или режет секвенсер.
 _PACER_TRANSPORT_REJECT: dict = {}  # канал -> сетевых отказов (over rate limit и пр.)
 
+# ---- БЁРСТ-В-ЩЕЛЬ (20.08): РЕЗЕРВ ВЕДРА ПОД МОМЕНТ ТРАНЗИТА ----
+#
+# ЗАМЕР, ПОРОДИВШИЙ ПАКЕТ (51 блок с вердиктом за 36ч): чужих ВПЕРЕДИ в призовой полосе —
+# медиана 1 (в 42/51 блоков <=5), то есть толпы у двери НЕТ. А наш ПЕРВЫЙ tx приходит на
+# медиану +12 позиций от транзита. Значит связывающий предел — не число ног и не класс tip
+# (tip-match взят 20.08), а МОМЕНТ ПРИБЫТИЯ собственного потока.
+#
+# ПОЧЕМУ ЗАЛП ДВИЖКА (Ш29) ЭТОГО НЕ РЕШИЛ. Движок честно выдаёт 24 жетона мимо своего ведра
+# (замер: transit_bursts 2-6 за окно, sent_burst = ровно 24×N — потрачены все). Но НИЖЕ стоит
+# ВТОРОЕ ведро — пейсер эндпоинта, и к моменту транзита оно ПУСТО по построению: горячая фаза
+# льёт ровно на максимуме, накопленного бурста не остаётся. Залп упирается в капельницу 110/с
+# и размазывается на ~218мс по каналу — то есть на весь суб-блок, ровно мимо щели.
+#
+# ФИКС: часть ведра КАЖДОГО канала недоступна ровному потоку и ждёт транзита. Обычная отправка
+# берёт токен только если их больше резерва; отправка, помеченная как залповая, берёт из
+# резерва. На транзите получаем 3 канала × RESERVE мгновенных отправок.
+#
+# КВОТУ СЕКВЕНСЕРА ЭТО НЕ НАРУШАЕТ — и это главный аргумент за безопасность: за любое окно
+# >=1с расход канала прежний (110/с на адрес, лимит меряется на IP — потому и разводили
+# адреса). Меняется только РАСПРЕДЕЛЕНИЕ токенов ВНУТРИ секунды: копим в тишине, тратим в
+# щели. Пик при этом рождается намеренно — против него и строился #136, поэтому размер
+# резерва мал по умолчанию и сторожится transport_reject (растёт -> резерв вниз).
+#
+# ФЛАГ — THREAD-LOCAL, А НЕ ПАРАМЕТР ЧЕРЕЗ ПЯТЬ КАДРОВ: жетон залпа берёт ТОТ ЖЕ тред
+# движка, который затем зовёт send_presigned_probe (16 воркеров, один тред = одна проба).
+# Отказ пометки = обычная отправка (fail-closed: незнание не открывает резерв).
+_PACER_RESERVE = float(os.environ.get("VOLLEY_PACER_RESERVE", "12"))
+_PACER_URGENT_SENT: dict = {}      # канал -> сколько отправок ушло ИЗ РЕЗЕРВА (приёмка пакета)
+_URGENT_TL = threading.local()
 
-def _pacer_take(url: str, rate: float, burst: float) -> bool:
-    """O(1) try-take: ленивое пополнение по монотонным часам. Токен есть -> True (списываем)."""
+
+def pacer_mark_urgent():
+    """Пометить ТЕКУЩИЙ тред: следующая отправка — залповая (может брать из резерва)."""
+    try:
+        _URGENT_TL.on = True
+    except Exception:                                    # noqa: BLE001
+        pass                                             # не открыли резерв — обычная отправка
+
+
+def _urgent_take_flag() -> bool:
+    """Снять пометку (одноразовая). Без пометки — обычная отправка."""
+    try:
+        if getattr(_URGENT_TL, "on", False):
+            _URGENT_TL.on = False
+            return True
+    except Exception:                                    # noqa: BLE001
+        pass
+    return False
+
+
+def pacer_urgent_stats():
+    """Канал -> отправок из резерва. Приёмка пакета: >0 в окне с транзитом."""
+    with _PACER_LOCK:
+        return dict(_PACER_URGENT_SENT)
+
+
+def _pacer_take(url: str, rate: float, burst: float, reserve: float = 0.0,
+                urgent: bool = False) -> bool:
+    """O(1) try-take: ленивое пополнение по монотонным часам. Токен есть -> True (списываем).
+
+    РЕЗЕРВ (бёрст-в-щель): обычной отправке нужно tok >= 1 + reserve, залповой — tok >= 1.
+    reserve=0 (или urgent=True) => условие прежнее посимвольно. Резерв клампится к burst-1,
+    иначе ручка, выставленная больше ведра, заперла бы канал для ровного потока НАСОВСЕМ —
+    это ровно класс «незнание обязано закрывать гард», только наоборот: тут гард обязан не
+    закрыться слишком сильно, поэтому предел жёсткий и в коде, а не в дисциплине вызывающего.
+    """
     now = time.monotonic()
+    _res = 0.0 if urgent else max(0.0, min(float(reserve), float(burst) - 1.0))
     with _PACER_LOCK:
         tok, last = _PACER_BUCKETS.get(url, (float(burst), now))
         tok = min(float(burst), tok + max(0.0, now - last) * float(rate))
-        if tok >= 1.0:
+        if tok >= 1.0 + _res:
             _PACER_BUCKETS[url] = [tok - 1.0, now]
+            if urgent:
+                _PACER_URGENT_SENT[url] = _PACER_URGENT_SENT.get(url, 0) + 1
             return True
         _PACER_BUCKETS[url] = [tok, now]
         return False
@@ -2536,7 +2608,7 @@ def volley_pacer_stats():
 
 def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5,
                    paced: bool = True, rate: float = None, burst: float = None,
-                   source_ip: str = None):
+                   source_ip: str = None, urgent: bool = False):
     """Синхронная рассылка raw в секвенсер тёплой сессией. Возврат (ok, err_msg).
     В отличие от _post_raw_tx (best-effort в треде, глотает всё) ЗДЕСЬ исход нужен вызывающему:
     от него зависит, вернуть ли запись лестницы на место или считать её потраченной.
@@ -2549,7 +2621,7 @@ def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5,
     if paced and _VOLLEY_PACER_ON:
         _r = _PACER_RATE if rate is None else rate
         _b = _PACER_BURST if burst is None else burst
-        if not _pacer_take(_ck, _r, _b):
+        if not _pacer_take(_ck, _r, _b, reserve=_PACER_RESERVE, urgent=urgent):
             return False, "pacer_dry"          # сухо: отдельный сигнал вызывающему, без RTT
     try:
         payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
