@@ -320,6 +320,69 @@ def decode_forward_answer(raw_hex):
     return agg, answer
 
 
+def tip_from_raw(raw_hex, basefee=None):
+    """tip (maxPriorityFeePerGas, wei) из СЫРОЙ tx кадра суб-блока, либо None.
+
+    21.08 (живое кольцо зеркала): класс tip эпизода съезжает за минуты (7.5→3.7 мгвей за
+    утро 21.08), а кольцо кормилось только полными сканами индекса (19% блоков, с лагом) —
+    tip-match=0 в 4/4 вердиктов эпизода. Кадр суб-блока несёт транзитную tx целиком, tip
+    лежит в её RLP: третье поле для type-2/3, gasPrice−basefee для type-0/1 (basefee — из
+    того же кадра). Мини-ридер первых трёх RLP-полей: O(десятков байт), без зависимостей.
+    Любая несходимость формы -> None (незнание не кормит кольцо)."""
+    if not raw_hex:
+        return None
+    try:
+        h = raw_hex[2:] if raw_hex.startswith("0x") else raw_hex
+        b = bytes.fromhex(h[:220])          # первые 3 поля живут в первых ~40 байтах
+        typ = b[0]
+        if typ in (1, 2, 3):
+            i = 1
+        elif typ >= 0xc0:                    # legacy: RLP-список сразу
+            i = 0
+        else:
+            return None
+
+        def _item(pos):
+            p = b[pos]
+            if p < 0x80:
+                return int(p), pos + 1
+            if p < 0xb8:
+                ln = p - 0x80
+                return int.from_bytes(b[pos + 1:pos + 1 + ln], "big"), pos + 1 + ln
+            return None, None                # длинное поле в первых трёх не встречается
+
+        # заголовок списка
+        p = b[i]
+        if p >= 0xf8:
+            i += 1 + (p - 0xf7)
+        elif p >= 0xc0:
+            i += 1
+        else:
+            return None
+        if typ in (1, 2, 3):
+            _, i = _item(i)                  # chain_id
+            if i is None:
+                return None
+            _, i = _item(i)                  # nonce
+            if i is None:
+                return None
+            v, _ = _item(i)                  # type-2/3: maxPriorityFee; type-1: gasPrice
+            if v is None:
+                return None
+            if typ == 1:
+                return (v - int(basefee)) if basefee else None
+            return int(v)
+        _, i = _item(i)                      # legacy: nonce
+        if i is None:
+            return None
+        v, _ = _item(i)                      # gasPrice
+        if v is None or not basefee:
+            return None
+        return int(v) - int(basefee)
+    except Exception:                        # noqa: BLE001
+        return None
+
+
 def extract_txs(d):
     diff = d.get("diff") or {}
     txs = diff.get("transactions")

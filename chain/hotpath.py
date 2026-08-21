@@ -70,6 +70,9 @@ CU_ALERT_PAGE_MIN_SPAN_SEC = float(os.environ.get("CU_ALERT_PAGE_MIN_SPAN_SEC", 
 # Порог эскалации бэкоффа, при котором обрывы hot-path будят ЧЕЛОВЕКА (#4 = ~24с ожидания,
 # то есть три подряд неудачных возврата). Быстрые удачные реконнекты остаются в журнале.
 HOT_WS_PAGE_BACKOFF_N = int(os.environ.get("HOT_WS_PAGE_BACKOFF_N", "4"))
+# 21.08: живая подача tip транзита в кольцо зеркала прямо из recv-петли (см. хук у
+# FORWARD_SEL). 0 = только прежняя индексная подача (полные сканы, с лагом).
+MIRROR_LIVE_FEED = os.environ.get("MIRROR_LIVE_FEED", "1").lower() not in ("0", "false", "no")
 # Сколько измеренного времени должно накопиться, прежде чем порогу можно верить. Это замена
 # защёлке «не раньше 6ч аптайма»: та глушила сторожа рестартами (07.08 — 21 рестарт, 0 тревог
 # в сутки максимального расхода), а требование span глушится только отсутствием ИЗМЕРЕНИЙ.
@@ -2708,7 +2711,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     import websockets
     import brotli
     from chain.feeds import (resolve_feeds, extract_txs, block_number_of, decode_forward_answer,
-                             FORWARD_SEL, basefee_of, primary_map)
+                             FORWARD_SEL, basefee_of, primary_map, tip_from_raw)
     # ФОНОВЫЕ чтения -> бесплатный публичный RPC (CU-замер 25.07: фоновые читатели съедали 5×
     # квоту Alchemy). Пусто/ошибка конструктора -> прежний rpc, поведение как раньше.
     _bg_rpc = rpc
@@ -3102,6 +3105,18 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                     for _raw, _to in txs:                        # SHADOW слоя 1: декод transmit из фида (log-only)
                         if _raw and FORWARD_SEL in _raw:
                             _dec = decode_forward_answer(_raw)
+                            # 21.08 ЖИВОЕ КОЛЬЦО ЗЕРКАЛА: tip транзита — в кольцо ЗДЕСЬ,
+                            # ~200мс от события, а не полным сканом индекса с лагом (класс
+                            # эпизода съезжал быстрее колец: tip-match=0 в 4/4 утром).
+                            # Дедуп на (agg, bn) — transmit виден в нескольких суб-кадрах,
+                            # повторы исказили бы моду кольца. Сбоку от денег: O(десятков
+                            # байт) + try в note_transit_tip; отказ = кольцо не пополнилось.
+                            # Откат: MIRROR_LIVE_FEED=0 (индексная подача остаётся как была).
+                            if _dec and MIRROR_LIVE_FEED and ("m", _dec[0], bn) not in feed_handled:
+                                feed_handled.add(("m", _dec[0], bn))
+                                from chain.execute import note_transit_tip as _ntt_live
+                                _ntt_live(tip_from_raw(_raw, basefee=_fresh_basefee()),
+                                          agg=_dec[0])
                             if _dec and _dec[0] in shadow_map:
                                 _sym, _scale, _oracle = shadow_map[_dec[0]]
                                 if cfg.price_from_feed and _feed_spawn_gate(_oracle, bn, feed_handled):
