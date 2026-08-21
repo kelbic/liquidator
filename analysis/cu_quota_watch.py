@@ -43,6 +43,13 @@ ex-boot-вид). Здесь — ДВА РАЗНЫХ ЧИСЛА ДЛЯ ДВУХ �
     Автодетектор режима сознательно НЕ строится: он резал бы историю, проверенную честной, и
     глушил бы собственный канал тревог — ровно тот отказ, что описан в каноне 20.08.
 
+(3) ТЕМП — НЕ ОСТАТОК. ЗАКРЫТ 21.08, СМ. БЛОК «ОСТАТОК» НИЖЕ. Приговор выше сравнивает
+    CU/мес с квотой 30M/мес, то есть СКОРОСТЬ со СКОРОСТЬЮ. Но квота Alchemy — это ВЕДРО,
+    которое сбрасывается раз в месяц, и темп ниже квоты совместим с НУЛЕВЫМ ОСТАТКОМ на
+    счету. Разбор 21.08: #5735 шёл 27M/мес (сторож писал «~33 сут» — успокаивающе), а по
+    факту месяц-к-дате был 26.3M из 30M, остаток 3.7M и до сброса 10 суток, то есть при
+    эпизодном темпе ~3.4 суток до нуля. Ни одно число прежнего приговора этого не видело.
+
 (2) КВОТА НА АККАУНТ, А СРАВНЕНИЕ ПО КЛЮЧУ. Если два ключа делят аккаунт, связывающий предел —
 их СУММА, и per-key сторож не зазвонит никогда. Развилка по ключу C поднята владельцу
 20.08 (HIL cu-quota:key-c-account); URL аккаунт не кодирует — агентом не решается.
@@ -58,6 +65,7 @@ ssh read-only; ключи/секреты не читаются, идентифи
          CU_WATCH_MIN_TRAIL_H (сколько накопить, чтобы вообще судить; дефолт 6)
          CU_WATCH_KEEP_H (сколько держать историю; дефолт 168)
 """
+import calendar
 import json
 import os
 import re
@@ -71,6 +79,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WATCH_DIR = os.path.expanduser("~/.fleet-watch")
 STATE_PATH = os.path.join(WATCH_DIR, "cu-quota.state")
 HISTORY_PATH = os.path.join(WATCH_DIR, "cu-quota.history.jsonl")
+# Боевые дефолты. run() их НЕ берёт напрямую — выводит из history_path (_beside_history),
+# иначе тест, уведший историю во временный каталог, писал бы книгу в боевой (поймано 21.08).
+ANCHOR_PATH = os.path.join(WATCH_DIR, "cu-quota.anchor.json")   # остаток: якорь от владельца
+LEDGER_PATH = os.path.join(WATCH_DIR, "cu-quota.ledger.json")   # остаток: расход ПОСЛЕ якоря
 SOURCE = "cu-quota"
 HOST = os.environ.get("CU_WATCH_SSH", "root@185.173.146.134")
 QUOTA_M = 30.0
@@ -269,6 +281,146 @@ def trail_summary(recs, *, trail_sec, now=None):
     return {h: ((cu / sec * SEC_MONTH / 1e6) if sec > 0 else 0.0, sec) for h, (cu, sec) in agg.items()}
 
 
+# ============================== ОСТАТОК (ПРЕДЕЛ 3, 21.08) ==============================
+# Приговор по темпу отвечает на вопрос «устойчиво ли много жжём». Вопрос «хватит ли до
+# сброса» — ДРУГОЙ, и требует ДРУГОЙ величины: сколько CU уже списано в ТЕКУЩЕМ биллинговом
+# месяце. Её нет ни в журнале, ни в нашем учёте: журнал знает только расход с момента, когда
+# мы начали смотреть. Поэтому механика двухчленная:
+#   ЯКОРЬ  (cu-quota.anchor.json) — месяц-к-дате на известный момент. Число ВНЕШНЕЕ: его
+#          источник — дашборд владельца, агенту он недоступен (квота на аккаунт, аккаунт
+#          владельческий). Ставится руками.
+#   КНИГА  (cu-quota.ledger.json) — сумма CU, накопленная прогонами ПОСЛЕ момента якоря.
+#          Отдельный файл, а не история: историю подрезает KEEP_H (168ч), а месяц длиннее.
+# МЕСЯЦ-К-ДАТЕ = ЯКОРЬ + КНИГА. Тревога — когда остатка не хватает до сброса.
+#
+# ТРИ ГАРДА, КАЖДЫЙ ИЗ КАНОНА (не из вкуса):
+#  * НЕТ ЯКОРЯ -> НЕ СУДИМ ВОВСЕ (не «считаем ведро полным»): незнание обязано закрывать
+#    гард. Тихий прогон при этом ОБЯЗАН сказать «якоря нет» — иначе молчание сторожа об
+#    остатке неотличимо от «остаток в порядке» (мёртвый сторож хуже отсутствующего).
+#  * ЯКОРЬ ПРОТУХ (с его момента прошёл сброс месяца) -> тоже НЕ СУДИМ и зовём разобраться.
+#    Протухший якорь ХУЖЕ отсутствующего: он считает прошлый месяц за текущий и врёт в
+#    успокаивающую сторону (канон acceptance-reference-not-self-report, форма «протухший
+#    артефакт», 16.08).
+#  * ЯКОРЬ — ЧИСЛО, ВВЕДЁННОЕ РУКАМИ, и тревога обязана это ГОВОРИТЬ вместе с приговором,
+#    как она уже везёт порог и горизонт (канон 29ae77e). Рукописный JSON однажды уже открыл
+#    гард огня — на веру он не принимается, и разбирающий должен видеть, на чём стоит вывод.
+
+
+def _beside_history(history_path, name):
+    """Путь рядом с ИСТОРИЕЙ, а не прибитый к боевому каталогу.
+
+    ГАРД НА ТРАНСПОРТЕ, А НЕ НА ДИСЦИПЛИНЕ ВЫЗЫВАЮЩЕГО (канон 19.07 + tests-never-touch-
+    production-channels; тот же приём, которым notify.py выводит HANDLED_ARCHIVE из INBOX).
+    Пойман 21.08 на себе: первая версия этого блока прибила ЛЕДЖЕР к WATCH_DIR, и уже
+    существующая сьюта — которая честно уводит STATE_PATH и HISTORY_PATH во временный
+    каталог — молча создала боевой cu-quota.ledger.json. Заглушка, которую каждый будущий
+    тест обязан не забыть, границу не держит: её забудут. Теперь достаточно увести историю,
+    и книга с якорем уезжают следом сами.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(history_path)) or ".", name)
+
+
+def load_anchor(path=None):
+    """Якорь месяца-к-дате. Отсутствие/порча -> {} (приговор по остатку просто не выносится)."""
+    try:
+        with open(path or ANCHOR_PATH, encoding="utf-8") as f:
+            a = json.load(f)
+        return a if isinstance(a, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_ledger(path=None):
+    try:
+        with open(path or LEDGER_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def ledger_add(per_host, anchor, path=None, *, now=None):
+    """Дописать расход ЭТОГО прогона в книгу и вернуть её.
+
+    Складываем только то, что уже отсечено по времени в parse_cu_windows (since_epoch), —
+    то есть окна, не посчитанные прошлым прогоном. Двойного счёта нет ровно по той же
+    причине, по которой его нет в истории, и проверяется тем же тестом перекрытия.
+    Ведём книгу ТОЛЬКО по хостам, у которых есть якорь: остальным её не с чем складывать.
+    """
+    path = path or LEDGER_PATH
+    led = load_ledger(path)
+    hosts = led.setdefault("hosts", {})
+    for host, d in (per_host or {}).items():
+        a = (anchor.get("hosts") or {}).get(host)
+        if not a:
+            continue
+        e = hosts.setdefault(host, {"cu": 0.0, "since": float(a.get("as_of", 0))})
+        e["cu"] = float(e.get("cu", 0.0)) + float(d.get("cu", 0))
+    if not hosts:
+        # Ни одного якорного хоста -> писать нечего. ВТОРОЙ, НЕЗАВИСИМЫЙ ГАРД к
+        # _beside_history: даже прибитый путь не породит файл там, где учёта остатка нет.
+        return led
+    led["ts"] = float(now if now is not None else time.time())
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(led, f, ensure_ascii=False)
+    except OSError:
+        pass
+    return led
+
+
+def next_reset(epoch, spec="calendar"):
+    """Момент следующего сброса квоты ПОСЛЕ epoch (UTC).
+
+    "calendar" — первое число следующего месяца. Иначе ожидается день месяца числом
+    (годовщина регистрации аккаунта): ближайшее наступление этого дня после epoch.
+    Смысл величины — не «когда красиво», а «когда ведро наполнится снова»: именно с ней
+    сравнивается срок до нуля.
+    """
+    tm = time.gmtime(epoch)
+    if spec == "calendar":
+        day = 1
+    else:
+        try:
+            day = max(1, min(28, int(spec)))
+        except (TypeError, ValueError):
+            day = 1
+    y, m = tm.tm_year, tm.tm_mon
+    if tm.tm_mday >= day:                      # этот месяц уже прошёл точку -> следующий
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    return calendar.timegm((y, m, day, 0, 0, 0, 0, 1, 0))
+
+
+def balance_verdicts(anchor, ledger, burn_cu_per_day, *, now=None):
+    """[(host, mtd, remaining, days_zero, days_reset, burn, stale)] по хостам С ЯКОРЕМ.
+
+    Тревожим, когда КОНЧИТСЯ РАНЬШЕ, ЧЕМ НАЛЬЁТСЯ: days_zero < days_reset. Именно это, а
+    не «темп выше квоты», и есть связывающий предел — 21.08 темп был 27M против квоты 30M
+    (сторож молчал бы вечно), а остатка было на трое суток.
+
+    stale=True — с момента якоря прошёл сброс: приговор НЕ выносится, но и молчать нельзя,
+    поэтому запись возвращается с пометкой и разбирается вызывающим отдельной веткой.
+    """
+    now = float(now if now is not None else time.time())
+    quota = float(anchor.get("quota_cu", QUOTA_M * 1e6))
+    spec = anchor.get("reset", "calendar")
+    led = (ledger or {}).get("hosts") or {}
+    out = []
+    for host, a in sorted((anchor.get("hosts") or {}).items()):
+        as_of = float(a.get("as_of", 0))
+        stale = as_of > 0 and now >= next_reset(as_of, spec)
+        mtd = float(a.get("mtd_cu", 0)) + float((led.get(host) or {}).get("cu", 0.0))
+        remaining = quota - mtd
+        burn = float(burn_cu_per_day.get(host, 0.0))
+        days_reset = max(0.0, (next_reset(now, spec) - now) / 86400.0)
+        days_zero = (remaining / burn) if burn > 0 else float("inf")
+        if stale or days_zero < days_reset:
+            out.append((host, mtd, remaining, days_zero, days_reset, burn, stale))
+    return out
+
+
 def _fetch_journal():
     r = subprocess.run(
         ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", HOST,
@@ -304,7 +456,8 @@ def _save_state(st):
         pass
 
 
-def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None):
+def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
+        anchor_path=None, ledger_path=None):
     threshold = float(os.environ.get("CU_WATCH_PROJ_M", "26"))
     min_windows = int(os.environ.get("CU_WATCH_MIN_WINDOWS", "20"))
     fail_streak_n = int(os.environ.get("CU_WATCH_FAIL_STREAK", "3"))
@@ -312,6 +465,8 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None):
     min_trail_sec = float(os.environ.get("CU_WATCH_MIN_TRAIL_H", "6")) * 3600.0
     keep_sec = float(os.environ.get("CU_WATCH_KEEP_H", "168")) * 3600.0
     history_path = history_path or HISTORY_PATH
+    anchor_path = anchor_path or _beside_history(history_path, "cu-quota.anchor.json")
+    ledger_path = ledger_path or _beside_history(history_path, "cu-quota.ledger.json")
     notify_fn = notify_fn or _fleet_notify()
     st = _load_state()
     now_s = float(now if now is not None else time.time())
@@ -356,6 +511,12 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None):
     trail = trail_summary(recs, trail_sec=trail_sec, now=now_s)
     alarms = quota_verdicts(recs, threshold=threshold, trail_sec=trail_sec,
                             min_trail_sec=min_trail_sec, now=now_s)
+    # ОСТАТОК — вторая, независимая величина (ПРЕДЕЛ 3). Темп берём тот же, которым судим
+    # квоту (интеграл хвоста), чтобы два приговора не разъехались основанием.
+    anchor = load_anchor(anchor_path)
+    ledger = ledger_add(per_host, anchor, ledger_path, now=now_s)
+    burn_day = {h: r * 1e6 / 30.0 for h, (r, _sec) in trail.items()}
+    bal = balance_verdicts(anchor, ledger, burn_day, now=now_s)
 
     for host, rate, sec, cu_total in alarms:
         days = QUOTA_M / rate * 30.0 if rate > 0 else 0.0
@@ -388,7 +549,46 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None):
                                 key="cu-quota:%s" % host, dedup_sec=21600)
             out("cu-quota: %s интеграл %.1fM за %.1fч (n=%d рестартов) -> %s"
                 % (host, rate, sec / 3600.0, restarts, verdict))
-    if not alarms:
+    for host, mtd, remaining, days_zero, days_reset, burn, stale in bal:
+        a = (anchor.get("hosts") or {}).get(host, {})
+        if stale:
+            # Протухший якорь = гард остатка ВЫКЛЮЧЕН. Молчать нельзя: молчание сторожа об
+            # остатке читается как «остаток в порядке» (мёртвый сторож хуже отсутствующего).
+            msg = ("💸 ЯКОРЬ ОСТАТКА ПРОТУХ (%s): он снят %s, а с тех пор биллинговый месяц "
+                   "уже сбрасывался ⇒ приговор по ОСТАТКУ НЕ ВЫНОСИТСЯ (считать прошлый месяц "
+                   "за текущий = врать в успокаивающую сторону). Темп судится по-прежнему.\n"
+                   "ЧТО СДЕЛАТЬ: взять у владельца свежий месяц-к-дате с дашборда Alchemy и "
+                   "переставить mtd_cu/as_of в %s (книга cu-quota.ledger.json обнуляется вместе "
+                   "с ним)." % (host, a.get("as_of_iso", a.get("as_of", "?")), ANCHOR_PATH))
+            key = "cu-quota:anchor-stale:%s" % host
+        else:
+            msg = ("💸 ОСТАТОК КВОТЫ (не темп!): %s израсходовал ~%.1fM из %.0fM за месяц, "
+                   "ОСТАТОК ~%.1fM. При текущем темпе %.0fk CU/сут это ~%.1f сут, а до сброса "
+                   "квоты ещё %.1f сут ⇒ ВЕДРО КОНЧИТСЯ РАНЬШЕ, ЧЕМ НАЛЬЁТСЯ.\n"
+                   "ОСНОВАНИЕ (обязано ехать вместе с приговором): якорь снят %s, "
+                   "месяц-к-дате на тот момент %.1fM; с тех пор насчитано книгой %.1fM. "
+                   "Источник якоря: %s\n"
+                   "ЯКОРЬ — ЧИСЛО, ВВЕДЁННОЕ РУКАМИ с владельческого дашборда, агентом он не "
+                   "перепроверяется: если он неверен, неверен и этот вывод.\n"
+                   "РАЗБОР АГЕНТУ: это НЕ то же самое, что тревога по темпу — темп может быть "
+                   "НИЖЕ квоты, а остатка не быть. Увести потребителей на ключ с запасом; "
+                   "звать человека, если нужен новый ключ/оплата или правка боевого env (HIL-1)."
+                   % (host, mtd / 1e6, float(anchor.get("quota_cu", QUOTA_M * 1e6)) / 1e6,
+                      remaining / 1e6, burn / 1000.0, days_zero, days_reset,
+                      a.get("as_of_iso", a.get("as_of", "?")),
+                      float(a.get("mtd_cu", 0)) / 1e6,
+                      (mtd - float(a.get("mtd_cu", 0))) / 1e6,
+                      a.get("source", "?")))
+            key = "cu-quota:balance:%s" % host
+        if notify_fn is None:
+            out("cu-quota: КАНАЛ НЕДОСТУПЕН, текст ниже"); out(msg)
+        else:
+            v = notify_fn(msg, source=SOURCE, hil=False, key=key, dedup_sec=21600)
+            out("cu-quota: ОСТАТОК %s %.1fM из %.0fM (%s) -> %s"
+                % (host, mtd / 1e6, float(anchor.get("quota_cu", QUOTA_M * 1e6)) / 1e6,
+                   "ЯКОРЬ ПРОТУХ" if stale else "%.1f сут против %.1f" % (days_zero, days_reset), v))
+
+    if not alarms and not bal:
         # Тихий прогон печатает ТО ЖЕ число, которым судит (интеграл), и рядом всплеск —
         # иначе «тихо» неотличимо от «нечем судить», а это разные состояния (канон
         # «мёртвый сторож хуже отсутствующего»: тишина требует положительного основания).
@@ -397,8 +597,16 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None):
             rate, sec = trail.get(h, (0.0, 0.0))
             mark = "" if sec >= min_trail_sec else "*копим"
             bm = ("всплеск %.1fM" % burst[h][0]) if h in burst else "всплеск —"
-            parts.append("%s=%.1fM/хв%.1fч%s(%s,бут%d)"
-                         % (h, rate, sec / 3600.0, mark, bm, per_host[h]["boot"]))
+            ah = (anchor.get("hosts") or {}).get(h)
+            if ah:
+                mtd_h = float(ah.get("mtd_cu", 0)) + float(
+                    ((ledger.get("hosts") or {}).get(h) or {}).get("cu", 0.0))
+                q = float(anchor.get("quota_cu", QUOTA_M * 1e6))
+                ost = "ост%.1fM" % ((q - mtd_h) / 1e6)
+            else:
+                ost = "ост:якоря нет"     # молчание об остатке обязано быть ПРОИЗНЕСЕНО
+            parts.append("%s=%.1fM/хв%.1fч%s(%s,бут%d,%s)"
+                         % (h, rate, sec / 3600.0, mark, bm, per_host[h]["boot"], ost))
         out("cu-quota: тихо (порог %.0fM, хвост %.0fч, мин %.0fч, рестартов %d): %s"
             % (threshold, trail_sec / 3600.0, min_trail_sec / 3600.0, restarts, ", ".join(parts)))
     return 0
