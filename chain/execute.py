@@ -2474,10 +2474,17 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
         # ХУДШЕМУ случаю (проба после срабатывания триггера), квитанция её освободит и
         # запишет истину — суточный ФАКТ от этого не растёт.
         try:
+            # 21.08 (вскрытие budget_reserve_skips=1690 при sent=2204): бронь ставится ПО
+            # ХЭШУ ОДИН РАЗ. Прежде повторная отправка ТОЙ ЖЕ подписанной пробы (запись
+            # вернулась в очередь после pacer_dry/отказа рассылки — 1349 возвратов за одно
+            # утреннее окно) перезаписывала словарь, но агрегат наращивала ЗАНОВО, а
+            # квитанция/таймаут освобождали только одну бронь: ~$0.47 фантома на повтор,
+            # ~$634 против капа $150 — гейт закрывался, флот молчал ровно в каскаде.
             _res = (_VOLLEY_PROBE_GAS_WORST * int(st["max_fee"])
                     * float(getattr(cfg, "eth_price_usd", 0.0) or 0.0) / 1e18)
-            _VOLLEY_RESERVE_BY_HASH[h] = max(0.0, _res)
-            _VOLLEY_GAS_RESERVED += max(0.0, _res)
+            if h not in _VOLLEY_RESERVE_BY_HASH:
+                _VOLLEY_RESERVE_BY_HASH[h] = max(0.0, _res)
+                _VOLLEY_GAS_RESERVED += max(0.0, _res)
         except Exception:
             pass
     return h
