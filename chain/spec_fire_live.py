@@ -3073,6 +3073,15 @@ class SpecFireLive:
             rows, (t_idx, t_tip) = t
             inter = [r for r in rows if 1 <= r[2] <= 20 and r[4]]
             match_d = [r[2] for r in rows if r[4]]
+            # Копилка kelbic 21.08: (а) транзит-класс МЕЖДУ слотами лестницы (наших tx есть,
+            # на классе — ни одной) — если доля заметна, аргумент за ДРОБЛЕНИЕ сетки слотов,
+            # не за интерполяцию; (б) низкая плотность (наших <10 в блоке с транзитом) —
+            # ДРУГОЙ дефект, чем латентность (дыра арма/бёрста), маскировать друг друга не
+            # должны. Оба — счётчиками, лечение только по замеренной доле.
+            if rows and not match_d:
+                self.stats["class_between_slots"] = self.stats.get("class_between_slots", 0) + 1
+            if len(rows) < 10:
+                self.stats["low_density_blocks"] = self.stats.get("low_density_blocks", 0) + 1
             ring = self.stats.setdefault("match_delta_ring", [])
             ring.extend(match_d)
             del ring[:-400]                       # кольцо ~400 последних значений
@@ -3092,9 +3101,11 @@ class SpecFireLive:
                                                bn=bn))
                 except Exception:                            # noqa: BLE001
                     pass
-            self._log("SPECFIRE СТАДИИ blk=%d проба=%s delta=%+d: %s | топ-вкладчик: %s%s"
+            self._log("SPECFIRE СТАДИИ blk=%d проба=%s delta=%+d плотность=%d%s: %s | топ-вкладчик: %s%s"
                       % (bn, str(_first_m[0])[:12] if _first_m else "—",
-                         _first_m[2] if _first_m else 0, _prof_s,
+                         _first_m[2] if _first_m else 0, len(rows),
+                         " (НИЗКАЯ — дыра арма/бёрста, не латентность)" if len(rows) < 10 else "",
+                         _prof_s,
                          _worst[0] or "—",
                          (" %.0fмс" % _worst[1]) if _worst[1] is not None else ""))
             self._log("SPECFIRE ПЕРЕСЕЧЕНИЕ blk=%d транзит=%d@%d: полоса∩класс=%d "
@@ -3789,11 +3800,14 @@ class SpecFireLive:
                       # int; с двумя egress-адресами суммарное число не отвечает на вопрос
                       # «умер адрес или режет секвенсер», а именно он теперь и стоит.
                       "pacer_dry=%s spill_sent=%s transport_reject=%s urgent_sent=%s match_delta=%s "
+                      "class_between_slots=%s low_density_blocks=%s "
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
                           _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej or "—",
                           _purg or "—", _md_str,
+                          self.stats.get("class_between_slots", 0),
+                          self.stats.get("low_density_blocks", 0),
                           _es or "—", _cs or "—", _is,
                           ("%s/%s" % (_wkey[0][:10], _wkey[1][:10])) if _wkey else "НЕТ",
                           _pw, self.stats))
