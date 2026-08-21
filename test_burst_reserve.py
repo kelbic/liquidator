@@ -106,10 +106,30 @@ while ex._pacer_take(C0, RATE, BURST):           # без reserve/urgent — к�
         break
 check("без резерва ведро отдаёт ровно burst (30)", took0 == 30, took0)
 
-# ---- 8. Гард дрейфа: флаг держится на ВЕСЬ обход каналов ----
+# ---- 8. Утечка пометки: ранний выход пробы НЕ заражает следующую (линза 20.08) ----
+# Стенд поведенческий: помечаем тред, пробуем отправку, которая умирает ДО обхода каналов
+# (нет лестницы у ноги) — пометка обязана сгореть вместе с ней.
+_died = {"n": 0}
+
+
+class _RpcStub:
+    def _web3(self):
+        raise AssertionError("сеть не должна вызываться")
+
+
+ex.pacer_mark_urgent()
+try:
+    ex.send_presigned_probe(_RpcStub(), None, "0x" + "11" * 20, log=None,
+                            broadcast_raw_urls=["http://x"])
+except Exception:
+    _died["n"] += 1
+check("пометка сгорела вместе со своей пробой (не досталась следующей)",
+      ex._urgent_take_flag() is False)
+
+# ---- 9. Гард дрейфа: флаг снимается на входе и держится на весь обход каналов ----
 _SRC = open(ex.__file__.replace(".pyc", ".py")).read()
-check("флаг снимается ОДИН раз на пробу (_urg перед обходом)",
-      "_urg = _urgent_take_flag()" in _SRC)
+check("флаг снимается НА ВХОДЕ функции (семантика «на попытку отправки»)",
+      _SRC.index("_urg = _urgent_take_flag()") < _SRC.index("_chans = broadcast_channels"))
 for frag in ("source_ip=_ip, urgent=_urg", "urgent=_urg)"):
     check("канал получает флаг: %r" % frag, frag in _SRC)
 import chain.fire_engine as fe  # noqa: E402
