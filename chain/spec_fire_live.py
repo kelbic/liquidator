@@ -3023,6 +3023,39 @@ class SpecFireLive:
                 if rep:
                     self._log("SPECFIRE %s" % rep)
                     self._pos_alert(rep, blind)
+                    # П.1/П.2 (kelbic 21.08): пересечение ПО ХЭШАМ + метрика «FCFS-полоса
+                    # на верном классе». Тред индекса (не recv-петля); лог КАПИРОВАН —
+                    # только delta в [-3..25] или match (урок «строка-на-пробу = вторая
+                    # нагрузка»). Кольцо delta-по-match кормит p50/p90 закрытия окна.
+                    if not blind:
+                        self._pos_table(ci, bn, agg)
+        except Exception:
+            pass
+
+    def _pos_table(self, ci, bn, agg):
+        """П.1: таблица пересечения по хэшам; П.2: копилка delta по tip-match. Сбоку от денег:
+        любой отказ глотается, деньги этот путь не трогает (прибор в треде индекса)."""
+        try:
+            t = ci.our_position_table(bn, agg=agg)
+            if not t:
+                return
+            rows, (t_idx, t_tip) = t
+            inter = [r for r in rows if 1 <= r[2] <= 20 and r[4]]
+            match_d = [r[2] for r in rows if r[4]]
+            ring = self.stats.setdefault("match_delta_ring", [])
+            ring.extend(match_d)
+            del ring[:-400]                       # кольцо ~400 последних значений
+            shown = [r for r in rows if (-3 <= r[2] <= 25) or r[4]][:60]
+            body = " ".join("%s:%+d@%d%s" % (h[:10], d, tip, "*" if m else "")
+                            for h, _i, d, tip, m in shown)
+            mm = sorted(match_d)
+            p50 = mm[len(mm) // 2] if mm else None
+            p90 = mm[int(len(mm) * 0.9)] if mm else None
+            self._log("SPECFIRE ПЕРЕСЕЧЕНИЕ blk=%d транзит=%d@%d: полоса∩класс=%d "
+                      "(вердикт «формула» пишет ТОЛЬКО это число), match=%d delta p50=%s "
+                      "p90=%s | %s%s"
+                      % (bn, t_idx, t_tip, len(inter), len(match_d), p50, p90, body,
+                         " …" if len(rows) > len(shown) else ""))
         except Exception:
             pass
 
@@ -3700,18 +3733,21 @@ class SpecFireLive:
                 # трейсбеком — то есть отказ учёта делал бы невидимым и сам отказ, и приёмку
                 # окна разом. Печатаем причину В ПОЛЕ и идём дальше.
                 _pw = "УЧЁТ ПОЗИЦИЙ УПАЛ: %s: %s" % (type(_e).__name__, _e)
+            _mdr = sorted(self.stats.get("match_delta_ring") or [])
+            _md_str = ("p50=%+d/p90=%+d/n=%d" % (_mdr[len(_mdr)//2], _mdr[int(len(_mdr)*0.9)],
+                                                 len(_mdr))) if _mdr else "—"
             self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
                       "budget_reserve_skips=%d budget_inflight_skips=%d "
                       # 20.08: все три — ПО КАНАЛАМ (url|ip). transport_reject был суммарным
                       # int; с двумя egress-адресами суммарное число не отвечает на вопрос
                       # «умер адрес или режет секвенсер», а именно он теперь и стоит.
-                      "pacer_dry=%s spill_sent=%s transport_reject=%s urgent_sent=%s "
+                      "pacer_dry=%s spill_sent=%s transport_reject=%s urgent_sent=%s match_delta=%s "
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
                           _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej or "—",
-                          _purg or "—",
+                          _purg or "—", _md_str,
                           _es or "—", _cs or "—", _is,
                           ("%s/%s" % (_wkey[0][:10], _wkey[1][:10])) if _wkey else "НЕТ",
                           _pw, self.stats))

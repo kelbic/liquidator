@@ -1177,6 +1177,27 @@ class ChainIndex:
             return s
 
     # ---- позиции наших проб (метрика №1) ----
+    def our_position_table(self, bn, agg=None):
+        """П.1 пакета kelbic 21.08: ПЕРЕСЕЧЕНИЕ ПО ХЭШАМ, не по агрегатным счётчикам.
+        [(hash, наш_idx, delta, tip_наш, tip_match)] для КАЖДОГО нашего tx блока с транзитом,
+        плюс (transit_idx, transit_tip). None — блока/транзита/наших нет. Урок 50262420:
+        полоса=9 и tip-match=42 в одной строке принадлежали РАЗНЫМ tx (пересечение 0) —
+        вердикт «формула собрана» имеет право писать только эта таблица."""
+        f = self.block_facts(bn)
+        if not f:
+            return None
+        ours = f.get("ours") or {}
+        if not ours:
+            return None
+        st, tr = self.transit_report(bn, agg=agg)
+        if st != "transit" or not tr:
+            return None
+        t_idx, t_tip = tr["index"], tr["tip"]
+        rows = [(h, x["index"], x["index"] - t_idx, x["tip"], x["tip"] == t_tip)
+                for h, x in ours.items()]
+        rows.sort(key=lambda r: r[2])
+        return rows, (t_idx, t_tip)
+
     def our_position_report(self, bn, agg=None):
         """Строка отчёта о позициях НАШИХ tx в блоке против транзита, либо None.
 

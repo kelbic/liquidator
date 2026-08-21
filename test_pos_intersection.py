@@ -1,0 +1,81 @@
+"""П.1/П.2 пакета kelbic 21.08: пересечение полоса∩класс ПО ХЭШАМ + метрика delta-по-match.
+
+Урок 50262420 (ретро с цепи): полоса=9 и tip-match=42 в одной строке принадлежали РАЗНЫМ tx —
+пересечение 0, вердикт «формула собрана» отозван. Два агрегатных счётчика НЕ доказывают
+пересечение; писать вердикт имеет право только таблица по хэшам.
+
+Фикстура ниже СПИСАНА С ЦЕПИ (блок 50262420, независимый ретро-проход), не с продукта:
+транзит idx=127 tip=1775000; в полосе 9 наших НЕ на классе; 42 на классе с delta +72..+267.
+"""
+import sys
+import pathlib as _pl
+
+sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
+
+FAILS = []
+
+
+def check(name, ok, extra=""):
+    print("%-4s %s%s" % ("OK" if ok else "FAIL", name, ("" if ok else " — " + str(extra)[:200])))
+    if not ok:
+        FAILS.append(name)
+
+
+# ---- Стенд chain_index.our_position_table на фикстуре 50262420 ----
+import chain.chain_index as ci  # noqa: E402
+
+idx = ci.ChainIndex.__new__(ci.ChainIndex)
+T_IDX, T_TIP = 127, 1775000
+ours = {}
+for k, i in enumerate(range(128, 137)):          # 9 в полосе, НЕ на классе (слоты 1.0/1.1)
+    ours["0xband%02d" % k] = {"index": i, "tip": 1_000_000 if k % 2 else 1_100_000}
+for k, i in enumerate(list(range(199, 213)) + list(range(261, 289))):   # 42 на классе, позади
+    ours["0xmatch%02d" % k] = {"index": i, "tip": T_TIP}
+_facts = {"ours": ours}
+idx.block_facts = lambda bn: _facts if bn == 50262420 else None
+idx.transit_report = lambda bn, agg=None: ("transit", {"index": T_IDX, "tip": T_TIP})
+
+t = idx.our_position_table(50262420)
+check("таблица построена", t is not None)
+rows, (t_i, t_t) = t
+check("транзит в кортеже", (t_i, t_t) == (T_IDX, T_TIP))
+check("строк = всем нашим tx", len(rows) == 9 + 42, len(rows))
+inter = [r for r in rows if 1 <= r[2] <= 20 and r[4]]
+check("УРОК 50262420: пересечение = 0 при полосе 9 и match 42", len(inter) == 0, len(inter))
+band = [r for r in rows if 1 <= r[2] <= 20]
+match = [r for r in rows if r[4]]
+check("полоса 9 (по индексу)", len(band) == 9, len(band))
+check("match 42 (по tip)", len(match) == 42, len(match))
+mm = sorted(r[2] for r in match)
+check("метрика п.2: медиана delta по match ~+140 (baseline)", 100 < mm[len(mm)//2] < 220,
+      mm[len(mm)//2])
+
+# ---- Пересечение НЕ пустое, когда тот же tx в полосе И на классе ----
+ours["0xwinner"] = {"index": T_IDX + 3, "tip": T_TIP}
+rows2, _ = idx.our_position_table(50262420)
+inter2 = [r for r in rows2 if 1 <= r[2] <= 20 and r[4]]
+check("tx в полосе И на классе даёт пересечение=1 (и только он)",
+      len(inter2) == 1 and inter2[0][0] == "0xwinner", inter2)
+del ours["0xwinner"]
+
+# ---- Отказы формы -> None ----
+check("нет блока -> None", idx.our_position_table(1) is None)
+idx.transit_report = lambda bn, agg=None: ("no_transit", None)
+check("нет транзита -> None", idx.our_position_table(50262420) is None)
+
+# ---- Гарды дрейфа боевого потребителя (spec_fire_live) ----
+import chain.spec_fire_live as sfl  # noqa: E402
+_SRC = open(sfl.__file__.replace(".pyc", ".py")).read()
+check("вердикт формулы пишет ТОЛЬКО пересечение (строка ПЕРЕСЕЧЕНИЕ)",
+      "полоса∩класс=%d" in _SRC and "пишет ТОЛЬКО это число" in _SRC)
+check("лог капирован (только delta -3..25 или match, максимум 60)",
+      "[:60]" in _SRC and "(-3 <= r[2] <= 25) or r[4]" in _SRC)
+check("кольцо delta-по-match капировано (~400)", "del ring[:-400]" in _SRC)
+check("p50/p90 по match в закрытии окна", "match_delta=%s" in _SRC and "match_delta_ring" in _SRC)
+check("прибор в треде индекса, не в recv-петле (внутри ветки rep)",
+      "self._pos_table(ci, bn, agg)" in _SRC)
+check("слепой суд таблицу не кормит", "if not blind:" in _SRC)
+
+print("\n%s" % ("FAIL: %d" % len(FAILS) if FAILS
+                else "OK: вердикт формулы — только по хэшам; метрика delta-по-match в бою"))
+sys.exit(1 if FAILS else 0)
