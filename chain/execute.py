@@ -2150,7 +2150,9 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
             signed = acct.sign_transaction(t)
             raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
             h = getattr(signed, "hash", None)
-            out.append((n0 + i, "0x" + bytes(raw).hex(), h.hex() if h is not None else None))
+            _hh = h.hex() if h is not None else None
+            out.append((n0 + i, "0x" + bytes(raw).hex(), _hh))
+            _stage_stamp(_hh, "sign")      # П.7: класс вшит ЗДЕСЬ — метка ловит его возраст
         return out
 
     # ---- ФАЗА 1: снимок + решение (под локом, без сети, без подписи) ----
@@ -2374,6 +2376,7 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
                 log.info("VOLLEY %s молчит: патрон на поле %.4f ETH", addr[:10], bal[0] / 1e18)
             return None
         nonce, raw_hex, h = st["q"].pop(0)
+        _probe_hash_set(h)                # П.7: метки pacer/ack лягут на ЭТУ пробу
     # ПУТЬ РАССЫЛКИ ВЫБРАН ЗАМЕРОМ (07.08): тёплая сессия до СЕКВЕНСЕРА держит тред 32.5мс
     # (p50, 25 проб), синхронная нога Alchemy — 60мс. Секвенсер и есть ордерер Base, а hash
     # пред-подписанной пробы известен из подписи, поэтому ответ Alchemy не нужен ВООБЩЕ.
@@ -2568,6 +2571,32 @@ _PACER_TRANSPORT_REJECT: dict = {}  # канал -> сетевых отказо�
 # движка, который затем зовёт send_presigned_probe (16 воркеров, один тред = одна проба).
 # Отказ пометки = обычная отправка (fail-closed: незнание не открывает резерв).
 _PACER_RESERVE = float(os.environ.get("VOLLEY_PACER_RESERVE", "12"))
+# П.7: хэш пробы, которую ЭТОТ тред сейчас отправляет — чтобы метки стадий (pacer/ack)
+# легли на конкретную пробу без протаскивания аргумента через пять кадров транспорта.
+_PROBE_H_TL = threading.local()
+
+
+def _probe_hash_set(h):
+    try:
+        _PROBE_H_TL.h = h
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def _probe_hash_hint():
+    try:
+        return getattr(_PROBE_H_TL, "h", None)
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def _stage_stamp(h, stage):
+    """Прибор СБОКУ: отказ метки не имеет права трогать отправку."""
+    try:
+        from chain.stage_probe import stamp as _st
+        _st(h, stage)
+    except Exception:                                        # noqa: BLE001
+        pass
 _PACER_URGENT_SENT: dict = {}      # канал -> сколько отправок ушло ИЗ РЕЗЕРВА (приёмка пакета)
 _URGENT_TL = threading.local()
 
@@ -2665,6 +2694,7 @@ def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5,
         _b = _PACER_BURST if burst is None else burst
         if not _pacer_take(_ck, _r, _b, reserve=_PACER_RESERVE, urgent=urgent):
             return False, "pacer_dry"          # сухо: отдельный сигнал вызывающему, без RTT
+        _stage_stamp(_probe_hash_hint(), "pacer")     # П.7: токен выдан ИМЕННО этой пробе
     try:
         payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
                    "params": [raw_hex]}
@@ -2677,6 +2707,7 @@ def _post_raw_sync(url: str, raw_hex: str, timeout: int = 5,
         err = resp.get("error")
         if err:
             return False, str(err.get("message", ""))
+        _stage_stamp(_probe_hash_hint(), "ack")       # П.7: секвенсер принял байты
         return True, None
     except Exception as e:
         return False, type(e).__name__

@@ -904,6 +904,11 @@ class SpecFireLive:
                 continue
             self._ws_handoff_ts[feed] = n
             self.pending_fire[feed] = (mid, b, debt, n)
+            try:                                  # П.7: метка стадии handoff (прибор сбоку)
+                from chain.stage_probe import mark_feed as _mf
+                _mf(feed, "handoff")
+            except Exception:                     # noqa: BLE001
+                pass
             hit = True
             self._log("SPECFIRE ws-handoff feed=%s %s/%s src=%s — транзит армленного фида "
                       "в формируемом блоке, огонь окну" % (feed, mid[:10], b[:10], src))
@@ -3077,6 +3082,21 @@ class SpecFireLive:
             mm = sorted(match_d)
             p50 = mm[len(mm) // 2] if mm else None
             p90 = mm[int(len(mm) * 0.9)] if mm else None
+            # П.7: профиль стадий НА ПЕРВУЮ пробу с tip_match — называет стадию-вкладчика
+            _prof_s, _worst = "—", (None, None)
+            _first_m = next((r for r in rows if r[4]), None)
+            if _first_m is not None:
+                try:
+                    from chain.stage_probe import profile as _pf, format_profile as _fmt
+                    _prof_s, _worst = _fmt(_pf(_first_m[0], feed=getattr(self, "_last_feed", None),
+                                               bn=bn))
+                except Exception:                            # noqa: BLE001
+                    pass
+            self._log("SPECFIRE СТАДИИ blk=%d проба=%s delta=%+d: %s | топ-вкладчик: %s%s"
+                      % (bn, str(_first_m[0])[:12] if _first_m else "—",
+                         _first_m[2] if _first_m else 0, _prof_s,
+                         _worst[0] or "—",
+                         (" %.0fмс" % _worst[1]) if _worst[1] is not None else ""))
             self._log("SPECFIRE ПЕРЕСЕЧЕНИЕ blk=%d транзит=%d@%d: полоса∩класс=%d "
                       "(вердикт «формула» пишет ТОЛЬКО это число), match=%d delta p50=%s "
                       "p90=%s | %s%s"

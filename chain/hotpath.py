@@ -73,6 +73,24 @@ HOT_WS_PAGE_BACKOFF_N = int(os.environ.get("HOT_WS_PAGE_BACKOFF_N", "4"))
 # 21.08: живая подача tip транзита в кольцо зеркала прямо из recv-петли (см. хук у
 # FORWARD_SEL). 0 = только прежняя индексная подача (полные сканы, с лагом).
 MIRROR_LIVE_FEED = os.environ.get("MIRROR_LIVE_FEED", "1").lower() not in ("0", "false", "no")
+
+
+def _stage_frame(bn, ts=None):
+    """П.7: метка «кадр суб-блока принят». Прибор сбоку — отказ не трогает петлю."""
+    try:
+        from chain.stage_probe import mark_frame
+        mark_frame(bn, ts)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def _stage_feed(feed, stage, ts=None):
+    """П.7: метка стадии по фиду (detect/handoff) — пробы ещё нет."""
+    try:
+        from chain.stage_probe import mark_feed
+        mark_feed(feed, stage, ts)
+    except Exception:                                        # noqa: BLE001
+        pass
 # Сколько измеренного времени должно накопиться, прежде чем порогу можно верить. Это замена
 # защёлке «не раньше 6ч аптайма»: та глушила сторожа рестартами (07.08 — 21 рестарт, 0 тревог
 # в сутки максимального расхода), а требование span глушится только отсутствием ИЗМЕРЕНИЙ.
@@ -3083,6 +3101,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                         # и ровно тем же способом — БЕЗ работы в recv-петле: индекс только
                         # запоминает номер и будит свой единственный тред.
                         _chain_index.offer_block(bn)
+                        _stage_frame(bn)                    # П.7: кадр суб-блока принят
                         feed_handled.clear()                  # Layer1: dedup set is per-block -> clear on block change
                         _bf = basefee_of(d)                   # 5a: index-0 кадр несёт base-хедер
                         if _bf is not None:
@@ -3127,6 +3146,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                 if cfg.price_from_feed and _feed_spawn_gate(_oracle, bn, feed_handled):
                                     # Layer1 LIVE: feed price triggers _process_transmit + dedups poll;
                                     # gate = один спавн на (oracle,bn) — transmit виден в неск. суб-кадрах
+                                    _stage_feed(_sym, "detect")   # П.7: транзит опознан НАШИМ
                                     log.info("DIAG feed-spawn mkt=%s oracle=%s bn=%s px_hint=%d",
                                              _sym, _oracle[:10], bn, _dec[1] * _scale)
                                     threading.Thread(target=_process_transmit,
