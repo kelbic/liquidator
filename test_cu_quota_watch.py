@@ -446,6 +446,123 @@ broke_b = w.balance_verdicts({"hosts": {B5735: {"mtd_cu": 29e6, "as_of": MID - H
 check("самоконтроль остатка: обе половины держат именно то, что заявлено",
       (not broke_a) and broke_b, (broke_a, broke_b))
 
+# ---- 29. ГЛАВНАЯ РЕГРЕССИЯ 21.08 23:07: СВЕЖЕЕ ОКНО ПРОТИВ СМАЗАННОГО ХВОСТА ----
+# Живой случай: в 22:00Z вечерняя кампания подняла #94bf с 54k до 188k CU/час. Хвост 21.6ч
+# (грязный — он пересекает якорь 18:53) дал 1.0M CU/сут, книге было 4.2ч (<6ч), и ветка
+# остатка ПРОМОЛЧАЛА: 28.7M / 1.0M = 28 суток «хватает». По факту при темпе последнего часа
+# ведро пустело за 6.1 суток при 10.0 сутках до сброса.
+as_of_man = MID - 4.2 * HOUR                 # якорь снят при манёвре 18:53
+anc_c = _anchor(1.0, as_of=as_of_man)        # C: месяц-к-дате 1.0M -> остаток 28.7M... (28.99M)
+led_young = _led(343529.0, since=as_of_man)  # книга 4.2ч: 343k CU -> ~1.96M/сут, ПОД критом
+tail_dirty = {B5735: 1.0e6}                  # хвост 24ч: 1.0M CU/сут, ПОД критом
+span_dirty = {B5735: 24 * HOUR}              # ...и он ПЕРЕСЕКАЕТ якорь => загрязнён
+fresh_hot = {B5735: (3.30e6, 2 * HOUR, MID - 2 * HOUR)}   # свежее окно 2ч: 3.30M CU/сут
+
+bal_f = w.balance_verdicts(anc_c, led_young, tail_dirty, burn_span=span_dirty,
+                           burn_fresh=fresh_hot, now=MID)
+check("свежее окно 3.3M/сут при остатке ~29M и 10 сут до сброса -> БУДИТ",
+      len(bal_f) == 1 and abs(bal_f[0][5] - 3.30e6) < 1, bal_f)
+if bal_f:
+    check("...и основание НАЗВАНО свежим окном (приговор везёт то, чем судил)",
+          "СВЕЖЕЕ ОКНО" in bal_f[0][7], bal_f[0][7])
+# ПОЗИТИВНЫЙ КОНТРОЛЬ НА ТОМ ЖЕ ВХОДЕ (канон test-that-can-only-return-zero): ровно эти
+# данные БЕЗ свежего окна обязаны молчать — иначе «будит» выше не доказывает новую ветку,
+# а тишина ниже и есть та слепота, ради которой ветка написана.
+bal_blind = w.balance_verdicts(anc_c, led_young, tail_dirty, burn_span=span_dirty, now=MID)
+check("...а БЕЗ свежего окна тот же вход молчит — это и есть найденная 23:07 слепота",
+      bal_blind == [], bal_blind)
+
+# ---- 30. ГАРД ЗАГРЯЗНЕНИЯ: свежее окно, залезающее ЗА якорь, кандидатом не становится ----
+# Иначе новая ветка вернула бы ту самую ошибку 20.08, от которой лечили грязный хвост:
+# приговор о будущем по конфигурации, которой уже нет.
+fresh_pre = {B5735: (3.30e6, 2 * HOUR, as_of_man - HOUR)}      # окно НАЧАЛОСЬ до якоря
+bal_pre = w.balance_verdicts(anc_c, led_young, tail_dirty, burn_span=span_dirty,
+                             burn_fresh=fresh_pre, now=MID)
+check("свежее окно, начавшееся ДО якоря -> отброшено (не судим снятой конфигурацией)",
+      bal_pre == [], bal_pre)
+# ---- 31. ГАРД ПОКРЫТИЯ: огрызок окна кандидатом не становится ----
+fresh_thin = {B5735: (9.9e6, 0.2 * HOUR, MID - 0.2 * HOUR)}    # 12 минут — не основание
+bal_thin = w.balance_verdicts(anc_c, led_young, tail_dirty, burn_span=span_dirty,
+                              burn_fresh=fresh_thin, now=MID)
+check("свежее окно покрыло 0.2ч (<1ч) -> отброшено даже при диком темпе", bal_thin == [], bal_thin)
+
+# ---- 32. МАКСИМУМ, А НЕ ЗАМЕНА: тихое свежее окно НЕ гасит уже звонящее основание ----
+# Новая ветка обязана только ДОБАВЛЯТЬ поводы звонить. Если бы свежее окно ВЫТЕСНЯЛО
+# книгу/хвост, кампания, кончившаяся десять минут назад, глушила бы тревогу об остатке,
+# который она уже сожгла.
+fresh_calm = {B5735: (1.0, 2 * HOUR, MID - 2 * HOUR)}
+bal_max = w.balance_verdicts(_anchor(26.3, as_of=MID - HOUR), _led(0.0), burn,
+                             burn_fresh=fresh_calm, now=MID)
+check("свежее окно в штиле НЕ гасит тревогу, которую даёт хвост (берётся максимум)",
+      len(bal_max) == 1 and abs(bal_max[0][5] - 1.10e6) < 1, bal_max)
+
+# ---- 33. fresh_summary: берёт N ПОСЛЕДНИХ записей и оценивает начало окна ----
+recs_f = [{"ts": MID - 3 * HOUR, "until": MID - 3 * HOUR, "hosts": {C: {"cu": 100, "sec": HOUR}}},
+          {"ts": MID - 2 * HOUR, "until": MID - 2 * HOUR, "hosts": {C: {"cu": 200, "sec": HOUR}}},
+          {"ts": MID - HOUR, "until": MID - HOUR, "hosts": {C: {"cu": 400, "sec": HOUR}}}]
+fr = w.fresh_summary(recs_f, n=2)
+check("fresh_summary: 2 последних записи (200+400 за 2ч), первая НЕ учтена",
+      abs(fr[C][0] - 600.0 * 86400.0 / (2 * HOUR)) < 1 and abs(fr[C][1] - 2 * HOUR) < 1, fr)
+check("fresh_summary: начало окна оценено (until самой ранней минус её покрытие)",
+      abs(fr[C][2] - (MID - 3 * HOUR)) < 1, fr)
+
+# ---- 34. РЕЖИМ В ТЕКСТЕ ТРЕВОГИ — ВЫЧИСЛЯЕМЫЙ, А НЕ КАНОННЫЙ ----
+# 21.08 23:07 шаблон утверждал «это НЕ пиковый час» в тревоге, где всплеск (141M) был в 4.7
+# раза выше хвоста (30M). Утверждение о событии, которого текст не проверял, — самоотчёт.
+sent.clear()
+hp_reg = os.path.join(_tmp, "regime", "h.jsonl")
+os.makedirs(os.path.dirname(hp_reg), exist_ok=True)
+_fresh_hist(30.0, path=hp_reg)                 # хвост ~30M
+# журнал прогона: 30 окон по 141M -> всплеск ex-boot 141M против хвоста 30M
+w.run(fetch=lambda: _journal(C, [141.0] * 30, pid=9), notify_fn=_nf, out=lambda *_: None,
+      now=NOW, history_path=hp_reg)   # NOW, а не MID: история фикстуры строится от NOW
+rate_alarms = [x for x in sent if x[2] == "cu-quota:%s" % C]
+check("тревога по темпу при всплеске >> хвоста говорит «всплеск ВЫШЕ хвоста», а не «НЕ пиковый час»",
+      len(rate_alarms) == 1 and "ВСПЛЕСК ВЫШЕ ХВОСТА" in rate_alarms[0][3]
+      and "это НЕ пиковый час" not in rate_alarms[0][3], [x[3][:200] for x in rate_alarms])
+# НЕГАТИВНЫЙ КОНТРОЛЬ ТОЙ ЖЕ ПОЛОВИНЫ: когда всплеск и хвост СОШЛИСЬ, текст обязан вернуться
+# к прежнему утверждению — иначе новая строка кричит всегда и перестаёт что-либо значить.
+sent.clear()
+hp_reg2 = os.path.join(_tmp, "regime2", "h.jsonl")
+os.makedirs(os.path.dirname(hp_reg2), exist_ok=True)
+_fresh_hist(30.0, path=hp_reg2)
+w.run(fetch=lambda: _journal(C, [30.0] * 30, pid=9), notify_fn=_nf, out=lambda *_: None,
+      now=NOW, history_path=hp_reg2)
+rate2 = [x for x in sent if x[2] == "cu-quota:%s" % C]
+check("...а при сошедшихся всплеске и хвосте — прежнее «НЕ пиковый час»",
+      len(rate2) == 1 and "это НЕ пиковый час" in rate2[0][3], [x[3][:200] for x in rate2])
+check("ПРЕДЕЛ 2 в тексте отсылает к INFRA-FACTS, а не пересказывает факт с истёкшим сроком",
+      len(rate2) == 1 and "INFRA-FACTS" in rate2[0][3], [x[3][:300] for x in rate2])
+
+# ...и третья ветка: всплеск НЕ ЗАМЕРЕН -> режим не устанавливается вовсе.
+sent.clear()
+hp_reg3 = os.path.join(_tmp, "regime3", "h.jsonl")
+os.makedirs(os.path.dirname(hp_reg3), exist_ok=True)
+_fresh_hist(30.0, path=hp_reg3)
+w.run(fetch=lambda: _journal(C, [141.0] * 5, pid=9), notify_fn=_nf, out=lambda *_: None,
+      now=NOW, history_path=hp_reg3)          # 5 окон < CU_WATCH_MIN_WINDOWS=20
+rate3 = [x for x in sent if x[2] == "cu-quota:%s" % C]
+check("всплеск не замерен -> режим НЕ УСТАНОВЛЕН, а не «темп держится на хвосте»",
+      len(rate3) == 1 and "режим НЕ УСТАНОВЛЕН" in rate3[0][3]
+      and "держится на хвосте" not in rate3[0][3], [x[3][:200] for x in rate3])
+
+# ---- 35. САМОКОНТРОЛЬ НОВОЙ ВЕТКИ: по КАЖДОЙ ПОЛОВИНЕ отдельно ----
+# (канон seam-stubbed-above-the-defect, форма 21.08: суита обязана краснеть на снятом фиксе)
+_real_fresh_min = w.FRESH_MIN_SEC
+try:
+    # (а) снят гард покрытия -> огрызок 0.2ч начинает судить (тест 31 краснеет)
+    w.FRESH_MIN_SEC = 0.0
+    broke_a = w.balance_verdicts(anc_c, led_young, tail_dirty, burn_span=span_dirty,
+                                 burn_fresh=fresh_thin, now=MID) != []
+finally:
+    w.FRESH_MIN_SEC = _real_fresh_min
+# (б) снят гард загрязнения -> до-якорное окно начинает судить (тест 30 краснеет).
+#     Моделируем ровно снятие проверки: то же окно, но помеченное как пост-якорное.
+broke_b = w.balance_verdicts(anc_c, led_young, tail_dirty, burn_span=span_dirty,
+                             burn_fresh={B5735: (3.30e6, 2 * HOUR, as_of_man)}, now=MID) != []
+check("самоконтроль свежего окна: обе половины (покрытие, загрязнение) держат заявленное",
+      broke_a and broke_b, (broke_a, broke_b))
+
 print("\n%s" % ("FAIL: %d" % len(FAILS) if FAILS
                 else "OK: сторож квоты — парс/всплеск/ИНТЕГРАЛ/ОСТАТОК/дедуп/слепота/самоконтроль"))
 sys.exit(1 if FAILS else 0)
