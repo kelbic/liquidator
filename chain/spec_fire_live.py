@@ -2572,7 +2572,7 @@ class SpecFireLive:
         addr, tgt = (meta or (None, None))
         _won = _receipt_has_win(r, self.cfg.liquidator_address) is True
         if _won:
-            self._probe_win(tgt, h, addr, gas_usd, src="движок")
+            self._probe_win(tgt, h, addr, gas_usd, src="движок", receipt=r)
             # #54: выручка победы — СБОКУ, ПОСЛЕ денег (правило р-7); бросок не трогает огонь
             self._accounted("выручка победы", h, self._book_probe_revenue, h, r)
         else:
@@ -2622,7 +2622,7 @@ class SpecFireLive:
                 pass
             return False
 
-    def _probe_win(self, tgt, h, addr, gas_usd=0.0, src="движок"):
+    def _probe_win(self, tgt, h, addr, gas_usd=0.0, src="движок", receipt=None):
         """ПОБЕДА ПРОБЫ ПО КВИТАНЦИИ: считаем, гасим огонь, закрываем окно, ставим паузу.
 
         СЛОЙ ПОБЕДЫ ЗАМОРОЖЕН И СРЕЗАН (решение архитектора, рез #110). Здесь стоит РОВНО ТО,
@@ -2652,12 +2652,38 @@ class SpecFireLive:
         eng = getattr(self, "_fire_engine", None)
         if eng is not None:
             eng.disarm()                 # приз взят — огонь гасим немедленно, не ждём TTL
-        self._set_cooldown(feed, "probe", proven=True)       # #46: победа пробы не гасит флот
-        if feed:
-            with self._lock:
-                stop = self._windows.pop(feed, None)
-            if stop is not None:
-                stop.set()
+        # П.3 (приказ владельца 21.08, снявший заморозку рез #110 МИНИМАЛЬНЫМ ходом):
+        # ярлык tgt СВЕРЯЕТСЯ с жертвой ИЗ КВИТАНЦИИ (Liquidated нашего контракта — тот же
+        # источник, что вердикт _won). Ярлык лжив в 59% (замер в докстринге ниже): keepalive
+        # ЛЮБОГО окна каскада перезаписывает FireEngine._target, а приз берётся под планом
+        # ОДНОЙ цели — гашение по ярлыку глушило окно СЛУЧАЙНОГО фида. Правило: гасим окно и
+        # ставим cooldown ТОЛЬКО если жертва квитанции совпала с ярлыком; несовпадение или
+        # незнание (parse пуст при победном topic0) — НЕ гасим ЧУЖОЕ окно (незнание закрывает
+        # гард на гашение; цена бездействия — окно доживёт TTL, цена ложного гашения — немой
+        # фид в каскаде). Три прежние редакции (р-6/7/8) падали, потому что СТРОИЛИ новую
+        # атрибуцию; эта — только запрещает действие по недоказанному ярлыку. receipt=None
+        # (пути вне движка/стабы) => поведение прежнее бит-в-бит.
+        _label_ok = True
+        if receipt is not None:
+            try:
+                from chain.execute import parse_batch_receipt
+                _wins, _ = parse_batch_receipt(receipt, self.cfg.liquidator_address)
+                _victims = {bw for (bw, _ln) in (_wins or {})}
+                _label_ok = bool(_victims) and str(b).lower() in _victims
+            except Exception:
+                _label_ok = False        # незнание закрывает гард на гашение
+            if not _label_ok:
+                log.warning("SPECFIRE WIN: ярлык окна ЛЖИВ (ярлык %s/%s, жертвы квитанции %s)"
+                            " — чужое окно НЕ гашу, cooldown не ставлю (п.3)",
+                            str(mid)[:10], str(b)[:10],
+                            [v[:10] for v in sorted(_victims)] if receipt is not None else "?")
+        if _label_ok:
+            self._set_cooldown(feed, "probe", proven=True)   # #46: победа пробы не гасит флот
+            if feed:
+                with self._lock:
+                    stop = self._windows.pop(feed, None)
+                if stop is not None:
+                    stop.set()
 
         def _mark():
             from chain.execute import mark_recent_send
