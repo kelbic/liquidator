@@ -2712,6 +2712,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
     import brotli
     from chain.feeds import (resolve_feeds, extract_txs, block_number_of, decode_forward_answer,
                              FORWARD_SEL, basefee_of, primary_map, tip_from_raw)
+    from chain.execute import note_transit_tip as _ntt_live   # живое кольцо: импорт ВНЕ петли
     # ФОНОВЫЕ чтения -> бесплатный публичный RPC (CU-замер 25.07: фоновые читатели съедали 5×
     # квоту Alchemy). Пусто/ошибка конструктора -> прежний rpc, поведение как раньше.
     _bg_rpc = rpc
@@ -3112,9 +3113,13 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             # повторы исказили бы моду кольца. Сбоку от денег: O(десятков
                             # байт) + try в note_transit_tip; отказ = кольцо не пополнилось.
                             # Откат: MIRROR_LIVE_FEED=0 (индексная подача остаётся как была).
-                            if _dec and MIRROR_LIVE_FEED and ("m", _dec[0], bn) not in feed_handled:
+                            # Линза 21.08: гейт ПО КАРТЕ НАШИХ агрегаторов (agg_set) — как
+                            # у shadow-ветки. Голый _dec кормил бы кольцо селектором-двойником
+                            # из чужих calldata и форвардами не-наших фидов; docstring
+                            # decode_forward_answer прямо требует этот фильтр от вызывающего.
+                            if (_dec and MIRROR_LIVE_FEED and _dec[0] in agg_set
+                                    and ("m", _dec[0], bn) not in feed_handled):
                                 feed_handled.add(("m", _dec[0], bn))
-                                from chain.execute import note_transit_tip as _ntt_live
                                 _ntt_live(tip_from_raw(_raw, basefee=_fresh_basefee()),
                                           agg=_dec[0])
                             if _dec and _dec[0] in shadow_map:

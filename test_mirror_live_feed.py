@@ -79,6 +79,10 @@ check("неизвестный тип 0x7f -> None", tip_from_raw("0x7f" + "00" *
 import chain.hotpath as hp  # noqa: E402
 _SRC = open(hp.__file__.replace(".pyc", ".py")).read()
 check("хук стоит в ветке FORWARD_SEL", '("m", _dec[0], bn) not in feed_handled' in _SRC)
+check("кольцо кормится ТОЛЬКО нашими агрегаторами (гейт agg_set, линза 21.08)",
+      "_dec[0] in agg_set" in _SRC)
+check("импорт note_transit_tip вне recv-петли",
+      "note_transit_tip as _ntt_live   # живое кольцо" in _SRC)
 check("дедуп помечается до вызова", 'feed_handled.add(("m", _dec[0], bn))' in _SRC)
 check("basefee — свежий (_fresh_basefee), не переменная кадра",
       "tip_from_raw(_raw, basefee=_fresh_basefee())" in _SRC)
