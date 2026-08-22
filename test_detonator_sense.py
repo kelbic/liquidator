@@ -74,12 +74,20 @@ thr5, _ = o5._det_thr("XRP", "down", UNI)
 check("пол шума: порог = 0.05%, не 0.0001%",
       abs(thr5 - sfl.SPEC_FIRE_DET_NOISE_FLOOR) < 1e-12, thr5)
 
-# ---- (г) кап окон близости в минуту ----
+# ---- (г) кап окон близости: ПЕР-ФИД (не глобальный — каскад разных фидов не гасится) ----
 o6 = mk({"0xdet": 1.0013})
-o6.stats["_det_win_ts"] = [999.0] * sfl.SPEC_FIRE_DET_WIN_CAP_MIN
+o6.stats["_det_win_ts::XRP"] = [999.0] * sfl.SPEC_FIRE_DET_WIN_CAP_MIN
 thr6, _ = o6._det_thr("XRP", "down", UNI)
-check("кап: %d det-окон/мин -> универсальный + счётчик" % sfl.SPEC_FIRE_DET_WIN_CAP_MIN,
+check("кап: %d det-окон/мин у ФИДА -> универсальный + счётчик" % sfl.SPEC_FIRE_DET_WIN_CAP_MIN,
       thr6 == UNI and o6.stats.get("det_win_capped") == 1, (thr6, o6.stats))
+o6._det_thr("XRP", "down", UNI)
+check("счётчик капа считает ПЕРЕХОДЫ, не 5с-рефреши (второй вызов не инкрементит)",
+      o6.stats.get("det_win_capped") == 1, o6.stats)
+o6.shared.by_id["0xmid"].collateral_token = "BTC"        # тот же стенд, другой фид
+thr6b, _ = o6._det_thr("BTC", "down", UNI)
+check("кап XRP НЕ душит соседний фид каскада (BTC связывается своим детонатором)",
+      thr6b < UNI, thr6b)
+o6.shared.by_id["0xmid"].collateral_token = "XRP"
 
 # ---- (д) откат одним env ----
 _sv = sfl.SPEC_FIRE_DET_SENSE
@@ -113,6 +121,26 @@ check("гистерезис det-арма ниже эффективного по�
 ev2 = P.on_mid("XRPUSDT", 1.0 - 0.0002)                  # ретрейс ниже гистерезиса
 check("ретрейс ниже det-гистерезиса -> disarm", any(e.get("event") == "disarm" for e in ev2),
       ev2)
+# линза (3): eff_disarm СБРАСЫВАЕТСЯ на следующем УНИВЕРСАЛЬНОМ арме (не липнет det-значение)
+pr._DET_DIST.clear()
+P.bootstrap("XRPUSDT", 1.0)
+ev3 = P.on_mid("XRPUSDT", 1.0 - 0.0046)                  # универсальный арм 0.45%
+check("универсальный арм после det: eff_disarm вернулся к disarm_pct (окно-зомби исключено)",
+      any(e.get("event") == "arm" for e in ev3)
+      and abs(f.eff_disarm - f.disarm_pct) < 1e-12, (getattr(f, "eff_disarm", None),
+                                                     f.disarm_pct))
+
+# ---- (ж) ИСПОЛНЯЕМЫЙ конец-в-конец: shared(hf) -> пушер -> predict -> арм ----
+pr._DET_DIST.clear()
+o7 = mk({"0xdet": 1.0013})
+o7.dev_by = {"XRP": 0.005}
+n_push = o7._det_push_once()
+check("пушер: один проход кладёт XRP в predict (независимо от движка)",
+      n_push == 1 and "XRP" in pr._DET_DIST
+      and abs(pr._DET_DIST["XRP"][0] - (1.0 - 1.0 / 1.0013)) < 1e-9,
+      (n_push, pr._DET_DIST.get("XRP")))
+check("и арм-порог из ЭТОГО пуша связан: 0.9x0.13%",
+      abs(pr._det_arm_pct("XRP", 0.0045) - (1.0 - 1.0 / 1.0013) * 0.9) < 1e-9)
 pr._DET_DIST.clear()
 
 # ---- гарды дрейфа ----
@@ -122,8 +150,10 @@ check("порог огня окна ходит через _det_thr + 5с-реф�
       "self._det_thr(feed, direction, _thr_uni)" in _S and "_det_next = self._now() + 5.0" in _S)
 check("строка ДЕТОНАТОР при связанном пороге + счётчик det_windows",
       "SPECFIRE ДЕТОНАТОР" in _S and "det_windows" in _S)
-check("аудит-цикл пушит flip_dist предиктору (обе стороны, min)",
-      "_pr.note_det_dist(_f, min(_ds))" in _S)
+check("пушер стартует в __init__ (с первой секунды, не из ленивого движка)",
+      "target=self._det_push_loop" in _S and "_pr.note_det_dist" in _S)
+check("петля пушера на НАСТОЯЩЕМ time.sleep (фейк self._sleep дал бы busy-loop)",
+      "time.sleep(30.0)" in _S)
 check("predict: арм через _det_arm_pct, гистерезис от eff_disarm",
       "_det_arm_pct(f.label, f.arm_pct)" in _P and 'getattr(f, "eff_disarm"' in _P)
 check("откат ОДНИМ env в обоих слоях", _S.count('SPEC_FIRE_DET_SENSE", "1"') == 1

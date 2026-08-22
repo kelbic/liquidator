@@ -928,6 +928,10 @@ class SpecFireLive:
                                                   # арма обязана перепробовать БЫСТРО, а не через
                                                   # каденс переарма — окно короче ретрая иначе
                                                   # остаётся без доски, и весь флот нем
+        self._det_capped: set = set()             # детонатор: фиды под капом окон близости
+        if SPEC_FIRE_DET_SENSE:                   # пушер det-dist — с ПЕРВОЙ секунды (линза (1))
+            threading.Thread(target=self._det_push_loop, daemon=True,
+                             name="det-dist-push").start()
 
     def note_ws_transmit(self, mids, src="ws"):
         """WS-handoff (06.08): recv-петля увидела transmit в ФОРМИРУЕМОМ блоке — если он бьёт
@@ -1260,8 +1264,9 @@ class SpecFireLive:
 
     def _det_thr(self, feed: str, direction: str, thr: float):
         """Порог огня окна с детонатор-чувствительностью: min(универсальный, ближайший
-        flip_dist), снизу пол шума; кап окон близости в минуту — при дребезге детонатор
-        отключается на универсальный (предохранитель). -> (порог, dist|None)."""
+        flip_dist), снизу пол шума; кап окон близости в минуту ПЕР-ФИД (линза (2): глобальный
+        кап выключал бы детонатор на пике каскада РАЗНЫХ целей — предохранитель против
+        дребезга одного фида, не против каскада). -> (порог, dist|None)."""
         if not SPEC_FIRE_DET_SENSE:
             return thr, None
         try:
@@ -1271,12 +1276,48 @@ class SpecFireLive:
         if d is None or d >= thr:
             return thr, d
         n = self._now()
-        dq = self.stats.setdefault("_det_win_ts", [])
+        dq = self.stats.setdefault("_det_win_ts::%s" % feed, [])
         dq[:] = [t for t in dq if n - t < 60.0]
+        capped = self.__dict__.setdefault("_det_capped", set())
         if len(dq) >= SPEC_FIRE_DET_WIN_CAP_MIN:
-            self.stats["det_win_capped"] = self.stats.get("det_win_capped", 0) + 1
+            if feed not in capped:                       # счётчик считает ПЕРЕХОДЫ, не рефреши
+                capped.add(feed)
+                self.stats["det_win_capped"] = self.stats.get("det_win_capped", 0) + 1
             return thr, d
+        capped.discard(feed)
         return max(SPEC_FIRE_DET_NOISE_FLOOR, d), d
+
+    def _det_push_once(self) -> int:
+        """Один проход пушера det-dist: свежие flip_dist всех фидов — предиктору (min по
+        направлениям; направление судит огневой порог окна). -> сколько фидов запушено."""
+        try:
+            from chain import predict as _pr
+        except Exception:                                # noqa: BLE001
+            return 0
+        n = 0
+        for f in list(self.dev_by):
+            try:
+                ds = [d for d in (self._min_flip_dist(f, "down"),
+                                  self._min_flip_dist(f, "up")) if d is not None]
+                if ds:
+                    _pr.note_det_dist(f, min(ds))
+                    n += 1
+            except Exception:                            # noqa: BLE001
+                pass
+        return n
+
+    def _det_push_loop(self):
+        """Линза 22.08 (находка 1): пушер живёт С ПЕРВОЙ СЕКУНДЫ и НЕЗАВИСИМО от ленивого
+        движка — детонаторы зреют в ШТИЛЬ (hf дрейфует к 1 часами), и lead предикта
+        покупается именно там; пуш из аудита движка молчал бы до первой сборки движка и в
+        штиле, а TTL 180с гасил бы сигнал. Период 30с << TTL. time.sleep НАСТОЯЩИЙ
+        намеренно: инжектированный фейк self._sleep дал бы busy-loop в стендах."""
+        while True:
+            try:
+                self._det_push_once()
+            except Exception:                            # noqa: BLE001
+                pass
+            time.sleep(30.0)
 
     def _bonus_of(self, mid: str) -> float:
         """LIF-1 рынка из covered-снапшота (гейт по призу); 0.0 = неизвестен -> долг-гейт."""
@@ -2647,18 +2688,6 @@ class SpecFireLive:
                 чья лестница действительно протухла: вздута (гейт патрона закрыт) либо ниже
                 нынешней базы (tx не включаема). Обе формы САМИ останавливают огонь, поэтому
                 триггер по глубине склада тут не срабатывает никогда."""
-                # ДЕТОНАТОР: свежие flip_dist фидов — предиктору (арм-порог видит близость
-                # жирной цели; min по направлениям, направление судит огневой порог окна).
-                # Прибор сбоку: отказ глотается, аудит лестниц не задевает.
-                try:
-                    from chain import predict as _pr
-                    for _f in list(self.dev_by):
-                        _ds = [d for d in (self._min_flip_dist(_f, "down"),
-                                           self._min_flip_dist(_f, "up")) if d is not None]
-                        if _ds:
-                            _pr.note_det_dist(_f, min(_ds))
-                except Exception:                        # noqa: BLE001
-                    pass
                 try:
                     # 20.08 раскидка квот: аудит — фоновое чтение, уходит с боевого ключа
                     bf = int(_ex.volley_bal_read_rpc(self.rpc)._web3()
@@ -3799,7 +3828,7 @@ class SpecFireLive:
         _thr_uni = dev * SPEC_FIRE_THRESHOLD
         thr, _det_d = self._det_thr(feed, direction, _thr_uni)
         if thr < _thr_uni:                       # детонатор связал порог — окно близости
-            self.stats.setdefault("_det_win_ts", []).append(self._now())
+            self.stats.setdefault("_det_win_ts::%s" % feed, []).append(self._now())
             self.stats["det_windows"] = self.stats.get("det_windows", 0) + 1
             self._log("SPECFIRE ДЕТОНАТОР feed=%s: порог огня %.3f%% (жир в %.3f%% от флипа; "
                       "универсальный %.3f%%)" % (feed, thr * 100.0,
