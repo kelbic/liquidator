@@ -767,6 +767,50 @@ check("ПУСТОЙ якорь (ветка не заведена) -> трево�
       not any(x[2].startswith("cu-quota:no-anchor:") for x in sent), [x[2] for x in sent])
 
 
+# ---- 35. ЗАКОНЧИВШИЙСЯ ЭПИЗОД НЕ ЕСТЬ ТЕМП (22.08) ----
+# Боевой случай: хвост 46M набран ночным эпизодом, свежий час идёт 9M при пороге 26.
+# Сторож печатал «разгон, похоже, УЖЕ КОНЧИЛСЯ» и всё равно звонил — четыре одинаковых
+# разбора за сутки. Приговор обязан сниматься, но ГРОМКО: строкой в журнал, не молчанием.
+sent.clear()
+lines_g = []
+hp_g = os.path.join(_tmp, "gate", "h.jsonl")
+os.makedirs(os.path.dirname(hp_g), exist_ok=True)
+_fresh_hist(46.0, path=hp_g)                   # хвост 46M > порога 26
+w.run(fetch=lambda: _journal(C, [9.0] * 30, pid=9), notify_fn=_nf, out=lines_g.append,
+      now=NOW, history_path=hp_g)              # свежий час 9M: ниже хвоста И под порогом
+gate_alarms = [x for x in sent if x[2] == "cu-quota:%s" % C]
+check("эпизод кончился (хвост 46M, всплеск 9M < порога 26): ЗВОНКА НЕТ",
+      len(gate_alarms) == 0, [x[3][:160] for x in gate_alarms])
+gate_line = [l for l in lines_g if "ПРИГОВОР СНЯТ" in l]
+# Числа сверяем СТРУКТУРНО, а не по круглому литералу фикстуры: хвост в прогоне слегка
+# разбавлен свежим окном (45M против 46M на входе), и тест, прибитый к литералу, мерил бы
+# арифметику фикстуры вместо того, что обязан мерить, — что строка САМОДОСТАТОЧНА.
+check("...и это НЕ тихое подавление: строка в журнале везёт ОБА числа, порог и остаток",
+      len(gate_line) == 1 and "9M/мес" in gate_line[0] and "порога 26M" in gate_line[0]
+      and "хвост 4" in gate_line[0] and "остаток ведра" in gate_line[0], lines_g)
+# НЕГАТИВНЫЙ КОНТРОЛЬ №1 — ТРЕТЬЕ УСЛОВИЕ ГАРДА (всплеск под порогом).
+# «Хвост 100M / всплеск 50M» — формально разгон кончился, а по факту двукратный перерасход.
+sent.clear()
+hp_g2 = os.path.join(_tmp, "gate2", "h.jsonl")
+os.makedirs(os.path.dirname(hp_g2), exist_ok=True)
+_fresh_hist(100.0, path=hp_g2)
+w.run(fetch=lambda: _journal(C, [50.0] * 30, pid=9), notify_fn=_nf, out=lambda *_: None,
+      now=NOW, history_path=hp_g2)
+g2 = [x for x in sent if x[2] == "cu-quota:%s" % C]
+check("всплеск НИЖЕ хвоста, но САМ ВЫШЕ порога (100M/50M) — ЗВОНИТ, гард не глотает",
+      len(g2) == 1, [x[3][:160] for x in g2])
+# НЕГАТИВНЫЙ КОНТРОЛЬ №2 — всплеск НЕ ЗАМЕРЕН: незнание не гасит приговор.
+sent.clear()
+hp_g3 = os.path.join(_tmp, "gate3", "h.jsonl")
+os.makedirs(os.path.dirname(hp_g3), exist_ok=True)
+_fresh_hist(46.0, path=hp_g3)
+os.environ["CU_WATCH_MIN_WINDOWS"] = "20"
+w.run(fetch=lambda: _journal(C, [9.0] * 5, pid=9), notify_fn=_nf, out=lambda *_: None,
+      now=NOW, history_path=hp_g3)             # 5 окон < min_windows -> всплеск не судим
+g3 = [x for x in sent if x[2] == "cu-quota:%s" % C]
+check("всплеск НЕ ЗАМЕРЕН (окон меньше min) — приговор ОСТАЁТСЯ, незнание не гасит",
+      len(g3) == 1 and "режим НЕ УСТАНОВЛЕН" in g3[0][3], [x[3][:200] for x in g3])
+
 print("\n%s" % ("FAIL: %d" % len(FAILS) if FAILS
                 else "OK: сторож квоты — парс/всплеск/ИНТЕГРАЛ/ОСТАТОК/дедуп/слепота/самоконтроль"))
 sys.exit(1 if FAILS else 0)
