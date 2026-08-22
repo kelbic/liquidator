@@ -1056,6 +1056,30 @@ class ChainIndex:
         with self._lock:
             return self._blocks.get(int(bn))
 
+    def liquidated_recently(self, market_id, borrower, lookback=150):
+        """HEALTHY-RACE фильтр трупов (П.1, 22.08): был ли Liquidate по (mid, borrower) в
+        последних lookback блоках индекса. Это же — «cooldown победителя»: победитель виден
+        только Liquidate-логом. Скан в памяти по уже добытым фактам; сеть не трогается.
+        Возврат bool; сравнение по нормализованным hex (mid без 0x, borrower lower)."""
+        mid = str(market_id).lower()
+        mid = mid[2:] if mid.startswith("0x") else mid       # НЕ lstrip("0x"): срезал бы ведущие нули
+        bor = str(borrower).lower()
+
+        def _midnorm(s):
+            s = str(s).lower()
+            return s[2:] if s.startswith("0x") else s
+        head = self.sealed_head()
+        with self._lock:
+            for bn in range(int(head), max(0, int(head) - int(lookback)), -1):
+                f = self._blocks.get(bn)
+                if not f:
+                    continue
+                for lq in (f.get("liquidate") or ()):
+                    if (_midnorm(lq.get("mid", "")) == mid
+                            and str(lq.get("borrower", "")).lower() == bor):
+                        return True
+        return False
+
     def transits_of(self, bn):
         """ВСЕ транзиты блока: [{"index","tip","agg","tx","band_ahead","band_full"}]. Их бывает несколько — в
         эталонном 49890266 их два (позиции 406 и 1083), и оба несут tip 2 000 000."""

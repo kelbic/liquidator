@@ -2068,6 +2068,49 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
             log.info("DIAG sim-revert %s/%s bucket=%s err=%s | repaid_shares=%d repaid_assets=%d seized=%d collateral=%d tba=%d tbs=%d price=%d lltv=%d lif=%.4f block=%d cd=%s",
                      market_id[:10], borrower[:10], _diag_bucket, str(sim["error"])[:40], repaid_shares, repaid_assets, seized,
                      collateral_dbg, tba, tbs, int(price), lltv_wad, lif_from_lltv(lltv_wad / 10**18), _diag_blk, cd0.hex() if isinstance(cd0, (bytes, bytearray)) else str(cd0))
+            # П.1 HEALTHY-RACE (22.08, дефолт ВЫКЛ): «healthy» при hf_est<=0.997 = лаг оракула,
+            # мы РАНЬШЕ флипа. Гейт (свежесть/труп/эпизод/приз/бакет) — в chain.healthy_race;
+            # on-chain страховка — min_profit 25% премии (труп/слип ревертит, цена = газ).
+            if _diag_bucket == "healthy-race":
+                try:
+                    from chain import healthy_race as _hr
+                    _hr_ba = to_assets_up(int(borrow_shares), tba, tbs)
+                    _hr_hf = _hr.hf_estimate(collateral_dbg, price, lltv_wad, _hr_ba)
+                    _hr_prize = (repaid_assets * debt_usd / debt_assets) * (
+                        lif_from_lltv(lltv_wad / 10**18) - 1.0) if debt_assets else 0.0
+                    _hr_state, _hr_why = _hr.classify(market_id, borrower, _hr_hf, _hr_prize,
+                                                      data_age_s=0.0,
+                                                      borrow_shares=int(borrow_shares))
+                    if _hr_state == "HEALTHY_RACE":
+                        _hr_minp = max(1, int(repaid_assets
+                                              * (lif_from_lltv(lltv_wad / 10**18) - 1.0) * 0.25))
+                        _hr_cd = encode_liquidate(mp, borrower, repaid_shares, swap["router"],
+                                                  swap["calldata"], _hr_minp, unwrap)
+                        _hr_tip = _hr.hr_tip_wei(int(cfg.tip_gwei * 1e9))
+                        _hr_gas = int(getattr(cfg, "gas_limit_floor", 3_000_000) or 3_000_000)
+                        log.info("HR bid target=%s/%s prize=$%.0f tip_class=%d reason=%s",
+                                 market_id[:10], borrower[:10], _hr_prize, _hr_tip, _hr_why)
+                        _hr_warn = _hr.note_bid(market_id, borrower, _hr_prize, _hr_tip, _hr_hf)
+                        if _hr_warn:
+                            log.warning("HR %s", _hr_warn)
+                        _hr_prep = {"ok": True, "healthy_race": True, "calldata": _hr_cd,
+                                    "gas": _hr_gas, "net_usd": _hr_prize,
+                                    "profit_usd": _hr_prize, "cost_usd": _hr.HR_MISS_COST_USD,
+                                    "mp": mp, "borrower": borrower,
+                                    "repaid_shares": repaid_shares,
+                                    "swap_target": swap["router"],
+                                    "swap_calldata": swap["calldata"], "min_profit": _hr_minp,
+                                    "debt_usd": debt_usd, "debt_assets": debt_assets,
+                                    "unwrap_target": unwrap, "swap_meta": _swap_meta,
+                                    "tip": _hr_tip}
+                        _hr_fb = _fresh_basefee()
+                        if _hr_fb is not None:
+                            _hr_prep["max_fee"] = _hr_fb * 2 + _hr_tip
+                        return _hr_prep
+                    log.info("HR skip target=%s/%s state=%s reason=%s",
+                             market_id[:10], borrower[:10], _hr_state, _hr_why)
+                except Exception as _hr_e:                       # noqa: BLE001
+                    log.info("HR gate error (закрыт): %s", type(_hr_e).__name__)
             return {"ok": False, "reason": f"preconf sim revert: {sim['error']}"}
         profit_wei = sim["profit"]
         # Р1б/#120: гейт и tip хвоста — ОДНО число (cost посчитан тем tip, которым стреляем)

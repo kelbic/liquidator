@@ -3939,7 +3939,7 @@ def prepare_liquidation(rpc, cfg, market_id: str, borrower: str, debt_usd: float
                               (_MORPHO_BLUE, encode_position_call(mid, borrower))])
         loan, coll, oracle, irm, lltv_wad = decode_id_to_market_params(r1[0][1])
         m = decode_market(r1[1][1]); tba, tbs = m[2], m[3]
-        borrow_shares, _ = decode_position(r1[2][1])
+        borrow_shares, collateral = decode_position(r1[2][1])   # collateral нужен HR-гейту (hf_est)
         if borrow_shares == 0:
             return {"ok": False, "reason": "no debt (cleared)"}
         price = decode_price(aggregate3(rpc, [(oracle, encode_price_call())])[0][1])
@@ -3980,6 +3980,36 @@ def prepare_liquidation(rpc, cfg, market_id: str, borrower: str, debt_usd: float
         cd0 = encode_liquidate(mp, borrower, repaid_shares, swap["router"], swap["calldata"], 0, unwrap)
         sim = simulate_tx(rpc, liq, bot, cd0)
         if not sim["ok"]:
+            # П.1 HEALTHY-RACE (22.08, дефолт ВЫКЛ): реактивный путь — тот самый срез, где
+            # 05:11:04 отдали $4436 (ACTIONABLE ... skip:sim revert: position is healthy).
+            # Гейт и экономика — chain.healthy_race; страховка — on-chain min_profit 25% премии.
+            if "healthy" in str(sim.get("error", "")).lower():
+                try:
+                    from chain import healthy_race as _hr
+                    _lif = lif_from_lltv(lltv_wad / 10**18)
+                    _hr_ba = to_assets_up(int(borrow_shares), tba, tbs)
+                    _hr_hf = _hr.hf_estimate(collateral, price, lltv_wad, _hr_ba)
+                    _hr_prize = (repaid_assets * debt_usd / debt_assets) * (_lif - 1.0) \
+                        if debt_assets else 0.0
+                    _hr_state, _hr_why = _hr.classify(market_id, borrower, _hr_hf, _hr_prize,
+                                                      data_age_s=0.0,
+                                                      borrow_shares=int(borrow_shares))
+                    if _hr_state == "HEALTHY_RACE":
+                        _hr_minp = max(1, int(repaid_assets * (_lif - 1.0) * 0.25))
+                        _hr_cd = encode_liquidate(mp, borrower, repaid_shares, swap["router"],
+                                                  swap["calldata"], _hr_minp, unwrap)
+                        _hr_tip = _hr.hr_tip_wei(int(cfg.tip_gwei * 1e9))
+                        _hr_warn = _hr.note_bid(market_id, borrower, _hr_prize, _hr_tip, _hr_hf)
+                        return {"ok": True, "healthy_race": True, "calldata": _hr_cd,
+                                "net_usd": _hr_prize, "profit_usd": _hr_prize,
+                                "cost_usd": _hr.HR_MISS_COST_USD, "gas": gas_floor_of(cfg),
+                                "hr_tip_wei": _hr_tip, "hr_reason": _hr_why,
+                                "hr_warn": _hr_warn, "slice_fraction": fraction}
+                    return {"ok": False,
+                            "reason": f"sim revert: {sim['error']} | HR {_hr_state}: {_hr_why}"}
+                except Exception as _hr_e:                       # noqa: BLE001
+                    return {"ok": False, "reason": f"sim revert: {sim['error']} "
+                                                   f"| HR gate error {type(_hr_e).__name__}"}
             return {"ok": False, "reason": f"sim revert: {sim['error']}"}
         profit_wei = sim["profit"]
         profit_usd = profit_wei * debt_usd / debt_assets if debt_assets else 0.0
@@ -4011,8 +4041,16 @@ def try_liquidate(rpc, cfg, market_id: str, borrower: str, debt_usd: float,
         return out
     try:
         _seq = str(getattr(cfg, "sequencer_rpc", "") or "")
+        # HR-бид: tip = зеркало класса эскалации (prep["hr_tip_wei"]), не пол политики
+        _tip = max(int(cfg.tip_gwei * 1e9), int(prep.get("hr_tip_wei") or 0))
+        if prep.get("healthy_race") and log:
+            log.info("HR bid target=%s/%s prize=$%.0f tip_class=%d reason=%s",
+                     market_id[:10], borrower[:10], prep["net_usd"], _tip,
+                     prep.get("hr_reason", ""))
+            if prep.get("hr_warn"):
+                log.warning("HR %s", prep["hr_warn"])
         res = send_tx(rpc, cfg.wallet_key, {"to": cfg.liquidator_address, "data": prep["calldata"]},
-                      min_tip_wei=int(cfg.tip_gwei * 1e9),
+                      min_tip_wei=_tip,
                       broadcast_raw_urls=([_seq] if (_seq and _seq.lower() not in ("off", "none", "0")) else None))
     except Exception as e:
         return {"sent": False, "reason": f"send error: {type(e).__name__}: {str(e)[:120]}"}
