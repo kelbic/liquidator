@@ -132,6 +132,18 @@ o4._rcpt_shadow_note("0xb", "коллектор", None)
 o4._rcpt_shadow_note("0xb", "легаси", None)
 check("shadow: совпадение (оба NO-RECEIPT) -> agree", o4.stats.get("rcpt_shadow_agree") == 1,
       o4.stats)
+o4._rcpt_shadow_note("0xe", "легаси", 1)
+o4._rcpt_shadow_note("0xe", "коллектор", None)
+check("shadow: «таймаут vs статус» — КРАЕВОЙ класс (разные часы дедлайнов), не расхождение",
+      o4.stats.get("rcpt_shadow_edge") == 1 and o4.stats.get("rcpt_shadow_diverged") == 1,
+      o4.stats)
+# переполнение В ТЕНИ — отдельное имя (деньги не задеты, легаси уже спавнут)
+o6, col6, out6, _, _ = mk("shadow", max_pending=1)
+o6._rcpt_dispatch("0xsh1", "probe", ("m", "b", 1.0, "F"))
+o6._rcpt_dispatch("0xsh2", "probe", ("m", "b", 1.0, "F"))
+check("shadow-переполнение: rcpt_shadow_dropped, collector_overflow НЕ трогается",
+      o6.stats.get("rcpt_shadow_dropped") == 1 and "collector_overflow" not in o6.stats,
+      o6.stats)
 # shadow-результат коллектора денег не трогает (core не зовётся)
 o4._rcpt_result(("shadow", "probe", ("m", "b", 1.0, "F"), 0.0), "0xc",
                 {"status": 1, "gasUsed": 1, "effectiveGasPrice": 1})

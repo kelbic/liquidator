@@ -1291,9 +1291,14 @@ class SpecFireLive:
                 self.stats.get("collector_dispatch_fail", 0) + 1
             self._log("SPECFIRE rcpt-коллектор dispatch fail tx=%s: %s" % (h, type(e).__name__))
         if not ok:
-            self.stats["collector_overflow"] = self.stats.get("collector_overflow", 0) + 1
-            if mode == "collector":                          # исход обязан случиться
+            # Линза 22.08: НЕ один счётчик на два разных факта (омонимия колонки). В shadow
+            # переполнение значит лишь «тень не всё сверила» (деньги ведёт легаси-тред,
+            # спавнутый выше); в collector — «фолбэк-тред спас исход».
+            if mode == "collector":
+                self.stats["collector_overflow"] = self.stats.get("collector_overflow", 0) + 1
                 threading.Thread(target=target, args=(h,) + args, daemon=True).start()
+            else:
+                self.stats["rcpt_shadow_dropped"] = self.stats.get("rcpt_shadow_dropped", 0) + 1
 
     def _rcpt_result(self, meta, h, r):
         src, kind, args, t0 = meta
@@ -1337,12 +1342,18 @@ class SpecFireLive:
                 return
         if other[0] == who:                                  # дубль своей же стороны — не суд
             return
-        if other[1] != status:
+        if other[1] == status:
+            self.stats["rcpt_shadow_agree"] = self.stats.get("rcpt_shadow_agree", 0) + 1
+        elif other[1] is None or status is None:
+            # Линза 22.08: КРАЕВОЙ класс, не расхождение — у легаси и коллектора РАЗНЫЕ часы
+            # дедлайна (спавн треда vs track+poll+min_age), квитанция у границы таймаута даёт
+            # «таймаут vs статус» законно. Судить годность коллектора по счётчику, замусоренному
+            # краевыми, нельзя — потому отдельное имя и тихий учёт.
+            self.stats["rcpt_shadow_edge"] = self.stats.get("rcpt_shadow_edge", 0) + 1
+        else:
             self.stats["rcpt_shadow_diverged"] = self.stats.get("rcpt_shadow_diverged", 0) + 1
             self._log("SPECFIRE RCPT-SHADOW РАСХОЖДЕНИЕ tx=%s: %s=%s %s=%s"
                       % (h, who, status, other[0], other[1]))
-        else:
-            self.stats["rcpt_shadow_agree"] = self.stats.get("rcpt_shadow_agree", 0) + 1
 
     def _collect(self, h, mid, borrower, debt_usd, feed=""):
         """ЛЕГАСИ-обёртка (тред-на-пробу): полл квитанции блокирует тред, исход ведёт core.
@@ -2677,6 +2688,14 @@ class SpecFireLive:
                                  audit_fn=_audit, log=self._log)
             self._fire_engine = eng
             eng.start()
+            # П.3/линза: коллектор ОКНА греется ЗДЕСЬ же, а не лениво в первом dispatch —
+            # иначе RTT сборки (импорты, цепочка узлов) лёг бы внутрь горячего пути первого
+            # выстрела окна. Ленивая ветка в _rcpt_coll остаётся страховкой.
+            if SPEC_FIRE_RCPT_MODE in ("shadow", "collector"):
+                try:
+                    self._rcpt_coll()
+                except Exception as _e:                      # noqa: BLE001
+                    self._log("SPECFIRE rcpt-коллектор прогрев fail: %s" % type(_e).__name__)
             return eng
 
     def _engine_result(self, meta, h, r):
