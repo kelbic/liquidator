@@ -21,9 +21,46 @@ from __future__ import annotations
 
 import os
 import threading
+import os
 import time
 from dataclasses import dataclass
 from chain.rpc import redact_clip
+
+# ДЕТОНАТОР (пост-мортем $128k 22.08): арм-порог обязан видеть БЛИЗОСТЬ жирной цели — цель
+# hf=0.9987 флипается движением 0.13%, а универсальный арм 0.9×dev=0.45% «не считал её своей
+# войной» (окно не армилось, залпа не было, реактивная лента проиграла предочереди).
+# Свежие flip_dist пушит spec_fire (note_det_dist, min по ОБОИМ направлениям — арм не знает
+# направление заранее, направление судит огневой порог окна); TTL гасит протухшие, пол шума
+# держит hf≈1.000001 от дребезга. При det-арме гистерезис disarm масштабируется от
+# эффективного арма — иначе окно армилось бы и гасло на одном тике.
+# Откат: SPEC_FIRE_DET_SENSE=0 (ОБЩИЙ env с порогом окна — слои включаются/выключаются вместе).
+_DET_ON = os.environ.get("SPEC_FIRE_DET_SENSE", "1").lower() not in ("0", "false", "no")
+_DET_FLOOR = float(os.environ.get("SPEC_FIRE_DET_NOISE_FLOOR", "0.0005"))
+_DET_TTL = float(os.environ.get("SPEC_FIRE_DET_TTL_SEC", "180"))
+_DET_DIST: dict = {}                     # label -> (min_flip_dist, wall_ts)
+
+
+def note_det_dist(label, dist, now=None):
+    try:
+        if dist is not None and float(dist) >= 0.0:
+            _DET_DIST[str(label)] = (float(dist),
+                                     float(now) if now is not None else time.time())
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+def _det_arm_pct(label, arm_pct, now=None):
+    """Эффективный арм-порог: min(универсальный, 0.9×flip_dist ближайшей жирной цели),
+    снизу пол шума; протухший/отсутствующий сигнал = универсальный (fail-open)."""
+    if not _DET_ON:
+        return arm_pct
+    e = _DET_DIST.get(str(label))
+    if not e:
+        return arm_pct
+    d, ts = e
+    if (float(now) if now is not None else time.time()) - ts > _DET_TTL:
+        return arm_pct
+    return max(_DET_FLOOR, min(arm_pct, d * 0.9))
 
 # Binance-символ -> {label, dev} (deviation Chainlink-фида на Base; arm=0.9*dev, disarm=0.7*dev).
 # ПРОКСИ-адреса фидов резолвятся у чейна (resolve_feed_proxies) — стабильны при ротации агрегаторов.
@@ -224,7 +261,9 @@ class PredictEngine:
         if not f.armed:
             if f.suppressed and mag < f.disarm_pct:
                 f.suppressed = False
-            if not f.suppressed and mag >= f.arm_pct:
+            _eff_arm = _det_arm_pct(f.label, f.arm_pct)
+            if not f.suppressed and mag >= _eff_arm:
+                f.eff_disarm = min(f.disarm_pct, _eff_arm * 0.85)   # гистерезис от det-арма
                 f.armed = True
                 f.arm_mono = self._now()
                 f.arm_wall = wall if wall is not None else time.time()
@@ -233,7 +272,8 @@ class PredictEngine:
                 events.append({"event": "arm", "feed": f.label, "ret_pct": r * 100.0,
                                "ret_bps": int(round(mag * 10000.0)), "anchor": f.anchor,
                                "mid": f.mid, "dir": ("up" if r >= 0 else "down")})
-        elif mag < f.disarm_pct:                   # ретрейс ниже гистерезиса без пуша
+        elif mag < min(f.disarm_pct, getattr(f, "eff_disarm", f.disarm_pct)):
+            # ретрейс ниже гистерезиса без пуша (гистерезис det-арма — от эффективного порога)
             events.append(self._end(f, "disarm", r))
         return events
 

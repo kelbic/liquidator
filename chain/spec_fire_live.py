@@ -663,6 +663,15 @@ def _facts_fresh(now_wall=None):
     except OSError:
         return False
 SPEC_FIRE_THRESHOLD = float(os.environ.get("SPEC_FIRE_THRESHOLD", "1.0"))     # ×dev
+# ДЕТОНАТОР-ЧУВСТВИТЕЛЬНОСТЬ (пост-мортем $128k 22.08): цель hf=0.9987 флипается движением
+# 0.13%, а универсальный порог окна dev×THRESHOLD=0.5% — окно «не считало эту цель своей
+# войной», залп не вышел, реактивная лента (+425мс = 2-4 суб-блока) проиграла стоячей
+# предочереди. Порог огня = clamp(min(универсальный, ближайший flip_dist жирной цели фида),
+# пол_шума, универсальный); пол шума держит hf=1.000001 от окна каждым тиком; кап окон
+# близости в минуту — предохранитель от дребезга. Откат: SPEC_FIRE_DET_SENSE=0.
+SPEC_FIRE_DET_SENSE = os.environ.get("SPEC_FIRE_DET_SENSE", "1").lower() not in ("0", "false", "no")
+SPEC_FIRE_DET_NOISE_FLOOR = float(os.environ.get("SPEC_FIRE_DET_NOISE_FLOOR", "0.0005"))
+SPEC_FIRE_DET_WIN_CAP_MIN = int(os.environ.get("SPEC_FIRE_DET_WIN_CAP_MIN", "6"))
 # Predicted-HF гейт (24.07, ревью + live-данные): цена на транзите ~= текущий Binance mid,
 # значит проба имеет смысл ТОЛЬКО если этот транзит способен флипнуть цель:
 #   dist_to_flip <= |ret| + MARGIN_DEVS × dev   (аддитивный запас на лаг HF-кэша ~60с,
@@ -1216,6 +1225,58 @@ class SpecFireLive:
         # post-selection), а ценностной гард #88 — в _arm_board. Здесь ранг чист по долгу.
         elig.sort(key=lambda t: -t[2])
         return elig[:k], hold_dist, edge_t
+
+    def _min_flip_dist(self, feed: str, direction: str):
+        """Детонатор: ближайший flip_dist ЖИРНОЙ цели фида — ТА ЖЕ математика, что в
+        _top_fat (down: 1−1/HF, up: HF−1; hf<=1 = уже за флипом = 0). None = ни у одной
+        цели dist не вычислим (fail-open: порог остаётся универсальным)."""
+        best = None
+        with self.shared.lock:
+            groups = dict(self.shared.groups)
+            debt_by = dict(self.shared.debt_by)
+            by_id = dict(self.shared.by_id)
+            hf_by = dict(getattr(self.shared, "hf_by", {}) or {})
+        for mid, borrowers in groups.items():
+            m = by_id.get(mid)
+            if m is None:
+                continue
+            cl = _label_of(getattr(m, "collateral_token", ""))
+            ll = _label_of(getattr(m, "loan_token", ""))
+            if cl == ll or not ((direction == "down" and cl == feed)
+                                or (direction == "up" and ll == feed)):
+                continue
+            _min_usd = _market_min_repaid_usd(getattr(m, "bonus", 0.0))
+            for b in borrowers:
+                if float(debt_by.get((mid, b), 0.0) or 0.0) < _min_usd:
+                    continue
+                hf = float(hf_by.get((mid, b), 0.0) or 0.0)
+                if hf <= 0.0:
+                    continue                              # HF неизвестен — эта цель не судит
+                dist = 0.0 if hf <= 1.0 else (
+                    (1.0 - 1.0 / hf) if direction == "down" else (hf - 1.0))
+                if best is None or dist < best:
+                    best = dist
+        return best
+
+    def _det_thr(self, feed: str, direction: str, thr: float):
+        """Порог огня окна с детонатор-чувствительностью: min(универсальный, ближайший
+        flip_dist), снизу пол шума; кап окон близости в минуту — при дребезге детонатор
+        отключается на универсальный (предохранитель). -> (порог, dist|None)."""
+        if not SPEC_FIRE_DET_SENSE:
+            return thr, None
+        try:
+            d = self._min_flip_dist(feed, direction)
+        except Exception:                                # noqa: BLE001
+            return thr, None
+        if d is None or d >= thr:
+            return thr, d
+        n = self._now()
+        dq = self.stats.setdefault("_det_win_ts", [])
+        dq[:] = [t for t in dq if n - t < 60.0]
+        if len(dq) >= SPEC_FIRE_DET_WIN_CAP_MIN:
+            self.stats["det_win_capped"] = self.stats.get("det_win_capped", 0) + 1
+            return thr, d
+        return max(SPEC_FIRE_DET_NOISE_FLOOR, d), d
 
     def _bonus_of(self, mid: str) -> float:
         """LIF-1 рынка из covered-снапшота (гейт по призу); 0.0 = неизвестен -> долг-гейт."""
@@ -2586,6 +2647,18 @@ class SpecFireLive:
                 чья лестница действительно протухла: вздута (гейт патрона закрыт) либо ниже
                 нынешней базы (tx не включаема). Обе формы САМИ останавливают огонь, поэтому
                 триггер по глубине склада тут не срабатывает никогда."""
+                # ДЕТОНАТОР: свежие flip_dist фидов — предиктору (арм-порог видит близость
+                # жирной цели; min по направлениям, направление судит огневой порог окна).
+                # Прибор сбоку: отказ глотается, аудит лестниц не задевает.
+                try:
+                    from chain import predict as _pr
+                    for _f in list(self.dev_by):
+                        _ds = [d for d in (self._min_flip_dist(_f, "down"),
+                                           self._min_flip_dist(_f, "up")) if d is not None]
+                        if _ds:
+                            _pr.note_det_dist(_f, min(_ds))
+                except Exception:                        # noqa: BLE001
+                    pass
                 try:
                     # 20.08 раскидка квот: аудит — фоновое чтение, уходит с боевого ключа
                     bf = int(_ex.volley_bal_read_rpc(self.rpc)._web3()
@@ -3723,7 +3796,15 @@ class SpecFireLive:
 
     def _window_loop(self, feed: str, direction: str, stop: threading.Event):
         dev = self.dev_by.get(feed, 0.005)
-        thr = dev * SPEC_FIRE_THRESHOLD
+        _thr_uni = dev * SPEC_FIRE_THRESHOLD
+        thr, _det_d = self._det_thr(feed, direction, _thr_uni)
+        if thr < _thr_uni:                       # детонатор связал порог — окно близости
+            self.stats.setdefault("_det_win_ts", []).append(self._now())
+            self.stats["det_windows"] = self.stats.get("det_windows", 0) + 1
+            self._log("SPECFIRE ДЕТОНАТОР feed=%s: порог огня %.3f%% (жир в %.3f%% от флипа; "
+                      "универсальный %.3f%%)" % (feed, thr * 100.0,
+                                                 (_det_d or 0.0) * 100.0, _thr_uni * 100.0))
+        _det_next = self._now() + 5.0            # цели дышат — порог перечитывается каждые 5с
         band = dev * SPEC_FIRE_OWED_BAND
         probes = 0
         last_fire = 0.0
@@ -3748,6 +3829,9 @@ class SpecFireLive:
         _probe0 = self._probe_snap()
         try:
             while not stop.is_set() and probes < _window_cap(fat_mode):
+                if self._now() >= _det_next:      # детонатор: перечитать близость целей
+                    _det_next = self._now() + 5.0
+                    thr, _det_d = self._det_thr(feed, direction, _thr_uni)
                 pf = self.pending_fire.pop(feed, None)
                 if pf is not None and self._now() - pf[3] <= PENDING_FIRE_FRESH_SEC:
                     # A2: handoff от pending-detect — жертва флипнута в ФОРМИРУЕМОМ блоке.
