@@ -38,14 +38,16 @@ assert direct_swap(_WSTETH, _UNIV3_WETH, 150 * 10**18, LIQ, LIQ, repaid_assets=1
 assert direct_swap(_WSTETH, _UNIV3_WETH, 150 * 10**18 + 1, LIQ, LIQ, repaid_assets=1) is None, "кап+1 — None"
 print("UNIT_OK: wstETH кап 150 включительно, кап+1 -> None")
 
-# 4) cbBTC/USDC кап 30 cbBTC (~$1.9M): кит $1.5M (~25 cbBTC) — директ; сверх — Kyber
+# 4) cbBTC/USDC кап 13 cbBTC (рекалибровка 22.08: ликвидность ушла, impact на старом капе
+#    30 = 5.23% > бонуса 4.38% — статик был размером, убыточным по построению; S_обрыв/2=13).
+#    Кит до капа — директ; сверх — Kyber (PREARM греет), живой слой поднимет при глубине.
 from chain.execute import _CBBTC, _UNIV3_USDC
 assert _SWAP_ROUTES[(_CBBTC, _UNIV3_USDC)]["max_in"] == 13 * 10**8   # 22.08 рекалибровка
-whale = direct_swap(_CBBTC, _UNIV3_USDC, 25 * 10**8, LIQ, LIQ, repaid_assets=1)
-assert whale is not None, "сайз кита обязан идти директом (скорость, профит жив)"
-mega = direct_swap(_CBBTC, _UNIV3_USDC, 31 * 10**8, LIQ, LIQ, repaid_assets=1)
-assert mega is None, "сверх капа (imp>бонуса) — None -> Kyber"
-print("UNIT_OK: cbBTC кап 30 — кит директом, минусовый мега-сайз в Kyber")
+whale = direct_swap(_CBBTC, _UNIV3_USDC, 12 * 10**8, LIQ, LIQ, repaid_assets=1)
+assert whale is not None, "сайз до капа обязан идти директом (скорость, профит жив)"
+mega = direct_swap(_CBBTC, _UNIV3_USDC, 14 * 10**8, LIQ, LIQ, repaid_assets=1)
+assert mega is None, "сверх капа (imp>бонуса на сегодняшней глубине) — None -> Kyber"
+print("UNIT_OK: cbBTC кап 13 — до капа директом, сверх в Kyber (глубина 22.08)")
 
 # 5) peg-пары (weETH/wstETH — обе ноги ETH) исключены из predict-окон -> кап там не нужен,
 #    он защищает ТОЛЬКО реактивное исполнение
