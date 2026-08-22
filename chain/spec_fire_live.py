@@ -508,6 +508,15 @@ SPEC_FIRE_FACTS_FLAG = os.environ.get("SPEC_FIRE_FACTS_FLAG", "state/cascade_fac
 SPEC_FIRE_COLLECTOR_RPC_URL = (os.environ.get("SPEC_FIRE_COLLECTOR_RPC_URL", "")
                                or os.environ.get("BG_RPC_URL_2", "")
                                or os.environ.get("BG_RPC_URL", ""))
+# 22.08 (kelbic, ключ D): ВТОРОЙ БЕСПЛАТНЫЙ узел квитанций ПЕРЕД платным откатом. Страховка
+# боевым срабатывала ~447 раз/сутки — каждый раз партия жгла платную квоту. Цепочка теперь:
+# свой bg (dRPC, партии 1-3) -> D (Alchemy free, СВОЙ аккаунт, 30M) -> платный боевой.
+# Назначение D — ИЗ ЗАМЕРА партий (не из надежды): не держит батчи -> CHUNK_2 режет партию,
+# совсем плох -> URL_2="" снимает звено целиком (цепочка бит-в-бит прежняя).
+SPEC_FIRE_COLLECTOR_RPC_URL_2 = (os.environ.get("SPEC_FIRE_COLLECTOR_RPC_URL_2", "")
+                                 or os.environ.get("ALCHEMY_D_URL", ""))
+SPEC_FIRE_COLLECTOR_BATCH_CHUNK_2 = int(
+    os.environ.get("SPEC_FIRE_COLLECTOR_BATCH_CHUNK_2", "0"))
 
 
 def _collector_node_kind() -> str:
@@ -548,7 +557,7 @@ SPEC_FIRE_COLLECTOR_INDEX = os.environ.get(
 
 
 def collect_receipts(hs, dedicated_url, combat_url, batch_fn, on_fallback=None,
-                     dedicated_chunk=0):
+                     dedicated_chunk=0, second_url="", second_chunk=0, on_second=None):
     """Квитанции с ВЫДЕЛЕННОГО узла; страховка боевым — ТОЛЬКО на реальном отказе выделенного.
 
     Почему это отдельная функция, а не тело замыкания внутри _engine: замыкание нельзя позвать
@@ -563,22 +572,39 @@ def collect_receipts(hs, dedicated_url, combat_url, batch_fn, on_fallback=None,
     nonce ноги и рушит её лестницу — приговор по слепому узлу («незнание обязано закрывать гард»).
     """
     from chain.execute import ReceiptsUnavailable
-    if not dedicated_url:
+    if not dedicated_url and not second_url:
         return batch_fn(combat_url, hs)
+
+    def _try(url, chunk):
+        # chunk передаём ТОЛЬКО бесплатным узлам и только когда он задан: боевой Alchemy
+        # держит большие батчи, резать его незачем. Ключевой аргумент, чтобы тестовые
+        # двойники с сигнатурой (url, hs) не ломались, когда нарезка выключена.
+        return (batch_fn(url, hs, chunk=chunk) if chunk > 0 else batch_fn(url, hs))
+
     why = None
-    try:
-        # chunk передаём ТОЛЬКО выделенному узлу и только когда он задан: боевой Alchemy держит
-        # большие батчи, резать его незачем. Ключевой аргумент, чтобы тестовые двойники с
-        # сигнатурой (url, hs) не ломались, когда нарезка выключена.
-        out = (batch_fn(dedicated_url, hs, chunk=dedicated_chunk) if dedicated_chunk > 0
-               else batch_fn(dedicated_url, hs))
-        if not SPEC_FIRE_COLLECTOR_FALLBACK_ON_EMPTY:
-            return out                              # узел ответил — боевой ключ не трогаем
-        if any(v is not None for v in (out or {}).values()):
-            return out
-        why = "откат: в партии ничего не резолвилось"
-    except ReceiptsUnavailable as e:
-        why = "отказ узла (%s)" % e
+    if dedicated_url:
+        try:
+            out = _try(dedicated_url, dedicated_chunk)
+            if not SPEC_FIRE_COLLECTOR_FALLBACK_ON_EMPTY:
+                return out                          # узел ответил — дальше по цепочке не идём
+            if any(v is not None for v in (out or {}).values()):
+                return out
+            why = "откат: в партии ничего не резолвилось"
+        except ReceiptsUnavailable as e:
+            why = "отказ узла (%s)" % e
+    # 22.08: ВТОРОЙ БЕСПЛАТНЫЙ (ключ D) — до платного. Спасённая им партия платный ключ не
+    # трогает; учёт спасений — on_second (прибор сбоку, судить эффект будет CU-атрибуция).
+    if second_url:
+        try:
+            out = _try(second_url, second_chunk)
+            if (not SPEC_FIRE_COLLECTOR_FALLBACK_ON_EMPTY
+                    or any(v is not None for v in (out or {}).values())):
+                if why is not None and on_second is not None:
+                    on_second(why)
+                return out
+            why = "откат-2: в партии ничего не резолвилось"
+        except ReceiptsUnavailable as e:
+            why = "%s; отказ узла-2 (%s)" % (why or "без выделенного", e)
     if on_fallback is not None:
         on_fallback(why)
     return batch_fn(combat_url, hs)
@@ -2279,7 +2305,22 @@ class SpecFireLive:
         return lambda hs: collect_receipts(hs, SPEC_FIRE_COLLECTOR_RPC_URL, combat_url(),
                                            _ex.batch_receipts,
                                            on_fallback=self._note_collector_fallback,
-                                           dedicated_chunk=SPEC_FIRE_COLLECTOR_BATCH_CHUNK)
+                                           dedicated_chunk=SPEC_FIRE_COLLECTOR_BATCH_CHUNK,
+                                           second_url=SPEC_FIRE_COLLECTOR_RPC_URL_2,
+                                           second_chunk=SPEC_FIRE_COLLECTOR_BATCH_CHUNK_2,
+                                           on_second=self._note_collector_second)
+
+    def _note_collector_second(self, why):
+        """22.08: партия спасена ВТОРЫМ бесплатным (ключ D) — платный ключ не тронут. Прибор
+        сбоку: счётчик + строка с прореживанием, отказ глотается вызывающим collect_receipts.
+        Судит эффект НЕ этот счётчик, а CU-атрибуция после рестарта (свой счётчик слеп)."""
+        n = self.stats["collector_second"] = self.stats.get("collector_second", 0) + 1
+        now = time.time()
+        if now - getattr(self, "_collector_2_logged", 0.0) < SPEC_FIRE_COLLECTOR_FALLBACK_LOG_SEC:
+            return
+        self._collector_2_logged = now
+        self._log("SPECFIRE коллектор: партия спасена бесплатным-2 (D) — %s "
+                  "(спасений %d, платный не тронут)" % (why, n))
 
     def _index_fn(self):
         """Шов ИНДЕКСА ЦЕПИ для коллектора (#110) либо None.

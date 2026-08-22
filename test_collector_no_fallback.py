@@ -260,6 +260,7 @@ class _Stub:
     stats: dict = {}
     _receipts_fn = sfl.SpecFireLive._receipts_fn
     _note_collector_fallback = sfl.SpecFireLive._note_collector_fallback
+    _note_collector_second = sfl.SpecFireLive._note_collector_second   # 22.08: звено D
 
 
 LOGS: list = []
