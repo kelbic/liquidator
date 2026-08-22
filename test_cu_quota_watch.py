@@ -732,6 +732,41 @@ check("начала окна не дали вовсе -> хвост выбыва
       bal_none == [], bal_none)
 
 
+# ---- 42. КЛЮЧ БЕЗ ЯКОРЯ ОСТАТКА: невидимость по остатку обязана БУДИТЬ, а не молчать ----
+# Живой повод: ключ D введён владельцем в бой 22.08 08:26Z; balance_verdicts ходит только по
+# хостам якоря, значит новый ключ по остатку невидим ЦЕЛИКОМ. Прежде об этом говорила одна
+# строка штиля, которая (а) печатается лишь в тихом прогоне и (б) никого не будит.
+sent.clear()
+hp_na = os.path.join(_tmp, "noanchor", "h.jsonl")
+os.makedirs(os.path.dirname(hp_na), exist_ok=True)
+_fresh_hist(5.0, path=hp_na)
+_anc_na = os.path.join(_tmp, "noanchor", "cu-quota.anchor.json")
+json.dump(_anchor(1.0, as_of=NOW - 44 * HOUR, host=A), open(_anc_na, "w", encoding="utf-8"))
+w.run(fetch=lambda: _journal(B5735, [5.0] * 30, pid=9), notify_fn=_nf, out=lambda *_: None,
+      now=NOW, history_path=hp_na)
+na = [x for x in sent if x[2] == "cu-quota:no-anchor:%s" % B5735]
+check("якорь ЕСТЬ, но ключа в нём нет и он жжёт -> тревога (не строка штиля)",
+      len(na) == 1 and na[0][1] is False, [x[2] for x in sent])
+if na:
+    check("...и текст велит НЕ ВЫДУМЫВАТЬ mtd_cu для НЕсвежего ключа",
+          "НЕ ВЫДУМЫВАТЬ" in na[0][3] and "нулевой на момент ввода в бой" in na[0][3],
+          na[0][3][:200])
+    check("...и не зовёт человека там, где справляется агент",
+          "человек не нужен" in na[0][3], na[0][3][:200])
+# НЕГАТИВНЫЙ КОНТРОЛЬ: ПУСТОЙ якорь — это «ветка остатка не заведена», состояние отдельное
+# и уже покрытое; звонить по нему = звенеть на норме. Гасить обязан именно этот гард.
+sent.clear()
+hp_na2 = os.path.join(_tmp, "noanchor2", "h.jsonl")
+os.makedirs(os.path.dirname(hp_na2), exist_ok=True)
+_fresh_hist(5.0, path=hp_na2)
+json.dump({"quota_cu": 30e6, "hosts": {}},
+          open(os.path.join(_tmp, "noanchor2", "cu-quota.anchor.json"), "w", encoding="utf-8"))
+w.run(fetch=lambda: _journal(B5735, [5.0] * 30, pid=9), notify_fn=_nf, out=lambda *_: None,
+      now=NOW, history_path=hp_na2)
+check("ПУСТОЙ якорь (ветка не заведена) -> тревоги о «ключе без якоря» НЕТ",
+      not any(x[2].startswith("cu-quota:no-anchor:") for x in sent), [x[2] for x in sent])
+
+
 print("\n%s" % ("FAIL: %d" % len(FAILS) if FAILS
                 else "OK: сторож квоты — парс/всплеск/ИНТЕГРАЛ/ОСТАТОК/дедуп/слепота/самоконтроль"))
 sys.exit(1 if FAILS else 0)
