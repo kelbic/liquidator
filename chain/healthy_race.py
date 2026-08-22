@@ -38,8 +38,11 @@ HR_MISS_COST_USD = float(os.environ.get("HR_MISS_COST_USD", "9"))           # о
 HR_CORPSE_LOOKBACK = int(os.environ.get("HR_CORPSE_LOOKBACK_BLOCKS", "150"))  # ~5 мин Base
 HR_JOURNAL = os.environ.get("HR_JOURNAL", "data/healthy_race_bids.jsonl")
 
+HR_REBID_SEC = float(os.environ.get("HR_REBID_SEC", "600"))   # защёлка: один бид на цель за эпизод
+
 _LOCK = threading.Lock()
 _BUCKET = {"day": None, "spent": 0.0, "alert80": False}
+_RECENT = {}                                            # (mid, borrower) -> ts бида (кап 64)
 COUNTERS = {"hr_bids": 0, "hr_hits": 0, "hr_misses": 0,
             "hr_corpse_filtered": 0, "hr_budget_skips": 0, "hr_gate_skips": 0}
 
@@ -118,6 +121,14 @@ def classify(market_id, borrower, hf_est, prize_net_usd, data_age_s=0.0,
             COUNTERS["hr_gate_skips"] += 1
         return ("SKIP", "приз $%.0f < $%.0f" % (prize_net_usd or 0.0, HR_MIN_PRIZE_USD))
     with _LOCK:
+        # Защёлка цели: повторный спавн того же транзита не сжигает дневной бакет об одного
+        # заёмщика (линза 22.08). ДО проверки бакета — повтор не считается budget_skip'ом.
+        _k = (str(market_id).lower(), str(borrower).lower())
+        _ts = _RECENT.get(_k)
+        if _ts is not None and now - _ts < HR_REBID_SEC:
+            COUNTERS["hr_gate_skips"] += 1
+            return ("SKIP", "уже бидили эту цель %.0fс назад (защёлка %ss)"
+                    % (now - _ts, int(HR_REBID_SEC)))
         day = _utc_day(now)
         if _BUCKET["day"] != day:
             _BUCKET.update({"day": day, "spent": 0.0, "alert80": False})
@@ -139,6 +150,9 @@ def note_bid(market_id, borrower, prize_usd, tip_wei, hf_est, txh=None, now=None
             _BUCKET.update({"day": day, "spent": 0.0, "alert80": False})
         _BUCKET["spent"] += HR_MISS_COST_USD
         COUNTERS["hr_bids"] += 1
+        _RECENT[(str(market_id).lower(), str(borrower).lower())] = now
+        while len(_RECENT) > 64:
+            _RECENT.pop(next(iter(_RECENT)))
         if not _BUCKET["alert80"] and _BUCKET["spent"] >= 0.8 * HR_BUDGET_USD:
             _BUCKET["alert80"] = True
             warn = "HR бюджет 80%%: $%.2f из $%.2f за сутки" % (_BUCKET["spent"], HR_BUDGET_USD)

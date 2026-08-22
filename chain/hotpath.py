@@ -2078,9 +2078,15 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
                     _hr_hf = _hr.hf_estimate(collateral_dbg, price, lltv_wad, _hr_ba)
                     _hr_prize = (repaid_assets * debt_usd / debt_assets) * (
                         lif_from_lltv(lltv_wad / 10**18) - 1.0) if debt_assets else 0.0
+                    # episode=True ПО ПОСТРОЕНИЮ (линза 22.08): prepare_hot зовётся только из
+                    # обработки транзита секунды назад — это и есть «pending<10с» спеки. Ждать
+                    # dominant_tip нельзя: в 05:11 класс эскалации въехал в кольцо ПОСТФАКТУМ,
+                    # гейт был бы закрыт ровно в момент, ради которого фича строилась.
+                    # Execute-путь (не транзит-контекст) остаётся на dominant_tip/pending.
                     _hr_state, _hr_why = _hr.classify(market_id, borrower, _hr_hf, _hr_prize,
                                                       data_age_s=0.0,
-                                                      borrow_shares=int(borrow_shares))
+                                                      borrow_shares=int(borrow_shares),
+                                                      episode=True)
                     if _hr_state == "HEALTHY_RACE":
                         _hr_minp = max(1, int(repaid_assets
                                               * (lif_from_lltv(lltv_wad / 10**18) - 1.0) * 0.25))
