@@ -94,6 +94,10 @@ MIN_BOOK_SEC = float(os.environ.get("CU_WATCH_MIN_BOOK_H", "6")) * 3600.0
 # два прогона подряд эту пилу гасят и при этом ловят ступень за 1-2 часа.
 FRESH_N = int(os.environ.get("CU_WATCH_FRESH_N", "2"))
 FRESH_MIN_SEC = float(os.environ.get("CU_WATCH_FRESH_MIN_H", "1")) * 3600.0
+# ПРИПАРКОВАННЫЙ КЛЮЧ (22.08): сколько прогонов подряд нулевого расхода при живом
+# co-наблюдении считать доказательством простоя. Три — час с лишним, пережидает одиночную
+# дыру в журнале и при этом возвращает гард в строй через час после возврата нагрузки.
+PARKED_N = int(os.environ.get("CU_WATCH_PARKED_N", "3"))
 SEC_MONTH = 30 * 24 * 3600.0
 WINDOW_SEC_FALLBACK = 120.0   # каденс CU-строки бота, если длительность не выводится из строки
 
@@ -238,7 +242,7 @@ def history_cutoff(recs):
     return max(tops) if tops else None
 
 
-def quota_verdicts(recs, *, threshold, trail_sec, min_trail_sec, now=None):
+def quota_verdicts(recs, *, threshold, trail_sec, min_trail_sec, now=None, parked=None):
     """ПРИГОВОР ПО КВОТЕ — интеграл, а не мгновенный темп.
 
     [(host, rate_M, covered_sec, cu_total)] по хвосту trail_sec: сумма ВСЕХ потраченных CU
@@ -265,8 +269,16 @@ def quota_verdicts(recs, *, threshold, trail_sec, min_trail_sec, now=None):
             a["cu"] += float(d.get("cu", 0))
             a["sec"] += float(d.get("sec", 0))
     out = []
+    parked = set(parked or ())
     for host, a in sorted(agg.items()):
         if a["sec"] < min_trail_sec:
+            continue
+        if host in parked:
+            # Тот же co-наблюдательный замер, что и в ветке остатка: 21.08-22.08 сторож
+            # объявлял «#5735 жжёт 31.6M CU/мес» по ключу, по которому бот не сделал ни
+            # одного вызова четыре часа. Порог этой правкой НЕ трогается (он защищён
+            # замером 22% ложных) — из-под него убирается ключ, расход которого ЗАМЕРЕН
+            # нулём, а не оценён хвостом.
             continue
         rate = a["cu"] / a["sec"] * SEC_MONTH / 1e6
         if rate >= threshold:
@@ -321,6 +333,45 @@ def fresh_summary(recs, *, n=None, now=None):
     return {h: ((cu / sec * 86400.0) if sec > 0 else 0.0, sec, since)
             for h, (cu, sec, since) in agg.items()}
 
+
+
+def parked_hosts(recs, candidates, *, n=None):
+    """Ключи из `candidates`, по которым бот ПОЛОЖИТЕЛЬНО не ходит. Возвращает множество.
+
+    ЗАЧЕМ (22.08, разбор своей же ложной тревоги по #5735). 21.08 18:53 потребители были
+    уведены с #5735, трафика по нему с 18:58 НЕТ ВОВСЕ — а сторож продолжал звонить «остатка
+    на 4.0 суток» раз в 6ч, потому что судил ключ ГРЯЗНЫМ ХВОСТОМ, захватившим время до
+    манёвра. Прошлая сессия предел назвала и чинить отказалась с обоснованием: «отличить
+    "ключ не жжёт" от "сторож ослеп" ОДНОЙ СТРОКОЙ нельзя». Обоснование верное ровно для
+    одной строки — и неверное для ПРОГОНА: в тех же самых прогонах, где по #5735 ноль,
+    по #3133 и #94bf окна разбираются штатно. Это и есть ПОЗИТИВНЫЙ КОНТРОЛЬ прибора
+    (канон test-that-can-only-return-zero: «пусто ⇒ явления нет» законно лишь после
+    позитивного контроля) — и он тут бесплатный, потому что уже лежит в той же записи.
+
+    ПРАВИЛО. Хост припаркован, если в КАЖДОМ из n последних прогонов (а) у него ноль CU —
+    неважно, отсутствием строк или явным нулём, и (б) в этом же прогоне хоть у одного
+    ДРУГОГО хоста покрытое время > 0. Прогон без единого разобранного окна контролем не
+    является и всё множество обнуляет: слепой сторож не имеет права объявлять тишину.
+
+    НАЗВАННЫЙ ПРЕДЕЛ. Доказывается простой БОТА, а не аккаунта: если по ключу ходит кто-то
+    ещё, здесь его не видно (канон own-meter-blind-path). Покрытия при этом не теряется —
+    и книга, и хвост, которыми сторож судил ДО этой правки, ровно так же считают только
+    ботовый расход; менее слепым приговор по грязному хвосту ключ не делал.
+    """
+    n = int(n if n is not None else PARKED_N)
+    rs = sorted([r for r in recs if r.get("ts") is not None], key=lambda r: float(r["ts"]))[-n:]
+    if len(rs) < n:
+        return set()                      # истории меньше окна — молчать нечем, не судим
+    out = set(candidates or ())
+    for r in rs:
+        hosts = r.get("hosts") or {}
+        control = any(float(d.get("sec", 0)) > 0 for d in hosts.values())
+        if not control:
+            return set()                  # прогон вслепую: позитивного контроля нет
+        for h in list(out):
+            if float((hosts.get(h) or {}).get("cu", 0)) > 0:
+                out.discard(h)
+    return out
 
 # ============================== ОСТАТОК (ПРЕДЕЛ 3, 21.08) ==============================
 # Приговор по темпу отвечает на вопрос «устойчиво ли много жжём». Вопрос «хватит ли до
@@ -446,8 +497,34 @@ def next_reset(epoch, spec="calendar"):
     return calendar.timegm((y, m, day, 0, 0, 0, 0, 1, 0))
 
 
+def host_reset_spec(anchor, host, horizon="cal"):
+    """Спека сброса для хоста: "cal" — ранний кандидат, "alt" — поздний (если он назван).
+
+    ДАТА СБРОСА КВОТЫ ALCHEMY НЕИЗВЕСТНА (INFRA-FACTS, проверено владельцем 21.08: дашборд
+    её не показывает). Сторож всё это время подставлял КАЛЕНДАРНОЕ 1-е число — и это не
+    нейтральное допущение: чем ПОЗЖЕ наливается ведро, тем РАНЬШЕ надо звонить, значит
+    ранний кандидат работает В СТОРОНУ МОЛЧАНИЯ. Для #94bf разница не косметическая:
+    аккаунт заведён 20.08, и при годовщине регистрации до сброса не 10 суток, а ~29.
+
+    ПОЧЕМУ ПРИГОВОР ВСЁ РАВНО ВЫНОСИТСЯ ПО РАННЕМУ КАНДИДАТУ, а не по худшему случаю
+    (это осознанный выбор, а не недосмотр). Худший случай для ключей БЕЗ известной даты
+    заведения — «сброс через месяц», и приговор по нему звонил бы на здоровых ключах
+    круглосуточно: порог, звенящий на норме, — не порог, это уже замерено 20.08 (22% ложных)
+    и стоило бы квоты побудок агента. Поэтому чинится не ПОРОГ, а САМООТЧЁТ: горизонт
+    больше не выдаётся за известный, оба кандидата едут в текст тревоги, а хост, который
+    молчит ТОЛЬКО на раннем кандидате, произносится в строке штиля (канон 29ae77e: приговор
+    везёт основание; и «молчание обязано быть произнесено»).
+    """
+    a = (anchor.get("hosts") or {}).get(host) or {}
+    base = anchor.get("reset", "calendar")
+    if horizon != "alt":
+        return base
+    alt = a.get("reset_alt")
+    return str(alt) if alt not in (None, "") else base
+
+
 def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fresh=None,
-                     now=None):
+                     now=None, horizon="cal", parked=None):
     """[(host, mtd, remaining, days_zero, days_reset, burn, stale, basis)] по хостам С ЯКОРЕМ.
 
     Тревожим, когда КОНЧИТСЯ РАНЬШЕ, ЧЕМ НАЛЬЁТСЯ: days_zero < days_reset. Именно это, а
@@ -493,12 +570,13 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fr
     """
     now = float(now if now is not None else time.time())
     quota = float(anchor.get("quota_cu", QUOTA_M * 1e6))
-    spec = anchor.get("reset", "calendar")
     led = (ledger or {}).get("hosts") or {}
     span = burn_span or {}
     fresh = burn_fresh or {}
+    parked = set(parked or ())
     out = []
     for host, a in sorted((anchor.get("hosts") or {}).items()):
+        spec = host_reset_spec(anchor, host, horizon)
         as_of = float(a.get("as_of", 0))
         stale = as_of > 0 and now >= next_reset(as_of, spec)
         book = led.get(host) or {}
@@ -510,6 +588,17 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fr
         tail = float(burn_cu_per_day.get(host, 0.0))
         tail_sec = float(span.get(host, 0.0))
         book_rate = (book_cu * 86400.0 / book_sec) if book_sec > 0 else 0.0
+
+        if host in parked:
+            # ПОЛОЖИТЕЛЬНО НУЛЕВОЙ РАСХОД (co-наблюдение, см. parked_hosts): судить такой
+            # ключ хвостом — значит выносить приговор о будущем по конфигурации, которой
+            # уже нет, в самой чистой её форме. Ноль здесь — ЗАМЕР, а не незнание, поэтому
+            # он и закрывает ветку, а не открывает её (зеркало канона «ноль — это число»).
+            days_reset = max(0.0, (next_reset(now, spec) - now) / 86400.0)
+            if stale:
+                out.append((host, mtd, remaining, float("inf"), days_reset, 0.0, stale,
+                            "ключ ПРИПАРКОВАН (co-наблюдение %d прогонов)" % PARKED_N))
+            continue
 
         # КАНДИДАТЫ (только незагрязнённые), победитель — максимум.
         cands = []
@@ -542,6 +631,29 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fr
         if stale or days_zero < days_reset:
             out.append((host, mtd, remaining, days_zero, days_reset, burn, stale, basis))
     return out
+
+
+def _horizon_txt(anchor, host, days_zero, days_reset, now):
+    """Строка про горизонт для текста тревоги: оба кандидата и цена разницы.
+
+    Приговор вынесен по РАННЕМУ кандидату (см. host_reset_spec). Тревога обязана это
+    сказать — иначе «до сброса ещё 10.0 сут» читается как измеренный факт, каким оно не
+    является: дата сброса у Alchemy владельцем не подтверждена.
+    """
+    base = ("дата сброса квоты НЕИЗВЕСТНА (INFRA-FACTS, проверено владельцем 21.08 — дашборд "
+            "её не показывает). Взят САМЫЙ РАННИЙ кандидат (%.1f сут), а он работает В "
+            "СТОРОНУ МОЛЧАНИЯ: чем позже наливается ведро, тем раньше надо звонить." % days_reset)
+    a = (anchor.get("hosts") or {}).get(host) or {}
+    if a.get("reset_alt") in (None, ""):
+        return base + (" ВТОРОГО КАНДИДАТА НЕТ: дата заведения аккаунта неизвестна, значит "
+                       "НАСКОЛЬКО поздним может быть сброс — не оценено, и дефицит ниже "
+                       "может быть занижен на неизвестную величину.")
+    d_alt = max(0.0, (next_reset(now, host_reset_spec(anchor, host, "alt")) - now) / 86400.0)
+    return base + (" Второй кандидат (годовщина заведения, день %s): до сброса %.1f сут ⇒ "
+                   "не «не хватает %.1f сут», а КЛЮЧ ТЁМНЫЙ %.1f сут. Разница между "
+                   "гипотезами и есть цена висящего вопроса о дате."
+                   % (a.get("reset_alt"), d_alt, max(0.0, days_reset - days_zero),
+                      max(0.0, d_alt - days_zero)))
 
 
 def _fetch_journal():
@@ -632,8 +744,13 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
     burst = {h: (statistics.fmean(d["projs"]), len(d["projs"]))
              for h, d in per_host.items() if len(d["projs"]) >= min_windows}
     trail = trail_summary(recs, trail_sec=trail_sec, now=now_s)
+    # ПРИПАРКОВАННЫЕ КЛЮЧИ. Судим по ним же, по кому есть якорь и/или хвост: множество
+    # кандидатов — объединение, иначе ключ без якоря так и остался бы под ложным приговором
+    # по темпу.
+    _cands = set((load_anchor(anchor_path).get("hosts") or {})) | set(trail)
+    parked = parked_hosts(recs, _cands)
     alarms = quota_verdicts(recs, threshold=threshold, trail_sec=trail_sec,
-                            min_trail_sec=min_trail_sec, now=now_s)
+                            min_trail_sec=min_trail_sec, now=now_s, parked=parked)
     # ОСТАТОК — вторая, независимая величина (ПРЕДЕЛ 3). Темп хвоста отдаём ВМЕСТЕ С ЕГО
     # ОКНОМ: без окна нельзя понять, лежит ли замер после якоря, а без этого приговор о
     # будущем строится на конфигурации, которой уже нет (разбор 21.08, см. balance_verdicts).
@@ -643,7 +760,40 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
     burn_span = {h: sec for h, (_r, sec) in trail.items()}
     fresh = fresh_summary(recs, now=now_s)
     bal = balance_verdicts(anchor, ledger, burn_day, burn_span=burn_span, burn_fresh=fresh,
-                           now=now_s)
+                           now=now_s, parked=parked)
+    # ТОТ ЖЕ приговор на ПОЗДНЕМ кандидате горизонта — не для звонка, а чтобы (а) тревога
+    # везла обе цифры и (б) штиль произносил ключ, который молчит ТОЛЬКО на раннем. Считаем
+    # той же функцией, а не повтором её логики: разошедшаяся копия соврала бы молча.
+    bal_alt = {r[0]: r for r in balance_verdicts(
+        anchor, ledger, burn_day, burn_span=burn_span, burn_fresh=fresh, now=now_s,
+        parked=parked, horizon="alt")}
+
+    # ДВА МОЛЧАНИЯ, ОБЯЗАННЫЕ БЫТЬ ПРОИЗНЕСЕННЫМИ, И ИМЕННО БЕЗУСЛОВНО (22.08). Строка штиля
+    # печатается только когда не звонит НИ ОДИН ключ — то есть ровно в шумном прогоне, где
+    # разбирающий и смотрит журнал, снятый с приговора ключ исчезал бы бесследно.
+    #  (1) ПРИПАРКОВАН — ключ снят с обоих приговоров по ЗАМЕРУ (co-наблюдение), не по
+    #      незнанию. Не сказать этого — значит сделать сторожа тихо слепым к ключу.
+    #  (2) МОЛЧИТ ТОЛЬКО НА РАННЕМ ГОРИЗОНТЕ — ключ проходит лишь потому, что мы допустили
+    #      самый ранний из возможных сбросов. В ЖУРНАЛ, а не в тревогу: звонить по
+    #      неподтверждённой дате — это порог, звенящий на норме (замер 22% ложных, 20.08).
+    if parked:
+        q_cu = float(anchor.get("quota_cu", QUOTA_M * 1e6))
+        pp = []
+        for h in sorted(parked):
+            ah = (anchor.get("hosts") or {}).get(h) or {}
+            mtd_h = float(ah.get("mtd_cu", 0)) + float(
+                ((ledger.get("hosts") or {}).get(h) or {}).get("cu", 0.0))
+            pp.append("%s(ост%.1fM%s)" % (h, (q_cu - mtd_h) / 1e6,
+                                          "" if h in per_host else ", строк в журнале нет"))
+        out("cu-quota: ПРИПАРКОВАНЫ и сняты с обоих приговоров — co-наблюдение %d прогонов "
+            "(ноль по ключу ПРИ разобранных окнах у других: замер, а не незнание): %s"
+            % (PARKED_N, ", ".join(pp)))
+    only_early = [h for h in sorted(bal_alt) if not any(b[0] == h for b in bal)]
+    if only_early:
+        out("cu-quota: МОЛЧАТ ТОЛЬКО НА РАННЕМ ГОРИЗОНТЕ (дата сброса НЕИЗВЕСТНА, приговор "
+            "вынесен по календарному 1-му числу; на позднем кандидате ведро не доживает): %s"
+            % ", ".join("%s (%.1f сут до позднего сброса)" % (h, bal_alt[h][4])
+                        for h in only_early))
 
     for host, rate, sec, cu_total in alarms:
         days = QUOTA_M / rate * 30.0 if rate > 0 else 0.0
@@ -727,15 +877,20 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
                    "ЧЕМ ИЗМЕРЕН ТЕМП: %s.\n"
                    "ЯКОРЬ — ЧИСЛО, ВВЕДЁННОЕ РУКАМИ с владельческого дашборда, агентом он не "
                    "перепроверяется: если он неверен, неверен и этот вывод.\n"
+                   "ГОРИЗОНТ СБРОСА — НЕ ФАКТ, А РАННИЙ КАНДИДАТ: %s\n"
                    "РАЗБОР АГЕНТУ: это НЕ то же самое, что тревога по темпу — темп может быть "
-                   "НИЖЕ квоты, а остатка не быть. Увести потребителей на ключ с запасом; "
-                   "звать человека, если нужен новый ключ/оплата или правка боевого env (HIL-1)."
+                   "НИЖЕ квоты, а остатка не быть. ПРЕЖДЕ ЧЕМ «увести на ключ с запасом» — "
+                   "СЛОЖИТЬ ОСТАТКИ И СПРОС: ключа с запасом может не быть вовсе, и тогда "
+                   "перестановка не лечит (22.08: 51.0M суммарно против 65.6M спроса до "
+                   "сброса). Звать человека, если нужен новый ключ/оплата или правка боевого "
+                   "env (HIL-1)."
                    % (host, mtd / 1e6, float(anchor.get("quota_cu", QUOTA_M * 1e6)) / 1e6,
                       remaining / 1e6, burn / 1000.0, days_zero, days_reset,
                       a.get("as_of_iso", a.get("as_of", "?")),
                       float(a.get("mtd_cu", 0)) / 1e6,
                       (mtd - float(a.get("mtd_cu", 0))) / 1e6,
-                      a.get("source", "?"), basis))
+                      a.get("source", "?"), basis, _horizon_txt(anchor, host, days_zero,
+                                                                days_reset, now_s)))
             key = "cu-quota:balance:%s" % host
         if notify_fn is None:
             out("cu-quota: КАНАЛ НЕДОСТУПЕН, текст ниже"); out(msg)

@@ -563,6 +563,127 @@ broke_b = w.balance_verdicts(anc_c, led_young, tail_dirty, burn_span=span_dirty,
 check("самоконтроль свежего окна: обе половины (покрытие, загрязнение) держат заявленное",
       broke_a and broke_b, (broke_a, broke_b))
 
+# ---- 36. ПРИПАРКОВАННЫЙ КЛЮЧ: co-наблюдение как позитивный контроль (22.08) ----
+# 21.08 18:53 потребители уведены с #5735; трафика по нему нет вовсе, а сторож звонил и по
+# ТЕМПУ («жжёт 31.6M/мес»), и по ОСТАТКУ («4.0 сут») — оба приговора по грязному хвосту.
+# Прошлая сессия чинить отказалась: «одной строкой не отличить простой от слепоты». Верно
+# для строки, неверно для ПРОГОНА: в тех же записях другие ключи разбираются штатно.
+def _rec(ts, hosts):
+    return {"ts": ts, "until": ts, "hosts": hosts}
+
+
+_live = {"cu": 50000.0, "sec": HOUR}
+recs_park = [_rec(MID - 3 * HOUR, {A: dict(_live), B5735: {"cu": 0.0, "sec": 120.0}}),
+             _rec(MID - 2 * HOUR, {A: dict(_live)}),                   # B пропал из журнала
+             _rec(MID - HOUR, {A: dict(_live)})]
+check("parked: ноль по ключу ПРИ разобранных окнах у другого -> ПРИПАРКОВАН",
+      w.parked_hosts(recs_park, [A, B5735]) == {B5735}, w.parked_hosts(recs_park, [A, B5735]))
+# НЕГАТИВНЫЙ КОНТРОЛЬ (а): хоть один ненулевой прогон -> НЕ припаркован (иначе гард гасил бы
+# живой ключ, а это уже не «сторож молчит», а «сторож ослеп по решению»).
+recs_alive = list(recs_park)
+recs_alive[1] = _rec(MID - 2 * HOUR, {A: dict(_live), B5735: {"cu": 1.0, "sec": HOUR}})
+check("parked: один ненулевой прогон из трёх -> НЕ припаркован",
+      w.parked_hosts(recs_alive, [A, B5735]) == set(), w.parked_hosts(recs_alive, [A, B5735]))
+# НЕГАТИВНЫЙ КОНТРОЛЬ (б): прогон БЕЗ позитивного контроля (никто не разобран) — это слепота
+# сторожа, а не простой ключа, и он обязан не объявлять тишину ни по кому.
+recs_blind = [_rec(MID - 3 * HOUR, {A: {"cu": 0.0, "sec": 0.0}}),
+              _rec(MID - 2 * HOUR, {A: {"cu": 0.0, "sec": 0.0}}),
+              _rec(MID - HOUR, {A: {"cu": 0.0, "sec": 0.0}})]
+check("parked: прогон без единого разобранного окна = слепота, НЕ парковка",
+      w.parked_hosts(recs_blind, [A, B5735]) == set(), w.parked_hosts(recs_blind, [A, B5735]))
+check("parked: истории меньше окна наблюдения -> не судим",
+      w.parked_hosts(recs_park[:2], [B5735]) == set())
+
+# ---- 37. Припаркованный ключ снят С ОБОИХ приговоров, и снят ИМЕННО фиксом ----
+anc_park = _anchor(25.8, as_of=MID - 30 * HOUR)      # остаток 4.2M, якорь ДО хвоста
+tail_park = {B5735: 1.05e6}
+span_park = {B5735: 20 * HOUR}
+bal_p = w.balance_verdicts(anc_park, _led(0.0, since=MID - 30 * HOUR), tail_park,
+                           burn_span=span_park, now=MID, parked={B5735})
+check("остаток: припаркованный ключ НЕ звонит (расход ЗАМЕРЕН нулём)", bal_p == [], bal_p)
+# НЕГАТИВНЫЙ КОНТРОЛЬ той же половины: без parked тот же вход обязан звонить — иначе тест
+# зелен по причине фикстуры, а не по причине фикса (канон seam-stubbed-above-the-defect).
+bal_np = w.balance_verdicts(anc_park, _led(0.0, since=MID - 30 * HOUR), tail_park,
+                            burn_span=span_park, now=MID)
+check("...а БЕЗ parked тот же вход звонит — гасит именно фикс, а не фикстура",
+      len(bal_np) == 1, bal_np)
+q_p = w.quota_verdicts(recs_park + [_rec(MID - 4 * HOUR, {B5735: {"cu": 3.0e6, "sec": 6 * HOUR}})],
+                       threshold=26.0, trail_sec=24 * HOUR, min_trail_sec=6 * HOUR,
+                       now=MID, parked={B5735})
+check("темп: припаркованный ключ НЕ звонит и по ИНТЕГРАЛУ",
+      [x[0] for x in q_p] == [], q_p)
+q_np = w.quota_verdicts(recs_park + [_rec(MID - 4 * HOUR, {B5735: {"cu": 3.0e6, "sec": 6 * HOUR}})],
+                        threshold=26.0, trail_sec=24 * HOUR, min_trail_sec=6 * HOUR, now=MID)
+check("...а БЕЗ parked он звонит по тому же хвосту (негативный контроль второй половины)",
+      B5735 in [x[0] for x in q_np], q_np)
+
+# ---- 38. ГОРИЗОНТ СБРОСА — КАНДИДАТ, А НЕ ФАКТ (22.08) ----
+# INFRA-FACTS: дата сброса НЕИЗВЕСТНА. Календарное 1-е число — САМЫЙ РАННИЙ кандидат, то есть
+# допущение работает В СТОРОНУ МОЛЧАНИЯ, и текст обязан это говорить, а не выдавать «10.0 сут»
+# за измеренное (канон 29ae77e: приговор везёт основание, по которому судил).
+anc_alt = _anchor(26.3, as_of=MID - HOUR)
+anc_alt["hosts"][B5735]["reset_alt"] = "20"          # годовщина заведения аккаунта
+check("host_reset_spec: cal -> календарь, alt -> день годовщины",
+      w.host_reset_spec(anc_alt, B5735, "cal") == "calendar"
+      and w.host_reset_spec(anc_alt, B5735, "alt") == "20")
+t_alt = w._horizon_txt(anc_alt, B5735, 3.4, 10.25, MID)
+check("текст горизонта: НЕИЗВЕСТНА + оба кандидата + цена разницы",
+      "НЕИЗВЕСТНА" in t_alt and "САМЫЙ РАННИЙ" in t_alt and "СТОРОНУ МОЛЧАНИЯ" in t_alt
+      and "Второй кандидат" in t_alt and "ТЁМНЫЙ" in t_alt, t_alt)
+# НЕГАТИВНЫЙ КОНТРОЛЬ: без reset_alt текст НЕ выдумывает годовщину, а называет незнание.
+t_noalt = w._horizon_txt(_anchor(26.3, as_of=MID - HOUR), B5735, 3.4, 10.25, MID)
+check("...а без reset_alt — «второго кандидата нет», а не выдуманная дата",
+      "ВТОРОГО КАНДИДАТА НЕТ" in t_noalt and "Второй кандидат" not in t_noalt, t_noalt)
+# ...и ПРИГОВОР при этом остаётся на раннем кандидате: поздний горизонт НЕ поднимает тревог
+# сам по себе (иначе порог звенел бы на здоровых ключах — замер 22% ложных, 20.08).
+quiet_burn = {B5735: 0.30e6}                # 3.7M остатка / 0.30M = 12.3 сут > 10.25
+check("приговор по РАННЕМУ кандидату: на календаре молчит...",
+      w.balance_verdicts(anc_alt, _led(0.0), quiet_burn, now=MID) == [])
+check("...а на ПОЗДНЕМ (годовщина 20-е, 29.6 сут) тот же вход не доживает — это и есть цена",
+      len(w.balance_verdicts(anc_alt, _led(0.0), quiet_burn, now=MID, horizon="alt")) == 1)
+
+# ---- 39. run(): горизонт в тексте тревоги, парковка — В ЖУРНАЛ И В ШУМНОМ ПРОГОНЕ ----
+sent.clear()
+lines_h = []
+hp_h = os.path.join(_tmp, "horizon", "h.jsonl")
+os.makedirs(os.path.dirname(hp_h), exist_ok=True)
+_fresh_hist(27.0, path=hp_h)
+_anc_file = os.path.join(_tmp, "horizon", "cu-quota.anchor.json")
+_a = _anchor(26.3, as_of=MID - 30 * HOUR)
+_a["hosts"][B5735]["reset_alt"] = "20"
+json.dump(_a, open(_anc_file, "w", encoding="utf-8"))
+os.environ["CU_WATCH_PROJ_M"] = "30"
+w.run(fetch=lambda: _journal(B5735, [27.0] * 30, pid=9), notify_fn=_nf, out=lines_h.append,
+      now=MID, history_path=hp_h)
+os.environ["CU_WATCH_PROJ_M"] = "26"
+bal_msgs = [x[3] for x in sent if x[2].startswith("cu-quota:balance:")]
+check("run: текст тревоги остатка везёт ГОРИЗОНТ как кандидат, а не как факт",
+      len(bal_msgs) == 1 and "ГОРИЗОНТ СБРОСА — НЕ ФАКТ" in bal_msgs[0]
+      and "НЕИЗВЕСТНА" in bal_msgs[0], [m[:300] for m in bal_msgs])
+check("run: текст велит СЛОЖИТЬ ОСТАТКИ И СПРОС до «увести на ключ с запасом»",
+      len(bal_msgs) == 1 and "СЛОЖИТЬ ОСТАТКИ И СПРОС" in bal_msgs[0], [m[:300] for m in bal_msgs])
+# Парковка обязана печататься и когда прогон ШУМНЫЙ (строка штиля тогда не печатается вовсе).
+sent.clear()
+lines_p = []
+hp_p = os.path.join(_tmp, "parkloud", "h.jsonl")
+os.makedirs(os.path.dirname(hp_p), exist_ok=True)
+# История: три прогона, в которых по C идёт трафик, а по B5735 — ноль (он и припаркован).
+with open(hp_p, "w", encoding="utf-8") as f:
+    for k in (3, 2, 1):
+        # sec=3ч на запись: хвосту нужно накопить >= CU_WATCH_MIN_TRAIL_H, иначе прогон
+        # выйдет ТИХИМ и проверка «произносится в шумном» проверяла бы не то.
+        f.write(json.dumps(_rec(NOW - k * HOUR, {C: {"cu": 3.0e6, "sec": 3 * HOUR}})) + "\n")
+json.dump(_anchor(25.8, as_of=NOW - 30 * HOUR, host=B5735),
+          open(os.path.join(_tmp, "parkloud", "cu-quota.anchor.json"), "w", encoding="utf-8"))
+w.run(fetch=lambda: _journal(C, [141.0] * 30, pid=9), notify_fn=_nf, out=lines_p.append,
+      now=NOW, history_path=hp_p)
+check("run: ПРИПАРКОВАН произносится и в ШУМНОМ прогоне (строки штиля там нет)",
+      any("ПРИПАРКОВАНЫ" in l and B5735 in l for l in lines_p)
+      and not any("тихо (порог" in l for l in lines_p), lines_p)
+check("run: по припаркованному ключу тревог не ушло",
+      not any(B5735 in x[2] for x in sent), [x[2] for x in sent])
+
+
 print("\n%s" % ("FAIL: %d" % len(FAILS) if FAILS
                 else "OK: сторож квоты — парс/всплеск/ИНТЕГРАЛ/ОСТАТОК/дедуп/слепота/самоконтроль"))
 sys.exit(1 if FAILS else 0)

@@ -26,7 +26,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analysis.cu_quota_watch import (  # noqa: E402
-    FRESH_MIN_SEC, MIN_BOOK_SEC, fresh_summary, trail_summary,
+    FRESH_MIN_SEC, MIN_BOOK_SEC, fresh_summary, parked_hosts, trail_summary,
 )
 
 WATCH_DIR = os.path.expanduser("~/.fleet-watch")
@@ -47,7 +47,7 @@ def main():
 
     recs.sort(key=lambda r: float(r["ts"]))
     hosts = sorted(anchor["hosts"])
-    fires = {h: {"хвост24ч": 0, "книга": 0, "свежее": 0, "n": 0} for h in hosts}
+    fires = {h: {"хвост24ч": 0, "книга": 0, "свежее": 0, "n": 0, "парк": 0} for h in hosts}
     rows = []
     for i in range(1, len(recs)):
         now = float(recs[i]["ts"])
@@ -55,6 +55,10 @@ def main():
         trail = _rate_day(window, trail_sec=24 * 3600.0, now=now)
         fresh = fresh_summary(window, now=now)
         d_reset = max(1e-9, (next_reset(now, anchor.get("reset", "calendar")) - now) / 86400.0)
+        # ГАРД ПАРКОВКИ (22.08) меряется ЗДЕСЬ ЖЕ, а не утверждается: он снимает с приговора
+        # ключ, по которому бот положительно не ходит, и разницу «до/после» обязан показать
+        # тот же прогон по истории, что оправдывал свежее окно.
+        parked = parked_hosts(window, hosts)
         for h in hosts:
             a = anchor["hosts"][h]
             mtd = float(a["mtd_cu"]) + float((ledger.get("hosts", {}).get(h) or {}).get("cu", 0))
@@ -68,6 +72,8 @@ def main():
                 fires[h]["хвост24ч"] += 1
             if f_rate > crit:
                 fires[h]["свежее"] += 1
+                if h not in parked:
+                    fires[h]["парк"] += 1
             rows.append((now, h, t_rate, f_rate, crit))
 
     print("КРИТИЧЕСКИЙ ТЕМП (остаток на 21.08 18:53Z / суток до сброса), CU/сут:")
@@ -80,9 +86,11 @@ def main():
         d = fires[h]
         if not d["n"]:
             continue
-        print("  %s: свежее %d/%d (%.0f%%), хвост24ч %d/%d (%.0f%%)"
+        print("  %s: свежее %d/%d (%.0f%%), хвост24ч %d/%d (%.0f%%), "
+              "свежее С ГАРДОМ ПАРКОВКИ %d/%d (%.0f%%)"
               % (h, d["свежее"], d["n"], 100.0 * d["свежее"] / d["n"],
-                 d["хвост24ч"], d["n"], 100.0 * d["хвост24ч"] / d["n"]))
+                 d["хвост24ч"], d["n"], 100.0 * d["хвост24ч"] / d["n"],
+                 d["парк"], d["n"], 100.0 * d["парк"] / d["n"]))
     print("\nПОСЛЕДНИЕ 8 ТОЧЕК (темп CU/сут против критического):")
     for now, h, t, f, crit in rows[-24:]:
         if h != "base-mainnet.g.alchemy.com#94bf":
