@@ -287,18 +287,37 @@ def quota_verdicts(recs, *, threshold, trail_sec, min_trail_sec, now=None, parke
 
 
 def trail_summary(recs, *, trail_sec, now=None):
-    """host -> (rate_M, covered_sec) по хвосту, БЕЗ порога — для журнальной строки штиля.
-    Тихий прогон обязан печатать то же число, которым судит, иначе «тихо» недоказуемо."""
+    """host -> (rate_M, covered_sec, since) по хвосту, БЕЗ порога — для строки штиля и остатка.
+
+    ТРЕТЬЕ ПОЛЕ ДОБАВЛЕНО 22.08 (разбор ложной тревоги по #5735) И ЭТО НЕ УДОБСТВО, А ГАРД.
+    covered_sec — сумма РАЗОБРАННОГО времени, величина СКВАЖНОСТНАЯ: у ключа с дырами в
+    журнале она усыхает, оставаясь при этом размазанной по всему 24-часовому окну. Ветка
+    остатка проверяла «хвост целиком после якоря» выражением (now - covered_sec) >= as_of,
+    то есть ЧИТАЛА ПОКРЫТИЕ КАК СТЕННУЮ КООРДИНАТУ. Для #5735 22.08 07:07 покрытие сжалось
+    до 11.8ч (ключ молчал 9 часов), проверка дала «начало 21.08 18:59» против якоря 18:53 и
+    объявила хвост чистым — при том что окно на деле доставало до 21.08 08:07, на 11 часов
+    ДО якоря. 85% CU этого «чистого» хвоста сожжены конфигурацией, уведённой манёвром 18:53.
+    Стенное начало окна нельзя вывести из покрытия — его надо ВЕРНУТЬ, что и делает since
+    (тем же способом, каким его давно возвращает fresh_summary: until минус покрытие).
+
+    NB: знаменатель ставки остаётся ПОКРЫТИЕМ — это намеренно и защищено замером (см.
+    quota_verdicts). Дефект был не в знаменателе, а в его переиспользовании как координаты.
+    """
     now = float(now if now is not None else time.time())
     agg = {}
     for r in recs:
         if now - float(r.get("ts", 0)) > trail_sec:
             continue
+        until = float(r.get("until") or r.get("ts") or 0)
         for host, d in (r.get("hosts") or {}).items():
-            a = agg.setdefault(host, [0.0, 0.0])
+            sec = float(d.get("sec", 0))
+            a = agg.setdefault(host, [0.0, 0.0, None])
             a[0] += float(d.get("cu", 0))
-            a[1] += float(d.get("sec", 0))
-    return {h: ((cu / sec * SEC_MONTH / 1e6) if sec > 0 else 0.0, sec) for h, (cu, sec) in agg.items()}
+            a[1] += sec
+            start = until - sec
+            a[2] = start if a[2] is None else min(a[2], start)
+    return {h: ((cu / sec * SEC_MONTH / 1e6) if sec > 0 else 0.0, sec, since)
+            for h, (cu, sec, since) in agg.items()}
 
 
 def fresh_summary(recs, *, n=None, now=None):
@@ -524,7 +543,7 @@ def host_reset_spec(anchor, host, horizon="cal"):
 
 
 def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fresh=None,
-                     now=None, horizon="cal", parked=None):
+                     burn_since=None, now=None, horizon="cal", parked=None):
     """[(host, mtd, remaining, days_zero, days_reset, burn, stale, basis)] по хостам С ЯКОРЕМ.
 
     Тревожим, когда КОНЧИТСЯ РАНЬШЕ, ЧЕМ НАЛЬЁТСЯ: days_zero < days_reset. Именно это, а
@@ -572,6 +591,7 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fr
     quota = float(anchor.get("quota_cu", QUOTA_M * 1e6))
     led = (ledger or {}).get("hosts") or {}
     span = burn_span or {}
+    since_map = burn_since or {}
     fresh = burn_fresh or {}
     parked = set(parked or ())
     out = []
@@ -587,6 +607,10 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fr
 
         tail = float(burn_cu_per_day.get(host, 0.0))
         tail_sec = float(span.get(host, 0.0))
+        # СТЕННОЕ начало окна хвоста. None = вызывающий его не дал ⇒ доказать, что хвост
+        # лежит после якоря, НЕЧЕМ, и он выбывает из кандидатов (незнание закрывает гард).
+        # Прежняя редакция выводила начало из ПОКРЫТИЯ — см. trail_summary, там разбор.
+        tail_since = since_map.get(host)
         book_rate = (book_cu * 86400.0 / book_sec) if book_sec > 0 else 0.0
 
         if host in parked:
@@ -602,8 +626,10 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fr
 
         # КАНДИДАТЫ (только незагрязнённые), победитель — максимум.
         cands = []
-        if tail_sec > 0 and (now - tail_sec) >= as_of:
-            cands.append((tail, "хвост целиком после якоря (%.1fч)" % (tail_sec / 3600.0)))
+        if tail_sec > 0 and tail_since is not None and tail_since >= as_of:
+            cands.append((tail, "хвост целиком после якоря (окно с %s, покрыто %.1fч)"
+                          % (time.strftime("%d.%m %H:%MZ", time.gmtime(tail_since)),
+                             tail_sec / 3600.0)))
             cands.append((book_rate, "книга %.1fч" % (book_sec / 3600.0)))
         elif book_sec >= MIN_BOOK_SEC:
             cands.append((book_rate, "книга за %.1fч после якоря (хвост пересекает якорь — "
@@ -756,17 +782,18 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
     # будущем строится на конфигурации, которой уже нет (разбор 21.08, см. balance_verdicts).
     anchor = load_anchor(anchor_path)
     ledger = ledger_add(per_host, anchor, ledger_path, now=now_s)
-    burn_day = {h: r * 1e6 / 30.0 for h, (r, _sec) in trail.items()}
-    burn_span = {h: sec for h, (_r, sec) in trail.items()}
+    burn_day = {h: r * 1e6 / 30.0 for h, (r, _sec, _since) in trail.items()}
+    burn_span = {h: sec for h, (_r, sec, _since) in trail.items()}
+    burn_since = {h: since for h, (_r, _sec, since) in trail.items() if since is not None}
     fresh = fresh_summary(recs, now=now_s)
     bal = balance_verdicts(anchor, ledger, burn_day, burn_span=burn_span, burn_fresh=fresh,
-                           now=now_s, parked=parked)
+                           burn_since=burn_since, now=now_s, parked=parked)
     # ТОТ ЖЕ приговор на ПОЗДНЕМ кандидате горизонта — не для звонка, а чтобы (а) тревога
     # везла обе цифры и (б) штиль произносил ключ, который молчит ТОЛЬКО на раннем. Считаем
     # той же функцией, а не повтором её логики: разошедшаяся копия соврала бы молча.
     bal_alt = {r[0]: r for r in balance_verdicts(
-        anchor, ledger, burn_day, burn_span=burn_span, burn_fresh=fresh, now=now_s,
-        parked=parked, horizon="alt")}
+        anchor, ledger, burn_day, burn_span=burn_span, burn_fresh=fresh,
+        burn_since=burn_since, now=now_s, parked=parked, horizon="alt")}
 
     # ДВА МОЛЧАНИЯ, ОБЯЗАННЫЕ БЫТЬ ПРОИЗНЕСЕННЫМИ, И ИМЕННО БЕЗУСЛОВНО (22.08). Строка штиля
     # печатается только когда не звонит НИ ОДИН ключ — то есть ровно в шумном прогоне, где
@@ -906,7 +933,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
         # «мёртвый сторож хуже отсутствующего»: тишина требует положительного основания).
         parts = []
         for h in sorted(per_host):
-            rate, sec = trail.get(h, (0.0, 0.0))
+            rate, sec, _tsince = trail.get(h, (0.0, 0.0, None))
             mark = "" if sec >= min_trail_sec else "*копим"
             bm = ("всплеск %.1fM" % burst[h][0]) if h in burst else "всплеск —"
             ah = (anchor.get("hosts") or {}).get(h)

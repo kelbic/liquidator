@@ -33,7 +33,7 @@ WATCH_DIR = os.path.expanduser("~/.fleet-watch")
 
 
 def _rate_day(recs, *, trail_sec, now):
-    return {h: r * 1e6 / 30.0 / 1.0 for h, (r, _s) in
+    return {h: r * 1e6 / 30.0 / 1.0 for h, (r, _s, _since) in
             trail_summary(recs, trail_sec=trail_sec, now=now).items()}
 
 

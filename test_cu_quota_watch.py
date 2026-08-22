@@ -342,7 +342,9 @@ check("хвост пересекает якорь -> судим КНИГОЙ (п
 # ПОЗИТИВНЫЙ КОНТРОЛЬ НА ТОМ ЖЕ ВХОДЕ (канон test-that-can-only-return-zero): те же данные
 # при НЕзагрязнённом хвосте обязаны будить — иначе «тишина» выше могла быть тишиной прибора.
 span_clean = {B5735: 4 * HOUR}                          # хвост целиком ПОСЛЕ якоря
-bal_c = w.balance_verdicts(anc_post, led_quiet, fat, burn_span=span_clean, now=MID)
+since_clean = {B5735: MID - 4 * HOUR}                   # ...и это доказано НАЧАЛОМ окна
+bal_c = w.balance_verdicts(anc_post, led_quiet, fat, burn_span=span_clean,
+                           burn_since=since_clean, now=MID)
 check("...а тот же вход с хвостом ЦЕЛИКОМ после якоря — будит (тишина выше не от прибора)",
       len(bal_c) == 1, bal_c)
 
@@ -392,7 +394,9 @@ check("книга накапливает 1000+500=1500 (а не перезапи
 sent.clear()
 hp_bal = os.path.join(_tmp, "bal_run.jsonl")
 _fresh_hist(27.0, path=hp_bal)
-json.dump(_anchor(26.3, as_of=MID - 30 * HOUR),
+# as_of ДО окон журнала (они лежат 20.08 00:00-01:00 = MID-42ч): прежние MID-30ч ставили
+# якорь ПОЗЖЕ данных, и «чистый хвост» держался лишь на дефекте проверки (22.08).
+json.dump(_anchor(26.3, as_of=MID - 44 * HOUR),
           open(os.path.join(_tmp, "cu-quota.anchor.json"), "w", encoding="utf-8"))
 os.environ["CU_WATCH_PROJ_M"] = "30"          # темп 27M ПОД порогом -> темповых тревог нет
 _prod_led_pre = os.path.expanduser("~/.fleet-watch/cu-quota.ledger.json")
@@ -598,13 +602,15 @@ check("parked: истории меньше окна наблюдения -> не
 anc_park = _anchor(25.8, as_of=MID - 30 * HOUR)      # остаток 4.2M, якорь ДО хвоста
 tail_park = {B5735: 1.05e6}
 span_park = {B5735: 20 * HOUR}
+since_park = {B5735: MID - 20 * HOUR}                # окно хвоста лежит ПОСЛЕ якоря (30ч)
 bal_p = w.balance_verdicts(anc_park, _led(0.0, since=MID - 30 * HOUR), tail_park,
-                           burn_span=span_park, now=MID, parked={B5735})
+                           burn_span=span_park, burn_since=since_park, now=MID,
+                           parked={B5735})
 check("остаток: припаркованный ключ НЕ звонит (расход ЗАМЕРЕН нулём)", bal_p == [], bal_p)
 # НЕГАТИВНЫЙ КОНТРОЛЬ той же половины: без parked тот же вход обязан звонить — иначе тест
 # зелен по причине фикстуры, а не по причине фикса (канон seam-stubbed-above-the-defect).
 bal_np = w.balance_verdicts(anc_park, _led(0.0, since=MID - 30 * HOUR), tail_park,
-                            burn_span=span_park, now=MID)
+                            burn_span=span_park, burn_since=since_park, now=MID)
 check("...а БЕЗ parked тот же вход звонит — гасит именно фикс, а не фикстура",
       len(bal_np) == 1, bal_np)
 q_p = w.quota_verdicts(recs_park + [_rec(MID - 4 * HOUR, {B5735: {"cu": 3.0e6, "sec": 6 * HOUR}})],
@@ -649,7 +655,7 @@ hp_h = os.path.join(_tmp, "horizon", "h.jsonl")
 os.makedirs(os.path.dirname(hp_h), exist_ok=True)
 _fresh_hist(27.0, path=hp_h)
 _anc_file = os.path.join(_tmp, "horizon", "cu-quota.anchor.json")
-_a = _anchor(26.3, as_of=MID - 30 * HOUR)
+_a = _anchor(26.3, as_of=MID - 44 * HOUR)      # см. 26: якорь обязан лежать ДО окон журнала
 _a["hosts"][B5735]["reset_alt"] = "20"
 json.dump(_a, open(_anc_file, "w", encoding="utf-8"))
 os.environ["CU_WATCH_PROJ_M"] = "30"
@@ -682,6 +688,48 @@ check("run: ПРИПАРКОВАН произносится и в ШУМНОМ �
       and not any("тихо (порог" in l for l in lines_p), lines_p)
 check("run: по припаркованному ключу тревог не ушло",
       not any(B5735 in x[2] for x in sent), [x[2] for x in sent])
+
+
+# ---- 41. РЕГРЕССИЯ 22.08 07:07: ПОКРЫТИЕ ХВОСТА ПРОЧИТАНО КАК СТЕННАЯ КООРДИНАТА ----
+# Живой случай (#5735). Якорь снят при манёвре 21.08 18:53. До манёвра ключ жёг тяжело,
+# после — молчал 9 часов, потом дал ОДИН 12-минутный всплеск (разовая заправка флота).
+# Хвост 24ч захватывал 11 часов ДОманёвренного расхода, но покрытие усохло до 11.8ч, и
+# проверка «(now - покрытие) >= as_of» объявила хвост чистым: 872026 CU / 42646 покрытых
+# секунд = 1767k CU/сут, из них 85% сожжены конфигурацией, которой уже нет.
+recs_gap = [                                              # 11ч тяжёлого расхода ДО якоря
+    _rec(MID - (24 - i) * HOUR, {B5735: {"cu": 68000.0, "sec": HOUR}}) for i in range(11)
+] + [                                                     # ...дыра: строк по ключу нет вовсе
+    _rec(MID - (13 - i) * HOUR, {A: {"cu": 5000.0, "sec": HOUR}}) for i in range(12)
+] + [_rec(MID - 0.2 * HOUR, {B5735: {"cu": 126543.0, "sec": 720.0},   # разовый всплеск
+                             A: {"cu": 5000.0, "sec": HOUR}})]
+anc_gap = _anchor(25.8, as_of=MID - 12 * HOUR)            # якорь ПОСЛЕ тяжёлых 11 часов
+tr_gap = w.trail_summary(recs_gap, trail_sec=24 * HOUR, now=MID)
+r_gap, sec_gap, since_gap = tr_gap[B5735]
+check("хвост с дырой: ПОКРЫТИЕ (11.2ч) много меньше стенного размаха окна (23.8ч)",
+      sec_gap < 12 * HOUR and (MID - since_gap) > 23 * HOUR, (sec_gap, MID - since_gap))
+check("...и since указывает НА ДОЯКОРНОЕ начало, а не на now минус покрытие",
+      since_gap < anc_gap["hosts"][B5735]["as_of"], (since_gap,))
+bal_gap = w.balance_verdicts(
+    anc_gap, _led(126543.0, since=MID - 12 * HOUR), {B5735: r_gap * 1e6 / 30.0},
+    burn_span={B5735: sec_gap}, burn_since={B5735: since_gap}, now=MID)
+check("ГРЯЗНЫЙ хвост (окно до якоря) отброшен -> судим книгой -> тревоги нет",
+      bal_gap == [], bal_gap)
+# НЕГАТИВНЫЙ КОНТРОЛЬ ФИКСА (канон seam-stubbed): снимаем ровно ту половину, что чинили —
+# перестаём давать НАЧАЛО окна и возвращаем прежнюю арифметику «now минус покрытие».
+bal_old = w.balance_verdicts(
+    anc_gap, _led(126543.0, since=MID - 12 * HOUR), {B5735: r_gap * 1e6 / 30.0},
+    burn_span={B5735: sec_gap}, burn_since={B5735: MID - sec_gap}, now=MID)
+check("...а с ПРЕЖНЕЙ арифметикой (now минус покрытие) тот же вход звонит — фикс гасит "
+      "именно это, а не фикстура", len(bal_old) == 1, bal_old)
+check("...и звонил он ГРЯЗНЫМ хвостом ~1767k CU/сут, а не книгой",
+      bal_old and 1.5e6 < bal_old[0][5] < 2.0e6, bal_old and bal_old[0][5])
+# ВТОРАЯ ПОЛОВИНА фикса отдельно: без since хвост не кандидат ВООБЩЕ (незнание закрывает
+# гард), а не «считаем чистым по умолчанию».
+bal_none = w.balance_verdicts(
+    anc_gap, _led(126543.0, since=MID - 12 * HOUR), {B5735: r_gap * 1e6 / 30.0},
+    burn_span={B5735: sec_gap}, now=MID)
+check("начала окна не дали вовсе -> хвост выбывает из кандидатов, а не проходит молча",
+      bal_none == [], bal_none)
 
 
 print("\n%s" % ("FAIL: %d" % len(FAILS) if FAILS
