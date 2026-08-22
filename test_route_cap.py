@@ -89,11 +89,12 @@ assert r["router"] == AERO_CL_ROUTER and r["max_in"] == 300 * 10**18, r
 assert _CBETH in RC, "cbETH не попал в fast-lane/кэш слоя-2"
 assert direct_swap(_CBETH, _UNIV3_WETH, 250 * 10**18, LIQ, LIQ, repaid_assets=1) is not None
 assert direct_swap(_CBETH, _UNIV3_WETH, 301 * 10**18, LIQ, LIQ, repaid_assets=1) is None
-assert _SWAP_ROUTES[(_CB, _EURC)]["max_in"] == 15 * 10**7, "EURC-нога: кап 1.5 cbBTC"
+assert _SWAP_ROUTES[(_CB, _EURC)]["max_in"] == 75 * 10**6, \
+    "EURC-нога: кап 0.75 cbBTC (рекалибровка 22.08: статик 1.5 стоял на точке разорения)"
 assert direct_swap(_CB, _EURC, 2 * 10**8, LIQ, LIQ, repaid_assets=1) is None, "2 cbBTC -> Kyber"
 from chain.spec_fire import _label_of as _lo
 assert _lo("cbETH") == "ETH", "cbETH — пег (ETH-нога), predict не армит"
-print("UNIT_OK: cbETH-роут (кап 300) + EURC-кап 1.5; пег-семантика верна")
+print("UNIT_OK: cbETH-роут (кап 300) + EURC-кап 0.75 (глубина 22.08); пег-семантика верна")
 
 # 8) 25.07: капы мем-путей по замеру обрыва (cbDOGE 100k ток., cbADA 60k)
 # #71 (09.08): кап понижен 100k -> 50k по ЗАМЕРУ канарейки — на 100k пул отдавал impact
