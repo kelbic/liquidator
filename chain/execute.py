@@ -1471,6 +1471,72 @@ _VOLLEY_BAL_FLOOR_WEI = int(float(os.environ.get("SPEC_FIRE_VOLLEY_FLOOR_ETH", "
 #   гейт     — по ХУДШЕМУ случаю: нога обязана быть способна оплатить полный выигрыш;
 #   декремент— по ОЖИДАЕМОМУ: no-op, а не лимит (истину всё равно вернёт refresh кэша).
 _VOLLEY_EXPECTED_GAS = int(os.environ.get("SPEC_FIRE_VOLLEY_EXPECTED_GAS", "45000"))
+# П.2 (22.08): ДВУХ-БАКЕТНЫЕ ПАТРОНЫ. Немота 05:11 была ПОГОЛОВНОЙ, потому что пол-гейт
+# считал ВСЕМ ногам худший случай ПОБЕДЫ; но нога с малым патроном в эскалацию всё равно не
+# выигрывает — её tx не проходит upfront-чек узла (gas_limit x maxFee > баланса). Тиры:
+#   A «win-loaded» — первые SPEC_FIRE_TIER_A_LEGS ног keyfile, патрон под победу в эскалации:
+#     гейт bal >= win_gas_worst x maxFee_лестницы x 1.3 (право на победу);
+#   B «density»    — остальные: гейт bal >= probe_gas x maxFee x 2 (право на плотность);
+#     в эскалационное ОКНО (класс живого портфеля >= TIER_ESC_WEI) их лестницы не
+#     выпускаются (admission, счётчик b_esc_skips), в спокойных классах дают плотность,
+#     и их лестницы НЕ переодеваются в эскалационный tip (кап в presign_ladder).
+# Откат: SPEC_FIRE_TIER_A_LEGS=0 — однотирная формула бит-в-бит.
+SPEC_FIRE_TIER_A_LEGS = int(os.environ.get("SPEC_FIRE_TIER_A_LEGS", "40"))
+SPEC_FIRE_TIER_ESC_WEI = int(os.environ.get("SPEC_FIRE_TIER_ESC_WEI", "3000000"))
+SPEC_FIRE_TIER_WIN_GAS = int(os.environ.get("SPEC_FIRE_TIER_WIN_GAS", "910000"))
+_TIER_A_SET: set = set()       # заполняет volley_accounts() — первые N ног keyfile
+_TIER_STATS = {"a_mute": 0, "b_mute": 0, "a_fired": 0, "b_esc_skips": 0}
+
+
+def volley_tier(addr) -> str:
+    return "A" if addr in _TIER_A_SET else "B"
+
+
+def volley_tier_gate_short(addr, bal_wei, gas, max_fee) -> bool:
+    """True = нога НЕ имеет права стрелять сейчас (немота по патрону). Двух-тирная формула;
+    SPEC_FIRE_TIER_A_LEGS=0 -> прежняя однотирная бит-в-бит."""
+    if SPEC_FIRE_TIER_A_LEGS <= 0:
+        return int(bal_wei) - int(gas) * int(max_fee) < _VOLLEY_BAL_FLOOR_WEI
+    if addr in _TIER_A_SET:
+        if int(bal_wei) < int(SPEC_FIRE_TIER_WIN_GAS * int(max_fee) * 1.3):
+            _TIER_STATS["a_mute"] += 1
+            return True
+        return False
+    # B: ПРЕЖНЯЯ формула (bal − gas×maxFee ≥ пол) — ОТКЛОНЕНИЕ ОТ БУКВЫ СПЕКИ («цена пробы
+    # ×2») названо: гейт по цене пробы нарушал инвариант #32 «нога обязана мочь оплатить
+    # ПОЛНЫЙ выигрыш» (B-нога, победившая в штиле, платит win-газ по своему maxFee; стенды
+    # patron_floor/presign_ladder этот инвариант и держат). Поголовной немоты это не вернёт:
+    # она шла от ЭСКАЛАЦИОННОГО maxFee в лестницах, который B больше не надевает (кап tip в
+    # presign_ladder) — в штиле B проходит всегда, в эскалацию её и так отсекает admission.
+    if int(bal_wei) - int(gas) * int(max_fee) < _VOLLEY_BAL_FLOOR_WEI:
+        _TIER_STATS["b_mute"] += 1
+        return True
+    return False
+
+
+def volley_tier_b_esc_skip(addr) -> bool:
+    """Admission эскалационного окна: B-ноги не выпускаются, когда живой портфель несёт
+    эскалационный класс — их tx там не замайнится, плотность впустую. Отказ сигнала = НЕ
+    эскалация (fail-open в сторону плотности: B молчит только по доказанной эскалации)."""
+    if SPEC_FIRE_TIER_A_LEGS <= 0 or addr in _TIER_A_SET:
+        return False
+    try:
+        slots = transit_tip_portfolio()
+        if slots and max(int(t) for t in slots) >= SPEC_FIRE_TIER_ESC_WEI:
+            _TIER_STATS["b_esc_skips"] += 1
+            return True
+    except Exception:                                    # noqa: BLE001
+        pass
+    return False
+
+
+def volley_tier_note_fire(addr):
+    if SPEC_FIRE_TIER_A_LEGS > 0 and addr in _TIER_A_SET:
+        _TIER_STATS["a_fired"] += 1
+
+
+def volley_tier_stats() -> dict:
+    return dict(_TIER_STATS)
 # ПУТЬ ДВИЖКА (#45, ревью 08.08): гейт патрона там был сломан в ОБЕ стороны — при пустом кэше
 # молча пропускался (незнание как разрешение — канон, экземпляр katana 08.08), а сам кэш на
 # этом пути никогда не обновлялся, и пессимистичный декремент по ЭСТИМЕЙТУ гнал его к полу:
@@ -1770,6 +1836,8 @@ def volley_accounts():
             log.info("VOLLEY ступень: %d ног из %d (SPEC_FIRE_EOA_MAX)", cap, len(accs))
             accs = accs[:cap]
         _VOLLEY_ACCTS = accs
+        # П.2: тир A = первые N ног в ПОРЯДКЕ keyfile (детерминированно, без перемешивания)
+        _TIER_A_SET.update(a for a, _ in accs[:SPEC_FIRE_TIER_A_LEGS])
         if accs:
             # адреса печатаем только у малого набора: строка на 70 адресов бесполезна в журнале
             tail = (", ".join(a for a, _ in accs) if len(accs) <= 8
@@ -1903,12 +1971,13 @@ def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, lo
         if bal is None:
             return None
         _px = int(max_fee if max_fee else int(cfg.tip_gwei * 1e9) * 3)
-        _worst = int(gas) * _px              # гейт: нога обязана потянуть ПОЛНЫЙ выигрыш
         _spend = _VOLLEY_EXPECTED_GAS * _px  # декремент: реальный расход тихой пробы
-        if bal[0] - _worst < _VOLLEY_BAL_FLOOR_WEI:
+        if volley_tier_b_esc_skip(addr):     # П.2: B-нога в эскалационное окно не выпускается
+            return None
+        if volley_tier_gate_short(addr, bal[0], gas, _px):   # П.2: пер-тирный пол
             if log:
-                log.info("VOLLEY %s молчит: патрон на поле %.4f ETH (долив — решение владельца)",
-                         addr[:10], bal[0] / 1e18)
+                log.info("VOLLEY %s [%s] молчит: патрон на поле %.4f ETH (долив — решение владельца)",
+                         addr[:10], volley_tier(addr), bal[0] / 1e18)
             return None
         nonce = _VOLLEY_NONCE.get(addr)
         if nonce is None:
@@ -1928,6 +1997,7 @@ def send_volley_probe(rpc, cfg, addr: str, key: str, calldata: str, gas: int, lo
             return None
         _VOLLEY_NONCE[addr] = nonce + 1
         volley_bal_note_sent(addr, _spend)   # П.4: единый шов — факт квитанции ЗАМЕСТИТ оценку
+        volley_tier_note_fire(addr)          # П.2: a_legs_firing в строку окна
         with _INFLIGHT_LOCK:
             _VOLLEY_PROBES += 1
         return res["hash"]
@@ -2132,6 +2202,10 @@ def presign_ladder(rpc, cfg, addr: str, key: str, gas: int, depth: int = None,
     # Ш24: у каждой ноги СВОЙ тир (см. probe_tip_for). Раньше здесь стояла одна константа на
     # весь флот, и мы были ниже класса в 56% блоков — то есть в хвосте за всем полем.
     tip_wei = int(tip) if tip else probe_tip_for(addr)
+    # П.2: B-нога НЕ переодевается в эскалационный класс — её патрон под него не сшит, а
+    # эскалацию кроют A-ноги; кап держит и гейт-цену B (probe_gas x maxFee x 2) маленькой.
+    if SPEC_FIRE_TIER_A_LEGS > 0 and addr not in _TIER_A_SET:
+        tip_wei = min(tip_wei, SPEC_FIRE_TIER_ESC_WEI)
     acct = account_for(w3, key)          # чистая крипта (from_key, кэш) — вне лока
     # СЕТЬ ВНЕ ЛОКА (#112): держать lk на RTT get_block значило бы немоту огня ноги на RTT.
     if base_fee is None:
@@ -2361,7 +2435,9 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
         if _age > _VOLLEY_BAL_TTL and rpc is not None:
             volley_bal_refresh_async(rpc, addr)       # фоном, огонь не ждёт
         # гейт по ХУДШЕМУ случаю: нога обязана быть способна оплатить полный выигрыш
-        if bal[0] - int(st["gas"]) * int(st["max_fee"]) < _VOLLEY_BAL_FLOOR_WEI:
+        if volley_tier_b_esc_skip(addr):     # П.2: B-нога в эскалационное окно не выпускается
+            return None
+        if volley_tier_gate_short(addr, bal[0], st["gas"], st["max_fee"]):   # П.2: пер-тирный пол
             with _INFLIGHT_LOCK:
                 _VOLLEY_FLOOR_SKIPS += 1
                 _VOLLEY_MAXFEE_MUTE.add(addr)   # У2: немота по комиссии обязана КРИЧАТЬ, иначе
@@ -2499,6 +2575,7 @@ def send_presigned_probe(rpc, cfg, addr: str, log=None, broadcast_raw_urls=None)
         # ДЕКРЕМЕНТ ПО ФАКТУ (#45): эстимейт здесь завышал расход no-op пробы в ~250 раз и
         # глушил ногу за ~135 проб. Истину приносит коллектор квитанций (volley_bal_charge),
         # а верхнюю границу дрейфа держит дозор по возрасту кэша.
+    volley_tier_note_fire(addr)              # П.2: a_legs_firing в строку окна
     with _INFLIGHT_LOCK:
         _VOLLEY_PROBES += 1
         # #93: БРОНЬ В МОМЕНТ ОТПРАВКИ. Гейт огня решает по ФАКТ+БРОНЬ, поэтому магазин

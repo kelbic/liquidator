@@ -4087,7 +4087,15 @@ class SpecFireLive:
                 self.stats.get("collector_overflow", 0),
                 ("%.1fс" % _rl[len(_rl) // 2]) if _rl else "—",
                 ("%.1fс" % _rl[int(len(_rl) * 0.9)]) if _rl else "—")
-            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s rcpt=%s "
+            # П.2: пер-тирная немота/огонь в строке окна
+            try:
+                from chain.execute import volley_tier_stats as _vts
+                _t = _vts()
+                _tier_s = "a_mute=%d b_mute=%d a_fired=%d b_esc_skips=%d" % (
+                    _t["a_mute"], _t["b_mute"], _t["a_fired"], _t["b_esc_skips"])
+            except Exception:                            # noqa: BLE001
+                _tier_s = "—"
+            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s rcpt=%s tiers[%s] "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
                       "budget_reserve_skips=%d budget_inflight_skips=%d "
                       # 20.08: все три — ПО КАНАЛАМ (url|ip). transport_reject был суммарным
@@ -4098,7 +4106,7 @@ class SpecFireLive:
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _rcpt_s,
+                          _rcpt_s, _tier_s,
                           _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej or "—",
                           _purg or "—", _md_str,
                           self.stats.get("class_between_slots", 0),
