@@ -66,7 +66,24 @@ def main():
         sys.exit(3)
     from web3 import Web3
     from eth_account import Account
-    w3 = Web3(Web3.HTTPProvider(env["RPC_URL"]))
+    # 22.08: узел переопределяем (PROVISION_RPC_URL) — боевой Alchemy на 220 одиночных
+    # балансов + 213 отправок ответил 429 посреди заправки. И ретраим 429/сеть с паузой:
+    # упасть с половиной розданных ног хуже, чем подождать секунды (идемпотентность спасает,
+    # но каждый рестарт скрипта — новый полный скан балансов).
+    w3 = Web3(Web3.HTTPProvider(env.get("PROVISION_RPC_URL") or env["RPC_URL"]))
+    import time as _t
+
+    def _retry(fn, *a, **kw):
+        for i in range(5):
+            try:
+                return fn(*a, **kw)
+            except Exception:                            # noqa: BLE001
+                if i == 4:
+                    raise
+                _t.sleep(2.0 * (i + 1))
+
+    def _bal(a):
+        return _retry(w3.eth.get_balance, a)
     acct = Account.from_key(env["WALLET_KEY"])
     bot = acct.address
     bal0 = w3.eth.get_balance(bot)
@@ -102,14 +119,14 @@ def main():
     if topup:
         todo = []
         for a in addrs:
-            d = fund_wei - w3.eth.get_balance(a)
+            d = fund_wei - _bal(a)
             if d >= min_topup_wei:
                 todo.append((a, d))
         need_wei = sum(d for _, d in todo) + len(todo) * 21000 * int(0.06e9)
         print("к ДОзаправке (TOPUP до %.4f): %d из %d ног, дефицит => %.5f ETH" % (
             FUND_ETH, len(todo), len(addrs), need_wei / 1e18))
     else:
-        todo = [(a, fund_wei) for a in addrs if w3.eth.get_balance(a) < fund_wei]
+        todo = [(a, fund_wei) for a in addrs if _bal(a) < fund_wei]
         need_wei = len(todo) * (fund_wei + 21000 * int(0.06e9))
         print("к заправке: %d из %d ног по %.4f ETH => %.5f ETH" % (
             len(todo), len(addrs), FUND_ETH, need_wei / 1e18))
@@ -127,13 +144,25 @@ def main():
     nonce = w3.eth.get_transaction_count(bot, "pending")
     tip = int(0.05e9)
     sent = 0
+    base = int(_retry(w3.eth.get_block, "latest")["baseFeePerGas"])
     for a, val in todo:
-        base = int(w3.eth.get_block("latest")["baseFeePerGas"])
         tx = {"from": bot, "to": a, "value": val, "gas": 21000, "nonce": nonce,
-              "chainId": 8453, "maxFeePerGas": base * 2 + tip, "maxPriorityFeePerGas": tip}
+              "chainId": 8453, "maxFeePerGas": base * 4 + tip, "maxPriorityFeePerGas": tip}
         signed = acct.sign_transaction(tx)
         raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-        h = w3.eth.send_raw_transaction(raw)
+        h = signed.hash
+        for _i in range(5):
+            try:
+                w3.eth.send_raw_transaction(raw)
+                break
+            except Exception as _e:                      # noqa: BLE001
+                _s = str(_e)
+                # повтор ПОСЛЕ принятого узлом = успех, а не отказ
+                if "already known" in _s or "nonce too low" in _s or "ALREADY" in _s:
+                    break
+                if _i == 4:
+                    raise
+                _t.sleep(2.0 * (_i + 1))
         nonce += 1
         sent += 1
         if sent % 10 == 0 or sent == len(todo):
@@ -143,7 +172,7 @@ def main():
 
     # 4. приёмка: считаем по ЦЕПИ, а не по числу отправленных tx (в TOPUP пыль — не недодача)
     _target = fund_wei - (min_topup_wei if topup else 0)
-    ok = sum(1 for a in addrs if w3.eth.get_balance(a) >= _target)
+    ok = sum(1 for a in addrs if _bal(a) >= _target)
     bal1 = w3.eth.get_balance(bot)
     print("ИТОГ: заправлено по цепи %d/%d ног, потрачено %.5f ETH, на главном %.5f ETH" % (
         ok, len(addrs), (bal0 - bal1) / 1e18, bal1 / 1e18))
