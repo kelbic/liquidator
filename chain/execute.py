@@ -1483,6 +1483,7 @@ _VOLLEY_EXPECTED_GAS = int(os.environ.get("SPEC_FIRE_VOLLEY_EXPECTED_GAS", "4500
 # Откат: SPEC_FIRE_TIER_A_LEGS=0 — однотирная формула бит-в-бит.
 SPEC_FIRE_TIER_A_LEGS = int(os.environ.get("SPEC_FIRE_TIER_A_LEGS", "40"))
 SPEC_FIRE_TIER_ESC_WEI = int(os.environ.get("SPEC_FIRE_TIER_ESC_WEI", "3000000"))
+SPEC_FIRE_TIER_ESC_FRESH_SEC = float(os.environ.get("SPEC_FIRE_TIER_ESC_FRESH_SEC", "120"))
 SPEC_FIRE_TIER_WIN_GAS = int(os.environ.get("SPEC_FIRE_TIER_WIN_GAS", "910000"))
 _TIER_A_SET: set = set()       # заполняет volley_accounts() — первые N ног keyfile
 _TIER_STATS = {"a_mute": 0, "b_mute": 0, "a_fired": 0, "b_esc_skips": 0}
@@ -1498,7 +1499,11 @@ def volley_tier_gate_short(addr, bal_wei, gas, max_fee) -> bool:
     if SPEC_FIRE_TIER_A_LEGS <= 0:
         return int(bal_wei) - int(gas) * int(max_fee) < _VOLLEY_BAL_FLOOR_WEI
     if addr in _TIER_A_SET:
-        if int(bal_wei) < int(SPEC_FIRE_TIER_WIN_GAS * int(max_fee) * 1.3):
+        # Линза 22.08 (2): пол ПОВЕРХ права на победу — без него A-нога с балансом ровно на
+        # один выигрыш стреляла бы в ноль, а кэш баланса (TTL) открывал окно двойной траты
+        # одного патрона. При 0.010 и p90 5 гвей: 0.010−0.0059=0.0041 ≥ 0.003 — проходит.
+        if int(bal_wei) - int(SPEC_FIRE_TIER_WIN_GAS * int(max_fee) * 1.3) \
+                < _VOLLEY_BAL_FLOOR_WEI:
             _TIER_STATS["a_mute"] += 1
             return True
         return False
@@ -1515,16 +1520,24 @@ def volley_tier_gate_short(addr, bal_wei, gas, max_fee) -> bool:
 
 
 def volley_tier_b_esc_skip(addr) -> bool:
-    """Admission эскалационного окна: B-ноги не выпускаются, когда живой портфель несёт
-    эскалационный класс — их tx там не замайнится, плотность впустую. Отказ сигнала = НЕ
-    эскалация (fail-open в сторону плотности: B молчит только по доказанной эскалации)."""
+    """Admission эскалационного окна: B-ноги не выпускаются, когда эскалационный класс жив
+    В СЫРОМ КОЛЬЦЕ транзитов — их tx там не замайнится (upfront-чек узла), а баунс рвал бы
+    nonce-потоки всего тира B разом. Линза 22.08 (1): судим по _TRANSIT_TIPS (сырьё, как
+    CLASS-CATCH), а НЕ по transit_tip_portfolio — портфель это производные СЛОТЫ, и
+    эскалация «между слотами» (4.67 мгвей между 1.775 и 12.76 — наблюдена сегодня) в нём
+    невидима. Отказ сигнала = НЕ эскалация (fail-open в сторону плотности)."""
     if SPEC_FIRE_TIER_A_LEGS <= 0 or addr in _TIER_A_SET:
         return False
     try:
-        slots = transit_tip_portfolio()
-        if slots and max(int(t) for t in slots) >= SPEC_FIRE_TIER_ESC_WEI:
-            _TIER_STATS["b_esc_skips"] += 1
-            return True
+        n = time.time()
+        with _TRANSIT_TIPS_LOCK:
+            for ring in _TRANSIT_TIPS.values():
+                for ts, w in reversed(ring):             # свежие в хвосте — выходим раньше
+                    if n - ts > SPEC_FIRE_TIER_ESC_FRESH_SEC:
+                        break
+                    if int(w) >= SPEC_FIRE_TIER_ESC_WEI:
+                        _TIER_STATS["b_esc_skips"] += 1
+                        return True
     except Exception:                                    # noqa: BLE001
         pass
     return False

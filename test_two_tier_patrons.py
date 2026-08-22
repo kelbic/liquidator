@@ -71,18 +71,31 @@ check("A-нога с патроном ниже права на победу — 
       ex.volley_tier_gate_short("0xA000", int(0.004 * ETH), 1_000_000, P90_FEE) is True
       and ex._TIER_STATS["a_mute"] == 1, ex._TIER_STATS)
 
-# 3. Admission эскалационного окна: B не выпускается, A выпускается
-ex.transit_tip_portfolio = lambda now=None: (1_000_000, 3_000_000)
-check("эскалация в портфеле: B-нога отсечена admission'ом (b_esc_skips)",
-      ex.volley_tier_b_esc_skip("0xB000") is True
-      and ex._TIER_STATS["b_esc_skips"] == 1)
-check("эскалация в портфеле: A-нога выпускается", ex.volley_tier_b_esc_skip("0xA000") is False)
-ex.transit_tip_portfolio = lambda now=None: (1_000_000, 1_775_000)
-check("спокойный портфель: B выпускается (fail-open в сторону плотности)",
+# 2б. Линза (2): пол ПОВЕРХ права на победу — A с балансом «ровно на один выигрыш» молчит
+check("A с патроном ровно на выигрыш (0.0065 при 2.98 гвей) — mute: пол бережёт от нуля",
+      ex.volley_tier_gate_short("0xA002", int(0.0065 * ETH), 1_000_000, ESC_FEE) is True)
+
+# 3. Admission эскалационного окна: сигнал — СЫРОЕ кольцо, не портфель слотов (линза (1))
+import time as _t  # noqa: E402
+_sv_ring = dict(ex._TRANSIT_TIPS)
+ex._TRANSIT_TIPS.clear()
+_nw = _t.time()
+# НЕГАТИВНЫЙ КОНТРОЛЬ КЛАССА ДЕФЕКТА: эскалация 4.67 мгвей ЕСТЬ в кольце, а в слотах
+# портфеля её НЕТ (между 1.775 и 12.76) — admission обязан видеть её ИЗ СЫРЬЯ
+ex._TRANSIT_TIPS["0xagg"] = [(_nw - 5.0, 4_669_231)]
+ex.transit_tip_portfolio = lambda now=None: (1_000_000, 1_775_000)   # слоты слепы
+check("эскалация в КОЛЬЦЕ (между слотами!): B отсечена admission'ом",
+      ex.volley_tier_b_esc_skip("0xB000") is True and ex._TIER_STATS["b_esc_skips"] == 1)
+check("та же эскалация: A-нога выпускается", ex.volley_tier_b_esc_skip("0xA000") is False)
+ex._TRANSIT_TIPS["0xagg"] = [(_nw - 300.0, 4_669_231)]               # протухшая запись
+check("ПРОТУХШАЯ эскалация (300с > свежести 120с): B выпускается",
       ex.volley_tier_b_esc_skip("0xB000") is False)
-ex.transit_tip_portfolio = lambda now=None: (_ for _ in ()).throw(RuntimeError("зеркало легло"))
-check("отказ сигнала эскалации = НЕ эскалация (B не глушится вслепую)",
+ex._TRANSIT_TIPS["0xagg"] = [(_nw - 5.0, 1_775_000)]                 # свежий штиль
+check("спокойное кольцо: B выпускается (fail-open в сторону плотности)",
       ex.volley_tier_b_esc_skip("0xB000") is False)
+ex._TRANSIT_TIPS.clear()
+check("пустое кольцо (сигнала нет): B выпускается", ex.volley_tier_b_esc_skip("0xB000") is False)
+ex._TRANSIT_TIPS.update(_sv_ring)
 ex.transit_tip_portfolio = _sv_ttp
 
 # 4. НЕГАТИВНЫЙ КОНТРОЛЬ: спокойный класс — молчат ноль в ОБОИХ тирах
