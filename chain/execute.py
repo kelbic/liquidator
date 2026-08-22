@@ -4174,7 +4174,10 @@ def _revert_bucket(err_str: str) -> str:
     m = re.search(r"reverted:?\s*(.+)", err_str)        # Error(string): 'execution reverted: <msg>'
     if m:
         return m.group(1).strip()[:80]
-    sel = re.search(r"0x[0-9a-fA-F]{8}", err_str)        # custom-error selector
+    # custom-error selector — РОВНО 8 hex с границей: без неё регэксп ел ПРЕФИКС tx-хэша из
+    # текста ошибки (пост-мортем $128k 22.08: reason=selector 0x8edd9824 = наш же хэш,
+    # настоящая причина реверта скрыта)
+    sel = re.search(r"0x[0-9a-fA-F]{8}(?![0-9a-fA-F])", err_str)
     if sel:
         return "selector " + sel.group(0)
     return err_str[:80]

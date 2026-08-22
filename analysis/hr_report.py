@@ -53,10 +53,17 @@ def block_at_ts(ts, head_bn, head_ts):
 
 def main():
     try:
-        bids = [json.loads(x) for x in open(JOURNAL) if x.strip()]
+        rows = [json.loads(x) for x in open(JOURNAL) if x.strip()]
     except FileNotFoundError:
         print("журнала нет (%s) — бидов ещё не было" % JOURNAL)
         return 0
+    # kind=obs_* — ЦЕНЗУРИРОВАННЫЕ наблюдения (напр. отказ по полу приза, забранный чужими):
+    # в P не входят ни числителем, ни знаменателем, но копятся для будущего триггера пола.
+    bids = [b for b in rows if b.get("kind", "bid") == "bid"]
+    obs = [b for b in rows if str(b.get("kind", "")).startswith("obs")]
+    if obs:
+        print("наблюдений ниже пола (цензурированных): %d — напр. %s"
+              % (len(obs), obs[-1].get("borrower", "?")))
     head = rpc("eth_getBlockByNumber", ["latest", False])
     if not head:
         print("узел не отвечает — отчёт не состоялся")
