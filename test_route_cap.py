@@ -40,7 +40,7 @@ print("UNIT_OK: wstETH кап 150 включительно, кап+1 -> None")
 
 # 4) cbBTC/USDC кап 30 cbBTC (~$1.9M): кит $1.5M (~25 cbBTC) — директ; сверх — Kyber
 from chain.execute import _CBBTC, _UNIV3_USDC
-assert _SWAP_ROUTES[(_CBBTC, _UNIV3_USDC)]["max_in"] == 30 * 10**8
+assert _SWAP_ROUTES[(_CBBTC, _UNIV3_USDC)]["max_in"] == 13 * 10**8   # 22.08 рекалибровка
 whale = direct_swap(_CBBTC, _UNIV3_USDC, 25 * 10**8, LIQ, LIQ, repaid_assets=1)
 assert whale is not None, "сайз кита обязан идти директом (скорость, профит жив)"
 mega = direct_swap(_CBBTC, _UNIV3_USDC, 31 * 10**8, LIQ, LIQ, repaid_assets=1)
