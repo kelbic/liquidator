@@ -746,6 +746,17 @@ SPEC_FIRE_COOLDOWN_SCOPE = os.environ.get("SPEC_FIRE_COOLDOWN_SCOPE", "feed").st
 SPEC_FIRE_MIN_PROFIT_BPS = int(os.environ.get("SPEC_FIRE_MIN_PROFIT_BPS", "30"))
 SPEC_FIRE_POLL_SEC = float(os.environ.get("SPEC_FIRE_POLL_SEC", "0.15"))
 SPEC_FIRE_RECEIPT_TIMEOUT = float(os.environ.get("SPEC_FIRE_RECEIPT_TIMEOUT", "45"))
+# П.3 (22.08): thread-per-call -> коллекторная модель квитанций ОКНА. Корень трёх инцидентов
+# (cgroup-душилка, TasksMax=256, «два потолка» 05:38Z) — тред на каждую пробу/квитанцию в
+# _collect/_collect_volley, при том что движок уже вылечен ReceiptCollector'ом. Режимы:
+#   thread    — легаси бит-в-бит (тред-на-пробу); это и ручка ОТКАТА без кода;
+#   shadow    — ДЕФОЛТ миграции: деньги ведёт легаси-тред, коллектор параллельно сверяет
+#               исход на тех же хэшах, расхождение в лог (неделя/200 проб -> collector);
+#   collector — очередь коллектора вместо тредов; переполнение = учётный дроп в
+#               collector_overflow + фолбэк легаси-тредом (денежный инвариант «ровно один
+#               исход на отправку» не теряется никогда).
+SPEC_FIRE_RCPT_MODE = os.environ.get("SPEC_FIRE_RCPT_MODE", "shadow").lower()
+SPEC_FIRE_RCPT_MAX_PENDING = int(os.environ.get("SPEC_FIRE_RCPT_MAX_PENDING", "4096"))
 
 
 def _probe_tip_wei(tip_gwei: float) -> int:
@@ -1230,9 +1241,121 @@ class SpecFireLive:
             return True
         return tied[int(n / max(0.25, SPEC_FIRE_DENSE_INTERVAL_SEC)) % len(tied)] == feed
 
+    # ---- П.3 (22.08): коллекторная модель квитанций ОКНА (см. SPEC_FIRE_RCPT_MODE) ----
+    def _res_from_receipt(self, r):
+        """Кортеж исхода из квитанции — ТА ЖЕ математика, что в _receipt (один источник формы)."""
+        gas_usd = (int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
+                   * float(self.cfg.eth_price_usd) / 1e18)
+        return (int(r.get("status") or 0), gas_usd, r.get("blockNumber"),
+                r.get("transactionIndex"), _receipt_has_win(r, self.cfg.liquidator_address))
+
+    def _rcpt_coll(self):
+        """Коллектор квитанций окна: ОДИН тред партиями вместо треда-на-пробу. Переиспользован
+        обстрелянный fire_engine.ReceiptCollector с той же проводкой узлов (bg->D->платный,
+        индекс первым #110). Ленивая сборка."""
+        col = getattr(self, "_rcpt_col", None)
+        if col is not None:
+            return col
+        with self._lock:
+            if getattr(self, "_rcpt_col", None) is None:
+                from chain import fire_engine as _fe
+
+                def _combat_url():
+                    return getattr(self.rpc, "rpc_url", None)
+                self._rcpt_col = _fe.ReceiptCollector(
+                    receipts_fn=self._receipts_fn(_combat_url), index_fn=self._index_fn(),
+                    on_result=self._rcpt_result, on_timeout=self._rcpt_timeout,
+                    timeout_sec=SPEC_FIRE_RECEIPT_TIMEOUT,
+                    max_pending=SPEC_FIRE_RCPT_MAX_PENDING, log=self._log)
+                self._rcpt_col.start()
+            return self._rcpt_col
+
+    def _rcpt_dispatch(self, h, kind, args):
+        """Точка ветвления режима: thread — легаси бит-в-бит; collector — очередь;
+        shadow — оба на одном хэше (деньги ведёт ЛЕГАСИ, коллектор лишь сверяет исход).
+        Переполнение/отказ коллектора в режиме collector НЕ теряет исход — фолбэк
+        легаси-тредом (учётный дроп в collector_overflow)."""
+        target = self._collect if kind == "probe" else self._collect_volley
+        mode = SPEC_FIRE_RCPT_MODE
+        if mode not in ("shadow", "collector"):                # thread и любой опечатанный
+            threading.Thread(target=target, args=(h,) + args, daemon=True).start()
+            return
+        if mode == "shadow":
+            threading.Thread(target=target, args=(h,) + args, daemon=True).start()
+        ok = False
+        try:
+            ok = self._rcpt_coll().track(
+                h, ("shadow" if mode == "shadow" else "live", kind, args, self._now()))
+        except Exception as e:                               # noqa: BLE001
+            self.stats["collector_dispatch_fail"] = \
+                self.stats.get("collector_dispatch_fail", 0) + 1
+            self._log("SPECFIRE rcpt-коллектор dispatch fail tx=%s: %s" % (h, type(e).__name__))
+        if not ok:
+            self.stats["collector_overflow"] = self.stats.get("collector_overflow", 0) + 1
+            if mode == "collector":                          # исход обязан случиться
+                threading.Thread(target=target, args=(h,) + args, daemon=True).start()
+
+    def _rcpt_result(self, meta, h, r):
+        src, kind, args, t0 = meta
+        lat = self._now() - t0
+        ring = self.stats.setdefault("rcpt_lat_ring", [])
+        ring.append(lat)
+        del ring[:-400]
+        res = self._res_from_receipt(r)
+        if src == "shadow":
+            self._rcpt_shadow_note(h, "коллектор", res[0])
+            return
+        if kind == "probe":
+            self._collect_core(res, h, *args)
+        else:
+            self._collect_volley_core(res, h, *args)
+
+    def _rcpt_timeout(self, meta, h):
+        """TTL-свипер инварианта: квитанция не собрана за таймаут — исход «NO-RECEIPT» по
+        худшему случаю (нонс-инвалидация ноги = ресинк её потока) случается РОВНО ОДИН РАЗ."""
+        src, kind, args, t0 = meta
+        if src == "shadow":
+            self._rcpt_shadow_note(h, "коллектор", None)
+            return
+        if kind == "probe":
+            self._collect_core(None, h, *args)
+        else:
+            self._collect_volley_core(None, h, *args)
+
+    def _rcpt_shadow_note(self, h, who, status):
+        """Тень миграции: первый пришедший кладёт исход, второй сверяет. Расхождение — в лог
+        и счётчик (деньги не трогаются: их в shadow ведёт только легаси)."""
+        with self._lock:
+            seen = getattr(self, "_rcpt_shadow_seen", None)
+            if seen is None:
+                seen = self._rcpt_shadow_seen = {}
+            other = seen.pop(h, None)
+            if other is None:
+                seen[h] = (who, status)
+                while len(seen) > 512:
+                    seen.pop(next(iter(seen)))
+                return
+        if other[0] == who:                                  # дубль своей же стороны — не суд
+            return
+        if other[1] != status:
+            self.stats["rcpt_shadow_diverged"] = self.stats.get("rcpt_shadow_diverged", 0) + 1
+            self._log("SPECFIRE RCPT-SHADOW РАСХОЖДЕНИЕ tx=%s: %s=%s %s=%s"
+                      % (h, who, status, other[0], other[1]))
+        else:
+            self.stats["rcpt_shadow_agree"] = self.stats.get("rcpt_shadow_agree", 0) + 1
+
     def _collect(self, h, mid, borrower, debt_usd, feed=""):
-        from chain.execute import specfire_gas_add, mark_recent_send, canary_invalidate_nonce
+        """ЛЕГАСИ-обёртка (тред-на-пробу): полл квитанции блокирует тред, исход ведёт core.
+        В shadow-режиме записывает свой исход для сверки с коллектором."""
         res = (self._receipt_fn or self._receipt)(h)
+        if SPEC_FIRE_RCPT_MODE == "shadow":
+            self._rcpt_shadow_note(h, "легаси", res[0] if res else None)
+        self._collect_core(res, h, mid, borrower, debt_usd, feed)
+
+    def _collect_core(self, res, h, mid, borrower, debt_usd, feed=""):
+        """ДЕНЬГИ исхода пробы главного кошелька: res = кортеж _receipt/_res_from_receipt
+        либо None (NO-RECEIPT/таймаут). Ровно один вызов на отправку — инвариант П.3."""
+        from chain.execute import specfire_gas_add, mark_recent_send, canary_invalidate_nonce
         if res is None:
             canary_invalidate_nonce(self.rpc, self.cfg)   # дроп? nonce вперёд чейна -> инвалидация
             self._log("SPECFIRE probe NO-RECEIPT tx=%s (nonce инвалидирован)" % h)
@@ -3494,9 +3617,7 @@ class SpecFireLive:
                 self._log("SPECFIRE volley leg=%d/%d%s%s eoa=%s feed=%s %s/%s tx=%s" % (
                     i + 1, len(accts), " [sync]" if sync else "", " [доска]" if board else "",
                     addr[:10], feed, mid[:10], b[:10], h))
-                threading.Thread(target=self._collect_volley,
-                                 args=(h, mid, b, d, feed, addr, board),
-                                 daemon=True).start()
+                self._rcpt_dispatch(h, "volley", (mid, b, d, feed, addr, board))
             except Exception as e:
                 self._log("SPECFIRE volley leg fail feed=%s eoa=%s: %s" % (
                     feed, addr[:10], type(e).__name__))
@@ -3538,13 +3659,19 @@ class SpecFireLive:
         threading.Thread(target=_run, daemon=True, name="volley-%s" % feed).start()
 
     def _collect_volley(self, h, mid, borrower, debt_usd, feed, addr, board=False):
-        """Receipt ноги залпа: газ — в бакет тира; WIN — та же семантика, что у главной пробы
+        """ЛЕГАСИ-обёртка ноги залпа (тред-на-пробу); исход ведёт core, shadow сверяется."""
+        res = (self._receipt_fn or self._receipt)(h)
+        if SPEC_FIRE_RCPT_MODE == "shadow":
+            self._rcpt_shadow_note(h, "легаси", res[0] if res else None)
+        self._collect_volley_core(res, h, mid, borrower, debt_usd, feed, addr, board)
+
+    def _collect_volley_core(self, res, h, mid, borrower, debt_usd, feed, addr, board=False):
+        """ДЕНЬГИ ноги залпа: газ — в бакет тира; WIN — та же семантика, что у главной пробы
         (дедуп-маркер, кулдаун, окно закрыть); NO-RECEIPT инвалидирует nonce СВОЕГО EOA.
 
         board=True — проба ДОСКИ: статус tx о победе не говорит ничего (три исхода дают
         status=1, см. LIQUIDATED_TOPIC0), поэтому вердикт выносит только событие Liquidated."""
         from chain.execute import volley_gas_add, volley_invalidate_nonce, mark_recent_send
-        res = (self._receipt_fn or self._receipt)(h)
         if res is None:
             volley_invalidate_nonce(addr)
             self._log("SPECFIRE volley NO-RECEIPT eoa=%s tx=%s (nonce EOA инвалидирован)" % (addr[:10], h))
@@ -3650,8 +3777,7 @@ class SpecFireLive:
                                 self._log("SPECFIRE probe #%d feed=%s %s/%s debt=$%.0fk "
                                           "[pending-handoff] tx=%s" % (
                                               probes, feed, _pm[:10], _pb[:10], _pd / 1e3, h))
-                                threading.Thread(target=self._collect, args=(h, _pm, _pb, _pd, feed),
-                                                 daemon=True).start()
+                                self._rcpt_dispatch(h, "probe", (_pm, _pb, _pd, feed))
                                 if fat_mode:      # тир: залп по подтверждённому флипу (07.08)
                                     # транзит подтверждён в pending -> момент известен: разом
                                     self._volley(probe, _pm, _pb, _pd, feed, simultaneous=True)
@@ -3841,8 +3967,7 @@ class SpecFireLive:
                                         _om += " [edge]"       # проба edge-слота (кромка по dist)
                                     self._log("SPECFIRE probe #%d feed=%s %s/%s debt=$%.0fk ret=%.4f%%%s tx=%s" % (
                                         probes, feed, mid[:10], b[:10], d / 1e3, (r or 0) * 100.0, _om, h))
-                                    threading.Thread(target=self._collect, args=(h, mid, b, d, feed),
-                                                     daemon=True).start()
+                                    self._rcpt_dispatch(h, "probe", (mid, b, d, feed))
                                     if fat_mode:  # тир: жир И каскад -> залп той же пробой (07.08)
                                         self._volley(probe, mid, b, d, feed)
                                 sent = True                    # слот тика израсходован отправкой
@@ -3935,7 +4060,15 @@ class SpecFireLive:
             _mdr = sorted(self.stats.get("match_delta_ring") or [])
             _md_str = ("p50=%+d/p90=%+d/n=%d" % (_mdr[len(_mdr)//2], _mdr[int(len(_mdr)*0.9)],
                                                  len(_mdr))) if _mdr else "—"
-            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s "
+            # П.3: наблюдаемость коллектора окна — глубина очереди, переполнения, латентность
+            _rl = sorted(self.stats.get("rcpt_lat_ring") or [])
+            _rcpt_s = "%s q=%d overflow=%d lat=%s/%s" % (
+                SPEC_FIRE_RCPT_MODE,
+                getattr(self, "_rcpt_col", None).pending() if getattr(self, "_rcpt_col", None) else 0,
+                self.stats.get("collector_overflow", 0),
+                ("%.1fс" % _rl[len(_rl) // 2]) if _rl else "—",
+                ("%.1fс" % _rl[int(len(_rl) * 0.9)]) if _rl else "—")
+            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s rcpt=%s "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
                       "budget_reserve_skips=%d budget_inflight_skips=%d "
                       # 20.08: все три — ПО КАНАЛАМ (url|ip). transport_reject был суммарным
@@ -3946,6 +4079,7 @@ class SpecFireLive:
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
+                          _rcpt_s,
                           _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej or "—",
                           _purg or "—", _md_str,
                           self.stats.get("class_between_slots", 0),

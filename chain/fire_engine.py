@@ -224,7 +224,7 @@ class ReceiptCollector:
 
     def __init__(self, receipts_fn, on_result, on_timeout=None, log=None,
                  poll_sec=None, timeout_sec=None, batch=None, now=None, sleep=None,
-                 min_age_sec=None, index_fn=None):
+                 min_age_sec=None, index_fn=None, max_pending=None):
         self._receipts_fn = receipts_fn
         self._index_fn = index_fn
         self._on_result = on_result
@@ -234,6 +234,7 @@ class ReceiptCollector:
         self._timeout = COLLECT_TIMEOUT_SEC if timeout_sec is None else float(timeout_sec)
         self._batch = COLLECT_BATCH if batch is None else int(batch)
         self._min_age = COLLECT_MIN_AGE_SEC if min_age_sec is None else float(min_age_sec)
+        self._max_pending = None if max_pending is None else int(max_pending)
         self._now = now or time.monotonic
         self._sleep = sleep or time.sleep
         self._lock = threading.Lock()
@@ -246,11 +247,18 @@ class ReceiptCollector:
         #                             только из close-строки окна, которого может и не быть
 
     def track(self, h, meta):
+        """-> True если хэш под надзором (включая дубль), False при переполнении очереди
+        (П.3 22.08: backpressure — вызывающий обязан сам не потерять денежный инвариант,
+        напр. фолбэком в легаси-тред). max_pending=None = прежнее поведение бит-в-бит."""
         with self._lock:
             if h in self._pending:
-                return
+                return True
+            if self._max_pending is not None and len(self._pending) >= self._max_pending:
+                self.stats["overflow"] = self.stats.get("overflow", 0) + 1
+                return False
             self._pending[h] = (meta, self._now() + self._timeout, self._now())
             self.stats["tracked"] += 1
+            return True
 
     def pending(self):
         with self._lock:
