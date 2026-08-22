@@ -3104,6 +3104,7 @@ class SpecFireLive:
             ring = self.stats.setdefault("match_delta_ring", [])
             ring.extend(match_d)
             del ring[:-400]                       # кольцо ~400 последних значений
+            self._class_catch(bn, agg, t_tip, bool(match_d))
             shown = [r for r in rows if (-3 <= r[2] <= 25) or r[4]][:60]
             body = " ".join("%s:%+d@%d%s" % (h[:10], d, tip, "*" if m else "")
                             for h, _i, d, tip, m in shown)
@@ -3133,7 +3134,12 @@ class SpecFireLive:
             # наблюдений; заодно последовательность строк показывает ФОРМУ затухания
             # эскалации (кандидат на второй слот). Вердикты редкие — один feeHistory на
             # вердикт, на узле индекса (не боевой ключ). Прибор сбоку: отказ глотается.
+            # ЗАКРЫТО 22.08 (ОПРОВЕРГНУТО тенью 0/9): p50(B-1) занижает tip транзиттера в
+            # ~2.6x — класс скачка не живёт в B-1. Тень выключена по умолчанию ради CU;
+            # SHADOW_SLOT_A1V3=1 возвращает замер, если направление когда-нибудь оживёт.
             try:
+                if os.environ.get("SHADOW_SLOT_A1V3", "0").lower() not in ("1", "true", "yes"):
+                    raise RuntimeError("shadow-slot закрыт (0/9)")
                 _fh = ci._rpc("eth_feeHistory", [1, hex(int(bn) - 1), [50]])
                 _rw = (_fh.get("reward") or [[None]])[0]
                 _p50 = int(_rw[0], 16) if isinstance(_rw[0], str) else (int(_rw[0]) if _rw[0] is not None else None)
@@ -3149,6 +3155,65 @@ class SpecFireLive:
                       "p90=%s | %s%s"
                       % (bn, t_idx, t_tip, len(inter), len(match_d), p50, p90, body,
                          " …" if len(rows) > len(shown) else ""))
+        except Exception:
+            pass
+
+    def _class_catch(self, bn, agg, t_tip, matched):
+        """П.2 ревьюера 22.08: class_catch_lag = число блоков от ПЕРВОГО tx с новым классом X
+        (первый судимый блок с новым t_tip: судятся ровно блоки с транзитом, слепой суд сюда
+        не попадает) до ПЕРВОЙ нашей пробы на X (первый блок с tip_match). Отвечает, где живёт
+        лаг: кольцо_знало≥Nс при большом lag ⇒ переодевание лестниц (класс→пресайн); малое/
+        отсутствующее кольцо_знало ⇒ подача (детект→кольцо). Вторая половина разреза — строка
+        СТАДИИ рядом: её «возраст_лестницы» на первой match-пробе показывает, КОГДА лестница
+        была переодета. Возраст кольца — от штампа стенки b0 В ЭТОМ ЖЕ треде (лаг индекса
+        сокращается), и это НИЖНЯЯ граница: кольцо капировано, ранние записи вытесняются.
+        Честный знаменатель (канон): пойманные — в class_catch_ring, непойманные смены — в
+        class_catch_uncaught; приёмку читать ТОЛЬКО парой. Прибор сбоку: весь путь в try,
+        отказ глотается, состояние — карта на агрегатора, капирована."""
+        try:
+            st_map = getattr(self, "_ccl", None)
+            if st_map is None:
+                st_map = self._ccl = {}
+            key = str(agg).lower() if agg else "?"
+            st = st_map.get(key)
+            if st is not None and st[0] == t_tip and st[3]:
+                return                          # класс тот же и уже пойман — тишина
+            if st is None or st[0] != t_tip:
+                if st is not None and not st[3]:
+                    self.stats["class_catch_uncaught"] = \
+                        self.stats.get("class_catch_uncaught", 0) + 1
+                    self._log("SPECFIRE CLASS-CATCH agg=%s класс=%d СМЕНИЛСЯ НЕПОЙМАННЫМ "
+                              "за %d блоков (b0=%d)" % (key[:10], st[0], bn - st[1], st[1]))
+                st = st_map[key] = [t_tip, bn, time.time(), False]
+                while len(st_map) > 8:
+                    st_map.pop(next(iter(st_map)))
+            if matched and not st[3]:
+                st[3] = True
+                lag = bn - st[1]
+                cring = self.stats.setdefault("class_catch_ring", [])
+                cring.append(lag)
+                del cring[:-100]
+                ring_s = None
+                try:
+                    from chain.execute import _TRANSIT_TIPS, _TRANSIT_TIPS_LOCK
+                    with _TRANSIT_TIPS_LOCK:
+                        rings = ([_TRANSIT_TIPS.get(key) or []] if agg
+                                 else list(_TRANSIT_TIPS.values()))
+                        for r in rings:
+                            for ts, w in r:
+                                if w == t_tip and (ring_s is None or ts < ring_s):
+                                    ring_s = ts
+                except Exception:                            # noqa: BLE001
+                    pass
+                extra = ""
+                if ring_s is not None:
+                    extra = " кольцо_знало≥%.1fс-до-b0" % (st[2] - ring_s) \
+                        if ring_s <= st[2] else \
+                        " кольцо_узнало_через=%.1fс-после-b0" % (ring_s - st[2])
+                self._log("SPECFIRE CLASS-CATCH agg=%s класс=%d class_catch_lag=%d блоков "
+                          "(b0=%d b1=%d, непойманных смен=%d)%s"
+                          % (key[:10], t_tip, lag, st[1], bn,
+                             self.stats.get("class_catch_uncaught", 0), extra))
         except Exception:
             pass
 
