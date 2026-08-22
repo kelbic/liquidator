@@ -93,11 +93,26 @@ def main():
     addrs = [Account.from_key(k).address for k in keys[:N]]
 
     # 2. смета: флот не имеет права съесть патронный резерв главного кошелька
+    # TOPUP=1 (22.08, решение kelbic «долить ДО 0.006»): шлём ДЕФИЦИТ до уровня FUND_ETH,
+    # а не полный FUND_ETH сверху (старый режим на p50=0.004 слал бы 0.006 => ноги по 0.010
+    # и 1.28 ETH сметы). Пыль < MIN_TOPUP не гоняем — 21000 газа ради копейки.
     fund_wei = int(FUND_ETH * 1e18)
-    todo = [a for a in addrs if w3.eth.get_balance(a) < fund_wei]
-    need_wei = len(todo) * (fund_wei + 21000 * int(0.06e9))
-    print("к заправке: %d из %d ног по %.4f ETH => %.5f ETH" % (
-        len(todo), len(addrs), FUND_ETH, need_wei / 1e18))
+    topup = os.environ.get("TOPUP", "").lower() in ("1", "true", "yes")
+    min_topup_wei = int(float(os.environ.get("MIN_TOPUP_ETH", "0.0005")) * 1e18)
+    if topup:
+        todo = []
+        for a in addrs:
+            d = fund_wei - w3.eth.get_balance(a)
+            if d >= min_topup_wei:
+                todo.append((a, d))
+        need_wei = sum(d for _, d in todo) + len(todo) * 21000 * int(0.06e9)
+        print("к ДОзаправке (TOPUP до %.4f): %d из %d ног, дефицит => %.5f ETH" % (
+            FUND_ETH, len(todo), len(addrs), need_wei / 1e18))
+    else:
+        todo = [(a, fund_wei) for a in addrs if w3.eth.get_balance(a) < fund_wei]
+        need_wei = len(todo) * (fund_wei + 21000 * int(0.06e9))
+        print("к заправке: %d из %d ног по %.4f ETH => %.5f ETH" % (
+            len(todo), len(addrs), FUND_ETH, need_wei / 1e18))
     print("останется на главном: %.5f ETH (порог KEEP=%.3f)" % (
         (bal0 - need_wei) / 1e18, KEEP_ETH))
     if bal0 - need_wei < KEEP_ETH * 1e18:
@@ -112,9 +127,9 @@ def main():
     nonce = w3.eth.get_transaction_count(bot, "pending")
     tip = int(0.05e9)
     sent = 0
-    for a in todo:
+    for a, val in todo:
         base = int(w3.eth.get_block("latest")["baseFeePerGas"])
-        tx = {"from": bot, "to": a, "value": fund_wei, "gas": 21000, "nonce": nonce,
+        tx = {"from": bot, "to": a, "value": val, "gas": 21000, "nonce": nonce,
               "chainId": 8453, "maxFeePerGas": base * 2 + tip, "maxPriorityFeePerGas": tip}
         signed = acct.sign_transaction(tx)
         raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
@@ -126,8 +141,9 @@ def main():
     # ждём только ПОСЛЕДНЮЮ: nonce последовательны, значит её приём подтверждает все прежние
     w3.eth.wait_for_transaction_receipt(h, timeout=300)
 
-    # 4. приёмка: считаем по ЦЕПИ, а не по числу отправленных tx
-    ok = sum(1 for a in addrs if w3.eth.get_balance(a) >= fund_wei)
+    # 4. приёмка: считаем по ЦЕПИ, а не по числу отправленных tx (в TOPUP пыль — не недодача)
+    _target = fund_wei - (min_topup_wei if topup else 0)
+    ok = sum(1 for a in addrs if w3.eth.get_balance(a) >= _target)
     bal1 = w3.eth.get_balance(bot)
     print("ИТОГ: заправлено по цепи %d/%d ног, потрачено %.5f ETH, на главном %.5f ETH" % (
         ok, len(addrs), (bal0 - bal1) / 1e18, bal1 / 1e18))
