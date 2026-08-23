@@ -97,6 +97,44 @@ def profile(h, feed=None, bn=None):
         return {}
 
 
+# ---- DISPATCH-ТРАКТ (пост-мортем $128k, блок 50302440) ----------------------------------
+# Гонный реактивный путь (детект транзита -> prep -> send) не был инструментирован — лестницы
+# имеют СТАДИИ, а dispatch нет; единственная цифра гонки жила в журнале руками (45.755 ->
+# prep +259мс -> отправка +425мс). Метки живут в ТЕХ ЖЕ кольцах (stamp), стадии с префиксом
+# d_, чтобы не смешиваться с лестничными. Логика тракта НЕ меняется — только метки.
+_DISPATCH_STAGES = ("d_detect", "d_prep", "d_sent", "d_ack")
+
+
+def stamp_dispatch(h, marks):
+    """Разом положить метки dispatch-tx (хэш известен только при отправке):
+    marks = {"detect": ts, "prep": ts, "sent": ts, "ack": ts} — любое подмножество."""
+    try:
+        for k, v in (marks or {}).items():
+            if v is not None:
+                stamp(h, "d_" + str(k), v)
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
+def format_dispatch(prof):
+    """(строка, (топ-стадия, мс)) по цепочке detect→prep→sent→ack dispatch-tx.
+    Меток меньше двух — честное «—» (прибор молчит, не выдумывает)."""
+    try:
+        known = [(s[2:], prof[s]) for s in _DISPATCH_STAGES if s in prof]
+    except Exception:                                        # noqa: BLE001
+        return "—", (None, None)
+    if len(known) < 2:
+        return "—", (None, None)
+    parts, worst, worst_ms = [], None, None
+    for (s0, t0), (s1, t1) in zip(known, known[1:]):
+        ms = (t1 - t0) * 1000.0
+        parts.append("%s→%s %.0fмс" % (s0, s1, ms))
+        if ms > 0 and (worst_ms is None or ms > worst_ms):
+            worst, worst_ms = "%s→%s" % (s0, s1), ms
+    total = (known[-1][1] - known[0][1]) * 1000.0
+    return "%s | всего %.0fмс" % (" ".join(parts), total), (worst, worst_ms)
+
+
 # ЦЕПОЧКА реактивного пути. `sign` в неё НЕ ВХОДИТ намеренно: лестница подписывается
 # АСИНХРОННО и заранее (обычно за десятки секунд до кадра), это не звено задержки, а ВОЗРАСТ
 # заготовки — и он важен отдельно: класс tip вшивается при подписи, поэтому старая лестница

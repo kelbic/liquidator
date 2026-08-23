@@ -2484,7 +2484,8 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
 
         def _run(it=item):
             _ds1 = time.perf_counter()
-            try:
+            _incr_state["t_prep_wall"] = time.time()   # СТАДИИ dispatch: prep кончился ЗДЕСЬ
+            try:                                       # (боевой путь по умолчанию — инкрементальный)
                 r = dispatch_fn(rpc, cfg, [it], log=log, max_inflight=cfg.max_inflight)
             except Exception as e:                # bare-тред: исключение не должно пропасть молча
                 log.error("HOT incr-dispatch error %s/%s: %s: %s",
@@ -2694,6 +2695,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             _th.join(timeout=150.0)                          # 120с receipt-таймаута dispatch)
         results = _incr_results
         _t_send = _incr_state["t_send"]
+        _t_prep_wall = _incr_state.get("t_prep_wall")   # СТАДИИ: метка prep инкрементального пути
     else:
         from chain.execute import current_inflight, specfire_gas_today
         today = store.realized_today()                       # SHARED kill-switch with the block loop
@@ -2706,6 +2708,7 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
             return []
 
         _ds = time.perf_counter()
+        _t_prep_wall = time.time()                   # СТАДИИ dispatch: prep-фаза кончилась ЗДЕСЬ
         results = dispatch_fn(rpc, cfg, ready, log=log, max_inflight=cfg.max_inflight)
         _t_send = (time.perf_counter() - _ds) * 1000.0
     _fl_trip = pop_fast_lane_trip()                # II.6: breaker сработал в receipt-цикле dispatch -> TG-пейдж
@@ -2732,6 +2735,21 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         store.log_action(market_id=r["market_id"], borrower=r["borrower"], mode=cfg.mode,
                          tx_hash=r.get("hash"), net_usd=r.get("net_usd", 0.0), gas_usd=r.get("gas_usd", 0.0), status=status)
         log.info("HOT ACTIONABLE %s/%s status=%s tx=%s", r["market_id"][:10], r["borrower"][:10], status, r.get("hash"))
+        # СТАДИИ dispatch-тракта (пост-мортем $128k): следующая такая гонка даёт адрес стадии
+        # вместо гипотезы. detect = спавн обработки транзита (t), prep = конец сборки ready.
+        # Прибор сбоку: без меток строка честно молчит, отказ глотается.
+        if r.get("sent") and r.get("hash"):
+            try:
+                from chain.stage_probe import stamp_dispatch as _sd2, profile as _pf2, \
+                    format_dispatch as _fd2
+                _sd2(r["hash"], {"detect": t, "prep": _t_prep_wall})   # None-метки не пишутся
+                _dl, _dworst = _fd2(_pf2(r["hash"]))
+                if _dl != "—":
+                    log.info("HOT СТАДИИ tx=%s: %s | топ-виновник: %s%s",
+                             str(r["hash"])[:14], _dl, _dworst[0] or "—",
+                             (" %.0fмс" % _dworst[1]) if _dworst[1] is not None else "")
+            except Exception:                        # noqa: BLE001
+                pass
         alerter.send_async(f"\U0001F525 HOT {cfg.mode} {r['borrower'][:10]} {status}", key=f"hot:{r['market_id']}:{r['borrower']}")
     return results
 

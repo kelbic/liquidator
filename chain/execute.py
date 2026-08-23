@@ -4543,10 +4543,16 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                     _txd["gas"] = _gas
                 if _mf:                                       # SEND-2: fee из fb-хедера; иначе send_tx доберёт сам
                     _txd["maxFeePerGas"] = _mf; _txd["maxPriorityFeePerGas"] = _tp
+                _t_snd = time.time()                          # СТАДИИ dispatch (пост-мортем $128k)
                 if send_fn is None:                           # SEND-3 только через штатный send_tx
                     res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip, broadcast_raw_urls=_bcast)
                 else:
                     res = send(rpc, cfg.wallet_key, _txd, wait=False, min_tip_wei=tip)
+                try:                                          # прибор сбоку: отказ глотается
+                    from chain.stage_probe import stamp_dispatch as _sd
+                    _sd(res["hash"], {"sent": _t_snd, "ack": time.time()})
+                except Exception:                             # noqa: BLE001
+                    pass
                 sent.append((unit, res["hash"]))
                 for _mid, _b, _p in unit:                     # дедуп: ВСЕ жертвы юнита помечены отправленными
                     _RECENT_SENDS[(_mid, _b)] = time.monotonic()
