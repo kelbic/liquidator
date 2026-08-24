@@ -36,6 +36,7 @@
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 
@@ -309,6 +310,81 @@ def live_cap_caveat():
             "виден" % (int(LIVE_CAP_TTL_SEC), LIVE_CAP_MIN_DEBT_USD / 1e3))
 
 
+
+def route_history(coll, loan, *, log_path=None, max_bytes=400000):
+    """Своя история по ЭТОМУ роуту из лога канарейки: (тревожных, всего, первая, последняя,
+    хвост_подряд) либо None, если лог не прочитан.
+
+    Зачем это в тексте тревоги (разборы 19.08, 20.08, 24.08 — ТРИ РАЗА ПОДРЯД). Число
+    impact в тревоге не говорит главного: это СОСТОЯНИЕ пула или ЭПИЗОД. Разница решает
+    исход разбора и правится по-разному: 19.08 weETH дал «8 тревожных из 42, и это ПОСЛЕДНИЕ
+    8 ПОДРЯД» -> статик рекалиброван; cbADA в том же прогоне дал «1 из 42» -> статик НЕ
+    ТРОНУТ, мерцание оставлено живому слою; wstETH «0 из 42» -> выброс, трогать запрещено.
+    Каждый раз распределение считали РУКАМИ из этого же лога, и каждый раз оно решало.
+    Лог сторожа — уже распределение: считать его стоит ноль RPC.
+
+    Что это НЕ говорит (границы, не чинить видимостью покрытия):
+      * сетка — проходы крона (6ч), эпизод короче сетки в неё не попадает вовсе;
+      * порог у выборки берётся ТОТ, что стоял в её строке: ряд, снятый до смены статика
+        или бонуса, сравнивать с сегодняшним нельзя, и «тревожных N» это не различает;
+      * лог агентской машины. Прогоны, которых тут нет (другой чекаут), не видны.
+
+    Текущая выборка в лог ещё НЕ записана (render идёт после справки) — вызывающий её
+    добавляет сам.
+    """
+    path = log_path or os.path.join(WATCH_DIR, "route-canary.log")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            blob = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    if size > max_bytes:                      # первая строка могла быть обрезана посередине
+        blob = blob.split("\n", 1)[-1]
+    c, l = str(coll)[:12].lower(), str(loan)[:12].lower()
+    ts, seen = None, []
+    for ln in blob.splitlines():
+        m = re.match(r"^(\S+Z) route-canary: старт", ln)
+        if m:
+            ts = m.group(1)
+            continue
+        f = ln.split()
+        # строка замера: coll loan венью статус выход impact порог [флаг]. Статус «НЕ ОПРОШЕН»
+        # это ДВА слова — такие строки отпадают сами проверкой f[3] == ALIVE.
+        if len(f) < 7 or f[0].lower() != c or f[1].lower() != l or f[3] != rc.ALIVE:
+            continue
+        try:
+            imp, th = float(f[5].rstrip("%")), float(f[6].rstrip("%"))
+        except ValueError:
+            continue
+        seen.append((ts, imp >= th))
+    if not seen:
+        return None
+    tail = 0
+    for _t, trip in reversed(seen):
+        if not trip:
+            break
+        tail += 1
+    return (sum(1 for _t, t in seen if t), len(seen), seen[0][0], seen[-1][0], tail)
+
+
+def history_note(coll, loan, *, streak_state=3, **kw):
+    """Строка справки о распределении этого роута. Незнание НЕ выдаёт себя за диагноз."""
+    h = route_history(coll, loan, **kw)
+    if h is None:
+        return ("\n    история роута: НЕ ПРОЧИТАНА (лога канарейки нет либо роут в нём не "
+                "встречался) — состояние от эпизода отличить нечем")
+    trips, total, first, last, tail = h
+    trips, total, tail = trips + 1, total + 1, tail + 1   # сегодняшняя выборка — тревожная
+    verdict = ("СОСТОЯНИЕ (>=%d тревожных подряд)" % streak_state if tail >= streak_state
+               else "ЭПИЗОД (тревожных подряд %d < %d)" % (tail, streak_state))
+    return ("\n    история роута в логе канарейки: %d тревожных выборок из %d (%s..%s, сетка "
+            "крона), хвост подряд %d ⇒ %s. Порог классификации назван, ряд снят с ТЕМИ "
+            "порогами, что стояли в его строках" % (
+                trips, total, (first or "?")[:10], (last or "?")[:10], tail, verdict))
+
 def annotate_policy(probs, *, call=None, measure=None, budget_sec=None, clock=None, **kw):
     """Дописывает к «глубоким» проблемам вердикт боевой политики капа. Только справка:
     состав probs и решение «тревожить» не меняются ни при каком исходе.
@@ -327,10 +403,15 @@ def annotate_policy(probs, *, call=None, measure=None, budget_sec=None, clock=No
         if p.get("kind") != "deep":
             continue
         if now() - t0 >= budget:
+            _r = p.get("row") or {}
             p["text"] += ("\n    политика капа: НЕ ПОСЧИТАНА (бюджет времени %ds исчерпан) — "
                           "справка не имеет права стоить самой тревоги" % int(budget))
+            p["text"] += history_note(_r.get("coll", ""), _r.get("loan", ""))
             continue
         r = p.get("row") or {}
+        # История — ноль RPC и ноль сети: её бюджет времени не касается, и она обязана
+        # доехать даже когда лестница капа не посчитана.
+        p["text"] += history_note(r.get("coll", ""), r.get("loan", ""))
         cap, static = policy_cap(r.get("coll", ""), r.get("loan", ""), call=call,
                                  measure=measure, **kw)
         if cap is None or not static:
