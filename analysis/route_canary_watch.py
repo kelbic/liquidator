@@ -359,27 +359,62 @@ def route_history(coll, loan, *, log_path=None, max_bytes=400000):
             imp, th = float(f[5].rstrip("%")), float(f[6].rstrip("%"))
         except ValueError:
             continue
-        seen.append((ts, imp >= th))
+        seen.append((ts, imp >= th, imp))
     if not seen:
         return None
     tail = 0
-    for _t, trip in reversed(seen):
+    for _t, trip, _i in reversed(seen):
         if not trip:
             break
         tail += 1
-    return (sum(1 for _t, t in seen if t), len(seen), seen[0][0], seen[-1][0], tail)
+    return (sum(1 for _t, t, _i in seen if t), len(seen), seen[0][0], seen[-1][0], tail,
+            [i for _t, _tr, i in seen])
 
 
-def history_note(coll, loan, *, streak_state=3, **kw):
+# Во сколько раз сегодняшний impact должен превысить МАКСИМУМ прежнего ряда, чтобы
+# выборку нельзя было называть мерцанием. Порог грубый намеренно: он не диагноз, он
+# запрет на диагноз (см. STEP_NOTE ниже).
+STEP_OUTLIER_X = 3.0
+
+
+def _step_note(impact, past, tail, streak_state):
+    """Приписка к вердикту, когда серии ЕЩЁ НЕТ (tail < streak_state).
+
+    Зачем (разбор cbDOGE/USDC 25.08). Классификатор судит ТОЛЬКО длину тревожного хвоста,
+    поэтому ПЕРВАЯ выборка после ступени вниз получает ярлык «ЭПИЗОД» ПО ПОСТРОЕНИЮ: серии
+    у неё быть не может, шаг сетки 6ч. В тот день у cbDOGE 64 выборки подряд стояли в полосе
+    0.53-3.47%, а 65-я дала 68.22% (выход упал 2.87e9 -> 8.99e8, роут насытился на потолке
+    ~$899) — и тревога всё равно назвала это эпизодом. Ярлык решает исход разбора: эпизод
+    отдают живому слою, ступень требует замера. Канон «хвост смазывает ступень вниз».
+
+    Лечится НЕ порогом серии (снизить его — значит звать состоянием любое мерцание, что
+    прямо запрещено разбором wstETH 19.08), а вторым основанием: своя же полоса ряда.
+    Полоса стоит ноль RPC — impact каждой выборки уже лежит в логе.
+    """
+    if impact is None or not past:
+        return ""
+    top = max(past)
+    med = sorted(past)[len(past) // 2]
+    band = ("; полоса ряда: медиана %.2f%%, максимум %.2f%% (без сегодняшней), сегодня %.2f%%"
+            % (med, top, impact))
+    if top > 0 and impact >= top * STEP_OUTLIER_X:
+        return (band + " ⇒ выборка ВНЕ ПОЛОСЫ (x%.1f к максимуму): ЭПИЗОД И НАЧАЛО СТУПЕНИ "
+                "по одной выборке НЕ РАЗЛИЧИМЫ, ярлык выше — только о длине хвоста"
+                % (impact / top))
+    return band
+
+
+def history_note(coll, loan, *, streak_state=3, impact=None, **kw):
     """Строка справки о распределении этого роута. Незнание НЕ выдаёт себя за диагноз."""
     h = route_history(coll, loan, **kw)
     if h is None:
         return ("\n    история роута: НЕ ПРОЧИТАНА (лога канарейки нет либо роут в нём не "
                 "встречался) — состояние от эпизода отличить нечем")
-    trips, total, first, last, tail = h
+    trips, total, first, last, tail, past = h
     trips, total, tail = trips + 1, total + 1, tail + 1   # сегодняшняя выборка — тревожная
     verdict = ("СОСТОЯНИЕ (>=%d тревожных подряд)" % streak_state if tail >= streak_state
-               else "ЭПИЗОД (тревожных подряд %d < %d)" % (tail, streak_state))
+               else "ЭПИЗОД (тревожных подряд %d < %d)%s" % (
+                   tail, streak_state, _step_note(impact, past, tail, streak_state)))
     return ("\n    история роута в логе канарейки: %d тревожных выборок из %d (%s..%s, сетка "
             "крона), хвост подряд %d ⇒ %s. Порог классификации назван, ряд снят с ТЕМИ "
             "порогами, что стояли в его строках" % (
@@ -406,12 +441,14 @@ def annotate_policy(probs, *, call=None, measure=None, budget_sec=None, clock=No
             _r = p.get("row") or {}
             p["text"] += ("\n    политика капа: НЕ ПОСЧИТАНА (бюджет времени %ds исчерпан) — "
                           "справка не имеет права стоить самой тревоги" % int(budget))
-            p["text"] += history_note(_r.get("coll", ""), _r.get("loan", ""))
+            p["text"] += history_note(_r.get("coll", ""), _r.get("loan", ""),
+                                      impact=_r.get("impact"))
             continue
         r = p.get("row") or {}
         # История — ноль RPC и ноль сети: её бюджет времени не касается, и она обязана
         # доехать даже когда лестница капа не посчитана.
-        p["text"] += history_note(r.get("coll", ""), r.get("loan", ""))
+        p["text"] += history_note(r.get("coll", ""), r.get("loan", ""),
+                                  impact=r.get("impact"))
         cap, static = policy_cap(r.get("coll", ""), r.get("loan", ""), call=call,
                                  measure=measure, **kw)
         if cap is None or not static:
