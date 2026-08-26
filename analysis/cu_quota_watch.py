@@ -1106,6 +1106,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
 
     for host, mtd, remaining, days_zero, days_reset, burn, stale, basis in bal:
         a = (anchor.get("hosts") or {}).get(host, {})
+        _stamp = None   # полоса, которую МОЖНО отметить прозвонившей — только после доставки
         if stale:
             # Протухший якорь = гард остатка ВЫКЛЮЧЕН. Молчать нельзя: молчание сторожа об
             # остатке читается как «остаток в порядке» (мёртвый сторож хуже отсутствующего).
@@ -1163,12 +1164,17 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
                     % (host, mtd / 1e6, float(anchor.get("quota_cu", QUOTA_M * 1e6)) / 1e6,
                        days_zero, days_reset, _band, (_marks.get(host) or {}).get("band")))
                 continue
-            _marks[host] = {"band": int(_band), "ts": now_s}
-            _save_state(st)
+            _stamp = int(_band)
         if notify_fn is None:
+            # ВОДОРАЗДЕЛ СТАВИТСЯ ПО ДОСТАВКЕ, А НЕ ПО НАМЕРЕНИЮ (канон tx-hash-is-not-an-effect).
+            # Отметить полосу прозвонившей и НЕ дозвониться = заглушить её на 6ч своей же
+            # записью — ровно тот дефект, который эта правка чинит, только этажом ниже.
             out("cu-quota: КАНАЛ НЕДОСТУПЕН, текст ниже"); out(msg)
         else:
             v = notify_fn(msg, source=SOURCE, hil=False, key=key, dedup_sec=21600)
+            if _stamp is not None:
+                st.setdefault("sev_marks", {})[host] = {"band": _stamp, "ts": now_s}
+                _save_state(st)
             out("cu-quota: ОСТАТОК %s %.1fM из %.0fM (%s) -> %s"
                 % (host, mtd / 1e6, float(anchor.get("quota_cu", QUOTA_M * 1e6)) / 1e6,
                    "ЯКОРЬ ПРОТУХ" if stale else "%.1f сут против %.1f" % (days_zero, days_reset), v))
