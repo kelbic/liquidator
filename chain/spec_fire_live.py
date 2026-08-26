@@ -238,6 +238,14 @@ def _plan_ev_val(debt, hf, direction):
 # но и резать нечего. Ручка готова и проверена стендом; включение — SPEC_FIRE_SMALL_CAP=20,
 # осмысленно ТОЛЬКО вместе с правкой права огня движка по тому же признаку (отдельная спека).
 SPEC_FIRE_SMALL_CAP = int(os.environ.get("SPEC_FIRE_SMALL_CAP", "0"))
+# ПОРОГ ПРИЗА ДЛЯ ИСКЛЮЧЕНИЯ ИЗ МАЛОГО КАПА (kelbic «го» 26.08, по аналогии с HR-полом $300).
+# Замер: XRP-окно на ПЫЛИ стоит 146-150 проб × 250 CU ≈ 36.5k CU при призе $2-16 — работа
+# пылесоса по тарифам боевого ключа. Детонатор освобождает от капа ТОЛЬКО настоящие призы;
+# пыль у воды режется до SPEC_FIRE_SMALL_CAP. Гейт считается НА АРМЕ окна и печатается в
+# close-строке (`det[...]`) — иначе спор «почему окно полное» повторится вслепую. НАЗВАННЫЙ
+# ПРЕДЕЛ: приз плавает с ценой, цель с $250 может перевалить $300 внутри окна — срез на
+# открытии осознанный. Откат: SPEC_FIRE_DET_PRIZE_USD=0 (исключение снова безусловное).
+SPEC_FIRE_DET_PRIZE_USD = float(os.environ.get("SPEC_FIRE_DET_PRIZE_USD", "300"))
 
 
 def _window_cap(fat_mode: bool, det: bool = False) -> int:
@@ -1255,7 +1263,7 @@ class SpecFireLive:
         """Детонатор: ближайший flip_dist ЖИРНОЙ цели фида — ТА ЖЕ математика, что в
         _top_fat (down: 1−1/HF, up: HF−1; hf<=1 = уже за флипом = 0). None = ни у одной
         цели dist не вычислим (fail-open: порог остаётся универсальным)."""
-        best, best_key = None, None
+        best, best_key, best_prize = None, None, 0.0
         with self.shared.lock:
             groups = dict(self.shared.groups)
             debt_by = dict(self.shared.debt_by)
@@ -1271,8 +1279,10 @@ class SpecFireLive:
                                 or (direction == "up" and ll == feed)):
                 continue
             _min_usd = _market_min_repaid_usd(getattr(m, "bonus", 0.0))
+            _bonus = float(getattr(m, "bonus", 0.0) or 0.0)
             for b in borrowers:
-                if float(debt_by.get((mid, b), 0.0) or 0.0) < _min_usd:
+                _debt = float(debt_by.get((mid, b), 0.0) or 0.0)
+                if _debt < _min_usd:
                     continue
                 hf = float(hf_by.get((mid, b), 0.0) or 0.0)
                 if hf <= 0.0:
@@ -1280,14 +1290,17 @@ class SpecFireLive:
                 dist = 0.0 if hf <= 1.0 else (
                     (1.0 - 1.0 / hf) if direction == "down" else (hf - 1.0))
                 if best is None or dist < best:
-                    best, best_key = dist, (mid, b)
+                    # ПРИЗ цели детонатора (kelbic «го» 26.08): долг × бонус рынка. Нужен
+                    # капу — исключение из малого капа даётся ТОЛЬКО настоящим призам.
+                    best, best_key, best_prize = dist, (mid, b), _debt * _bonus
         # ОСЕВОЕ РАССЛОЕНИЕ (класс дефектов, назван 26.08): слой-открыватель обязан отдавать
         # ЦЕЛЬ, а не только число — иначе планировщик внизу ищет цель СВОИМ критерием и
         # окно живёт без плана (замер: 135 проб при 29 отказах арма доски подряд).
         _dk_map = getattr(self, "_det_key_by_feed", None)
         if _dk_map is None:
             _dk_map = self._det_key_by_feed = {}      # ленивая карта: прибор не падает на
-        _dk_map[feed] = (best_key, best, self._now()) if best_key else None   # «голом» объекте
+        _dk_map[feed] = ((best_key, best, self._now(), best_prize) if best_key
+                         else None)                    # «голом» объекте; 4-й элемент = ПРИЗ
         return best
 
     def _det_thr(self, feed: str, direction: str, thr: float):
@@ -3976,6 +3989,21 @@ class SpecFireLive:
             self._log("SPECFIRE ДЕТОНАТОР feed=%s: порог огня %.3f%% (жир в %.3f%% от флипа; "
                       "универсальный %.3f%%)" % (feed, thr * 100.0,
                                                  (_det_d or 0.0) * 100.0, _thr_uni * 100.0))
+        # ГЕЙТ ИСКЛЮЧЕНИЯ — НА АРМЕ ОКНА (kelbic 26.08): детонатор снимает малый кап только
+        # если ПРИЗ его цели >= SPEC_FIRE_DET_PRIZE_USD. Считается один раз и подписывается в
+        # close-строку: состояние окна не должно «мерцать» вместе с ценой внутри окна.
+        _det_prize = 0.0
+        try:
+            _dk0 = (getattr(self, "_det_key_by_feed", None) or {}).get(feed)
+            if _dk0 and len(_dk0) > 3:
+                _det_prize = float(_dk0[3] or 0.0)
+        except Exception:                                # noqa: BLE001
+            pass
+        _det_exempt = bool(thr < _thr_uni and (SPEC_FIRE_DET_PRIZE_USD <= 0
+                                               or _det_prize >= SPEC_FIRE_DET_PRIZE_USD))
+        _det_state = "det=%s приз=$%.0f кап=%s" % (
+            "да" if thr < _thr_uni else "нет", _det_prize,
+            "снят" if _det_exempt else "малый")
         _det_next = self._now() + 5.0            # цели дышат — порог перечитывается каждые 5с
         band = dev * SPEC_FIRE_OWED_BAND
         probes = 0
@@ -4000,7 +4028,7 @@ class SpecFireLive:
         # выбирается на закрытии — из плана, который опубликовало это самое окно.
         _probe0 = self._probe_snap()
         try:
-            while not stop.is_set() and probes < _window_cap(fat_mode, thr < _thr_uni):
+            while not stop.is_set() and probes < _window_cap(fat_mode, _det_exempt):
                 if self._now() >= _det_next:      # детонатор: перечитать близость целей
                     _det_next = self._now() + 5.0
                     thr, _det_d = self._det_thr(feed, direction, _thr_uni)
@@ -4378,7 +4406,7 @@ class SpecFireLive:
                     _t["a_mute"], _t["b_mute"], _t["a_fired"], _t["b_esc_skips"])
             except Exception:                            # noqa: BLE001
                 _tier_s = "—"
-            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s позиция[%s] каденс[%s] rcpt=%s tiers[%s] "
+            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s det[%s] позиция[%s] каденс[%s] rcpt=%s tiers[%s] "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
                       "budget_reserve_skips=%d budget_inflight_skips=%d "
                       # 20.08: все три — ПО КАНАЛАМ (url|ip). transport_reject был суммарным
@@ -4389,7 +4417,7 @@ class SpecFireLive:
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _pos_s, _cad, _rcpt_s, _tier_s,
+                          _det_state, _pos_s, _cad, _rcpt_s, _tier_s,
                           _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej or "—",
                           _purg or "—", _md_str,
                           self.stats.get("class_between_slots", 0),
