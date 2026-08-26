@@ -4304,6 +4304,21 @@ class SpecFireLive:
                 self.stats.get("collector_overflow", 0),
                 ("%.1fс" % _rl[len(_rl) // 2]) if _rl else "—",
                 ("%.1fс" % _rl[int(len(_rl) * 0.9)]) if _rl else "—")
+            # МЕТРИКА ПОЗИЦИИ Г-ЗВЕНА (п.2 ревьюера 26.08): «наш первый idx − транзит» —
+            # ГЛАВНАЯ цифра звена Г, рядом с плотностью чужих в полосе. Цель +1..+5; анкер
+            # 50471608: наши +12..+20 при конкурентах +1..+11 (они снимают приз раньше нас
+            # на ~10 позиций ≈ 100-200мс — ровно наш разрыв detect→prep).
+            _pos_s = "—"
+            try:
+                _nd = sorted(self.stats.get("nearest_delta_ring") or [])
+                _nn = self.stats.get("nearest_n", 0)
+                if _nd:
+                    _fs_avg = (self.stats.get("nearest_foreign_sum", 0) / _nn) if _nn else 0.0
+                    _in_target = 100.0 * sum(1 for x in _nd if 1 <= x <= 5) / len(_nd)
+                    _pos_s = "первый_delta p50=%+d p90=%+d чужих_между_ср=%.1f в_цели(+1..+5)=%.0f%% n=%d" % (
+                        _nd[len(_nd) // 2], _nd[int(len(_nd) * 0.9)], _fs_avg, _in_target, len(_nd))
+            except Exception:                                # noqa: BLE001
+                pass
             # ПРИБОР КАДЕНСА (26.08): ритм ОТПРАВОК ДВИЖКА — «стоим в окне» или «стоим в
             # СУБ-БЛОКЕ». Цель ≤0.2с (суб-блок Base); 0.9с = пол-блока = +80-180 позиций.
             _cad = "—"
@@ -4324,7 +4339,7 @@ class SpecFireLive:
                     _t["a_mute"], _t["b_mute"], _t["a_fired"], _t["b_esc_skips"])
             except Exception:                            # noqa: BLE001
                 _tier_s = "—"
-            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s каденс[%s] rcpt=%s tiers[%s] "
+            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s позиция[%s] каденс[%s] rcpt=%s tiers[%s] "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
                       "budget_reserve_skips=%d budget_inflight_skips=%d "
                       # 20.08: все три — ПО КАНАЛАМ (url|ip). transport_reject был суммарным
@@ -4335,7 +4350,7 @@ class SpecFireLive:
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _cad, _rcpt_s, _tier_s,
+                          _pos_s, _cad, _rcpt_s, _tier_s,
                           _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej or "—",
                           _purg or "—", _md_str,
                           self.stats.get("class_between_slots", 0),

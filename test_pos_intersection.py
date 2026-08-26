@@ -128,6 +128,16 @@ check("прибор в треде индекса, не в recv-петле (вн�
       "self._pos_table(ci, bn, agg)" in _SRC)
 check("слепой суд таблицу не кормит", "if not blind:" in _SRC)
 
+# ---- п.2/п.3 (26.08): метрика позиции в дайджест окна ----
+_S3 = open("chain/spec_fire_live.py").read()
+check("строка окна несёт позиция[первый_delta p50/p90 + чужих_между_ср + в_цели]",
+      "позиция[%s]" in _S3 and "первый_delta p50=" in _S3 and "чужих_между_ср=" in _S3
+      and "в_цели(+1..+5)=" in _S3)
+check("метрика считается из кольца nearest_delta_ring (а не из воздуха)",
+      'self.stats.get("nearest_delta_ring")' in _S3 and 'self.stats.get("nearest_n", 0)' in _S3)
+check("анкер 50471608 назван в коде (наши +12..+20 против чужих +1..+11)",
+      "50471608" in _S3 and "+12..+20" in _S3)
+
 print("\n%s" % ("FAIL: %d" % len(FAILS) if FAILS
                 else "OK: вердикт формулы — только по хэшам; метрика delta-по-match в бою"))
 sys.exit(1 if FAILS else 0)
