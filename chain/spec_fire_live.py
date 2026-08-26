@@ -224,8 +224,28 @@ def _plan_ev_val(debt, hf, direction):
     return dd * (1.0 / max(d, _EV_CLOSE_EPS))
 
 
-def _window_cap(fat_mode: bool) -> int:
-    return SPEC_FIRE_FAT_CAP if (SPEC_FIRE_EV_DENSITY and fat_mode) else SPEC_FIRE_MAX_PROBES_WINDOW
+# КАП МЕЛКОГО ОКНА (kelbic «го б» 26.08, вариант (б) экономики). Замер суток: 2317 проб из
+# 2382 (97%) ушли в 13 плотных окон, 12 из них — XRP на целях debt=$0-2k (приз десятки $), а
+# транзитов С ЖЕРТВОЙ за сутки был ОДИН. То есть 97% газа жглось там, где приза физически
+# нет, и суточный бакет $450 исчерпывался к 09:46 — к настоящему каскаду денег могло не
+# остаться. Мелкое окно = НЕ fat (приз ниже SPEC_FIRE_FAT_PRIZE_USD) И НЕ открытое
+# детонатором (детонаторное = близкая цель, ради которой окно и живёт). Жирные и
+# детонаторные окна НЕ ТРОГАЮТСЯ вовсе.
+# ДЕФОЛТ 0 = ВЫКЛЮЧЕНО (поправка 26.08 по вопросу kelbic «а приборы?»): замер показал, что
+# кап окна режет лишь пробы ГЛАВНОГО кошелька (1207 за 4.2ч), а основной расход даёт ДВИЖОК
+# с ног флота (board_probes 4731) — он капом окна не ограничен. Экономия вышла бы ~$25-35 из
+# $390/сутки, при этом приборы позиции/класса кормятся именно tx движка и не пострадали бы —
+# но и резать нечего. Ручка готова и проверена стендом; включение — SPEC_FIRE_SMALL_CAP=20,
+# осмысленно ТОЛЬКО вместе с правкой права огня движка по тому же признаку (отдельная спека).
+SPEC_FIRE_SMALL_CAP = int(os.environ.get("SPEC_FIRE_SMALL_CAP", "0"))
+
+
+def _window_cap(fat_mode: bool, det: bool = False) -> int:
+    if SPEC_FIRE_EV_DENSITY and fat_mode:
+        return SPEC_FIRE_FAT_CAP
+    if SPEC_FIRE_SMALL_CAP > 0 and not det:
+        return min(SPEC_FIRE_SMALL_CAP, SPEC_FIRE_MAX_PROBES_WINDOW)
+    return SPEC_FIRE_MAX_PROBES_WINDOW
 
 
 def _dense_interval(fat_mode: bool) -> float:
@@ -3980,7 +4000,7 @@ class SpecFireLive:
         # выбирается на закрытии — из плана, который опубликовало это самое окно.
         _probe0 = self._probe_snap()
         try:
-            while not stop.is_set() and probes < _window_cap(fat_mode):
+            while not stop.is_set() and probes < _window_cap(fat_mode, thr < _thr_uni):
                 if self._now() >= _det_next:      # детонатор: перечитать близость целей
                     _det_next = self._now() + 5.0
                     thr, _det_d = self._det_thr(feed, direction, _thr_uni)
