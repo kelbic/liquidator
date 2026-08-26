@@ -164,6 +164,20 @@ check("переполнение: collector_overflow=4, но исходов вс�
       and all(len(v) == 1 for v in out5.values()),
       (o5.stats.get("collector_overflow"), len(out5)))
 
+# ---- РАЗБОР 26.08: буфер сверки вытеснялся ДО прихода второй стороны ----
+o8, col8, out8, _, logs8 = mk("shadow")
+o8._rcpt_shadow_note("0xslow", "коллектор", 1)          # коллектор пришёл первым (4-6с)
+for i in range(1000):                                    # плотное окно: 1000 проб между ними
+    o8._rcpt_shadow_note("0xnoise%d" % i, "коллектор", 1)
+o8._rcpt_shadow_note("0xslow", "легаси", 1)              # легаси пришёл через ~40с
+check("сверка ДОЖИВАЕТ до второй стороны при 1000 проб между (было: вытеснялась на 512)",
+      o8.stats.get("rcpt_shadow_agree") == 1, o8.stats)
+_F2 = open("chain/spec_fire_live.py").read()
+check("кап буфера поднят и чистится ПО ВОЗРАСТУ (буфер не растёт при мёртвом источнике)",
+      "len(seen) > 8192" in _F2 and "SPEC_FIRE_RECEIPT_TIMEOUT * 2" in _F2)
+check("причина записана в коде (арифметика 4-6с против 45с)",
+      "коллектор резолвит за 4-6с" in _F2)
+
 # ---- 6. Гарды дрейфа ----
 _S = open("chain/spec_fire_live.py").read()
 _F = open("chain/fire_engine.py").read()

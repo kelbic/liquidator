@@ -1496,9 +1496,20 @@ class SpecFireLive:
                 seen = self._rcpt_shadow_seen = {}
             other = seen.pop(h, None)
             if other is None:
-                seen[h] = (who, status)
-                while len(seen) > 512:
-                    seen.pop(next(iter(seen)))
+                seen[h] = (who, status, self._now())
+                # КАП БУФЕРА СВЕРКИ (разбор 26.08): было 512 — и тень НЕ СВЕРИЛА НИ ОДНОЙ
+                # пары за сутки. Арифметика: коллектор резолвит за 4-6с, легаси-полл ждёт до
+                # SPEC_FIRE_RECEIPT_TIMEOUT (45с), а за эти ~40с в плотном окне проходит
+                # 150-600 проб — метка первого вытеснялась ДО прихода второго. Кап поднят до
+                # 8192 (память копеечная: кортеж на хэш) + чистка по ВОЗРАСТУ, чтобы буфер не
+                # рос без границы при мёртвом втором источнике.
+                if len(seen) > 8192:
+                    _cut = self._now() - (SPEC_FIRE_RECEIPT_TIMEOUT * 2)
+                    for _k in [k for k, v in seen.items()
+                               if len(v) > 2 and v[2] < _cut][:4096]:
+                        seen.pop(_k, None)
+                    while len(seen) > 8192:
+                        seen.pop(next(iter(seen)))
                 return
         if other[0] == who:                                  # дубль своей же стороны — не суд
             return
