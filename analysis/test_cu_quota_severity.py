@@ -53,3 +53,53 @@ class TestSeverityBand(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSeverityWatermark(unittest.TestCase):
+    """ЭТАЛОН — РЕАЛЬНЫЙ ИНЦИДЕНТ 26.08: 11:07Z ушёл sev2 (1.6 сут против 5.5), в 12:07Z
+    запас ВЫРОС до 3.0 сут, и sev1 прозвонил как «стало хуже». Тест обязан падать со снятым
+    фиксом (severity_should_ring, возвращающий True всегда).
+    """
+
+    def test_реальный_инцидент_улучшение_не_звонит(self):
+        from analysis.cu_quota_watch import severity_band, severity_should_ring
+        тяжёлый = severity_band(1.6, 5.5)   # 11:07Z -> sev2
+        мягче = severity_band(3.0, 5.5)     # 12:07Z -> sev1, звонить НЕ должен
+        self.assertLess(мягче, тяжёлый)
+        mark = {"band": тяжёлый, "ts": 1000.0}
+        self.assertFalse(severity_should_ring(мягче, mark, 1000.0 + 3600),
+                         "улучшение на полосу обязано молчать: это не ухудшение")
+
+    def test_ухудшение_проходит_всегда(self):
+        from analysis.cu_quota_watch import severity_should_ring
+        mark = {"band": 1, "ts": 1000.0}
+        self.assertTrue(severity_should_ring(2, mark, 1000.0 + 60))
+        self.assertTrue(severity_should_ring(3, mark, 1000.0 + 60))
+
+    def test_равная_полоса_молчит_а_после_TTL_звонит(self):
+        from analysis.cu_quota_watch import severity_should_ring
+        mark = {"band": 2, "ts": 1000.0}
+        self.assertFalse(severity_should_ring(2, mark, 1000.0 + 21599))
+        self.assertTrue(severity_should_ring(2, mark, 1000.0 + 21600),
+                        "после TTL тревога обязана вернуться — иначе водораздел глушит навсегда")
+
+    def test_нет_памяти_или_мусор_звонит(self):
+        from analysis.cu_quota_watch import severity_should_ring
+        for плохой in (None, {}, {"band": "x", "ts": 1.0}, {"band": 2}, "не словарь", 5):
+            self.assertTrue(severity_should_ring(0, плохой, 5000.0),
+                            "потеря памяти о тяжести обязана ОТКРЫВАТЬ звонок, а не глушить")
+
+    def test_часы_назад_звонит(self):
+        from analysis.cu_quota_watch import severity_should_ring
+        self.assertTrue(severity_should_ring(0, {"band": 3, "ts": 9000.0}, 1000.0))
+
+    def test_осцилляция_вокруг_границы_бесплатна(self):
+        from analysis.cu_quota_watch import severity_band, severity_should_ring
+        mark, t, звонков = None, 0.0, 0
+        for dz in (5.4, 5.6, 5.4, 5.6, 5.4, 5.6):   # r скачет через 0.75 при dr=7.4
+            b = severity_band(dz, 7.4)
+            if severity_should_ring(b, mark, t):
+                звонков += 1
+                mark = {"band": b, "ts": t}
+            t += 600.0
+        self.assertEqual(звонков, 1, "дребезг вокруг границы обязан стоить один звонок")
