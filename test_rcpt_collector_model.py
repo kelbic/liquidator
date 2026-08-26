@@ -48,7 +48,11 @@ def mk(mode, max_pending=4096, receipt_ready=None, clock=None):
     def _receipts(hs):
         calls["batch"] += 1
         t = o._now()
-        return {h: ({"status": 1, "gasUsed": 100, "effectiveGasPrice": 1}
+        # ФИКСТУРА В СЕТЕВОЙ ФОРМЕ (hex) — намеренно. 26.08: стенд кормил коллектор int'ами,
+        # как web3, и был зелен там, где бой падал 4905 раз за 6ч (`int('0x1c5b3')` ->
+        # ValueError в _res_from_receipt, исход терялся молча). Сырой JSON-RPC отдаёт hex —
+        # значит и стенд обязан: тракт dispatch->collector->result теперь хожен ТОЙ формой.
+        return {h: ({"status": "0x1", "gasUsed": "0x64", "effectiveGasPrice": "0x1"}
                     if ready.get(h, 0) <= t else None) for h in hs}
 
     def _single(h):

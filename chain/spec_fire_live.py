@@ -1193,6 +1193,12 @@ class SpecFireLive:
             except Exception:
                 pass                              # not found / транспорт — ждём следующий полл
             if r is not None:
+                # Голый int() здесь ЗАКОНЕН: единственный источник r — web3 строкой выше,
+                # а web3 отдаёт числа готовыми int. Hex-форма ('0x1c5b3') сюда не доезжает:
+                # ни batch_receipts, ни receipt_like индекса в этот путь не подключены.
+                # Если источник когда-нибудь станет сырым JSON — разбор обязан переехать на
+                # chain_index.rcpt_int (см. _res_from_receipt: 26.08 та же строка на hex
+                # молча теряла исход 4905 раз за 6ч).
                 gas_usd = (int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
                            * float(self.cfg.eth_price_usd) / 1e18)
                 # blk/idx — метрика гонки плотностей: позиция пробы в очереди против
