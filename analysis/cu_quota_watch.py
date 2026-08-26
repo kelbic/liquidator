@@ -973,17 +973,24 @@ def _fleet_notify():
         return None
 
 
-def _load_state():
+def _load_state(path=None):
+    """26.08: путь — параметр, по той же причине, что у книги и якоря (комментарий у
+    ANCHOR_PATH, поймано 21.08): run() обязан выводить ВСЕ свои файлы из history_path,
+    иначе стенд, честно уведший историю во временный каталог, пишет ПАМЯТЬ ТЯЖЕСТИ
+    (sev_marks водораздела) в боевой ~/.fleet-watch/cu-quota.state. Ровно это и случилось
+    с водоразделом 012d44e: стенд с now=MID штамповал боевые метки древним ts (порча
+    памяти в сторону ложных звонков), а внутри одного прогона сценарий 26 глушил
+    сценарий 39 (равная полоса за TTL) — стенд красен при исправном продукте."""
     try:
-        with open(STATE_PATH) as f:
+        with open(path or STATE_PATH) as f:
             return json.load(f)
     except Exception:  # noqa: BLE001
         return {}
 
 
-def _save_state(st):
+def _save_state(st, path=None):
     try:
-        with open(STATE_PATH, "w") as f:
+        with open(path or STATE_PATH, "w") as f:
             json.dump(st, f)
     except Exception:  # noqa: BLE001
         pass
@@ -1000,8 +1007,11 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
     history_path = history_path or HISTORY_PATH
     anchor_path = anchor_path or _beside_history(history_path, "cu-quota.anchor.json")
     ledger_path = ledger_path or _beside_history(history_path, "cu-quota.ledger.json")
+    # state — ПО ТОМУ ЖЕ ПРАВИЛУ, что книга и якорь (21.08): все файлы прогона из
+    # history_path. Иначе стенд пишет память тяжести водораздела в боевой каталог.
+    state_path = _beside_history(history_path, "cu-quota.state")
     notify_fn = notify_fn or _fleet_notify()
-    st = _load_state()
+    st = _load_state(state_path)
     now_s = float(now if now is not None else time.time())
 
     try:
@@ -1016,7 +1026,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
         # Слепой прогон. Одиночный ssh-фейл — транзиент (раз в час их будет достаточно,
         # чтобы заспамить); тревога о САМОМ стороже — только серия подряд (Ш23а).
         st["fails"] = int(st.get("fails", 0)) + 1
-        _save_state(st)
+        _save_state(st, state_path)
         out("cu-quota: слепой прогон %d/%d: %s" % (st["fails"], fail_streak_n, str(e)[:160]))
         if st["fails"] >= fail_streak_n and notify_fn is not None:
             notify_fn("💸 сторож квоты CU СЛЕП %d прогонов подряд (%s) — журнал Шарлотт "
@@ -1027,7 +1037,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
 
     st["fails"] = 0
     st["last_ok"] = now_s
-    _save_state(st)
+    _save_state(st, state_path)
 
     restarts = count_restarts(text)
     recs = append_history({
@@ -1345,7 +1355,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
             v = notify_fn(msg, source=SOURCE, hil=False, key=key, dedup_sec=21600)
             if _stamp is not None:
                 st.setdefault("sev_marks", {})[host] = {"band": _stamp, "ts": now_s}
-                _save_state(st)
+                _save_state(st, state_path)
             out("cu-quota: ОСТАТОК %s %.1fM из %.0fM (%s) -> %s"
                 % (host, mtd / 1e6, float(anchor.get("quota_cu", QUOTA_M * 1e6)) / 1e6,
                    "ЯКОРЬ ПРОТУХ" if stale else "%.1f сут против %.1f" % (days_zero, days_reset), v))

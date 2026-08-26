@@ -36,7 +36,14 @@ HOUR = 3600.0
 
 L = ("Aug 20 %(hm)s host python[%(pid)d]: 2026-08-20 %(hm)s,752 INFO CU %(host)s: %(cu)d "
      "CU/окно = 7 CU/s (проекция %(proj).1fM/мес, скольз.%(span)dмин 50.8M/мес) | "
-     "eth_call@prearm.py:_read_target×38")
+     "%(top)s")
+# 26.08 (фикс 7307a9a: бут = молодой спан И прогревный топ): фикстура обязана нести
+# РЕАЛЬНУЮ форму — у настоящих бут-окон топ ПРОГРЕВНЫЙ (замер 20.08: «бут = 72 мин своей
+# же работы» — presign_ladder/bal_warm/nonce). Прежний единый топ на все строки был
+# фикстурой, списанной со слепоты продукта: классификатор топ игнорировал — и стенд
+# был зелен там, где семантика не проверялась.
+TOP_STEADY = "eth_call@prearm.py:_read_target×38"
+TOP_WARMUP = "eth_getBlockByNumber@execute.py:presign_ladder×40"
 
 
 def _cu_for(proj_m, sec=120.0):
@@ -45,14 +52,19 @@ def _cu_for(proj_m, sec=120.0):
     return int(round(proj_m * 1e6 / w.SEC_MONTH * sec))
 
 
-def _journal(host, projs, spans=None, *, pid=1, t0=0):
-    """Окна по 120с подряд; штампы РАЗНЫЕ (перекрытие прогонов ловится по ним)."""
+def _journal(host, projs, spans=None, *, pid=1, t0=0, tops=None):
+    """Окна по 120с подряд; штампы РАЗНЫЕ (перекрытие прогонов ловится по ним).
+    tops: топ-атрибуция пер-окно; дефолт — установившийся потребитель (TOP_STEADY).
+    Молодой спан сам по себе бутом больше не является (7307a9a) — бут-строка фикстуры
+    обязана нести прогревный топ явно (TOP_WARMUP)."""
     spans = spans or [30] * len(projs)
+    tops = tops or [TOP_STEADY] * len(projs)
     lines = []
     for i, (p, sp) in enumerate(zip(projs, spans)):
         sec = (t0 + i) * 120
         hm = "%02d:%02d:%02d" % (sec // 3600 % 24, sec // 60 % 60, sec % 60)
-        lines.append(L % {"hm": hm, "pid": pid, "host": host, "cu": _cu_for(p), "proj": p, "span": sp})
+        lines.append(L % {"hm": hm, "pid": pid, "host": host, "cu": _cu_for(p), "proj": p,
+                          "span": sp, "top": tops[i]})
     return "\n".join(lines)
 
 
@@ -67,7 +79,9 @@ check("длительность окна выведена ИЗ СТРОКИ (~12
 # ---- 2. Бут: вне ВСПЛЕСКА, но ВНУТРИ интеграла (провайдер списывает и его) ----
 projs = [60.0] * 6 + [12.0] * 24
 spans = [2, 4, 6, 9, 11, 14] + [30] * 24
-ph = w.parse_cu_windows(_journal(A, projs, spans))
+# бут-окна — В РЕАЛЬНОЙ ФОРМЕ: молодой спан + прогревный топ (обе координаты)
+ph = w.parse_cu_windows(_journal(A, projs, spans,
+                                 tops=[TOP_WARMUP] * 6 + [TOP_STEADY] * 24))
 check("бут-окна выкинуты из всплеска (boot=6, осталось 24)",
       ph[A]["boot"] == 6 and len(ph[A]["projs"]) == 24, ph)
 check("среднее без бута = штиль (12M < 26) -> всплеска нет",
@@ -137,7 +151,8 @@ boot_recs = [{"ts": NOW - i * HOUR, "until": None, "restarts": 3,
              for i in range(8)]
 q = w.quota_verdicts(boot_recs, threshold=26, trail_sec=24 * HOUR, min_trail_sec=6 * HOUR, now=NOW)
 check("бут-CU внутри интеграла: 28.4M >= 26 -> ключ A виден", len(q) == 1 and q[0][0] == A, q)
-ph_a = w.parse_cu_windows(_journal(A, [60.0] * 6 + [17.5] * 24, [2, 4, 6, 9, 11, 14] + [30] * 24))
+ph_a = w.parse_cu_windows(_journal(A, [60.0] * 6 + [17.5] * 24, [2, 4, 6, 9, 11, 14] + [30] * 24,
+                                   tops=[TOP_WARMUP] * 6 + [TOP_STEADY] * 24))
 check("...а ПРЕЖНЯЯ метрика (ex-boot 17.5M) по нему молчала бы ПО ПОСТРОЕНИЮ",
       w.verdicts(ph_a, threshold=26, min_windows=20) == [])
 
@@ -415,8 +430,11 @@ check("run: книга/якорь легли РЯДОМ С ИСТОРИЕЙ, б�
       os.path.exists(os.path.join(_tmp, "cu-quota.ledger.json"))
       and (((os.path.getmtime(_prod_led), open(_prod_led, "rb").read()) == _prod_before)
            if _prod_before is not None else not os.path.exists(_prod_led)))
-check("run: при темпе ПОД порогом ушла ровно одна тревога — по ОСТАТКУ",
-      rc == 0 and len(sent) == 1 and sent[0][2] == "cu-quota:balance:%s" % B5735, sent)
+# d75268e/012d44e: полоса тяжести НАМЕРЕННО едет в ключ дедупа (":sevN") — ухудшение
+# обязано проходить дедуп. Гард сверяет префикс, а суффикс полосы требует ЯВНО.
+check("run: при темпе ПОД порогом ушла ровно одна тревога — по ОСТАТКУ (ключ с полосой)",
+      rc == 0 and len(sent) == 1
+      and sent[0][2].startswith("cu-quota:balance:%s:sev" % B5735), sent)
 if sent:
     t = sent[0][3]
     check("run: текст остатка везёт ОСНОВАНИЕ — якорь, дату и что он рукописный",
