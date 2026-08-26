@@ -1403,11 +1403,32 @@ class SpecFireLive:
 
     # ---- П.3 (22.08): коллекторная модель квитанций ОКНА (см. SPEC_FIRE_RCPT_MODE) ----
     def _res_from_receipt(self, r):
-        """Кортеж исхода из квитанции — ТА ЖЕ математика, что в _receipt (один источник формы)."""
-        gas_usd = (int(r.get("gasUsed") or 0) * int(r.get("effectiveGasPrice") or 0)
+        """Кортеж исхода из квитанции — ТА ЖЕ математика, что в _receipt.
+
+        26.08 (вскрытие `collect handler fail`, 4905 падений за 6ч): прежний докстринг обещал
+        «один источник формы», и это было НЕВЕРНО. Квитанция доезжает двумя путями с разной
+        формой одного поля: легаси-тред читает через web3 (`gasUsed` = int), коллектор окна —
+        сырым JSON-RPC ('0x1c5b3'). Голый `int()` на второй форме бросал ValueError ВНУТРИ
+        этой функции, то есть раньше, чем исход успевал записаться, и `_pending` к тому
+        моменту был уже очищен — след оставался только в строке `collect handler fail`.
+
+        Разбор форм у нас УЖЕ БЫЛ — `chain_index.rcpt_int`, заведённый под этот же класс
+        («второй формат уже стоил нам молчаливого ValueError в денежном пути»). Здесь его
+        просто забыли применить. Единый разбор, а не второй свой.
+
+        Названный предел принятой конвенции: `rcpt_int` — fail-open, нечитаемое поле уходит
+        в default. Для газа это «0», то есть незнание в виде бесплатной пробы. Менять
+        конвенцию в одиночку не стали: она общая для обоих источников (см. `receipt_like`)."""
+        from chain.chain_index import rcpt_int
+        gas_usd = (rcpt_int(r.get("gasUsed"), 0) * rcpt_int(r.get("effectiveGasPrice"), 0)
                    * float(self.cfg.eth_price_usd) / 1e18)
-        return (int(r.get("status") or 0), gas_usd, r.get("blockNumber"),
-                r.get("transactionIndex"), _receipt_has_win(r, self.cfg.liquidator_address))
+        # ПОЗИЦИЯ: default=None намеренно. С default=0 «поля нет» стало бы «блок 0, индекс 0»
+        # — незнание под видом измерения, тот же класс, что `(p50 or -1) >= 0`. Ноль здесь
+        # законное значение индекса, и путать его с «не знаю» нельзя.
+        return (rcpt_int(r.get("status"), 0), gas_usd,
+                rcpt_int(r.get("blockNumber"), None),
+                rcpt_int(r.get("transactionIndex"), None),
+                _receipt_has_win(r, self.cfg.liquidator_address))
 
     def _rcpt_coll(self):
         """Коллектор квитанций окна: ОДИН тред партиями вместо треда-на-пробу. Переиспользован
