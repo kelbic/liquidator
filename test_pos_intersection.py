@@ -91,6 +91,30 @@ check("отказ feeHistory глотается (вердикт и пересе�
 _os.environ.pop("SHADOW_SLOT_A1V3", None)
 idx._rpc = None
 
+# ---- П.2б/в (26.08): ДВОЙНАЯ метрика + плотность полосы ----
+_logs.clear()
+idx._rpc = None
+_o.stats = {}
+_o._pos_table(idx, 50262420, None)
+_near = [l for l in _logs if "БЛИЖАЙШАЯ" in l]
+check("новая метрика: строка БЛИЖАЙШАЯ с delta/классом/чужими_между",
+      len(_near) == 1 and "delta=+" in _near[0] and "чужих_между=" in _near[0], _near)
+check("СТАРАЯ метрика не снята — ПЕРЕСЕЧЕНИЕ по-прежнему пишется",
+      any("ПЕРЕСЕЧЕНИЕ" in l for l in _logs))
+check("кольцо ближайших дельт копится отдельно от match-кольца",
+      _o.stats.get("nearest_delta_ring") and _o.stats.get("nearest_n") == 1, _o.stats)
+# фикстура: наша tx на transit+1 при нуле чужих между
+ours["0xright_behind"] = {"index": T_IDX + 1, "tip": 1_000_000}
+_logs.clear()
+_o.stats = {}
+_o._pos_table(idx, 50262420, None)
+_n2 = [l for l in _logs if "БЛИЖАЙШАЯ" in l]
+check("tx на transit+1: чужих_между=0 (мы фактически сразу за транзитом)",
+      "delta=+1" in _n2[0] and "чужих_между=0" in _n2[0], _n2)
+check("класс при этом «нет» — новая метрика НЕ требует равенства tip",
+      "класс=нет" in _n2[0], _n2)
+del ours["0xright_behind"]
+
 # ---- Гарды дрейфа боевого потребителя (spec_fire_live) ----
 import chain.spec_fire_live as sfl  # noqa: E402
 _SRC = open(sfl.__file__.replace(".pyc", ".py")).read()

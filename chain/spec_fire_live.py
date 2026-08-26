@@ -3440,6 +3440,26 @@ class SpecFireLive:
                 return
             rows, (t_idx, t_tip) = t
             inter = [r for r in rows if 1 <= r[2] <= 20 and r[4]]
+            # П.2б (ревьюер 26.08): МЕТРИКА ВЕДЁТСЯ ДВОЙНОЙ до вердикта боем.
+            # СТАРАЯ (inter) — полоса И точный класс на одной tx: исторические победители
+            # зеркалили tip ТОЧНО 10/10, поэтому равенство может быть НУЖНЫМ, и снимать её
+            # нельзя. НОВАЯ (nearest) — наша ближайшая tx ПОСЛЕ транзита безотносительно
+            # класса: гипотеза «достаточно быть сразу за транзитом при тонкой полосе tip».
+            # П.2в: ПЛОТНОСТЬ ПОЛОСЫ — сколько ЧУЖИХ tx между транзитом и нашей ближайшей.
+            # Это и есть прямая мера «тонкости», на которой держится вся гипотеза: чужих 0 —
+            # мы фактически на transit+1; чужих много — быть «сразу за» недостаточно.
+            _after = [r for r in rows if r[2] >= 1]
+            _near = _after[0] if _after else None
+            _foreign = (_near[2] - 1) if _near else None   # tx между транзитом и нашей
+            _near_s = ("delta=+%d класс=%s чужих_между=%s"
+                       % (_near[2], "ДА" if _near[4] else "нет", _foreign)) if _near else "нет"
+            ring2 = self.stats.setdefault("nearest_delta_ring", [])
+            if _near:
+                ring2.append(_near[2])
+                del ring2[:-400]
+                self.stats["nearest_foreign_sum"] = \
+                    self.stats.get("nearest_foreign_sum", 0) + (_foreign or 0)
+                self.stats["nearest_n"] = self.stats.get("nearest_n", 0) + 1
             match_d = [r[2] for r in rows if r[4]]
             # Копилка kelbic 21.08: (а) транзит-класс МЕЖДУ слотами лестницы (наших tx есть,
             # на классе — ни одной) — если доля заметна, аргумент за ДРОБЛЕНИЕ сетки слотов,
@@ -3510,6 +3530,8 @@ class SpecFireLive:
                                                      0.9 <= _ratio <= 1.1, 0.75 <= _ratio <= 1.25))
             except Exception:                                # noqa: BLE001
                 pass
+            self._log("SPECFIRE БЛИЖАЙШАЯ blk=%d транзит=%d@%d: %s (гипотеза «равенство tip "
+                      "не обязательно» — судится блоком С ЖЕРТВОЙ)" % (bn, t_idx, t_tip, _near_s))
             self._log("SPECFIRE ПЕРЕСЕЧЕНИЕ blk=%d транзит=%d@%d: полоса∩класс=%d "
                       "(вердикт «формула» пишет ТОЛЬКО это число), match=%d delta p50=%s "
                       "p90=%s | %s%s"
