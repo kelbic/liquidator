@@ -624,6 +624,22 @@ class FireEngine:
                 self._sleep(ENGINE_IDLE_SEC)
                 continue
             self.stats["sent"] += 1
+            # ПРИБОР КАДЕНСА (26.08): межпробные дельты ОТПРАВОК ДВИЖКА. Строку на пробу
+            # движок не пишет намеренно (журнал стал бы второй нагрузкой), поэтому ритм
+            # предочереди из логов не восстановим — а именно он решает, стоим ли мы в
+            # СУБ-БЛОКЕ или только в окне. Кольцо капировано, считается p50/p90 в close-строке.
+            # Сбоку от денег: только запись числа под тем же локом, ноль сети.
+            try:
+                _n = self._now()
+                with self._lock:
+                    _prev = self.stats.get("_last_sent_ts")
+                    self.stats["_last_sent_ts"] = _n
+                    if _prev:
+                        _r = self.stats.setdefault("send_gap_ring", [])
+                        _r.append(_n - _prev)
+                        del _r[:-400]
+            except Exception:                                # noqa: BLE001
+                pass
             if not hot_at_send:
                 self.stats["sent_hold"] = self.stats.get("sent_hold", 0) + 1
                 if self.in_hold_near():                       # Э1б: приёмка ближнего хвоста

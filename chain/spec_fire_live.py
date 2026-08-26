@@ -929,6 +929,7 @@ class SpecFireLive:
                                                   # каденс переарма — окно короче ретрая иначе
                                                   # остаётся без доски, и весь флот нем
         self._det_capped: set = set()             # детонатор: фиды под капом окон близости
+        self._det_key_by_feed: dict = {}          # feed -> ((mid,b), dist, ts): ЦЕЛЬ детонатора
         if SPEC_FIRE_DET_SENSE:                   # пушер det-dist — с ПЕРВОЙ секунды (линза (1))
             threading.Thread(target=self._det_push_loop, daemon=True,
                              name="det-dist-push").start()
@@ -1234,7 +1235,7 @@ class SpecFireLive:
         """Детонатор: ближайший flip_dist ЖИРНОЙ цели фида — ТА ЖЕ математика, что в
         _top_fat (down: 1−1/HF, up: HF−1; hf<=1 = уже за флипом = 0). None = ни у одной
         цели dist не вычислим (fail-open: порог остаётся универсальным)."""
-        best = None
+        best, best_key = None, None
         with self.shared.lock:
             groups = dict(self.shared.groups)
             debt_by = dict(self.shared.debt_by)
@@ -1259,7 +1260,14 @@ class SpecFireLive:
                 dist = 0.0 if hf <= 1.0 else (
                     (1.0 - 1.0 / hf) if direction == "down" else (hf - 1.0))
                 if best is None or dist < best:
-                    best = dist
+                    best, best_key = dist, (mid, b)
+        # ОСЕВОЕ РАССЛОЕНИЕ (класс дефектов, назван 26.08): слой-открыватель обязан отдавать
+        # ЦЕЛЬ, а не только число — иначе планировщик внизу ищет цель СВОИМ критерием и
+        # окно живёт без плана (замер: 135 проб при 29 отказах арма доски подряд).
+        _dk_map = getattr(self, "_det_key_by_feed", None)
+        if _dk_map is None:
+            _dk_map = self._det_key_by_feed = {}      # ленивая карта: прибор не падает на
+        _dk_map[feed] = (best_key, best, self._now()) if best_key else None   # «голом» объекте
         return best
 
     def _det_thr(self, feed: str, direction: str, thr: float):
@@ -1274,6 +1282,23 @@ class SpecFireLive:
         except Exception:                                # noqa: BLE001
             return thr, None
         if d is None or d >= thr:
+            return thr, d
+        # ГАРД ОБРАТНОЙ НЕСВЯЗНОСТИ (26.08): детонатор связывает порог ТОЛЬКО если его цель
+        # реально планируема — иначе окно открывается ради цели, которую доска не возьмёт, и
+        # получаются холостые пробы без плана (замер: 135 проб / 29 отказов арма). Цель
+        # планируема, когда у неё есть живой долг в shared (то же условие, по которому доска
+        # строит план). Нет цели/долга -> порог остаётся УНИВЕРСАЛЬНЫМ (fail-closed к окну).
+        _dk = (getattr(self, "_det_key_by_feed", None) or {}).get(feed)
+        if not (_dk and _dk[0]):
+            self.stats["det_no_target"] = self.stats.get("det_no_target", 0) + 1
+            return thr, d
+        try:
+            with self.shared.lock:
+                _ok = float(self.shared.debt_by.get(_dk[0], 0.0) or 0.0) > 0
+        except Exception:                                    # noqa: BLE001
+            _ok = False
+        if not _ok:
+            self.stats["det_unplannable"] = self.stats.get("det_unplannable", 0) + 1
             return thr, d
         n = self._now()
         dq = self.stats.setdefault("_det_win_ts::%s" % feed, [])
@@ -2340,6 +2365,30 @@ class SpecFireLive:
             reach = max(dev * (SPEC_FIRE_THRESHOLD + SPEC_FIRE_DIST_MARGIN_DEVS),
                         SPEC_FIRE_PREARM_MIN_REACH)
             tgts, _hold, _edge = self._top_fat(feed, direction, max_dist=reach, k=1)
+            # СВЯЗНОСТЬ ДЕТОНАТОР→ДОСКА (26.08, класс «осевое расслоение»): если окно открыл
+            # ДЕТОНАТОР, доска обязана планировать НА ЕГО ЦЕЛЬ, а не искать свою по «жир ×
+            # досягаемость» — иначе окно живёт без плана («без доски флот нем»), что и
+            # замерено боем: 135 проб при 29 отказах арма подряд, все «жир вне досягаемости».
+            # reach здесь становится СПРАВКОЙ в строке, а не гейтом. Универсальные окна (без
+            # детонатора) идут прежней веткой БИТ-В-БИТ. Свежесть ключа 120с — протухший
+            # детонатор не имеет права навязывать цель.
+            _dk = (getattr(self, "_det_key_by_feed", None) or {}).get(feed)
+            if _dk and _dk[0] and (self._now() - _dk[2]) <= 120.0:
+                _dmid, _db = _dk[0]
+                _ddebt = 0.0
+                try:
+                    with self.shared.lock:
+                        _ddebt = float(self.shared.debt_by.get((_dmid, _db), 0.0) or 0.0)
+                except Exception:                            # noqa: BLE001
+                    pass
+                if _ddebt > 0 and not tgts:
+                    self._log("SPECFIRE доска: план ПОД ЦЕЛЬ ДЕТОНАТОРА %s/%s (dist %.3f%%, "
+                              "жир вне reach %.2f%% — справка, не гейт)"
+                              % (str(_dmid)[:10], str(_db)[:10], (_dk[1] or 0.0) * 100.0,
+                                 reach * 100.0))
+                    tgts = [(_dmid, _db, _ddebt)]
+                    self.stats["board_det_target"] = self.stats.get("board_det_target", 0) + 1
+                    self.__dict__.setdefault("_arm_fail_series", {})[feed] = 0
             if not tgts:
                 # #92: САМАЯ ЧАСТАЯ ветка отказа была ЕДИНСТВЕННОЙ без переспроса. Попытка одна
                 # на окно, в момент t~0, когда |ret| минимален ПО ПОСТРОЕНИЮ, а расписание уже
@@ -2514,6 +2563,18 @@ class SpecFireLive:
         на вид движке, поэтому она ещё и громкая (счётчик виден в close-строке окна)."""
         self._board_next_try[feed] = self._now() + SPEC_FIRE_V2_ARM_RETRY_SEC
         self.stats["board_arm_fails"] = self.stats.get("board_arm_fails", 0) + 1
+        # СЧЁТЧИК ПОРОГА РЕШЕНИЯ (26.08): серии отказов арма ПРИ ЖИВОМ ДЕТОНАТОРЕ — это и
+        # есть «окно голодает без плана». Порог из Plan: доля таких окон >=30% ⇒ спека.
+        try:
+            _dk = (getattr(self, "_det_key_by_feed", None) or {}).get(feed)
+            if _dk and _dk[0]:
+                _ser = self.__dict__.setdefault("_arm_fail_series", {})
+                _ser[feed] = _ser.get(feed, 0) + 1
+                if _ser[feed] == 5:
+                    self.stats["det_windows_starved"] = \
+                        self.stats.get("det_windows_starved", 0) + 1
+        except Exception:                                    # noqa: BLE001
+            pass
         self._log("SPECFIRE доска: арм НЕ ВЗВЁЛСЯ feed=%s (%s) — переспрос через %.0fс "
                   "(без доски флот нем)" % (feed, why, SPEC_FIRE_V2_ARM_RETRY_SEC))
 
@@ -4221,6 +4282,18 @@ class SpecFireLive:
                 self.stats.get("collector_overflow", 0),
                 ("%.1fс" % _rl[len(_rl) // 2]) if _rl else "—",
                 ("%.1fс" % _rl[int(len(_rl) * 0.9)]) if _rl else "—")
+            # ПРИБОР КАДЕНСА (26.08): ритм ОТПРАВОК ДВИЖКА — «стоим в окне» или «стоим в
+            # СУБ-БЛОКЕ». Цель ≤0.2с (суб-блок Base); 0.9с = пол-блока = +80-180 позиций.
+            _cad = "—"
+            try:
+                _eng = getattr(self, "_fire_engine", None)
+                _gr = sorted((_eng.stats.get("send_gap_ring") or [])) if _eng else []
+                if _gr:
+                    _cad = "p50=%.2fс p90=%.2fс n=%d доля≤0.2с=%.0f%%" % (
+                        _gr[len(_gr) // 2], _gr[int(len(_gr) * 0.9)], len(_gr),
+                        100.0 * sum(1 for x in _gr if x <= 0.2) / len(_gr))
+            except Exception:                                # noqa: BLE001
+                pass
             # П.2: пер-тирная немота/огонь в строке окна
             try:
                 from chain.execute import volley_tier_stats as _vts
@@ -4229,7 +4302,7 @@ class SpecFireLive:
                     _t["a_mute"], _t["b_mute"], _t["a_fired"], _t["b_esc_skips"])
             except Exception:                            # noqa: BLE001
                 _tier_s = "—"
-            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s rcpt=%s tiers[%s] "
+            self._log("SPECFIRE window close feed=%s probes=%d gap_p95=%s каденс[%s] rcpt=%s tiers[%s] "
                       "patron_floor_skips=%d patron_unknown_skips=%d leg_maxfee_mute=%d "
                       "budget_reserve_skips=%d budget_inflight_skips=%d "
                       # 20.08: все три — ПО КАНАЛАМ (url|ip). transport_reject был суммарным
@@ -4240,7 +4313,7 @@ class SpecFireLive:
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _rcpt_s, _tier_s,
+                          _cad, _rcpt_s, _tier_s,
                           _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej or "—",
                           _purg or "—", _md_str,
                           self.stats.get("class_between_slots", 0),
