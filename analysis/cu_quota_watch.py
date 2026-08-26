@@ -94,6 +94,14 @@ MIN_BOOK_SEC = float(os.environ.get("CU_WATCH_MIN_BOOK_H", "6")) * 3600.0
 # два прогона подряд эту пилу гасят и при этом ловят ступень за 1-2 часа.
 FRESH_N = int(os.environ.get("CU_WATCH_FRESH_N", "2"))
 FRESH_MIN_SEC = float(os.environ.get("CU_WATCH_FRESH_MIN_H", "1")) * 3600.0
+# ДО СКОЛЬКИХ ПРОГОНОВ СВЕЖЕЕ ОКНО РАСТЁТ, когда двух не хватило на покрытие (26.08).
+# Разбор тревоги 06:28Z: деплой-кампания рвёт журнал, покрытие двух прогонов просело до
+# 0.93ч < 1ч — и свежий кандидат МОЛЧА выбывал, оставляя судить хвост, который в тот момент
+# описывал полумёртвого бота (predict стоял 2.5 суток, c35efcf). Прогон 07:07Z ушёл в «тихо»,
+# печатая свеж 94M/мес в той же строке. То есть громкость сторожа зависела от ПОКРЫТИЯ
+# ЖУРНАЛА, а не от расхода. Растим окно назад по прогонам, пока покрытия не хватит; потолок
+# нужен, чтобы свежее окно не выродилось во второй хвост.
+FRESH_MAX_N = int(os.environ.get("CU_WATCH_FRESH_MAX_N", "6"))
 # ПРИПАРКОВАННЫЙ КЛЮЧ (22.08): сколько прогонов подряд нулевого расхода при живом
 # co-наблюдении считать доказательством простоя. Три — час с лишним, пережидает одиночную
 # дыру в журнале и при этом возвращает гард в строй через час после возврата нагрузки.
@@ -320,8 +328,8 @@ def trail_summary(recs, *, trail_sec, now=None):
             for h, (cu, sec, since) in agg.items()}
 
 
-def fresh_summary(recs, *, n=None, now=None):
-    """host -> (cu_per_day, покрытые_секунды, начало_окна) по N ПОСЛЕДНИМ записям истории.
+def fresh_summary(recs, *, n=None, now=None, min_sec=None, max_n=None, as_of_map=None):
+    """host -> (cu_per_day, покрытые_секунды, начало_окна, взято_прогонов) по последним записям.
 
     ЗАЧЕМ ОТДЕЛЬНАЯ ВЕЛИЧИНА (ПРЕДЕЛ 4, разбор тревоги 21.08 23:07). Хвост 24ч — это
     ИНТЕГРАЛ, и он размазывает СТУПЕНЬ. 21.08 в 22:00Z вечерняя кампания подняла #94bf с
@@ -338,19 +346,49 @@ def fresh_summary(recs, *, n=None, now=None):
     свежее окно не залезает за якорь, то есть не описывает конфигурацию до манёвра.
     """
     n = int(n if n is not None else FRESH_N)
-    rs = sorted([r for r in recs if r.get("ts") is not None], key=lambda r: float(r["ts"]))[-n:]
-    agg = {}
-    for r in rs:
-        until = float(r.get("until") or r.get("ts") or 0)
-        for host, d in (r.get("hosts") or {}).items():
-            sec = float(d.get("sec", 0))
-            a = agg.setdefault(host, [0.0, 0.0, None])
-            a[0] += float(d.get("cu", 0))
-            a[1] += sec
-            start = until - sec
-            a[2] = start if a[2] is None else min(a[2], start)
-    return {h: ((cu / sec * 86400.0) if sec > 0 else 0.0, sec, since)
-            for h, (cu, sec, since) in agg.items()}
+    min_sec = float(min_sec if min_sec is not None else FRESH_MIN_SEC)
+    max_n = max(n, int(max_n if max_n is not None else FRESH_MAX_N))
+    as_of_map = as_of_map or {}
+    rs = sorted([r for r in recs if r.get("ts") is not None], key=lambda r: float(r["ts"]))
+
+    def _agg(host, k):
+        cu = sec = 0.0
+        since = None
+        for r in rs[-k:]:
+            d = (r.get("hosts") or {}).get(host)
+            if not d:
+                continue
+            s = float(d.get("sec", 0))
+            cu += float(d.get("cu", 0))
+            sec += s
+            start = float(r.get("until") or r.get("ts") or 0) - s
+            since = start if since is None else min(since, start)
+        return cu, sec, since
+
+    hosts = set()
+    for r in rs[-max_n:]:
+        hosts.update((r.get("hosts") or {}).keys())
+
+    out = {}
+    for host in hosts:
+        as_of = as_of_map.get(host)
+        best = None
+        for k in range(n, max_n + 1):
+            cu, sec, since = _agg(host, k)
+            if best is not None and as_of is not None and since is not None and since < float(as_of):
+                # РОСТ ЗАЛЕЗ ЗА ЯКОРЬ: дальше окно описывало бы конфигурацию до манёвра —
+                # ровно тот дефект, ради которого свежее окно и заводилось. Берём последнее
+                # чистое. Базовое окно (k=n) не отбрасываем здесь: его чистоту проверяет
+                # balance_verdicts тем же сравнением, и снятие проверки обязано краснеть там.
+                break
+            best = (cu, sec, since, k)
+            if sec >= min_sec:
+                break
+        if best is None:
+            continue
+        cu, sec, since, k = best
+        out[host] = ((cu / sec * 86400.0) if sec > 0 else 0.0, sec, since, k)
+    return out
 
 
 
@@ -634,10 +672,14 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fr
         elif book_sec >= MIN_BOOK_SEC:
             cands.append((book_rate, "книга за %.1fч после якоря (хвост пересекает якорь — "
                                      "отброшен)" % (book_sec / 3600.0)))
-        f_rate, f_sec, f_since = fresh.get(host, (0.0, 0.0, None))
+        # Кортеж принимается и трёх-, и четырёхэлементный: 3 — старая форма (её и сейчас
+        # подают тесты и любой внешний вызов), 4 — с ФАКТИЧЕСКИ взятым числом прогонов.
+        fv = fresh.get(host) or (0.0, 0.0, None)
+        f_rate, f_sec, f_since = float(fv[0]), float(fv[1]), fv[2]
+        f_n = int(fv[3]) if len(fv) > 3 else FRESH_N
         if f_sec >= FRESH_MIN_SEC and (f_since is None or f_since >= as_of):
             cands.append((f_rate, "СВЕЖЕЕ ОКНО %.1fч (%d последних прогона)"
-                          % (f_sec / 3600.0, FRESH_N)))
+                          % (f_sec / 3600.0, f_n)))
         if cands:
             burn, basis = max(cands, key=lambda c: c[0])
             if len(cands) > 1:
@@ -785,7 +827,9 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
     burn_day = {h: r * 1e6 / 30.0 for h, (r, _sec, _since) in trail.items()}
     burn_span = {h: sec for h, (_r, sec, _since) in trail.items()}
     burn_since = {h: since for h, (_r, _sec, since) in trail.items() if since is not None}
-    fresh = fresh_summary(recs, now=now_s)
+    fresh = fresh_summary(recs, now=now_s, as_of_map={
+        h: float((d or {}).get("as_of", 0) or 0)
+        for h, d in ((anchor.get("hosts") or {}).items())})
     bal = balance_verdicts(anchor, ledger, burn_day, burn_span=burn_span, burn_fresh=fresh,
                            burn_since=burn_since, now=now_s, parked=parked)
     # ТОТ ЖЕ приговор на ПОЗДНЕМ кандидате горизонта — не для звонка, а чтобы (а) тревога
@@ -1021,8 +1065,22 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
             # а тихий прогон обязан показывать то число, которым судит (иначе «тихо»
             # недоказуемо). Оно же — ранний признак ступени: 21.08 хвост показывал 30M,
             # когда свежее окно уже стояло на 99M.
-            fr, fsec, _fsince = fresh.get(h, (0.0, 0.0, None))
-            f_txt = ("свеж%.0fM/%.1fч" % (fr * 30.0 / 1e6, fsec / 3600.0)) if fsec > 0 else "свеж—"
+            _fv = fresh.get(h) or (0.0, 0.0, None)
+            fr, fsec, _fsince = float(_fv[0]), float(_fv[1]), _fv[2]
+            if fsec <= 0:
+                f_txt = "свеж—"
+            else:
+                f_txt = "свеж%.0fM/%.1fч" % (fr * 30.0 / 1e6, fsec / 3600.0)
+                # НЕЗНАНИЕ НЕ ОТКРЫВАЕТ ТИХИЙ ПУТЬ (26.08): если свежее окно напечатано, но
+                # в приговор не вошло, «тихо» обязано сказать ЧЕМ ИМЕННО оно дисквалифицировано,
+                # иначе разбирающий читает большое число рядом со словом «тихо» и не знает,
+                # судило оно или молча выбыло (ровно случай прогона 07:07Z).
+                _ah = (anchor.get("hosts") or {}).get(h) or {}
+                _as_of = float(_ah.get("as_of", 0) or 0)
+                if fsec < FRESH_MIN_SEC:
+                    f_txt += "*НЕ СУДИЛ(покрытие<%.0fч)" % (FRESH_MIN_SEC / 3600.0)
+                elif _ah and _fsince is not None and _fsince < _as_of:
+                    f_txt += "*НЕ СУДИЛ(окно до якоря)"
             parts.append("%s=%.1fM/хв%.1fч%s(%s,%s,бут%d,%s)"
                          % (h, rate, sec / 3600.0, mark, bm, f_txt, per_host[h]["boot"], ost))
         out("cu-quota: тихо (порог %.0fM, хвост %.0fч, мин %.0fч, рестартов %d): %s"

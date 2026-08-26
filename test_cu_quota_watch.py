@@ -811,6 +811,54 @@ g3 = [x for x in sent if x[2] == "cu-quota:%s" % C]
 check("всплеск НЕ ЗАМЕРЕН (окон меньше min) — приговор ОСТАЁТСЯ, незнание не гасит",
       len(g3) == 1 and "режим НЕ УСТАНОВЛЕН" in g3[0][3], [x[3][:200] for x in g3])
 
+# ---- 41. СВЕЖЕЕ ОКНО РАСТЁТ, КОГДА ДВУХ ПРОГОНОВ НЕ ХВАТИЛО НА ПОКРЫТИЕ (26.08) ----
+# Реплей прогона 26.08 07:07Z: деплой-кампания порвала журнал, два последних прогона покрыли
+# 0.93ч < 1ч, свежий кандидат МОЛЧА выбывал — и судить оставался хвост, описывавший бота с
+# застрявшим predict (2.5 суток без армов, c35efcf). Громкость сторожа зависела от покрытия
+# журнала, а не от расхода.
+_M = MID
+_recs_grow = [{"ts": _M - 3 * HOUR, "until": _M - 3 * HOUR, "hosts": {C: {"cu": 9000, "sec": 3600}}},
+              {"ts": _M - 2 * HOUR, "until": _M - 2 * HOUR, "hosts": {C: {"cu": 101797, "sec": 3120}}},
+              {"ts": _M - HOUR, "until": _M - HOUR, "hosts": {C: {"cu": 73643, "sec": 1320}}},
+              {"ts": _M, "until": _M, "hosts": {C: {"cu": 48436, "sec": 2043}}}]
+_g = w.fresh_summary(_recs_grow, now=_M)          # n=2 покрывает 3363с < 3600с -> обязано вырасти
+check("свежее окно доросло до покрытия (2 прогона 0.93ч -> 3 прогона >=1ч)",
+      _g[C][1] >= w.FRESH_MIN_SEC and _g[C][3] == 3, _g)
+check("выросшее окно НЕ втянуло лишнего: взяты ровно 3 последних прогона",
+      abs(_g[C][1] - (3120 + 1320 + 2043)) < 1, _g)
+# ПОТОЛОК: свежее окно не вырождается во второй хвост.
+_g_cap = w.fresh_summary(_recs_grow, now=_M, min_sec=10 * HOUR, max_n=3)
+check("потолок роста держит: покрытия не хватило, но взято не больше max_n",
+      _g_cap[C][3] == 3, _g_cap)
+# ЯКОРЬ ОСТАНАВЛИВАЕТ РОСТ: за as_of окно описывало бы конфигурацию до манёвра.
+_g_anch = w.fresh_summary(_recs_grow, now=_M, as_of_map={C: _M - 2 * HOUR - 3000})
+check("рост останавливается на якоре (третий прогон залез бы за as_of)",
+      _g_anch[C][3] == 2, _g_anch)
+# НЕГАТИВНЫЙ КОНТРОЛЬ К СУИТЕ (канон seam-stubbed-above-the-defect): со снятым ростом
+# (max_n=FRESH_N) окно остаётся огрызком 0.93ч и НЕ проходит гард покрытия — проверка выше
+# краснеет, то есть она смотрит на фикс, а не мимо него.
+_g_off = w.fresh_summary(_recs_grow, now=_M, max_n=w.FRESH_N)
+check("самоконтроль: со снятым ростом окно остаётся 0.93ч и дисквалифицировано покрытием",
+      _g_off[C][1] < w.FRESH_MIN_SEC and _g_off[C][3] == 2, _g_off)
+# И ПРИГОВОР: выросшее окно ДОПУЩЕНО в кандидаты, огрызок — нет.
+_as_of_g = _M - 4 * HOUR
+_anc_g = {"quota_cu": 30e6, "reset": "calendar",
+          "hosts": {C: {"mtd_cu": 13.0e6, "as_of": _as_of_g}}}
+_led_g = {"hosts": {C: {"cu": 0.0, "since": _as_of_g}}}
+_tail_g, _span_g, _since_g = {C: 400e3}, {C: 24 * HOUR}, {C: _as_of_g}
+_v_grown = w.balance_verdicts(_anc_g, _led_g, _tail_g, burn_span=_span_g, burn_since=_since_g,
+                              burn_fresh=w.fresh_summary(_recs_grow, now=_M), now=_M)
+_v_stub = w.balance_verdicts(_anc_g, _led_g, _tail_g, burn_span=_span_g, burn_since=_since_g,
+                             burn_fresh=w.fresh_summary(_recs_grow, now=_M, max_n=w.FRESH_N),
+                             now=_M)
+check("выросшее окно СУДИТ (ступень видна), огрызок молчал бы — приговоры расходятся",
+      len(_v_grown) == 1 and "СВЕЖЕЕ ОКНО" in _v_grown[0][7] and _v_stub == [],
+      ([x[7][:120] for x in _v_grown], _v_stub))
+# СТАРАЯ ФОРМА КОРТЕЖА (3 элемента) обязана приниматься: её подают и тесты, и внешние вызовы.
+check("трёхэлементный burn_fresh принят без падения (обратная совместимость)",
+      w.balance_verdicts(_anc_g, _led_g, _tail_g, burn_span=_span_g, burn_since=_since_g,
+                         burn_fresh={C: (3.0e6, 2 * HOUR, _as_of_g)}, now=_M) != [], "")
+
 print("\n%s" % ("FAIL: %d" % len(FAILS) if FAILS
                 else "OK: сторож квоты — парс/всплеск/ИНТЕГРАЛ/ОСТАТОК/дедуп/слепота/самоконтроль"))
 sys.exit(1 if FAILS else 0)
