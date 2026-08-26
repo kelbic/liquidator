@@ -353,6 +353,8 @@ def fresh_summary(recs, *, n=None, now=None, min_sec=None, max_n=None, as_of_map
 
     def _agg(host, k):
         cu = sec = 0.0
+        cu_boot = 0.0
+        n_sub = n_boot = 0
         since = None
         for r in rs[-k:]:
             d = (r.get("hosts") or {}).get(host)
@@ -360,10 +362,13 @@ def fresh_summary(recs, *, n=None, now=None, min_sec=None, max_n=None, as_of_map
                 continue
             s = float(d.get("sec", 0))
             cu += float(d.get("cu", 0))
+            cu_boot += float(d.get("cu_boot", 0) or 0)
+            n_sub += int(d.get("n", 0) or 0)
+            n_boot += int(d.get("boot", 0) or 0)
             sec += s
             start = float(r.get("until") or r.get("ts") or 0) - s
             since = start if since is None else min(since, start)
-        return cu, sec, since
+        return cu, sec, since, cu_boot, n_sub, n_boot
 
     hosts = set()
     for r in rs[-max_n:]:
@@ -374,20 +379,21 @@ def fresh_summary(recs, *, n=None, now=None, min_sec=None, max_n=None, as_of_map
         as_of = as_of_map.get(host)
         best = None
         for k in range(n, max_n + 1):
-            cu, sec, since = _agg(host, k)
+            cu, sec, since, cu_boot, n_sub, n_boot = _agg(host, k)
             if best is not None and as_of is not None and since is not None and since < float(as_of):
                 # РОСТ ЗАЛЕЗ ЗА ЯКОРЬ: дальше окно описывало бы конфигурацию до манёвра —
                 # ровно тот дефект, ради которого свежее окно и заводилось. Берём последнее
                 # чистое. Базовое окно (k=n) не отбрасываем здесь: его чистоту проверяет
                 # balance_verdicts тем же сравнением, и снятие проверки обязано краснеть там.
                 break
-            best = (cu, sec, since, k)
+            best = (cu, sec, since, k, cu_boot, n_sub, n_boot)
             if sec >= min_sec:
                 break
         if best is None:
             continue
-        cu, sec, since, k = best
-        out[host] = ((cu / sec * 86400.0) if sec > 0 else 0.0, sec, since, k)
+        cu, sec, since, k, cu_boot, n_sub, n_boot = best
+        out[host] = ((cu / sec * 86400.0) if sec > 0 else 0.0, sec, since, k,
+                     cu_boot, n_sub, n_boot)
     return out
 
 
@@ -672,14 +678,32 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fr
         elif book_sec >= MIN_BOOK_SEC:
             cands.append((book_rate, "книга за %.1fч после якоря (хвост пересекает якорь — "
                                      "отброшен)" % (book_sec / 3600.0)))
-        # Кортеж принимается и трёх-, и четырёхэлементный: 3 — старая форма (её и сейчас
-        # подают тесты и любой внешний вызов), 4 — с ФАКТИЧЕСКИ взятым числом прогонов.
+        # Кортеж принимается и трёх-, и четырёх-, и семиэлементный: 3 — старая форма (её и
+        # сейчас подают тесты и любой внешний вызов), 4 — с ФАКТИЧЕСКИ взятым числом
+        # прогонов, 7 — с разложением на бут (26.08).
         fv = fresh.get(host) or (0.0, 0.0, None)
         f_rate, f_sec, f_since = float(fv[0]), float(fv[1]), fv[2]
         f_n = int(fv[3]) if len(fv) > 3 else FRESH_N
+        f_boot_cu = float(fv[4]) if len(fv) > 4 else 0.0
+        f_sub, f_sub_boot = (int(fv[5]), int(fv[6])) if len(fv) > 6 else (0, 0)
         if f_sec >= FRESH_MIN_SEC and (f_since is None or f_since >= as_of):
-            cands.append((f_rate, "СВЕЖЕЕ ОКНО %.1fч (%d последних прогона)"
-                          % (f_sec / 3600.0, f_n)))
+            lbl = "СВЕЖЕЕ ОКНО %.1fч (%d последних прогона)" % (f_sec / 3600.0, f_n)
+            # ДОЛЯ БУТА ЕДЕТ ВМЕСТЕ С ПРИГОВОРОМ (26.08, разбор тревоги 11:07 по A#3133).
+            # Свежее окно 1.9ч дало 9474k CU/сут и приговор «1.6 суток» — а 57.5% этого
+            # числа были прогревом ТРЁХ рестартов деплой-кампании, экстраполированным как
+            # установившийся темп на 5.5 суток. Бут из счёта НЕ выкидывается (канон 20.08:
+            # он реально списан провайдером, «выкинутый прогрев» = 54% реального расхода) и
+            # приговор здесь НЕ смягчается — max по кандидатам и полосы тяжести не тронуты.
+            # Чинится САМООТЧЁТ: разбирающий читал приговор, не видя единственного числа,
+            # которое его переворачивает, и обязан был лезть в cu-quota.history.jsonl руками.
+            # Доля считается по ПОДОКНАМ хоста (поля n/boot той же записи), поэтому она
+            # пер-ключевая; поле restarts записи сюда НЕ тянется — оно общее по прогону.
+            if f_boot_cu > 0:
+                f_cu = f_rate * f_sec / 86400.0
+                lbl += ", ИЗ НИХ БУТ %.0f%%" % (100.0 * f_boot_cu / f_cu if f_cu > 0 else 0.0)
+                if f_sub > 0:
+                    lbl += " (%d из %d подокон бутовые)" % (f_sub_boot, f_sub)
+            cands.append((f_rate, lbl))
         if cands:
             burn, basis = max(cands, key=lambda c: c[0])
             if len(cands) > 1:
