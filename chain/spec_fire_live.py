@@ -2790,15 +2790,18 @@ class SpecFireLive:
                                  audit_fn=_audit, log=self._log)
             self._fire_engine = eng
             eng.start()
-            # П.3/линза: коллектор ОКНА греется ЗДЕСЬ же, а не лениво в первом dispatch —
-            # иначе RTT сборки (импорты, цепочка узлов) лёг бы внутрь горячего пути первого
-            # выстрела окна. Ленивая ветка в _rcpt_coll остаётся страховкой.
-            if SPEC_FIRE_RCPT_MODE in ("shadow", "collector"):
-                try:
-                    self._rcpt_coll()
-                except Exception as _e:                      # noqa: BLE001
-                    self._log("SPECFIRE rcpt-коллектор прогрев fail: %s" % type(_e).__name__)
-            return eng
+        # П.3/линза: коллектор ОКНА греется на сборке движка, а не лениво в первом dispatch
+        # (иначе RTT сборки лёг бы в горячий путь первого выстрела). ВНЕ `with self._lock`
+        # НАМЕРЕННО (регрессия 23-26.08, поймана py-spy): _rcpt_coll берёт ТОТ ЖЕ
+        # нерекурсивный self._lock — вложенный захват давал САМОДЕДЛОК, лок не отпускался
+        # никогда, и predict-driver вставал на нём в первом же handle_event: окна не армились
+        # 2.5 суток, флот молчал, работала одна реактивная лента. Лок здесь уже отпущен.
+        if SPEC_FIRE_RCPT_MODE in ("shadow", "collector"):
+            try:
+                self._rcpt_coll()
+            except Exception as _e:                          # noqa: BLE001
+                self._log("SPECFIRE rcpt-коллектор прогрев fail: %s" % type(_e).__name__)
+        return eng
 
     def _engine_result(self, meta, h, r):
         """ИСХОД ПРОБЫ ПО КВИТАНЦИИ. ДЕНЬГИ В `try`, БРОНЬ #93 — В `finally`.
