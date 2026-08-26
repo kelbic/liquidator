@@ -878,6 +878,43 @@ def transit_tip_mirror(now=None):
     return (slots[0], slots[1] if len(slots) > 1 else slots[0])
 
 
+# Вскрытие гонки 50480780 (26.08): решающий блок каскада (2240 tx, газом 48%) держал ВЕСЬ
+# хвост, включая транзит и победителей, на tip 1.3 mgwei — а пробы главного кошелька шли на
+# фикс-полу 1.0 mgwei из замера 11.08. Сортировка суб-блока по убыванию tip кладёт 1.0 ПОЗАДИ
+# всей полосы 1.3 независимо от времени прихода, а под наплывом 1.0 вовсе не проходит отсечку
+# включения (наша проба ждала 27 блоков при годном maxFee). Пол-tip = запрет участия в
+# каскадный блок ПО ПОСТРОЕНИЮ. Лечится не константой (полоса дрейфует: 7 транзитов 26.08 =
+# 1.0..12.9 mgwei), а живым полом полосы из того же зеркала, что кормит тиры ног.
+_TIP_BAND_TRACK = os.environ.get("SPEC_FIRE_TIP_TRACK", "1").lower() not in ("0", "off", "")
+_TIP_BAND_TTL_SEC = float(os.environ.get("SPEC_FIRE_TIP_TRACK_TTL_SEC", "600"))
+_TIP_BAND_MIN_N = int(os.environ.get("SPEC_FIRE_TIP_TRACK_MIN_N", "3"))
+_TIP_BAND_CAP_WEI = int(os.environ.get("SPEC_FIRE_TIP_TRACK_CAP_WEI", "3000000"))
+
+
+def probe_tip_band(now=None):
+    """Пол ЖИВОЙ полосы транзитов: МОДА свежих сэмплов всех колец зеркала. None = «не знаю».
+
+    Мода, а не медиана: класс tip — дискретная величина (полосы 1.0/1.15/1.3/2.0 mgwei),
+    медиана между двумя классами дала бы значение, которого в цепи не существует. Один
+    выброс (транзит 12.9 mgwei в кольце) моду не сдвигает — медиану бы сдвинул к дорогому.
+    Разброд (мода < 1/3 сэмплов) — законное «не знаю»: у полосы либо есть доминанта, либо
+    угадывать нечего, и незнание НЕ открывает трату (вызывающий падает на пол).
+    Прибор без сети и без состояния: одно чтение колец под тем же локом, что и портфель."""
+    if not _TIP_BAND_TRACK:
+        return None
+    n = float(now if now is not None else time.time())
+    with _TRANSIT_TIPS_LOCK:
+        fresh = [w for v in _TRANSIT_TIPS.values() for ts, w in v
+                 if n - ts <= _TIP_BAND_TTL_SEC]
+    if len(fresh) < _TIP_BAND_MIN_N:
+        return None
+    from collections import Counter
+    m, cnt = Counter(fresh).most_common(1)[0]
+    if cnt * 3 < len(fresh):
+        return None
+    return int(m)
+
+
 def probe_tip_for(addr) -> int:
     """Тир tip ЭТОЙ ноги. Детерминированно по адресу, без состояния и без сети.
 

@@ -809,9 +809,22 @@ def _probe_tip_wei(tip_gwei: float) -> int:
 
     Кап каскадной ступени сохраняем как ВЕРХНЮЮ границу: если кто-то поднимет cfg.tip_gwei,
     проба всё равно не уедет выше капа. Но по умолчанию проба идёт на полу — внутри суб-блока
-    сортировка по убыванию tip, и плата выше пола выносит нас ПРОЧЬ от транзита."""
-    from chain.execute import _PROBE_TIP_WEI
-    return int(min(_PROBE_TIP_WEI, SPEC_FIRE_TIP_CAP_GWEI * 1e9))
+    сортировка по убыванию tip, и плата выше пола выносит нас ПРОЧЬ от транзита.
+
+    26.08 (вскрытие 50480780): «пол» — не константа, а ЖИВАЯ величина. Решающий блок каскада
+    держал весь хвост на 1.3 mgwei, и наш фикс-пол 1.0 (замер 11.08) сортировался ПОЗАДИ всей
+    полосы, а под наплывом не проходил отсечку включения вовсе (проба ждала 27 блоков при
+    годном maxFee) — участие в каскадный блок было запрещено по построению. Теперь пол
+    подтягивается к моде живой полосы из зеркала транзитов (probe_tip_band), клэмп
+    [статический пол, SPEC_FIRE_TIP_TRACK_CAP_WEI]: выше моды не платим (плата выше полосы
+    выносит ВПЕРЁД транзита — реверт до цены), незнание полосы падает на статический пол
+    (незнание не открывает трату). Откат одним env: SPEC_FIRE_TIP_TRACK=0 — бит-в-бит пол."""
+    from chain.execute import _PROBE_TIP_WEI, _TIP_BAND_CAP_WEI, probe_tip_band
+    floor = int(min(_PROBE_TIP_WEI, SPEC_FIRE_TIP_CAP_GWEI * 1e9))
+    band = probe_tip_band()
+    if band is None:
+        return floor
+    return int(min(max(band, floor), _TIP_BAND_CAP_WEI))
 
 
 def _receipt_has_win(r, liquidator_addr: str):
