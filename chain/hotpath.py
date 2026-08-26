@@ -233,6 +233,13 @@ _RL_SINK = None                  # (alerter, cfg) — ставит make_refusal_
 # нонсами) — латентность дороже ордеринга (наш промах = +785мс). Откат HOT_DISPATCH_INCREMENTAL=0
 # = прежний батч бит-в-бит.
 HOT_DISPATCH_INCREMENTAL = os.environ.get("HOT_DISPATCH_INCREMENTAL", "1").lower() not in ("0", "false", "no")
+# СТОРОЖ ЖИВОСТИ PREDICT (после самодедлока 23-26.08). Пороги названы от НАБЛЮДЁННОГО:
+# пушей оракула ~528/сутки (22/час) при рабочем предикте события идут пачками ежечасно;
+# 20 пушей БЕЗ единого события — состояние, которого в норме не бывает. Тишина 30 мин
+# отделяет штиль от смерти: в живом штиле события всё равно есть (stale/recovered/bootstrap).
+PREDICT_SILENCE_PUSHES = int(os.environ.get("PREDICT_SILENCE_PUSHES", "20"))
+PREDICT_SILENCE_SEC = float(os.environ.get("PREDICT_SILENCE_SEC", "1800"))
+_PRED_WATCH = {"pushes": 0, "born": time.time()}
 # Р1: ПАРАЛЛЕЛЬНАЯ ПОДГОТОВКА ЦЕЛЕЙ ХВОСТА КАСКАДА.
 #
 # ЗАМЕР. Каскад 11.08 06:38 — 30 ликвидаций в двух блоках (49820471/49820472). Голову забирает
@@ -3090,6 +3097,30 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                               _s["conf"], _s["fails"], _s["beyond_head"])
                         except Exception:
                             pass
+                        # ЖИВОСТЬ PREDICT (после самодедлока 23-26.08: 0 армов при 528 пушах
+                        # оракула в сутки, и МОЛЧАНИЕ НИКОГО НЕ БУДИЛО — «ошибок нет» читалось
+                        # как «всё хорошо»). Позитивный контроль встроен в саму метрику: пуши
+                        # оракула — наблюдаемое СОБЫТИЕ ПОЛЯ, арм — наша реакция на него.
+                        # Пушей много, а армов ноль ⇒ верх сигнального тракта мёртв (дедлок,
+                        # мёртвый WS, застрявший хендлер) — громко и в инбокс агента.
+                        try:
+                            from chain.predict import last_event_ts as _pred_ts
+                            _pn = _PRED_WATCH["pushes"]
+                            _age = time.time() - (_pred_ts() or _PRED_WATCH["born"])
+                            if _pn >= PREDICT_SILENCE_PUSHES and _age >= PREDICT_SILENCE_SEC:
+                                log.error("PREDICT МЁРТВ: пушей оракула %d за %.0f мин, армов/"
+                                          "событий НОЛЬ (%.0f мин тишины). Верх сигнального "
+                                          "тракта не работает: окна не армятся, залпов нет — "
+                                          "проверь дедлок (py-spy dump) и живость Binance WS",
+                                          _pn, (time.time() - _PRED_WATCH["born"]) / 60.0,
+                                          _age / 60.0)
+                                _PRED_WATCH["born"] = time.time()   # не звеним чаще раза в окно
+                                _PRED_WATCH["pushes"] = 0
+                            elif _age < PREDICT_SILENCE_SEC:
+                                _PRED_WATCH["born"] = time.time()
+                                _PRED_WATCH["pushes"] = 0
+                        except Exception:
+                            pass
                         # #109 ЗА СУТКИ: экономия поштучных квитанций. polls — СЕТЕВЫЕ поллы,
                         # polls_saved — партии, закрытые индексом целиком, index_hits — исходы,
                         # взятые из индекса. Это и есть приёмка пакета в деньгах запросов.
@@ -3214,6 +3245,7 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                                     # Layer1 LIVE: feed price triggers _process_transmit + dedups poll;
                                     # gate = один спавн на (oracle,bn) — transmit виден в неск. суб-кадрах
                                     _stage_feed(_sym, "detect")   # П.7: транзит опознан НАШИМ
+                                    _PRED_WATCH["pushes"] += 1   # сторож живости predict
                                     log.info("DIAG feed-spawn mkt=%s oracle=%s bn=%s px_hint=%d",
                                              _sym, _oracle[:10], bn, _dec[1] * _scale)
                                     threading.Thread(target=_process_transmit,

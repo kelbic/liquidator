@@ -39,6 +39,20 @@ _DET_FLOOR = float(os.environ.get("SPEC_FIRE_DET_NOISE_FLOOR", "0.0005"))
 _DET_TTL = float(os.environ.get("SPEC_FIRE_DET_TTL_SEC", "180"))
 _DET_DIST: dict = {}                     # label -> (min_flip_dist, wall_ts)
 
+# ЖИВОСТЬ ВЕРХА СИГНАЛЬНОГО ТРАКТА (после самодедлока 23-26.08: predict молчал 2.5 суток,
+# окна не армились, и НИКТО не звенел — «ошибок нет» читалось как «всё хорошо»). Метка
+# ставится на КАЖДОМ событии движка; судит её hot-петля, сопоставляя с пушами оракула.
+_LAST_EVENT_TS = [0.0]
+
+
+def _note_event_ts():
+    _LAST_EVENT_TS[0] = time.time()
+
+
+def last_event_ts():
+    """Время последнего события предиктора (0.0 = ни одного с запуска)."""
+    return _LAST_EVENT_TS[0] or None
+
 
 def note_det_dist(label, dist, now=None):
     try:
@@ -440,6 +454,7 @@ class PredictDriver:
         events += self.engine.tick(wall, exclude=stale)
         for ev in events:
             self.log(format_line(ev))
+            _note_event_ts()                   # живость верха сигнального тракта (см. ниже)
             if ev["event"] == "arm":
                 self.stats["arms"] += 1
             elif ev["event"] == "confirmed":
