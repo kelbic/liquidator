@@ -3392,7 +3392,18 @@ class SpecFireLive:
             ring = self.stats.setdefault("match_delta_ring", [])
             ring.extend(match_d)
             del ring[:-400]                       # кольцо ~400 последних значений
-            self._class_catch(bn, agg, t_tip, bool(match_d))
+            # Ключ CLASS-CATCH — ФАКТИЧЕСКИЙ агрегатор транзита (строка-адрес), а НЕ `agg`:
+            # тот приезжает НАБОРОМ watch-ног рынка (frozenset) для проверки владения, и в
+            # ключе кольца давал «agg=frozenset(…)» + промах lookup'а по _TRANSIT_TIPS
+            # (там ключ — str(agg).lower() из note_transit_tip). Отказ -> None (ключ "?").
+            _t_agg = None
+            try:
+                _st, _tr = ci.transit_report(bn, agg=agg)     # из памяти индекса, без сети
+                if _tr:
+                    _t_agg = _tr.get("agg")
+            except Exception:                                # noqa: BLE001
+                pass
+            self._class_catch(bn, _t_agg, t_tip, bool(match_d))
             shown = [r for r in rows if (-3 <= r[2] <= 25) or r[4]][:60]
             body = " ".join("%s:%+d@%d%s" % (h[:10], d, tip, "*" if m else "")
                             for h, _i, d, tip, m in shown)
@@ -3462,6 +3473,13 @@ class SpecFireLive:
             st_map = getattr(self, "_ccl", None)
             if st_map is None:
                 st_map = self._ccl = {}
+            # Ключ — ИМЯ агрегатора. Fail-safe 26.08: если приехал НАБОР ног рынка
+            # (frozenset/set/list — так его несёт `agg` в _pos_table), берём ДЕТЕРМИНИРОВАННО
+            # первый по сортировке, а не repr множества: иначе ключ читался «frozenset(…)» и
+            # промахивался мимо _TRANSIT_TIPS (там ключ str(agg).lower()).
+            if isinstance(agg, (frozenset, set, list, tuple)):
+                _cands = sorted(str(a).lower() for a in agg if a)
+                agg = _cands[0] if _cands else None
             key = str(agg).lower() if agg else "?"
             st = st_map.get(key)
             if st is not None and st[0] == t_tip and st[3]:

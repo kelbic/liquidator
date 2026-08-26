@@ -7,6 +7,7 @@ class_catch_ring, непойманные смены — счётчик class_cat
 иначе выборка цензурирована (p50 кольца «улучшается» ровно тогда, когда ловим меньше).
 """
 import sys
+import threading
 import time
 import pathlib as _pl
 
@@ -98,9 +99,34 @@ o2._class_catch(103, AGG, 1, True)                   # _log бросает на 
 check("отказ журнала глотается (прибор сбоку)", True)
 
 # ---- 8. Гарды дрейфа боевого потребителя ----
+# ---- ПОЧИНКА 26.08: ключ = ИМЯ агрегатора транзита, не frozenset владельцев ----
+o9 = sfl.SpecFireLive.__new__(sfl.SpecFireLive)
+o9.stats = {}
+o9._lock = threading.Lock()
+logs9 = []
+o9._log = logs9.append
+o9._now = lambda: 3000.0
+o9._class_catch(200, frozenset({"0xaaa", "0xbbb"}), 1_775_000, False)
+o9._class_catch(203, frozenset({"0xaaa", "0xbbb"}), 1_775_000, True)
+check("frozenset в ключе больше не появляется в строке (регресс 26.08)",
+      all("frozenset" not in l for l in logs9), logs9)
+logs9.clear()
+o9b = sfl.SpecFireLive.__new__(sfl.SpecFireLive)
+o9b.stats = {}; o9b._lock = threading.Lock(); o9b._log = logs9.append; o9b._now = lambda: 3000.0
+o9b._class_catch(200, "0x92A7c3a5", 1_775_000, False)
+o9b._class_catch(203, "0x92A7c3a5", 1_775_000, True)
+check("строка несёт ИМЯ агрегатора (нижним регистром, как ключ кольца)",
+      any("agg=0x92a7c3a5" in l for l in logs9), logs9)
+_S2 = open("chain/spec_fire_live.py").read()
+check("вызов берёт agg ИЗ ТРАНЗИТА, а не набор владельцев",
+      "self._class_catch(bn, _t_agg, t_tip, bool(match_d))" in _S2
+      and '_t_agg = _tr.get("agg")' in _S2)
+
 _SRC = open("chain/spec_fire_live.py").read()
-check("вызов стоит в _pos_table после копилки match",
-      "self._class_catch(bn, agg, t_tip, bool(match_d))" in _SRC)
+check("вызов стоит в _pos_table после копилки match (с agg транзита)",
+      "self._class_catch(bn, _t_agg, t_tip, bool(match_d))" in _SRC)
+check("fail-safe нормализации набора в приборе (детерминированный первый)",
+      "isinstance(agg, (frozenset, set, list, tuple))" in _SRC and "sorted(str(a).lower()" in _SRC)
 check("кольцо лагов капировано (~100)", "del cring[:-100]" in _SRC)
 check("литерал class_catch_lag= в строке (приёмка грепает каноничное имя)",
       "class_catch_lag=%d" in _SRC)
