@@ -3421,7 +3421,15 @@ class SpecFireLive:
                 rep = ci.our_position_report(bn, agg=agg)
                 if rep:
                     self._log("SPECFIRE %s" % rep)
-                    self._pos_alert(rep, blind)
+                    # ГЕЙТ ЖЕРТВЫ для TG: была ли в блоке РЕАЛЬНАЯ ликвидация (наша/чужая).
+                    # Источник — факты индекса того же блока (без сети).
+                    _victim = None
+                    try:
+                        _bf = ci.block_facts(bn) or {}
+                        _victim = bool(_bf.get("liquidate"))
+                    except Exception:                        # noqa: BLE001
+                        _victim = None
+                    self._pos_alert(rep, blind, victim=_victim)
                     # П.1/П.2 (kelbic 21.08): пересечение ПО ХЭШАМ + метрика «FCFS-полоса
                     # на верном классе». Тред индекса (не recv-петля); лог КАПИРОВАН —
                     # только delta в [-3..25] или match (урок «строка-на-пробу = вторая
@@ -3615,9 +3623,20 @@ class SpecFireLive:
     # «судить не о чем» (нет транзита) — тоже. Кулдаун свой и явный: судимые блоки идут
     # пачкой ~10 за эпизод, человеку нужна ПЕРВАЯ строка эпизода. Победа кулдаун ПРОБИВАЕТ
     # всегда. Откат: SPEC_FIRE_RACE_ALERT=0 (снимает ПРИБОР, денежный путь не трогает).
-    def _pos_alert(self, rep, blind):
+    def _pos_alert(self, rep, blind, victim=None):
+        """Вердикт гонки — В TG. ГЕЙТ ЖЕРТВЫ (kelbic 26.08): человеку идут только НАСТОЯЩИЕ
+        гонки — блоки, где ликвидация ДЕЙСТВИТЕЛЬНО состоялась (наша или чужая). Фантомные
+        транзиты (жертвы нет, приза не существовало) — их подавляющее большинство, и они
+        приходили каждые 15 мин — остаются в ЖУРНАЛЕ, но человека не будят: канон «алерты
+        только там, где человек действует». victim=None -> сигнала нет -> НЕ шлём (незнание
+        закрывает алерт, а не открывает). Откат: SPEC_FIRE_RACE_ALERT_PHANTOM=1."""
         try:
             if blind or not rep or "транзит idx=" not in rep:
+                return
+            if not victim and os.environ.get(
+                    "SPEC_FIRE_RACE_ALERT_PHANTOM", "0").lower() not in ("1", "true", "yes"):
+                self.stats["race_alert_phantom_skips"] = \
+                    self.stats.get("race_alert_phantom_skips", 0) + 1
                 return
             if os.environ.get("SPEC_FIRE_RACE_ALERT", "1").lower() in ("0", "false", "no"):
                 return

@@ -19,15 +19,22 @@ NO_TRANSIT = ("ПОЗИЦИИ blk=50191661 [суд: владелец извес�
 def _bare(alert=None):
     o = SpecFireLive.__new__(SpecFireLive)
     o._alert = alert
+    o.stats = {}
     return o
+
+
+def _alert(o, rep, blind=False, victim=True):
+    """Хелпер: по умолчанию НАСТОЯЩАЯ гонка (жертва есть) — прежняя семантика стендов.
+    Гейт жертвы (kelbic 26.08) проверяется отдельным тестом ниже."""
+    return o._pos_alert(rep, blind=blind, victim=victim)
 
 
 class RaceAlertTest(unittest.TestCase):
     def test_first_verdict_alerts_then_cooldown(self):
         sent = []
         o = _bare(lambda t, k: sent.append((t, k)))
-        o._pos_alert(VERDICT, blind=False)
-        o._pos_alert(VERDICT, blind=False)          # тот же эпизод — кулдаун глотает
+        _alert(o, VERDICT, blind=False)
+        _alert(o, VERDICT, blind=False)          # тот же эпизод — кулдаун глотает
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][1], "race-verdict")
         self.assertIn("транзит idx=3068", sent[0][0])
@@ -35,15 +42,15 @@ class RaceAlertTest(unittest.TestCase):
     def test_win_pierces_cooldown(self):
         sent = []
         o = _bare(lambda t, k: sent.append((t, k)))
-        o._pos_alert(VERDICT, blind=False)
-        o._pos_alert(WIN, blind=False)              # победа — сквозь кулдаун
+        _alert(o, VERDICT, blind=False)
+        _alert(o, WIN, blind=False)              # победа — сквозь кулдаун
         self.assertEqual([k for _, k in sent], ["race-verdict", "race-win"])
 
     def test_blind_and_no_transit_silent(self):
         sent = []
         o = _bare(lambda t, k: sent.append((t, k)))
-        o._pos_alert(VERDICT, blind=True)
-        o._pos_alert(NO_TRANSIT, blind=False)
+        _alert(o, VERDICT, blind=True)
+        _alert(o, NO_TRANSIT, blind=False)
         o._pos_alert(None, blind=False)
         self.assertEqual(sent, [])
 
@@ -54,13 +61,49 @@ class RaceAlertTest(unittest.TestCase):
         sent = []
         o = _bare(lambda t, k: sent.append((t, k)))
         with mock.patch.dict(os.environ, {"SPEC_FIRE_RACE_ALERT": "0"}):
-            o._pos_alert(VERDICT, blind=False)
+            _alert(o, VERDICT, blind=False)
         self.assertEqual(sent, [])
 
     def test_channel_exception_swallowed(self):
         def _boom(t, k):
             raise RuntimeError("канал упал")
         _bare(alert=_boom)._pos_alert(VERDICT, blind=False)  # не летит наверх
+
+
+
+class VictimGateTest(unittest.TestCase):
+    """ГЕЙТ ЖЕРТВЫ (kelbic 26.08): человека будят только НАСТОЯЩИЕ гонки."""
+
+    def test_phantom_silent(self):
+        sent = []
+        o = _bare(lambda t, k: sent.append((t, k)))
+        o._pos_alert(VERDICT, blind=False, victim=False)      # ликвидации в блоке НЕ было
+        self.assertEqual(sent, [])
+        self.assertGreaterEqual(o.stats.get("race_alert_phantom_skips", 0), 1)
+
+    def test_unknown_victim_silent(self):
+        sent = []
+        o = _bare(lambda t, k: sent.append((t, k)))
+        o._pos_alert(VERDICT, blind=False, victim=None)       # сигнала нет -> молчим
+        self.assertEqual(sent, [])
+
+    def test_real_race_alerts(self):
+        sent = []
+        o = _bare(lambda t, k: sent.append((t, k)))
+        o._pos_alert(VERDICT, blind=False, victim=True)
+        self.assertEqual([k for _, k in sent], ["race-verdict"])
+
+    def test_win_alerts_with_victim(self):
+        sent = []
+        o = _bare(lambda t, k: sent.append((t, k)))
+        o._pos_alert(WIN, blind=False, victim=True)
+        self.assertEqual([k for _, k in sent], ["race-win"])
+
+    def test_wiring_and_rollback(self):
+        src = open("chain/spec_fire_live.py").read()
+        self.assertIn("_bf = ci.block_facts(bn) or {}", src)   # факты индекса, без сети
+        self.assertIn('_victim = bool(_bf.get("liquidate"))', src)
+        self.assertIn('SPEC_FIRE_RACE_ALERT_PHANTOM", "0"', src)   # откат одним env
 
 
 if __name__ == "__main__":
