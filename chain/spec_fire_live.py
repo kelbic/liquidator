@@ -4052,9 +4052,13 @@ class SpecFireLive:
             pass
         _det_exempt = bool(thr < _thr_uni and (SPEC_FIRE_DET_PRIZE_USD <= 0
                                                or _det_prize >= SPEC_FIRE_DET_PRIZE_USD))
-        _det_state = "det=%s приз=$%.0f кап=%s" % (
-            "да" if thr < _thr_uni else "нет", _det_prize,
-            "снят" if _det_exempt else "малый")
+        # 26.08 (DOGE probes=120 при «кап=малый»): подпись капа здесь ВРАЛА — она считалась
+        # только от детонатора, а fat_mode выставляется ПОЗЖЕ, внутри петли, и кап реально
+        # был жирным (600). Самоотчёт «кап=малый» против вычисленного режима — тот же класс,
+        # что вшитая строка «это НЕ пиковый час». det/приз замораживаются на арме (гейт
+        # kelbic: состояние не мерцает с ценой), а подпись КАПА уезжает в close-строку, где
+        # финальный fat_mode известен и кап вычисляется, а не постулируется.
+        _det_state = "det=%s приз=$%.0f" % ("да" if thr < _thr_uni else "нет", _det_prize)
         _det_next = self._now() + 5.0            # цели дышат — порог перечитывается каждые 5с
         band = dev * SPEC_FIRE_OWED_BAND
         probes = 0
@@ -4468,7 +4472,15 @@ class SpecFireLive:
                       "engine=%s collector=%s index=%s план_окна=%s окно_позиции=%s stats=%s" % (
                           feed, probes,
                           ("%.1fс" % _g[max(0, int(len(_g) * 0.95) - 1)]) if _g else "—",
-                          _det_state, _pos_s, _cad, _rcpt_s, _tier_s,
+                          # кап ВЫЧИСЛЯЕТСЯ по финальному состоянию окна, не постулируется
+                          # на арме (см. комментарий у _det_state): fat_mode известен только
+                          # здесь. Режим и число — ИЗ САМОЙ _window_cap с теми же аргументами,
+                          # что и петля: подпись не может разъехаться с гейтом по построению.
+                          "%s кап=%s(%d)" % (_det_state,
+                                             ("жирный" if fat_mode else
+                                              "снят" if _det_exempt else "малый"),
+                                             _window_cap(fat_mode, _det_exempt)),
+                          _pos_s, _cad, _rcpt_s, _tier_s,
                           _fs, _us, _mm, _rs, _ifs, _pdry or "—", _pspill or "—", _prej or "—",
                           _purg or "—", _md_str,
                           self.stats.get("class_between_slots", 0),
