@@ -107,8 +107,21 @@ ENGINE_HOLD_NEAR_SEC = float(os.environ.get("SPEC_FIRE_ENGINE_HOLD_NEAR_SEC", "1
 # Жетоны залпа держим ОТДЕЛЬНО от ведра. Ведро КЛАМПИТ остаток к burst-капу
 # (`min(burst, ...)`), и в фазе удержания кап равен 2 — добавленные в ведро жетоны залпа были
 # бы срезаны в тот же миг. Отдельный счётчик клампу не подвержен и тратится первым.
-ENGINE_TRANSIT_BURST = float(os.environ.get("SPEC_FIRE_ENGINE_TRANSIT_BURST", "24"))
-ENGINE_TRANSIT_BURST_MAX = float(os.environ.get("SPEC_FIRE_ENGINE_TRANSIT_BURST_MAX", "40"))
+# 27.08 РАЗМЕР ЗАЛПА ПОДНЯТ 24 -> 500. Механизм работал (687 залпов за 8 суток), но был зажат
+# в 58 раз меньше противника: замер каскадного блока 50483683 (10 призов) — у победителя 1 393 tx
+# и 1 043 ноги (139 на флешблок, охват idx 21..4553, треть блока), у нас 8 tx и 5 долетевших ног
+# (0.8 на флешблок) при 220 ногах в наличии. Прежний дефолт 24 стоял «по Правилу денег», но
+# ЦЕНА ПРОБЫ $0.00115-0.00130 (76 214 газа × (base 5M + tip 1.0-1.8M), ETH $2507): залп 500 =
+# $0.57-0.65, при 86 залпах/сутки = $49-56/сутки ПРОТИВ НЫНЕШНИХ $271 размазкой. То есть подъём
+# делает огонь ВПЯТЕРО ДЕШЕВЛЕ и в 60 раз плотнее в решающем блоке.
+# Цепочка ограничителей проверена: пейсер 110/с (220 за блок), движок 200/с (400 за блок),
+# ног 220 — все имеют запас; связывал именно залп.
+# СУТОЧНЫЙ ПРЕДОХРАНИТЕЛЬ: BURST_DAY_MAX проб в залпах за UTC-сутки; при исчерпании залп
+# падает к прежним 24 (не к нулю: механизм не должен умирать молча). Откат ручкой в 24.
+ENGINE_TRANSIT_BURST = float(os.environ.get("SPEC_FIRE_ENGINE_TRANSIT_BURST", "500"))
+ENGINE_TRANSIT_BURST_MAX = float(os.environ.get("SPEC_FIRE_ENGINE_TRANSIT_BURST_MAX", "600"))
+ENGINE_BURST_DAY_MAX = float(os.environ.get("SPEC_FIRE_ENGINE_BURST_DAY_MAX", "60000"))
+ENGINE_BURST_FALLBACK = float(os.environ.get("SPEC_FIRE_ENGINE_BURST_FALLBACK", "24"))
 # Пополнение склада: ниже какой глубины лестницу дотачивать и как часто смотреть.
 #
 # #112 (14.08): ПОРОГ ПОДНЯТ 12 -> 39, полоса гистерезиса [39,40] СУЖЕНА почти в ноль.
@@ -537,8 +550,30 @@ class FireEngine:
         if add <= 0:
             return 0.0
         with self._lock:
+            # Суточный предохранитель (27.08, вместе с подъёмом 24 -> 500): считаем ВЫДАННЫЕ
+            # жетоны залпа за UTC-сутки. Исчерпан -> залп падает к прежнему размеру, а не к нулю:
+            # молча умерший механизм хуже дорогого. Счётчик и порог печатаются в лог при переходе,
+            # иначе мы слепы к тому, что живём на фолбэке.
+            _day = int(self._now() // 86400)
+            if getattr(self, "_burst_day", None) != _day:
+                self._burst_day, self._burst_day_sent = _day, 0.0
+            if ENGINE_BURST_DAY_MAX > 0 and self._burst_day_sent >= ENGINE_BURST_DAY_MAX:
+                if not getattr(self, "_burst_day_warned", False):
+                    self._burst_day_warned = True
+                    # _log у движка может быть None (боевой конструктор его не требует) —
+                    # молчаливый лог лучше падения НА ПУТИ ОГНЯ. Поймано стендом 27.08.
+                    _lg = getattr(self, "_log", None)
+                    if callable(_lg):
+                        _lg("FIRE движок: суточный бюджет залпа исчерпан (%.0f >= %.0f) — "
+                            "залп падает к %.0f до UTC-полуночи"
+                            % (self._burst_day_sent, ENGINE_BURST_DAY_MAX, ENGINE_BURST_FALLBACK))
+                add = ENGINE_BURST_FALLBACK
+            else:
+                self._burst_day_warned = False
+            self._burst_day_sent = getattr(self, "_burst_day_sent", 0.0) + add
             self._burst_tokens = min(ENGINE_TRANSIT_BURST_MAX, self._burst_tokens + add)
             self.stats["transit_bursts"] = self.stats.get("transit_bursts", 0) + 1
+            self.stats["burst_day_sent"] = self._burst_day_sent
             return self._burst_tokens
 
     def _take_token(self) -> bool:
