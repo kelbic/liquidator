@@ -97,26 +97,47 @@ _SWAP_FAIL: dict = {}
 HR_SWAPFAIL_TTL_SEC = float(os.environ.get("HR_SWAPFAIL_TTL_SEC", "300"))
 
 
+HR_SWAPFAIL_BACKOFF_MAX = float(os.environ.get("HR_SWAPFAIL_BACKOFF_MAX", "14400"))   # 4 часа
+
+
 def note_swap_fail(market_id, borrower, why="", now=None):
     """Запомнить отказ СВОПНОЙ стороны по цели (SwapFailed / CannotRepay / нет глубины).
-    Зовётся из горячего пути ПОСЛЕ симуляции; учёт сбоку, огня не касается."""
+    Зовётся и из симуляции, и из ветки РЕАЛЬНОГО реверта; учёт сбоку, огня не касается.
+
+    ОТСРОЧКА РАСТЁТ НА ПОВТОРАХ. Плоский TTL 300с означал бы, что структурно непродаваемый залог
+    простреливается каждые пять минут (~$1.2/час газа на ровном месте). Каждый следующий отказ по
+    ТОЙ ЖЕ цели удваивает окно молчания до HR_SWAPFAIL_BACKOFF_MAX. Счётчик забывается, когда
+    прошлое окно истекло с запасом — цель, которая починилась, не наказана навсегда.
+    """
     now = time.time() if now is None else now
+    k = (str(market_id).lower(), str(borrower).lower())
     with _LOCK:
-        _SWAP_FAIL[(str(market_id).lower(), str(borrower).lower())] = (now, str(why)[:40])
-        for k, (ts, _w) in list(_SWAP_FAIL.items()):
-            if now - ts > HR_SWAPFAIL_TTL_SEC * 4:
-                del _SWAP_FAIL[k]
+        prev = _SWAP_FAIL.get(k)
+        streak = 1
+        if prev is not None and len(prev) >= 3:
+            _ts, _w, _n = prev[0], prev[1], prev[2]
+            span = HR_SWAPFAIL_TTL_SEC * (2 ** (_n - 1))
+            if now - _ts <= min(span, HR_SWAPFAIL_BACKOFF_MAX) * 2:
+                streak = _n + 1
+        _SWAP_FAIL[k] = (now, str(why)[:40], streak)
+        _keep = min(HR_SWAPFAIL_BACKOFF_MAX, HR_SWAPFAIL_TTL_SEC * 4)
+        for kk, v in list(_SWAP_FAIL.items()):
+            if now - v[0] > max(_keep, HR_SWAPFAIL_BACKOFF_MAX) * 2:
+                del _SWAP_FAIL[kk]
 
 
 def swap_fail_fresh(market_id, borrower, now=None):
-    """(возраст, причина) свежего отказа свопа по цели либо None. Чистая (под стенд)."""
+    """(возраст, причина) свежего отказа свопа по цели либо None. Окно растёт с числом повторов
+    (см. note_swap_fail). Чистая (под стенд)."""
     now = time.time() if now is None else now
     with _LOCK:
         v = _SWAP_FAIL.get((str(market_id).lower(), str(borrower).lower()))
     if v is None:
         return None
     age = now - v[0]
-    return (age, v[1]) if age <= HR_SWAPFAIL_TTL_SEC else None
+    streak = v[2] if len(v) >= 3 else 1
+    span = min(HR_SWAPFAIL_TTL_SEC * (2 ** (streak - 1)), HR_SWAPFAIL_BACKOFF_MAX)
+    return (age, v[1]) if age <= span else None
 
 
 def classify(market_id, borrower, hf_est, prize_net_usd, data_age_s=0.0,

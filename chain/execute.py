@@ -4844,6 +4844,20 @@ def dispatch_liquidations(rpc, cfg, prepared: list, log=None, max_inflight: int 
                     row["revert_reason"] = reason
                     if log:
                         log.warning("liquidate revert %s/%s reason=%s tx=%s", mid[:10], borrower[:10], reason, h)
+                    # 27.08: РЕАЛЬНЫЙ реверт — сильнейшее свидетельство о сломанном выходе, сильнее
+                    # симуляции. Гейт HEALTHY-RACE учился ТОЛЬКО на sim-ревертах и поэтому дважды
+                    # пропустил один и тот же выстрел по 0xb3920b96/0xAA80d36B (16:15 и 18:38, оба
+                    # упали нашим CannotRepay 0x2206a00f, по $0.10 газа). Пишем и отсюда.
+                    # SwapFailed 0x81ceff30 и CannotRepay 0x2206a00f — обе про СВОП, не про здоровье.
+                    _rs = str(reason or "").lower()
+                    if "0x2206a00f" in _rs or "0x81ceff30" in _rs:
+                        try:
+                            from chain import healthy_race as _hr_note
+                            _hr_note.note_swap_fail(
+                                mid, borrower,
+                                "CannotRepay(tx)" if "0x2206a00f" in _rs else "SwapFailed(tx)")
+                        except Exception:                       # noqa: BLE001
+                            pass                                # учёт сбоку: не трогает огонь
                     _xr = _submit_xray(rpc, borrower, _blk, _txi, log, cfg=cfg,
                                        our_debt_usd=prep.get("debt_usd"))
                     row["xray"] = _xr

@@ -62,3 +62,45 @@ st, _ = hr.classify(MID, BOR, now=NOW + 5, **KW)
 assert st == "HEALTHY_RACE", "отказ по ЧУЖОЙ цели не должен глушить эту"
 print("UNIT_OK 5: память пер-цель — соседний заёмщик не задет")
 print("=== HR swapfail-гейт: 5/5 ===")
+
+# --- 6. РЕАЛЬНЫЙ РЕВЕРТ ТОЖЕ УЧИТ ГЕЙТ (27.08, второй инцидент) --------------------------
+# 16:15 и 18:38 — два выстрела по одной цели, оба упали нашим CannotRepay(0x2206a00f), по $0.10.
+# Первый фикс писал память ТОЛЬКО из симуляции, поэтому второй выстрел прошёл: сим в тот раз
+# не ревертил свопом, а исполненная tx — да. Реальный реверт сильнее симуляции и обязан учить.
+src_ex = open("chain/execute.py").read()
+i = src_ex.index('log.warning("liquidate revert %s/%s reason=%s tx=%s"')
+blk = src_ex[i:i + 1400]
+assert "0x2206a00f" in blk and "0x81ceff30" in blk and "note_swap_fail" in blk, \
+    "реальный реверт не учит гейт: тот же выстрел повторится"
+assert "except Exception" in blk, "запись обязана быть СБОКУ (бросок не трогает денежный путь)"
+print("UNIT_OK 6: реальный реверт (CannotRepay/SwapFailed) пишет память гейта")
+
+# поведенчески: после отметки из tx-ветки классификатор закрыт
+hr._SWAP_FAIL.clear(); hr._RECENT.clear()
+hr.note_swap_fail(MID, BOR, "CannotRepay(tx)", now=NOW)
+st, why = hr.classify(MID, BOR, now=NOW + 3, **KW)
+assert st == "SKIP" and "CannotRepay(tx)" in why, (st, why)
+print("UNIT_OK 7: отметка из tx-ветки закрывает HEALTHY_RACE — %s" % why)
+print("=== HR swapfail-гейт: 7/7 ===")
+
+# --- 8. ОТСРОЧКА РАСТЁТ НА ПОВТОРАХ ------------------------------------------------------
+# Плоские 300с = структурно непродаваемая цель простреливается каждые 5 минут (~$1.2/час газа).
+hr._SWAP_FAIL.clear(); hr._RECENT.clear()
+T = hr.HR_SWAPFAIL_TTL_SEC
+hr.note_swap_fail(MID, BOR, "CannotRepay(tx)", now=NOW)
+assert hr.swap_fail_fresh(MID, BOR, now=NOW + T - 1) is not None
+assert hr.swap_fail_fresh(MID, BOR, now=NOW + T + 1) is None, "первое окно = ровно TTL"
+hr.note_swap_fail(MID, BOR, "CannotRepay(tx)", now=NOW + T + 1)          # повтор
+assert hr.swap_fail_fresh(MID, BOR, now=NOW + T + 1 + 2 * T - 1) is not None, \
+    "второй отказ обязан УДВОИТЬ окно молчания"
+hr.note_swap_fail(MID, BOR, "CannotRepay(tx)", now=NOW + T + 1 + 2 * T + 1)
+assert hr.swap_fail_fresh(MID, BOR, now=NOW + T + 1 + 2 * T + 1 + 4 * T - 1) is not None, \
+    "третий отказ — вчетверо"
+# ПОЗИТИВНЫЙ КОНТРОЛЬ: цель, которая ПОЧИНИЛАСЬ, не наказана навсегда
+hr._SWAP_FAIL.clear()
+hr.note_swap_fail(MID, BOR, "SwapFailed", now=NOW)
+assert hr.swap_fail_fresh(MID, BOR, now=NOW + hr.HR_SWAPFAIL_BACKOFF_MAX + 1) is None, \
+    "отсрочка обязана иметь потолок — иначе одна осечка глушит цель навсегда"
+print("UNIT_OK 8: окно молчания удваивается на повторах (%.0f -> %.0f -> %.0f с), потолок %.0f с"
+      % (T, 2 * T, 4 * T, hr.HR_SWAPFAIL_BACKOFF_MAX))
+print("=== HR swapfail-гейт: 8/8 ===")
