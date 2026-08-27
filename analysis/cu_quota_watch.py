@@ -276,8 +276,19 @@ def history_cutoff(recs):
     return max(tops) if tops else None
 
 
-def quota_verdicts(recs, *, threshold, trail_sec, min_trail_sec, now=None, parked=None):
+def quota_verdicts(recs, *, threshold, trail_sec, min_trail_sec, now=None, parked=None,
+                   threshold_for=None):
     """ПРИГОВОР ПО КВОТЕ — интеграл, а не мгновенный темп.
+
+    ПОРОГ ПЕР-ХОСТОВЫЙ С 27.08 (`threshold_for(host) -> порог M CU/мес`, None -> общий).
+    Зачем: плоские 26M выведены из free-ведра 30M — это доля ведра, а не физическая величина.
+    Ключ A переведён владельцем на PAYG 27.08 ~11:00Z (ведро 1e10, INFRA-FACTS), и ветка темпа
+    продолжала бы звонить по нему КАЖДЫЙ ЧАС на 127M/мес против порога от ведра, которого у
+    этого ключа больше нет (первая такая тревога — 11:07:03Z, разобрана крон-триажем как
+    ложная по премиссе). Молчание тут НЕ слепота: у PAYG вопрос «доживёт ли ведро» не имеет
+    предмета. Вопрос «сколько это стоит» — ДРУГАЯ величина, у сторожа её знаменателя нет
+    (цена за 1M CU владельческая), поэтому она печатается в журнал отдельной строкой и
+    названа неизмеренной, а не подменяется CU-порогом.
 
     [(host, rate_M, covered_sec, cu_total)] по хвосту trail_sec: сумма ВСЕХ потраченных CU
     (вкл. бут) делить на покрытое время. Пока покрыто меньше min_trail_sec — НЕ СУДИМ ВОВСЕ
@@ -315,9 +326,30 @@ def quota_verdicts(recs, *, threshold, trail_sec, min_trail_sec, now=None, parke
             # нулём, а не оценён хвостом.
             continue
         rate = a["cu"] / a["sec"] * SEC_MONTH / 1e6
-        if rate >= threshold:
+        th = threshold
+        if threshold_for is not None:
+            try:
+                th = float(threshold_for(host) or threshold)
+            except Exception:
+                th = threshold
+        if rate >= th:
             out.append((host, rate, a["sec"], a["cu"]))
     return out
+
+
+def host_threshold(anchor, host, base_threshold, *, base_quota_cu=None):
+    """Порог темпа ХОСТА = доля его ведра, а не плоское число из free-тарифа.
+
+    base_threshold относится к базовому ведру (QUOTA_M=30M): 26M/мес — это «ведро не доживает
+    до сброса». Величина смысл сохраняет только вместе со СВОИМ знаменателем, поэтому при
+    другом ведре порог едет пропорционально. Для PAYG-ведра (1e10) порог уходит в бесконечность
+    — и это ВЕРНЫЙ ответ на вопрос ветки темпа, см. quota_verdicts.
+    """
+    base = float(base_quota_cu or (QUOTA_M * 1e6))
+    q = _host_quota(anchor, host)
+    if base <= 0:
+        return base_threshold
+    return base_threshold * (q / base)
 
 
 def trail_summary(recs, *, trail_sec, now=None):
@@ -1123,8 +1155,24 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
     # по темпу.
     _cands = set((load_anchor(anchor_path).get("hosts") or {})) | set(trail)
     parked = parked_hosts(recs, _cands)
+    _anchor_th = load_anchor(anchor_path)
     alarms = quota_verdicts(recs, threshold=threshold, trail_sec=trail_sec,
-                            min_trail_sec=min_trail_sec, now=now_s, parked=parked)
+                            min_trail_sec=min_trail_sec, now=now_s, parked=parked,
+                            threshold_for=lambda h: host_threshold(_anchor_th, h, threshold))
+    # СТРОКА ЖУРНАЛА ПО ХОСТАМ, КОТОРЫЕ ЗАМОЛЧАЛИ ИМЕННО ПОРОГОМ ВЕДРА. Без неё правка
+    # «пер-хостовый порог» меняла бы ложный звон на тихую слепоту — а расход на PAYG стоит
+    # ДЕНЕГ. Знаменателя ($/1M CU) у сторожа нет: он владельческий, поэтому величина
+    # называется неизмеренной, а не выдумывается.
+    for _h, (_r, _cov, _since) in sorted(trail.items()):
+        if _h in parked or _cov < min_trail_sec:
+            continue
+        _th_h = host_threshold(_anchor_th, _h, threshold)
+        if _r >= threshold and _r < _th_h:
+            out("cu-quota: %s темп %.1fM/мес ВЫШЕ базового порога %.0fM, но его ведро "
+                "%.0fM (пер-хостовый порог %.0fM) — по ВЕДРУ вопроса нет. ПРЕДЕЛ ЭТОГО "
+                "КЛЮЧА — ДЕНЬГИ, и он сторожем НЕ ИЗМЕРЯЕТСЯ: цена за 1M CU владельческая "
+                "(Alchemy Manage). Пока её нет в якоре, расход в $ здесь НЕ ПОСЧИТАН."
+                % (_h, _r, threshold, _host_quota(_anchor_th, _h) / 1e6, _th_h))
     # ОСТАТОК — вторая, независимая величина (ПРЕДЕЛ 3). Темп хвоста отдаём ВМЕСТЕ С ЕГО
     # ОКНОМ: без окна нельзя понять, лежит ли замер после якоря, а без этого приговор о
     # будущем строится на конфигурации, которой уже нет (разбор 21.08, см. balance_verdicts).
@@ -1218,7 +1266,10 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
                 "границах" % (head, fd["deficit_lo"] / 1e6, fd["deficit_hi"] / 1e6))
 
     for host, rate, sec, cu_total in alarms:
-        days = QUOTA_M / rate * 30.0 if rate > 0 else 0.0
+        # ВЕДРО — ХОСТА, А НЕ ПЛОСКИЕ 30M (27.08). Прежняя строка делила на QUOTA_M даже
+        # у ключа с чужим ведром: в тревоге 11:07:03Z по #3133 (PAYG, ведро 1e10) шапка
+        # напечатала «~7 сут» от ведра, которого у ключа нет.
+        days = (_host_quota(_anchor_th, host) / 1e6) / rate * 30.0 if rate > 0 else 0.0
         # ПРЕДЕЛ 3 ЕДЕТ В САМУ ТРЕВОГУ (27.08, крон-триаж). `days` выше считается от ПОЛНОГО
         # ведра (QUOTA_M/rate) — это ровно тот «скорость против скорости», который шапка файла
         # объявляет закрытым: 21.08 #5735 шёл 27M/мес, сторож писал «~33 сут», а ведро кончалось
