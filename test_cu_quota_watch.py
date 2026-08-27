@@ -7,6 +7,7 @@
 """
 import calendar
 import json
+import re
 import os
 import sys
 import tempfile
@@ -876,6 +877,70 @@ check("выросшее окно СУДИТ (ступень видна), огр�
 check("трёхэлементный burn_fresh принят без падения (обратная совместимость)",
       w.balance_verdicts(_anc_g, _led_g, _tail_g, burn_span=_span_g, burn_since=_since_g,
                          burn_fresh={C: (3.0e6, 2 * HOUR, _as_of_g)}, now=_M) != [], "")
+
+# ================== 40. ОСТАТОК В ТЕВОГЕ ПО ТЕМПУ — ДВА КАНДИДАТА (27.08) ==================
+# Разбор 27.08 04:2xZ (крон-триаж тревоги #3133). Строка ОСТАТКА, добавленная 9e4a93f,
+# делила ведро на ХВОСТОВОЙ темп и объявляла результат связывающей величиной («~2.9 сут до
+# нуля»), а строка РЕЖИМ той же тревоги двумя абзацами ниже называла этот хвост протухшим
+# («всплеск НИЖЕ хвоста: разгон, похоже, УЖЕ КОНЧИЛСЯ»). Замер: хвост 24.3ч = 146.5M/мес
+# распадался на 243.3M до рестарта 26.08 18:10:59 и 27.6M после; при остатке 14.28M и 4.83
+# сут до сброса «2.9 сут» читалось как дыра, а живой темп давал 15.5 сут.
+sent.clear()
+hp_two = os.path.join(_tmp, "twocand", "h.jsonl")
+os.makedirs(os.path.dirname(hp_two), exist_ok=True)
+_fresh_hist(147.0, path=hp_two)                       # мёртвый хвост, как в тревоге 04:07
+# ЯКОРЬ — рядом с историей (правило run(): все файлы прогона из history_path).
+open(os.path.join(os.path.dirname(hp_two), "cu-quota.anchor.json"), "w",
+     encoding="utf-8").write(json.dumps(
+         {"quota_cu": 30e6, "reset": "calendar",
+          "hosts": {C: {"mtd_cu": 15.7e6, "as_of": NOW - HOUR,
+                        "as_of_iso": "2026-08-26T18:57:52Z", "source": "фикстура"}}},
+         ensure_ascii=False))
+# свежий час 30M: НИЖЕ 0.67*хвоста (приговор не снимается — условие (3) не выполнено,
+# 30 >= порога 26), но втрое ниже хвоста. Ровно вход тревоги 27.08 04:07Z.
+w.run(fetch=lambda: _journal(C, [30.0] * 30, pid=9), notify_fn=_nf, out=lambda *_: None,
+      now=NOW, history_path=hp_two)
+two = [x for x in sent if x[2] == "cu-quota:%s" % C]
+check("всплеск ниже хвоста, но НАД порогом -> тревога всё ещё звонит (условие (3) цело)",
+      len(two) == 1, [x[2] for x in sent])
+if two:
+    t = two[0][3]
+    check("...ОСТАТОК везёт ОБА кандидата срока, а не один",
+          "ДВА КАНДИДАТА СРОКА ДО НУЛЯ" in t and "по ХВОСТУ" in t and "по СВЕЖЕМУ ЧАСУ" in t,
+          t[:400])
+    check("...и рядом ГОРИЗОНТ, иначе «N сут до нуля» не с чем сравнить",
+          "горизонт до РАННЕГО кандидата сброса" in t, t[:400])
+    # КРАСНЫЙ-НА-БАЗЕ: прежний текст объявлял ОДИН (хвостовой) кандидат связывающим.
+    check("...прежняя формулировка «при ЭТОМ темпе» из тревоги УШЛА (краснеет на базе)",
+          "при ЭТОМ темпе" not in t, t[:400])
+    # число ХВОСТА в строке ОСТАТКА обязано совпасть с числом ШАПКИ (одна тревога — один
+    # хвост; расхождение означало бы, что строки считают разными величинами)
+    _hd = re.search(r"жжёт (\d+)M CU/мес", t)
+    check("...оба числа названы явно, и хвост в ОСТАТКЕ = хвост в шапке",
+          bool(_hd) and ("по ХВОСТУ %sM/мес" % _hd.group(1)) in t
+          and "по СВЕЖЕМУ ЧАСУ (ex-boot) 30M/мес" in t, t[:500])
+# НЕГАТИВНЫЙ КОНТРОЛЬ ТОЙ ЖЕ ПОЛОВИНЫ: когда всплеск СОШЁЛСЯ с хвостом, второго кандидата
+# нет и текст обязан вернуться к одному числу — иначе новая строка кричит всегда.
+sent.clear()
+hp_one = os.path.join(_tmp, "onecand", "h.jsonl")
+os.makedirs(os.path.dirname(hp_one), exist_ok=True)
+_fresh_hist(31.0, path=hp_one)
+open(os.path.join(os.path.dirname(hp_one), "cu-quota.anchor.json"), "w",
+     encoding="utf-8").write(json.dumps(
+         {"quota_cu": 30e6, "reset": "calendar",
+          "hosts": {C: {"mtd_cu": 15.7e6, "as_of": NOW - HOUR,
+                        "as_of_iso": "2026-08-26T18:57:52Z", "source": "фикстура"}}},
+         ensure_ascii=False))
+w.run(fetch=lambda: _journal(C, [31.0] * 30, pid=9), notify_fn=_nf, out=lambda *_: None,
+      now=NOW, history_path=hp_one)
+one = [x for x in sent if x[2] == "cu-quota:%s" % C]
+check("...а при сошедшихся всплеске и хвосте — ОДИН кандидат и прежняя формулировка",
+      len(one) == 1 and "ДВА КАНДИДАТА" not in one[0][3]
+      and "при ЭТОМ темпе" in one[0][3], [x[3][:300] for x in one])
+check("...и он честно говорит, что второго кандидата нет (не молчит об этом)",
+      len(one) == 1 and "второго кандидата нет" in one[0][3],
+      [x[3][:300] for x in one])
+
 
 print("\n%s" % ("FAIL: %d" % len(FAILS) if FAILS
                 else "OK: сторож квоты — парс/всплеск/ИНТЕГРАЛ/ОСТАТОК/дедуп/слепота/самоконтроль"))
