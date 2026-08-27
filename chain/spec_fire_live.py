@@ -714,6 +714,10 @@ SPEC_FIRE_DET_WIN_CAP_MIN = int(os.environ.get("SPEC_FIRE_DET_WIN_CAP_MIN", "6")
 # Откат без кода: SPEC_FIRE_DIST_MARGIN_DEVS=1e9 / SPEC_FIRE_ARM_MAX_DIST=1e9.
 # HF цели неизвестен -> fail-open.
 SPEC_FIRE_DIST_MARGIN_DEVS = float(os.environ.get("SPEC_FIRE_DIST_MARGIN_DEVS", "2.0"))
+# 27.08 НЕДОСТАЮЩИЙ КУСОК: арм отбирает цели по ОЖИДАЕМОМУ ходу (|ret| + MARGIN x dev), а не по
+# статическому потолку, и берёт ВЕСЬ флип-набор, а не top-1. Откат SPEC_FIRE_FLIP_SET=0.
+SPEC_FIRE_FLIP_SET = os.environ.get("SPEC_FIRE_FLIP_SET", "1").lower() not in ("0", "off", "false", "no")
+SPEC_FIRE_FLIP_SET_K = int(os.environ.get("SPEC_FIRE_FLIP_SET_K", "8"))   # доска держит до 8 целей
 SPEC_FIRE_ARM_MAX_DIST = float(os.environ.get("SPEC_FIRE_ARM_MAX_DIST", "0.03"))
 # 27.08: пол досягаемости у перехвата доски детонатором — во сколько p99-толчков фида
 # укладывается срок жизни доски. 0 = откат к прежнему поведению (перехват без пола).
@@ -1342,6 +1346,58 @@ class SpecFireLive:
                      p99 * 100.0, SPEC_FIRE_DET_REACH_PUSHES))
         self.stats["board_det_out_of_reach"] = self.stats.get("board_det_out_of_reach", 0) + 1
         return False
+
+    def _flip_set(self, feed: str, direction: str, k: int = 1):
+        """КОГО ФЛИПНЕТ ОЖИДАЕМЫЙ ХОД — собрано из двух уже существующих деталей.
+
+        Деталь 1: `ret_fn(feed)` — текущая доходность к якорю, то есть УЖЕ ИДУЩЕЕ движение
+        оффчейн-цены. Предиктор даёт по нему упреждение 70-160с до пуша оракула (замер 27.08).
+        Деталь 2: `hf_by` — карта здоровья всех кандидатов, свежесть 75с (замер 27.08).
+
+        Досягаемость считается ТОЙ ЖЕ формулой, что уже стоит в FIRE-гейте ниже по пути:
+        |ret| + SPEC_FIRE_DIST_MARGIN_DEVS x dev. Разница только в МЕСТЕ применения: раньше ею
+        решали «стрелять или держать» ПОСЛЕ арма одной цели, теперь ею ОТБИРАЮТ, кого вообще
+        ставить на доску.
+
+        ЗАЧЕМ. Замер каскада 26.08: на доске стоял заёмщик на 2.27% при десяти победителях в
+        пределах 0.51%; арм брал ОДНУ цель в статическом окне 3%. Победитель в том же блоке взял
+        десять РАЗНЫХ жертв — то есть он заряжает не «самую жирную», а ВСЕХ, кого движение
+        перекрывает. Ни новых данных, ни новой сети для этого не нужно.
+
+        Незнание НЕ сужает окно: `ret_fn` молчит (None) либо dev неизвестна -> отдаём прежний
+        статический потолок бит-в-бит, потому что пустая доска = немой флот, а это дороже.
+        Потолок SPEC_FIRE_ARM_MAX_DIST остаётся ВЕРХНЕЙ границей: шире прежнего не берём никогда.
+        Откат: SPEC_FIRE_FLIP_SET=0.
+        """
+        cap = SPEC_FIRE_ARM_MAX_DIST
+        if not SPEC_FIRE_FLIP_SET:
+            return self._top_fat(feed, direction, max_dist=cap, k=k) + (cap, "off")
+        r = None
+        try:
+            r = self.ret_fn(feed) if self.ret_fn is not None else None
+        except Exception:                                # noqa: BLE001
+            r = None
+        try:
+            dev = float((self.dev_by or {}).get(feed) or 0.0)
+        except Exception:                                # noqa: BLE001
+            dev = 0.0
+        # НИЖНЯЯ ГРАНИЦА — ЗАМЕРЕННОЕ РАСПРЕДЕЛЕНИЕ ТОЛЧКОВ ЭТОГО ФИДА (push_scale). Без неё
+        # при малом текущем ходе набор пуст, доска не армится, и мы НЕ ГОТОВЫ к моменту, когда
+        # ход вырастет: арм идёт по цепи (setGroup+setHot) и мгновенным не бывает. Поймано
+        # соседним стендом 27.08 (фикстура 7b: цель на 2.00% при ходе 0.31%).
+        # Итог: берём ШИРЕ из двух — что покрывает ЭТОТ ход и что покрывает ТИПИЧНЫЙ толчок,
+        # но никогда шире прежнего статического потолка.
+        floor = 0.0
+        try:
+            floor = float(_push_scale.reach(feed) or 0.0)
+        except Exception:                                # noqa: BLE001
+            floor = 0.0
+        if r is None or dev <= 0.0:
+            reach = min(cap, floor) if floor > 0 else cap
+            return self._top_fat(feed, direction, max_dist=reach, k=k) + (
+                reach, "незнание+замер" if floor > 0 else "незнание")
+        reach = min(cap, max(abs(float(r)) + SPEC_FIRE_DIST_MARGIN_DEVS * dev, floor))
+        return self._top_fat(feed, direction, max_dist=reach, k=k) + (reach, "ход+замер")
 
     def _min_flip_dist(self, feed: str, direction: str):
         """Детонатор: ближайший flip_dist ЖИРНОЙ цели фида — ТА ЖЕ математика, что в
@@ -4611,15 +4667,23 @@ class SpecFireLive:
                 # FIRE-гейт (|ret| + 2*dev) ниже по пути — там ей и место.
                 # Потолок арма остаётся прежней константой; рычаг отката SPEC_FIRE_ARM_MAX_DIST
                 # снова работает (min() его глушил).
-                best, hold_dist, _ = self._top_fat(feed, direction, max_dist=SPEC_FIRE_ARM_MAX_DIST)
+                best, hold_dist, _, _reach, _src = self._flip_set(
+                    feed, direction, k=SPEC_FIRE_FLIP_SET_K)
                 if not best:
                     if hold_dist is not None:              # жир есть, но заведомо вне окна — не палим
                         _n = self._now()                   # ни петлю, ни ончейн-паттерн
                         if _n - self._armskip_ts.get(feed, -1e9) >= 300.0:
                             self._armskip_ts[feed] = _n
-                            self._log("SPECFIRE arm-skip feed=%s: ближ. жир dist=%.2f%% > потолок %.1f%%" % (
-                                feed, hold_dist * 100.0, SPEC_FIRE_ARM_MAX_DIST * 100.0))
+                            # ПОРОГ, ПО КОТОРОМУ СУДИЛИ, — в самой строке (канон): раньше здесь
+                            # печаталась константа 3%, а решение могло приниматься по другому числу.
+                            self._log("SPECFIRE arm-skip feed=%s: ближ. жир dist=%.2f%% > "
+                                      "досягаемость %.2f%% (%s)"
+                                      % (feed, hold_dist * 100.0, _reach * 100.0, _src))
                     return None                            # окна без (досягаемого) жира не запускают петлю
+                if len(best) > 1:
+                    self._log("SPECFIRE флип-набор feed=%s: %d целей внутри %.2f%% (%s) — "
+                              "доска заряжается ВСЕМИ, кого перекрывает ход"
+                              % (feed, len(best), _reach * 100.0, _src))
                 with self._lock:
                     old = self._windows.pop(feed, None)
                     if old is not None:
