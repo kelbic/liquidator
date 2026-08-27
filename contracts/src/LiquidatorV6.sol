@@ -26,6 +26,13 @@ import {MarketParams, LiquidationItem, IMorpho, IERC20, IERC4626, IOracle} from 
 ///                  +3 swapCallData(header), +4 minProfit, +5 unwrapTarget, +6 triggerPrice
 ///   60           _hot (g0 | count<<8 | until<<16)
 contract LiquidatorV6 {
+    /// 27.08 СВИП ГРУППЫ: газ на одну ПОПЫТКУ (провал «position is healthy» ~15-40k с запасом
+    /// на try/emit) и на следующую ПОЛНУЮ ликвидацию после успеха (liquidateEx+swap ~600-800k).
+    /// Лестницы ног подписаны на ~771k: провалов хватит на все 8 целей группы, второй успех —
+    /// только при поднятом лимите (кап свипа ~1.2M по адверсарной линзе, не 3M).
+    uint256 internal constant SWEEP_MIN_TRY_GAS = 120_000;
+    uint256 internal constant SWEEP_MIN_NEXT_GAS = 900_000;
+
     address public immutable MORPHO;
     address public owner;
     uint256 private _locked = 1; // 1 = unlocked, 2 = locked (ненулевая инициализация дешевле)
@@ -383,17 +390,31 @@ contract LiquidatorV6 {
             // Персональный порог применяется ТОЛЬКО при известной цене. Неизвестная цена
             // (оракул ревертнул ИЛИ гейта нет вовсе) = фильтра нет = пробуем.
             if (pxKnown && t != 0 && px > t) continue;
+            // Гард газа стоит ДО копии: копия тянет КБ swapCallData холодными SLOAD'ами
+            // (~2100/слово). Проверять остаток ПОСЛЕ неё значило бы сначала потратить десятки
+            // тысяч газа и только потом узнать, что на попытку его уже нет. Здесь же он держит
+            // путь после catch дешёвым: после сожранной попытки родителю остаётся 1/64 остатка
+            // (при гейте успеха 900k это >=14k), а до следующей проверки нужно ~6k — emit,
+            // два SLOAD'а и виток; копия в этот бюджет не входит.
+            if (gasleft() < SWEEP_MIN_TRY_GAS) return;
             Target memory tg = st;                      // копия КБ-байтов ТОЛЬКО здесь
+            // 27.08 (каскад 15:04, блок 50483683): наша проба стояла на idx 1461 МЕЖДУ
+            // победителями 1460 и 1463..1470 (8 жертв, один вызывающий) и сгорела «position is
+            // healthy» — цель уже забрал сосед, а `return` после ПЕРВОЙ попытки бросил семь
+            // живых. «Одна проба = одна попытка» снято: провал -> СЛЕДУЮЩАЯ цель кольца, пока
+            // хватает газа на попытку; успех -> дальше только при запасе газа на ПОЛНУЮ
+            // ликвидацию (иначе out-of-gas откатил бы и уже взятую). Учёта на денежном пути
+            // по-прежнему нет; денежный путь (liquidateEx/onMorphoLiquidate) не тронут.
             try this.liquidateEx(
                 mp, tg.borrower, tg.seizedAssets, tg.repaidShares, tg.swapTarget, tg.swapCallData,
                 tg.minProfit, tg.unwrapTarget
             ) returns (uint256 profit) {
                 delete ts[i];              // односрельность: гаснет РОВНО отстрелянная цель
                 emit PlanExecuted(tg.borrower, profit);
+                if (gasleft() < SWEEP_MIN_NEXT_GAS) return;
             } catch (bytes memory reason) {
                 emit PlanFailed(bytes4(reason));        // #70: молчаливый отказ хуже отказа
             }
-            return;                        // одна проба = одна попытка
         }
     }
 
