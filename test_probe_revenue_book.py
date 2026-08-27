@@ -5,6 +5,7 @@
 _REVENUE_BOOK (арм ЯВНЫЙ в main). Канон: незнание НЕ приписывает выручку; store фейковый.
 """
 import os
+import re
 import sys
 import types
 
@@ -85,9 +86,14 @@ finally:
 
 # --- 6. ПРОВОДКА: вызов стоит в _engine_result_verdict ЗА _probe_win, через _accounted ---
 src = open(os.path.join(os.path.dirname(sfl.__file__), "spec_fire_live.py")).read()
-i_win = src.find('self._probe_win(tgt, h, addr, gas_usd, src="движок")')
+# Ищем ВЫЗОВ по устойчивому признаку (имя + источник), а не по точной сигнатуре: 27.08 в вызов
+# добавили receipt=r, и точный литерал перестал находиться — тест краснел, ХОТЯ проводка цела.
+# Проверяемое требование не в форме аргументов, а в том, что книжка стоит ЗА деньгами и СБОКУ
+# (через _accounted, чтобы бросок учёта не трогал огонь — правило р-7).
+i_win = next((m.start() for m in re.finditer(r'self\._probe_win\([^)]*src="движок"', src)), -1)
 check("проводка: книжка после _probe_win, сбоку",
-      i_win > 0 and '_accounted("выручка победы"' in src[i_win:i_win + 300])
+      i_win > 0 and '_accounted("выручка победы"' in src[i_win:i_win + 300],
+      "вызов _probe_win(src=движок) не найден" if i_win < 0 else "найден, но книжки за ним нет")
 src_main = open(os.path.join(os.path.dirname(os.path.dirname(sfl.__file__)), "main.py")).read()
 check("проводка: арм явный в main + фильтр kill-switch",
       "set_revenue_book" in src_main and "submitted:1 probe-win" in src_main)

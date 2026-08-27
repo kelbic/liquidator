@@ -89,8 +89,12 @@ SCRIPT = {}
 CALLS = []
 
 
-def scripted_sync(url, raw_hex, timeout=5, paced=True, rate=None, burst=None, source_ip=None):
+def scripted_sync(url, raw_hex, timeout=5, paced=True, rate=None, burst=None, source_ip=None,
+                  urgent=False, **_kw):
     # source_ip — канал рассылки (20.08). Стенд сети не касается, поэтому просто фиксируем.
+    # urgent (27.08) — залповая полоса в пейсере; двойник обязан принимать НОВЫЕ параметры боевой
+    # функции, иначе TypeError красит блок B целиком и прячет то, что он на самом деле проверяет.
+    # **_kw — намеренно: следующий добавленный флаг не должен снова валить весь блок.
     CALLS.append(url if source_ip is None else "%s|%s" % (url, source_ip))
     seq = SCRIPT.get(url)
     if isinstance(seq, list):
@@ -120,6 +124,12 @@ try:
     ex._seq_session = lambda url: _FakeSession()
     reset_pacer()
     # rate=0 -> пополнения нет; burst=2 -> ровно 2 токена, третий сухой
+    # 27.08: у ведра ПОЯВИЛСЯ резерв «бёрст-в-щель» (_PACER_RESERVE): обычной отправке нужно
+    # tok >= 1 + reserve, залповой (urgent=True) — tok >= 1. Прежние строки считали, что burst=2
+    # даёт ДВЕ обычные отправки; с резервом это неверно ПО ЗАМЫСЛУ, и тест краснел на живой фиче.
+    # Проверяем обе семантики: ниже — чистое ведро (резерв снят), а следом отдельный блок на резерв.
+    _saved_reserve = ex._PACER_RESERVE
+    ex._PACER_RESERVE = 0.0
     r1 = ex._post_raw_sync("uA", RAW, paced=True, rate=0.0, burst=2)
     r2 = ex._post_raw_sync("uA", RAW, paced=True, rate=0.0, burst=2)
     r3 = ex._post_raw_sync("uA", RAW, paced=True, rate=0.0, burst=2)
@@ -135,6 +145,23 @@ try:
     r5 = ex._post_raw_sync("uA", RAW, paced=True, rate=0.0, burst=2)
     check("ведро: VOLLEY_PACER=off -> ведро не консультируется",
           r5 == (True, None) and len(POSTS) == 4, (r5, POSTS))
+    # --- РЕЗЕРВ: обычная отправка держит щель для залповой -------------------------------
+    # Пейсер ОБЯЗАН быть включён: блок стоит после кейса VOLLEY_PACER=off, и без этой строки
+    # весь блок мерил бы выключенный механизм (все отправки проходят => «резерв работает»).
+    ex._VOLLEY_PACER_ON = True
+    reset_pacer(); POSTS.clear()
+    ex._PACER_RESERVE = 1.0
+    q1 = ex._post_raw_sync("uB", RAW, paced=True, rate=0.0, burst=2)   # tok 2 -> 1
+    q2 = ex._post_raw_sync("uB", RAW, paced=True, rate=0.0, burst=2)   # нужно >= 2 -> сухо
+    check("резерв: обычная отправка НЕ съедает щель (burst=2, reserve=1 -> одна обычная)",
+          q1 == (True, None) and q2 == (False, "pacer_dry"), (q1, q2))
+    q3 = ex._post_raw_sync("uB", RAW, paced=True, rate=0.0, burst=2, urgent=True)
+    check("резерв: залповая (urgent) щель ЗАБИРАЕТ — ради неё резерв и держали",
+          q3 == (True, None), (q3, POSTS))
+    q4 = ex._post_raw_sync("uB", RAW, paced=True, rate=0.0, burst=2, urgent=True)
+    check("резерв: после щели ведро пусто и для залповой (гард не бесконечный)",
+          q4 == (False, "pacer_dry"), (q4,))
+    ex._PACER_RESERVE = _saved_reserve
     ex._VOLLEY_PACER_ON = True
     ex._seq_session = _real_seq_session
 except Exception as e:

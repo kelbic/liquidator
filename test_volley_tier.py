@@ -81,14 +81,36 @@ PROBE = {"calldata": "0xdeadbeef", "gas": 625_000}
 
 
 class SyncThread:                      # детерминизм: "тред" исполняется в момент .start()
+    """Синхронно исполняются только ОДНОРАЗОВЫЕ цели. Демоны-петли пропускаются.
+
+    27.08: с линзы 22.08 конструктор SpecFireLive поднимает `_det_push_loop` — БЕСКОНЕЧНЫЙ
+    цикл с НАСТОЯЩИМ time.sleep(30) (так и задумано: инжектированный сон дал бы busy-loop).
+    Синхронный «тред» исполнял его прямо в .start(), и стенд вис НАВСЕГДА ещё в make() —
+    до единой проверки. Прав продукт, а не приём стенда: демон-пушер обязан жить с первой
+    секунды. Стенд судит `_volley`, пушер он не тестирует вовсе, поэтому петли не запускаем.
+    Признак — имя потока/цели, а не «пропустить всё, что мешает»: новый демон-цикл, добавленный
+    завтра, обязан попасть под это же правило и НЕ повесить суиту.
+    """
+
+    SKIP_NAMES = ("det-dist-push", "spec-seed")
+
     def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
         self._t, self._a, self._k = target, args, (kwargs or {})
+        self._name = name or getattr(target, "__name__", "")
+        self._loop = (self._name in self.SKIP_NAMES
+                      or getattr(target, "__name__", "").endswith("_loop"))
 
     def start(self):
+        if self._loop:
+            SKIPPED_LOOPS.append(self._name)
+            return
         self._t(*self._a, **self._k)
 
     def join(self, timeout=None):
         pass
+
+
+SKIPPED_LOOPS = []
 
 
 # ---- Часть A: _volley детерминированно (SyncThread) ----
@@ -342,3 +364,12 @@ finally:
     sfl_mod._facts_fresh = _orig_facts
 
 print("ПРОШЛИ: каскадный тир (залповый слой)")
+
+# ПОЗИТИВНЫЙ КОНТРОЛЬ ГАРДА: пропуск обязан быть НАБЛЮДЁН, иначе «тест не завис» объяснялось бы
+# и тем, что демон-пушер просто выключен (SPEC_FIRE_DET_SENSE=0) — а тогда гард мёртв и следующий
+# демон-цикл повесит суиту молча.
+assert "det-dist-push" in SKIPPED_LOOPS, (
+    "гард петель не сработал: SKIPPED_LOOPS=%s. Либо пушер не поднимался (SPEC_FIRE_DET_SENSE?), "
+    "либо имя потока изменилось — проверь spec_fire_live.py:982" % (SKIPPED_LOOPS,))
+print("UNIT_OK: гард петель наблюдён — %s пропущены синхронным тредом" % (SKIPPED_LOOPS,))
+
