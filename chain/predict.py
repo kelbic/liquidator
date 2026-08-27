@@ -20,6 +20,8 @@ FP = (disarm+falsepos)/arm; recall = confirmed/(confirmed+push); lead_s по con
 from __future__ import annotations
 
 import os
+
+_PS_SAVE_EVERY = 10          # 27.08: как часто ронять кольцо масштаба на диск
 import threading
 import os
 import time
@@ -463,7 +465,13 @@ class PredictDriver:
                 # Кормит гейт досягаемости доски: цель дальше p99 толчков фида не флипает вовсе.
                 try:
                     from chain import push_scale as _ps
-                    _ps.note_push(ev.get("feed"), ev.get("ret_pct"))
+                    if _ps.note_push(ev.get("feed"), ev.get("ret_pct")):
+                        # Сохраняем РЕДКО (раз в _PS_SAVE_EVERY пушей): при 3150 пушах за 7 суток
+                        # это ~1 запись в 20 минут, а кольцо переживает рестарт (63 старта юнита
+                        # за 10 суток, аптайм 3.8ч — иначе MIN_N не набирается никогда).
+                        self._ps_pushes = getattr(self, "_ps_pushes", 0) + 1
+                        if self._ps_pushes % _PS_SAVE_EVERY == 0:
+                            _ps.save()
                 except Exception:                       # noqa: BLE001
                     pass
             elif ev["event"] == "falsepos":

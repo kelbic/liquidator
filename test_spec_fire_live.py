@@ -199,6 +199,7 @@ sf7.handle_event({"event": "arm", "feed": "BTC", "dir": "down"})
 time.sleep(0.6)
 assert sf7.stats["windows_armed"] == 1 and not sent, sent
 assert any("hold" in m and "2.00" in m for m in LOGS), LOGS
+_ps_live.CAP_PCT = _ps_live_cap                   # потолок ВЕРНУТЬ: глобал протекал на процесс
 RET["v"] = -0.019                                 # 1.9%+0.2% = 2.1% >= 2.00% — этот транзит флипает
 time.sleep(1.0)
 sf7.handle_event({"event": "disarm", "feed": "BTC"})
