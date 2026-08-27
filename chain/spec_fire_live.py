@@ -715,6 +715,9 @@ SPEC_FIRE_DET_WIN_CAP_MIN = int(os.environ.get("SPEC_FIRE_DET_WIN_CAP_MIN", "6")
 # HF цели неизвестен -> fail-open.
 SPEC_FIRE_DIST_MARGIN_DEVS = float(os.environ.get("SPEC_FIRE_DIST_MARGIN_DEVS", "2.0"))
 SPEC_FIRE_ARM_MAX_DIST = float(os.environ.get("SPEC_FIRE_ARM_MAX_DIST", "0.03"))
+# 27.08: пол досягаемости у перехвата доски детонатором — во сколько p99-толчков фида
+# укладывается срок жизни доски. 0 = откат к прежнему поведению (перехват без пола).
+SPEC_FIRE_DET_REACH_PUSHES = float(os.environ.get("SPEC_FIRE_DET_REACH_PUSHES", "2"))
 # #92: пол досягаемости ПРОГРЕВА доски. Прежде она считалась только как 3xdev от статической
 # константы фида и при спокойной dev не дотягивалась до целей вовсе. По умолчанию равен
 # порогу арма окна: доска планирует на ту же дистанцию, на какой окно себя армит.
@@ -1314,6 +1317,31 @@ class SpecFireLive:
             return (-(float(t[2]) * _w), -float(t[2]))
         elig.sort(key=_ev_key)
         return elig[:k], hold_dist, edge_t
+
+    def _det_reach_ok(self, feed, dist, mid=None, borrower=None) -> bool:
+        """Пол досягаемости перехвата: дотянется ли цель до кромки за срок жизни доски.
+
+        Бюджет = p99 толчков ЭТОГО фида x SPEC_FIRE_DET_REACH_PUSHES (сколько пушей укладывается
+        в TTL доски: при темпе ~6 пушей/час и TTL 14 мин это 1-2). `push_scale` молчит (нет
+        замера/выключен) -> True, поведение прежнее бит-в-бит. Ручка =0 снимает пол.
+        Отдельный метод, а не строка внутри ветки, — чтобы стенд звал БОЕВОЕ решение, а не его
+        копию (27.08: копия логики в тесте уже проходила мимо дефекта).
+        """
+        if SPEC_FIRE_DET_REACH_PUSHES <= 0 or dist is None:
+            return True
+        p99 = _push_scale.reach(feed)
+        if p99 is None:
+            return True
+        budget = p99 * SPEC_FIRE_DET_REACH_PUSHES
+        if dist <= budget:
+            return True
+        self._log("SPECFIRE доска: перехват детонатора ОТКЛОНЁН %s/%s (dist %.3f%% > бюджет "
+                  "%.3f%% = p99 толчка %.3f%% x %g) — цель не дотянется за жизнь доски, "
+                  "флот молчит дешевле"
+                  % (str(mid)[:10], str(borrower)[:10], dist * 100.0, budget * 100.0,
+                     p99 * 100.0, SPEC_FIRE_DET_REACH_PUSHES))
+        self.stats["board_det_out_of_reach"] = self.stats.get("board_det_out_of_reach", 0) + 1
+        return False
 
     def _min_flip_dist(self, feed: str, direction: str):
         """Детонатор: ближайший flip_dist ЖИРНОЙ цели фида — ТА ЖЕ математика, что в
@@ -2510,6 +2538,22 @@ class SpecFireLive:
                 _dum = (getattr(self, "_unbuildable_mid", None) or {}).get(_dmid)
                 if (_dub is not None and _dub > self._now()) or (_dum is not None and _dum > self._now()):
                     _ddebt = 0.0                                 # 27.08: несобираемую цель/рынок не навязываем
+                # 27.08 ПОЛ ДОСЯГАЕМОСТИ У ПЕРЕХВАТА. Замер на цепи: доска систематически несла
+                # цели в 10.3-10.8% от кромки при p99 реального толчка 1.82% по всему полю.
+                # Источник — эта самая ветка: за сутки 89 перехватов против 58 успешных армов,
+                # и dist перехваченных 5.98-6.48%. Одна и та же цель 0x5dffffc7/0x1a1e7a3B
+                # держалась 5.5 часа подряд, причём расстояние НЕ сокращалось, а РОСЛО
+                # (5.16% -> 6.27%), при TTL доски 14 минут. Флот всё это время стрелял по цели,
+                # которая уходит от кромки: 7 391 проба за 9.8 суток, все «position is healthy».
+                # «Без доски флот нем» — верно, но НЕМОЙ ФЛОТ ДЕШЕВЛЕ стреляющего вхолостую
+                # (~$84/сутки газа при нуле побед). Поэтому справка становится ПОЛОМ: цель, до
+                # которой не дотянуться за срок жизни доски, слот не занимает.
+                # Бюджет = p99 толчков ЭТОГО фида x DET_REACH_PUSHES (сколько пушей укладывается
+                # в TTL доски; при темпе ~6 пушей/час и TTL 14 мин это ~1-2). push_scale молчит
+                # (нет замера) -> пол не применяется, поведение прежнее бит-в-бит.
+                # Откат: SPEC_FIRE_DET_REACH_PUSHES=0.
+                if _ddebt > 0 and not tgts and not self._det_reach_ok(feed, _dk[1], _dmid, _db):
+                    _ddebt = 0.0
                 if _ddebt > 0 and not tgts:
                     self._log("SPECFIRE доска: план ПОД ЦЕЛЬ ДЕТОНАТОРА %s/%s (dist %.3f%%, "
                               "жир вне reach %.2f%% — справка, не гейт)"
