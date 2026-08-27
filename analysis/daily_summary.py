@@ -128,8 +128,83 @@ try:
 except Exception as e:
     lines.append(f"пульсы сторожей: блок упал: {type(e).__name__}")
 
+
+# ---- KPI «транзит+N» (kelbic 27.08): вход в призовую полосу по прибору ПОЗИЦИИ, было -> стало ----
+# Читаем ТОЛЬКО нужные строки через grep в пайпе: полный журнал штормового дня (330k строк)
+# уже уложил сводку OOM-ом 27.08 (256M), второе окно удвоило бы память.
+def _pos_lines(since, until):
+    try:
+        cmd = ("journalctl -u liquidator-bot --since '%s' --until '%s' --no-pager -o cat | "
+               "grep -E 'SPECFIRE ПОЗИЦИИ|первый_delta p50'" % (since, until))
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60).stdout
+    except Exception:
+        return ""
+
+
+def _kpi(text):
+    v = re.findall(r"ПОЗИЦИИ blk=(\d+).*?транзит idx=(\d+) tip=(\d+).*?наших (\d+), в полосе "
+                   r"\[T\+1,T\+20\]=(\d+), tip-match=(\d+), побед=(\d+); наши idx (\d+)\.\.(\d+)", text)
+    v = [tuple(int(x) for x in r) for r in v if int(r[3]) >= 5]        # окна с <5 наших — не вердикт
+    if not v:
+        return None
+    n = len(v)
+    exact = sum(1 for r in v if r[5] > 0)
+    band = sum(1 for r in v if r[4] > 0)
+    wins = sum(r[6] for r in v)
+    # первый наш ПОСЛЕ транзита: по нижней границе диапазона, если она за транзитом; иначе
+    # (наши стоят и до транзита) честнее взять кольцо p50 из close-строки
+    after = sorted(r[7] - r[1] for r in v if r[7] > r[1])
+    ring = re.findall(r"первый_delta p50=([+-]?\d+)", text)
+    p50_ring = int(ring[-1]) if ring else None
+    best = min(after) if after else None
+    return dict(n=n, exact=exact, band=band, wins=wins, best=best, p50=p50_ring,
+                band_mean=(sum(r[4] for r in v if r[4] > 0) / band) if band else 0.0)
+
+
+try:
+    _H = int(HOURS)
+    now_k = _kpi(_pos_lines("-%dh" % _H, "now"))
+    prev_k = _kpi(_pos_lines("-%dh" % (2 * _H), "-%dh" % _H))
+
+    def _f(k):
+        if not k:
+            return "нет вердиктов"
+        return ("n=%d, exact %d%% , в полосе %d%% (ср. %.0f наших), первый наш p50 %s, лучший +%s, побед %d"
+                % (k["n"], 100 * k["exact"] // k["n"], 100 * k["band"] // k["n"], k["band_mean"],
+                   ("%+d" % k["p50"]) if k["p50"] is not None else "—",
+                   k["best"] if k["best"] is not None else "—", k["wins"]))
+    lines.append("KPI транзит+N: " + _f(now_k))
+    if prev_k and now_k:
+        lines.append("  было (пред. %dч): exact %d%% -> %d%%, в полосе %d%% -> %d%%"
+                     % (_H, 100 * prev_k["exact"] // prev_k["n"], 100 * now_k["exact"] // now_k["n"],
+                        100 * prev_k["band"] // prev_k["n"], 100 * now_k["band"] // now_k["n"]))
+except Exception as e:
+    lines.append(f"KPI транзит+N: блок упал: {type(e).__name__}")
+
+# ---- прогресс по плану: сделано (коммиты за окно) и следующее (Plan.md «Открыто») ----
+try:
+    done = subprocess.run(["git", "-C", "/root/liquidator", "log", "--since=-%dh" % int(HOURS),
+                           "--format=%s", "--no-merges"], capture_output=True, text=True,
+                          timeout=20).stdout.splitlines()
+    done = [d.split(" — ")[0].split(":")[0][:64] if len(d) > 72 else d[:72] for d in done if d.strip()]
+    if done:
+        lines.append("сделано за окно (%d коммитов): " % len(done) + " | ".join(done[:5])
+                     + (" | …" if len(done) > 5 else ""))
+    plan = open("/root/liquidator/Plan.md", encoding="utf-8").read()
+    sec = plan.split("## Открыто", 1)[1] if "## Открыто" in plan else ""
+    nxt = re.findall(r"^\d+\.\s+\**(.+?)\**(?:\s*[—:-]|$)", sec, re.M)
+    nxt = [x.strip("* ").split("(")[0].strip()[:70] for x in nxt if not x.startswith("~~")]
+    if nxt:
+        lines.append("следующие шаги (Plan «Открыто»): " + "; ".join(nxt[:4]))
+except Exception as e:
+    lines.append(f"прогресс по плану: блок упал: {type(e).__name__}")
+
 msg = "\n".join(lines)[:3900]
 print(msg)
+import os as _os
+if _os.environ.get("DAILY_DRY") == "1":            # проверка без боевого канала и без пульса
+    print("\n[DRY: не отправлено, пульс не бьётся]")
+    sys.exit(0)
 ok = Alerter(cfg.tg_bot_token, cfg.tg_admin_id, antiflood_sec=0, tag=cfg.bot_tag).send(msg, key=f"daily:{dt.date.today()}")
 print(f"\n[tg sent={ok}]")
 if ok:
