@@ -141,8 +141,16 @@ def _execute_actionable(rpc, cfg, actionable, debt_by, debt_assets_by, store, gu
                  mid[:10], borrower[:10], hr.hf, net, cfg.mode, status)
         # 28.07: исход ОБЯЗАН быть в тексте — «💰 execute … net $6.79» без статуса читается
         # с телефона как заработок, хотя это мог быть skip:sim (вопрос kelbic по 0x6e0bdA0b)
-        alerter.send_async(f"\U0001F4B0 {cfg.mode} liquidation {borrower[:10]} "
-                     f"net ${net:.2f} HF={hr.hf:.4f} → {status[:60]}", key=f"act:{mid}:{borrower}")
+        # 27.08 (kelbic, stkWELL/USDC net $142): пропуск класса «нет роута/нет глубины» — решённый
+        # класс (20.08: анврап-хоп не строим), в TG он тратит внимание на известное; журнал остаётся.
+        _quiet_skip = status.startswith("skip:") and any(
+            k in status for k in ("нет глубины", "нет роута", "нет свопа", "SLICE_MIN_FRACTION"))
+        if _quiet_skip:
+            log.info("ACTIONABLE %s/%s: TG-тревога подавлена (класс без роута/глубины решён 20.08): %s",
+                     mid[:10], borrower[:10], status[:80])
+        else:
+            alerter.send_async(f"\U0001F4B0 {cfg.mode} liquidation {borrower[:10]} "
+                         f"net ${net:.2f} HF={hr.hf:.4f} → {status[:60]}", key=f"act:{mid}:{borrower}")
 
     if not actionable:
         return

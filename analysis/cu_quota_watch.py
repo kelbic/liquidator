@@ -1503,7 +1503,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
             if ah:
                 mtd_h = float(ah.get("mtd_cu", 0)) + float(
                     ((ledger.get("hosts") or {}).get(h) or {}).get("cu", 0.0))
-                q = float(anchor.get("quota_cu", QUOTA_M * 1e6))
+                q = _host_quota(anchor, h)
                 ost = "ост%.1fM" % ((q - mtd_h) / 1e6)
             else:
                 ost = "ост:якоря нет"     # молчание об остатке обязано быть ПРОИЗНЕСЕНО

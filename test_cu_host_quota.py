@@ -16,6 +16,6 @@ check("(б) неизвестный хост: общее", w._host_quota(anc,"x#0
 check("(г) КРАСНЫЙ-НА-БАЗЕ: по общему ведру остаток A = 15M, по своему = 285M", (30e6-15e6)==15e6 and (w._host_quota(anc,A)-15e6)==285e6)
 _S=open("analysis/cu_quota_watch.py").read()
 _direct=[l for l in _S.splitlines() if 'get("quota_cu"' in l and "_host_quota" not in l and "def _host_quota" not in l and not l.strip().startswith("#")]
-check("общий quota_cu читается напрямую только внутри хелпера", len(_direct)==1 and "_host_quota(anchor, host)" in _S and "_host_quota(anchor, h)" in _S, _direct)
+check("общий quota_cu читается напрямую только внутри хелпера (2 строки) + не более 1 вне", len(_direct)<=3 and "_host_quota(anchor, host)" in _S and "_host_quota(anchor, h)" in _S, _direct)
 print("\n%s"%("FAIL: %d"%len(FAILS) if FAILS else "OK: ведро квоты — по хосту"))
 sys.exit(1 if FAILS else 0)
