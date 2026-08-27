@@ -1309,6 +1309,10 @@ def refresh_position_cache(cache_rpc, mid, borrowers):
         _POSITION_CACHE[mid] = (tba, tbs, positions)
 
 
+# 27.08: потолок возраста кэша, по которому ДЕЙСТВУЕМ при провале живого чтения (каскад 15:04).
+_HOT_STALE_FALLBACK_SEC = float(os.environ.get("HOT_STALE_FALLBACK_SEC", "600"))
+
+
 def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
     """Drop-in for read_positions (same signature — swaps in via _process_transmit's reads_fn=
     default, no call-site change needed). Market not yet in _POSITION_CACHE (not money-market-
@@ -1359,9 +1363,29 @@ def read_positions_cached(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
             if src_out is not None:
                 src_out["src"] = "cache+" + str(src_out.get("src") or "live")
         else:
+            # 27.08 — КАСКАД 15:04 (19 жертв, $ дня): 18 из 19 жертв БЫЛИ в кандидатах и были
+            # выброшены ЗДЕСЬ строкой «stale-skip: live-fail» (443 за 80с) — живое чтение упало
+            # (боевой ключ в 429 от нашего же шквала), и гейт «не действовать по протухшим
+            # данным» отдал весь каскад конкурентам. Цена действия по кэшу — реверт «healthy»
+            # ~$0.002; цена пропуска — приз. Поэтому при провале живого чтения ДЕЙСТВУЕМ ПО
+            # КЭШУ (возраст <= HOT_STALE_FALLBACK_SEC; позиции меняются медленно, флип двигает
+            # цена — она живая), выбрасываем только тех, кого в кэше нет вовсе.
+            used, dropped = 0, 0
             for b in stale:
-                log.info("DIAG position-cache stale-skip market=%s borrower=%s reason=live-fail",
-                         mid[:10], b[:10])
+                p = positions.get(b)
+                if p is not None and now - p[2] <= _HOT_STALE_FALLBACK_SEC:
+                    pos.append((b, p[0], p[1]))
+                    used += 1
+                else:
+                    dropped += 1
+                    log.info("DIAG position-cache stale-skip market=%s borrower=%s reason=live-fail-nocache",
+                             mid[:10], b[:10])
+            if used:
+                log.info("DIAG position-cache stale-USE market=%s n=%d (выброшено %d) reason=live-fail "
+                         "age<=%ds — действуем по кэшу, страховка = реверт на цепи", mid[:10], used,
+                         dropped, int(_HOT_STALE_FALLBACK_SEC))
+            if src_out is not None:
+                src_out["src"] = "cache+stale"
     return tba, tbs, pos
 
 
