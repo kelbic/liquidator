@@ -792,6 +792,7 @@ SPEC_FIRE_RECEIPT_TIMEOUT = float(os.environ.get("SPEC_FIRE_RECEIPT_TIMEOUT", "4
 #   collector — очередь коллектора вместо тредов; переполнение = учётный дроп в
 #               collector_overflow + фолбэк легаси-тредом (денежный инвариант «ровно один
 #               исход на отправку» не теряется никогда).
+SPEC_FIRE_UNBUILDABLE_TTL_SEC = float(os.environ.get("SPEC_FIRE_UNBUILDABLE_TTL_SEC", "900"))
 SPEC_FIRE_RCPT_MODE = os.environ.get("SPEC_FIRE_RCPT_MODE", "shadow").lower()
 SPEC_FIRE_RCPT_MAX_PENDING = int(os.environ.get("SPEC_FIRE_RCPT_MAX_PENDING", "4096"))
 
@@ -877,6 +878,10 @@ class SpecFireLive:
         self._lock = threading.Lock()
         self._windows: dict = {}                  # feed -> stop Event
         self._armskip_ts: dict = {}               # feed -> ts последнего arm-skip-лога (троттлинг 300с)
+        # 27.08: цели, у которых проба НЕ СОБИРАЕТСЯ (нет роута/котировки — yoETH/WETH), на TTL
+        # исключаются из вершины _top_fat: иначе доска переспрашивает ТУ ЖЕ цель каждые 5с
+        # (682 раза за 2ч, 5ч без единого выстрела при живой службе — «без доски флот нем»).
+        self._unbuildable: dict = {}              # (mid, b) -> until_ts
         self._cooldown_until = 0.0                # WIN-пауза (SCOPE=global): окна не армим
         self._cooldown_feed: dict = {}            # feed -> ts (SCOPE=feed, дефолт): гаснет только
                                                   # фид, чья цель взята — ноги 2+ каскада живы
@@ -1255,6 +1260,9 @@ class SpecFireLive:
             for b in borrowers:
                 d = float(debt_by.get((mid, b), 0.0) or 0.0)
                 if d < _min_usd:
+                    continue
+                _ub = (getattr(self, "_unbuildable", None) or {}).get((mid, b))
+                if _ub is not None and _ub > self._now():      # 27.08: несобираемая — мимо вершины
                     continue
                 dist = None
                 if max_dist is not None:
@@ -2545,6 +2553,13 @@ class SpecFireLive:
                     self._log("SPECFIRE доска prearm feed=%s %s/%s: цель мертва (нет долга либо "
                               "залога) — быстрый переспрос не нужен" % (feed, mid[:10], b[:10]))
                 else:
+                    # 27.08: цель, которую НЕ СОБРАТЬ (нет роута), не должна держать доску:
+                    # помечаем на TTL и даём _top_fat выдать СЛЕДУЮЩУЮ вершину уже на переспросе
+                    self._unbuildable[(mid, b)] = self._now() + SPEC_FIRE_UNBUILDABLE_TTL_SEC
+                    self.stats["board_unbuildable"] = self.stats.get("board_unbuildable", 0) + 1
+                    self._log("SPECFIRE доска: цель %s/%s несобираема (нет роута/котировки) — "
+                              "исключена из вершины на %.0fс, доска пойдёт к следующей"
+                              % (mid[:10], b[:10], SPEC_FIRE_UNBUILDABLE_TTL_SEC))
                     self._arm_retry(feed, "проба не собралась")
                 # #78: склад и прогрев патрона НЕ зависят от того, собралась ли эта цель.
                 # Раньше _engine() жил только внутри ветки dict, и одна несобираемая цель на
