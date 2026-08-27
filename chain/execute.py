@@ -3235,6 +3235,17 @@ def kyber_swap(token_in: str, token_out: str, amount_in: int, sender: str, recip
 #  cbLTC -> WETH ts=200 -> USDC ts=100 Slipstream (на UniV3 у cbLTC ликвидности НЕТ вообще).
 UNIV3_SWAP_ROUTER = "0x2626664c2603336E57B271c5C0b26F421741e481"  # Uniswap SwapRouter02 (Base)
 AERO_CL_ROUTER = "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"     # Aerodrome Slipstream SwapRouter (Base)
+# 27.08 ВТОРАЯ CL-ФАБРИКА (та же кодовая база Slipstream: CLFactory/CLPool/SwapRouter/QuoterV2,
+# деплоер 0x2BbFA3f31b12D7a773B2058Ac74659C8db891624, Kyber зовёт её aerodrome-cl-3). Найдена
+# вскрытием каскада cbXRP 26.08 15:05 (блок 50483683): все 10 побед вышли пулом cbXRP/WETH
+# ts=100 0xb90fe999 ЭТОЙ фабрики (163k cbXRP + 78 WETH, liquidity 6.6e16), а наш пул ts=2000
+# старой фабрики 0xa6da283c держит 93k cbXRP + 5.78 WETH (1.1e15): продавать cbXRP в него
+# некому. Роутер верифицирован: factory()=0xf8f2eb49, WETH9()=0x4200, в байткоде селектор
+# exactInput v1-формы c04b8d59 (та же ABI, что у AERO_CL_ROUTER) — direct_swap меняет только
+# адрес и путь. Квотер той же фабрики обязателен: старый 0x254cF9E1 считает адрес пула через
+# СТАРУЮ фабрику и на новом пути отдаёт ноль/реверт (живой кап схлопнулся бы в 0).
+AERO_CL3_ROUTER = "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F"    # SwapRouter CLFactory 0xf8f2eb49
+AERO_CL3_QUOTER = "0x514c8B5f54112481E28028F1166Bd78501089259"    # QuoterV2 той же фабрики
 _UNIV3_WETH = "0x4200000000000000000000000000000000000006"
 _UNIV3_USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 _EURC = "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42"
@@ -3318,9 +3329,19 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     # Замер 09.08 (три блока): 5000 -> imp 4.00%, 7361 -> 6.59%, 8664 -> 8.28%, 12000 -> 19.1%.
     # S_обрыв (imp = бонус 7.41%) = 7996 cbXRP ($8.3k) -> кап 3900 (~$4.05k, imp ~2.9%).
     # Сверх капа — Kyber (в доску не помещается: она quote-free, см. #69 п.2 про частичный план).
-    (_CBXRP, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
-                            "path": _pack_path(_CBXRP, 2000, _UNIV3_WETH, 100, _UNIV3_USDC),
-                            "max_in": 3900 * 10**6},
+    # 27.08 ЛИКВИДНОСТЬ УЕХАЛА НА ВТОРУЮ ФАБРИКУ (см. AERO_CL3_ROUTER). Замер квотерами обеих
+    # фабрик, блок 50525761, imp к 100 XRP: НОВЫЙ путь ts100->ts50 2k -0.01%, 4k -0.02%,
+    # 8k -0.05%, 16k -0.11%, 32k -0.56%, 64k -1.62%, 96k -2.72%, 128k -3.99%, 192k -25.4%;
+    # СТАРЫЙ ts2000->ts100 на тех же размерах 2k -3.83%, 4k -7.56%, 8k -45.6%, 16k -72.8%.
+    # Второй ноги WETH->USDC ts=100 на новой фабрике нет; ts=50 (726 WETH + $4.87M USDC) глубже
+    # ts=1 (8.7 WETH): 16k -0.11% против -1.12%. S_обрыв (imp = бонус тесного рынка 7.41%)
+    # ~150k cbXRP -> кап 64 000 (~$93k, imp 1.62%, запас 4.6x) по тому же правилу половины,
+    # что и прежние 3900 при обрыве 7996. Цена ошибки: за 7 суток до 27.08 рынок cbXRP/USDC
+    # 0xd4a903dc — 129 из 203 ликвидаций Morpho/Base и $840k из ~$937k погашенного долга; стена
+    # 0x8cc0204e брала на нём полные позиции ($19.4k одной tx), мы резали сейз до 122 cbXRP.
+    (_CBXRP, _UNIV3_USDC): {"router": AERO_CL3_ROUTER, "style": "v1",
+                            "path": _pack_path(_CBXRP, 100, _UNIV3_WETH, 50, _UNIV3_USDC),
+                            "max_in": 64000 * 10**6, "quoter": AERO_CL3_QUOTER},
     # cbBTC/USDC 28.07: UniV3 fee=500 -> Aerodrome Slipstream ts=100 (пул 0x4e962bb3, liq 3.7e12
     # против 2.1e12, fee динамический 30-162 = 0.003-0.016% против наших 0.05%). Урок разбора
     # победителя cbBTC $65.6k (27.07 23:04): его РЕАЛЬНЫЙ выход через этот пул стоил 0.52% против

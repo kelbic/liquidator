@@ -45,6 +45,17 @@ log = logging.getLogger("liq.route_depth")
 AERO_QUOTER = "0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0"    # Slipstream QuoterV2 (бенч 28.07)
 UNIV3_QUOTER = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"   # UniV3 QuoterV2 (сан-квота 24.07)
 _QUOTE_SEL = bytes.fromhex("cdca1753")                        # quoteExactInput(bytes,uint256)
+
+
+def _route_quoter(r) -> str:
+    """Квотер маршрута: явный `quoter` записи (27.08: вторая CL-фабрика, cbXRP) либо квотер
+    семейства по стилю. Квотер ОБЯЗАН быть той же фабрики, что роутер: QuoterV2 считает адрес
+    пула через свою factory(), и чужой квотер на живом пути отдаёт ноль — живой кап схлопнулся
+    бы в 0 и роут молча выпал бы из строек. Чистая."""
+    q = r.get("quoter")
+    if q:
+        return q
+    return AERO_QUOTER if r["style"] == "v1" else UNIV3_QUOTER
 _MORPHO = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
 
 LIVE_CAP_LADDER = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0)   # доли статик max_in
@@ -157,7 +168,7 @@ def measure_route_cap(rpc, token_in, token_out, batch_fn=None, log_fn=None):
     if r is None or r.get("max_in") is None:
         return None
     static = int(r["max_in"])
-    quoter = AERO_QUOTER if r["style"] == "v1" else UNIV3_QUOTER
+    quoter = _route_quoter(r)
     sizes = [max(static // 100, 1)] + [int(static * f) for f in LIVE_CAP_LADDER]
     calls = [(quoter, _QUOTE_SEL + encode(["bytes", "uint256"], [r["path"], s]))
              for s in sizes]
@@ -236,7 +247,7 @@ def cumulative_quotes(rpc, token_in, token_out, sizes, batch_fn=None):
     r = _SWAP_ROUTES.get(key)
     if r is None:
         return None
-    quoter = AERO_QUOTER if r["style"] == "v1" else UNIV3_QUOTER
+    quoter = _route_quoter(r)
     sizes = [int(s) for s in sizes if int(s) > 0]
     if not sizes:
         return {}
