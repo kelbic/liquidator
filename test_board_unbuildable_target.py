@@ -33,7 +33,14 @@ check("(б) TTL истёк — цель возвращается в вершин
 # (в) красный-на-базе: без пометки вершина не меняется сколько ни переспрашивай
 o2=mk(); tops=[o2._top_fat("ETH","down",k=1)[0][0][1] for _ in range(3)]
 check("(в) КРАСНЫЙ-НА-БАЗЕ: без пометки три переспроса = та же цель (замкнутый круг)", tops==[BAD,BAD,BAD], tops)
+# детонатор тоже не должен судить по несобираемой цели (доска планирует ПОД ЦЕЛЬ ДЕТОНАТОРА)
+o4=mk(); o4._det_key_by_feed={}; o4.dev_by={"ETH":0.0015}
+o4._unbuildable[(MID,BAD)]=o4._now()+sfl.SPEC_FIRE_UNBUILDABLE_TTL_SEC
+o4._min_flip_dist("ETH","down")
+_dk=(o4._det_key_by_feed or {}).get("ETH")
+check("детонатор: несобираемая цель пропущена, ключ — собираемая", _dk is not None and _dk[0]==(MID,GOOD), _dk)
 _S=open("chain/spec_fire_live.py").read()
+check("гард: пропуск стоит и в _min_flip_dist, и в ветке «под цель детонатора»", _S.count("несобираемая цель не судит детонатор")==1 and "несобираемую не навязываем" in _S)
 check("пометка стоит в ветке «проба не собралась» и печатает причину", "self._unbuildable[(mid, b)] = self._now() + SPEC_FIRE_UNBUILDABLE_TTL_SEC" in _S and "несобираема (нет роута/котировки)" in _S)
 check("причина записана (682 отказа, 5ч без выстрела)", "682 раза" in _S and "5ч без единого выстрела" in _S)
 sfl._label_of=_sv

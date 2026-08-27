@@ -1308,6 +1308,9 @@ class SpecFireLive:
             _min_usd = _market_min_repaid_usd(getattr(m, "bonus", 0.0))
             _bonus = float(getattr(m, "bonus", 0.0) or 0.0)
             for b in borrowers:
+                _ub = (getattr(self, "_unbuildable", None) or {}).get((mid, b))
+                if _ub is not None and _ub > self._now():      # 27.08: несобираемая цель не судит детонатор
+                    continue
                 _debt = float(debt_by.get((mid, b), 0.0) or 0.0)
                 if _debt < _min_usd:
                     continue
@@ -2473,6 +2476,9 @@ class SpecFireLive:
                         _ddebt = float(self.shared.debt_by.get((_dmid, _db), 0.0) or 0.0)
                 except Exception:                            # noqa: BLE001
                     pass
+                _dub = (getattr(self, "_unbuildable", None) or {}).get((_dmid, _db))
+                if _dub is not None and _dub > self._now():     # 27.08: несобираемую не навязываем
+                    _ddebt = 0.0
                 if _ddebt > 0 and not tgts:
                     self._log("SPECFIRE доска: план ПОД ЦЕЛЬ ДЕТОНАТОРА %s/%s (dist %.3f%%, "
                               "жир вне reach %.2f%% — справка, не гейт)"
