@@ -627,7 +627,7 @@ _PROBE_TIP_WEI = int(os.environ.get("SPEC_FIRE_PROBE_TIP_WEI", "1000000"))   # 0
 # с 3 000 000 были бы ВЫШЕ класса в 99.9% — то есть единая тройка не лечит, а переворачивает
 # промах и делает его почти стопроцентным.
 _PROBE_TIP_TIERS = tuple(int(x) for x in os.environ.get(
-    "SPEC_FIRE_PROBE_TIP_TIERS", "1000000,1100000,1775000,3000000").split(",") if x.strip())
+    "SPEC_FIRE_PROBE_TIP_TIERS", "1000000,1100000,1150000,1300000").split(",") if x.strip())
 
 # Ш24b/#104: ЗЕРКАЛО ТРАНЗИТА (доказано боем 49978436, 14.08 22:23).
 #
@@ -692,6 +692,47 @@ _MIRROR_FLOOR_MAX = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_FLOOR_MAX", "
 # То есть на ПЕРВОЙ пачке зеркало физически не успевает, и платить за неё пересборкой нечем.
 _MIRROR_ENTRY_N = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_ENTRY_N", "8"))
 _MIRROR_ENTRY_AGE_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_ENTRY_AGE_SEC", "60"))
+# 27.08 — СЛЕПОЙ ДИЗАЙН ПОРТФЕЛЯ (STATE 79bd9dd; замер: коэффициент цены $0.344 за 1M wei
+# Σtip слотов/окно, состав [15.86,10,5,1] = $10.94/окно при 2/10 точных попаданий против
+# 3/10 у пола-4 за $1.56). ДВЕ ЗОНЫ с разными правилами:
+#  * полоса ПОЛА (< EXPENSIVE_WEI): ТОЧНЫЕ значения без склейки — в суб-блоке 1.0 и 1.15 это
+#    разные когорты, склейка ±10% сливала 1.0…1.21 в класс-представитель 1.0, стоящий позади
+#    всей полосы; отбор по весу улики, пол получает минимум SLOTS-EXPENSIVE_SLOTS слотов;
+#  * ДОРОГАЯ зона (>= EXPENSIVE_WEI): склейка 10% остаётся (дрейф оператора 10.0/10.1), вход
+#    только по >= ENTRY_N ТОЧНЫХ свежих (<= EXPENSIVE_FRESH_SEC) сэмплов ОДНОГО агрегатора
+#    (путь «возраст» закрыт: 4/4 у минорного агрегатора = ничего), не более EXPENSIVE_SLOTS,
+#    Σtip портфеля <= SUM_CAP (пол 1.0+1.1+1.15 + дорогой до ~8.7M); ШТОРМ-исключение до
+#    STORM_MAX при >= ENTRY_N точных за <= EXPENSIVE_FRESH_SEC, ограничено STORM_SEC_PER_DAY.
+#  * антифлап (520 смен состава/сутки 26-27.08): дорогой класс держится >= DWELL, замена
+#    дорогого дорогим — при весе нового >= старого + REPLACE_MARGIN и не чаще GAP; индексы
+#    слотов СТАБИЛЬНЫ (сдвиг [15.86,1.0,1.1,1.15]->[15.86,5.0,1.0,1.1] переодевал 165 ног
+#    вместо 55). Статика по умолчанию = пол-4 бит-в-бит с составом «только пол» — переходы
+#    статика<->слоты (174/сутки) перестают менять tip хоть одной ноги.
+_MIRROR_EXP_MIN = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_WEI", "2500000"))
+_MIRROR_EXP_SLOTS = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_SLOTS", "1"))
+_MIRROR_SUM_CAP = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_SUM_CAP_WEI", "12000000"))
+_MIRROR_EXP_FRESH_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_FRESH_SEC", "300"))
+_MIRROR_STORM_MAX = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_STORM_MAX_WEI", "35000000"))
+_MIRROR_STORM_SEC_PER_DAY = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_STORM_SEC_PER_DAY", "3600"))
+_MIRROR_EXP_DWELL_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_DWELL_SEC", "600"))
+_MIRROR_EXP_GAP_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_GAP_SEC", "300"))
+_MIRROR_EXP_REPLACE_MARGIN = 2
+# Порог входа дорогого класса — ПО ФЛОТУ (сумма по всем кольцам), не по одному агрегатору:
+# затор 19.08 дал 8 сэмплов 28-34M за 145с с ДВУХ агрегаторов по 4 — «≥8 у одного» его
+# структурно не берёт (агрегатор шлёт транзит ~раз в минуту, 8 за 300с невозможно).
+# Полоса подсчёта свежих = ШАГ СКЛЕЙКИ (±10%): затор 19.08 даёт 6 сэмплов 30.5-34.0M за 145с
+# (реплей mirror_v2_replay — позитивный контроль). Полоса шире склейки (пробовал ±20%) давала
+# соседним классам (6M/7M) считать улику друг друга — равный вес, замена глохла на марже.
+_MIRROR_EXP_N = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_N", "6"))
+_MIRROR_STORM_GLUE = _MIRROR_GLUE_STEP
+_MIRROR_EXP = {"cls": None, "w": 0, "since": 0.0, "last_change": 0.0, "storm": False,
+               "storm_used": 0.0, "storm_day": None, "tick": 0.0}
+
+
+def _mirror_exp_reset():
+    """Стенды/реплей: сброс состояния дорогого слота вместе с кольцами."""
+    _MIRROR_EXP.update({"cls": None, "w": 0, "since": 0.0, "last_change": 0.0, "storm": False,
+                        "storm_used": 0.0, "storm_day": None, "tick": 0.0})
 # ЗАМЕР 7 СУТОК ЖУРНАЛА (analysis/transit_tips_7d.txt, 129 транзитов, 5.7 суток) — числа,
 # ради которых поднят верх и введена склейка:
 #   0x0e3dc8a6 (74 сэмпла): мода 1.0-1.15 mgwei, режимные выбросы 21.2 и 33.4;
@@ -797,29 +838,98 @@ def transit_tip_portfolio(now=None) -> tuple:
         rings = {k: [(ts, w) for ts, w in v if n - ts <= _MIRROR_TTL_SEC]
                  for k, v in _TRANSIT_TIPS.items()}
     cands = [c for c in (_agg_mode(f) for f in rings.values()) if c is not None]
-    glued = _glue_modes(cands)
-    # ГИСТЕРЕЗИС ВХОДА: класс, которого в действующем составе НЕТ, обязан быть подтверждён.
-    # Класс, УЖЕ занимающий слот, переподтверждать не надо — иначе портфель дёргался бы туда-сюда.
-    ready = [g for g in glued
-             if g[0] in _MIRROR_APPLIED_MODES or g[1] >= _MIRROR_ENTRY_N
-             or (n - g[2]) >= _MIRROR_ENTRY_AGE_SEC]
-    sel = sorted(ready, key=lambda g: (-g[1], -g[0]))[:_MIRROR_SLOTS]
-    floors = [g for g in ready if g[0] <= _MIRROR_FLOOR_MAX]
-    if floors and not any(g[0] <= _MIRROR_FLOOR_MAX for g in sel):
-        # ГАРАНТИЯ ПОЛА: худший по весу из отобранных уступает место лучшему по весу полу.
-        sel = sel[:_MIRROR_SLOTS - 1] + [max(floors, key=lambda g: g[1])]
-    if not sel:
+    # --- полоса пола: ТОЧНЫЕ значения (склейки нет), дубли значений из разных колец суммируются
+    fl = {}
+    for m, w, ts in cands:
+        if m < _MIRROR_EXP_MIN:
+            g = fl.setdefault(m, [0, ts])
+            g[0] += w
+            g[1] = min(g[1], ts)
+    floor_c = [(m, g[0], g[1]) for m, g in fl.items()]
+    floor_ready = [g for g in floor_c
+                   if g[0] in _MIRROR_APPLIED_MODES or g[1] >= _MIRROR_ENTRY_N
+                   or (n - g[2]) >= _MIRROR_ENTRY_AGE_SEC]
+    # --- дорогая зона: склейка, вход ТОЛЬКО по свежим точным сэмплам одного агрегатора
+    exp_glued = _glue_modes([c for c in cands if c[0] >= _MIRROR_EXP_MIN])
+
+    def _fresh_exact(m):
+        """Число свежих (<= EXPENSIVE_FRESH_SEC) сэмплов класса m (полоса ±STORM_GLUE) ПО ФЛОТУ."""
+        return sum(1 for ring in rings.values() for ts, w in ring
+                   if n - ts <= _MIRROR_EXP_FRESH_SEC and m / _MIRROR_STORM_GLUE <= w <= m * _MIRROR_STORM_GLUE)
+
+    exp_ready = [(m, _fresh_exact(m), ts) for m, w, ts in exp_glued]
+    exp_ready = [g for g in exp_ready if g[1] >= _MIRROR_EXP_N and g[0] <= _MIRROR_STORM_MAX]
+    # при равной улике предпочесть класс, укладывающийся в Σ-кап (шторм-бюджет не жечь зря)
+    _floor_pre = sum(sorted((g[0] for g in floor_ready), key=lambda x: x)[:_MIRROR_SLOTS - _MIRROR_EXP_SLOTS])
+    exp_ready.sort(key=lambda g: (-g[1], (_floor_pre + g[0]) > _MIRROR_SUM_CAP, -g[0]))
+    # --- шторм-бюджет: секунды в сутки, пока дорогой слот стоит по шторм-исключению
+    st = _MIRROR_EXP
+    day = int(n // 86400)
+    if st["storm_day"] != day:
+        st["storm_day"], st["storm_used"] = day, 0.0
+    if st["storm"] and st["cls"] is not None and st["tick"]:
+        st["storm_used"] += max(0.0, n - st["tick"])
+    st["tick"] = n
+    # --- пол: сколько слотов ему положено и какие значения
+    n_floor = _MIRROR_SLOTS - _MIRROR_EXP_SLOTS
+    floor_sel = [g[0] for g in sorted(floor_ready, key=lambda g: (-g[1], -g[0]))[:_MIRROR_SLOTS]]
+    # --- дорогой слот: удержание/замена/вход с гистерезисом, Σ-кап и шторм
+    cur = st["cls"]
+    # ВЫХОД мягче ВХОДА (слепой дизайн: вход 6 свежих за 300с, удержание пока >= 4 за 600с):
+    # иначе класс вылетает раньше, чем dwell успевает его защитить
+    cur_alive = next((g for g in exp_ready if g[0] == cur), None) if cur is not None else None
+    if cur is not None and cur_alive is None:
+        k_hold = sum(1 for ring in rings.values() for ts, w in ring
+                     if n - ts <= 2 * _MIRROR_EXP_FRESH_SEC and cur / _MIRROR_STORM_GLUE <= w <= cur * _MIRROR_STORM_GLUE)
+        if k_hold >= max(1, _MIRROR_EXP_N - 2):
+            cur_alive = (cur, k_hold, st["since"])
+    sum_floor = sum(floor_sel[:n_floor])
+    want = None
+    if cur is not None and cur_alive is not None and (n - st["since"]) < _MIRROR_EXP_DWELL_SEC:
+        want = cur_alive                                    # dwell: держим, что вошло
+    elif cur is not None and cur_alive is not None:
+        want = cur_alive
+        if exp_ready and exp_ready[0][0] != cur and exp_ready[0][1] >= cur_alive[1] + _MIRROR_EXP_REPLACE_MARGIN \
+                and (n - st["last_change"]) >= _MIRROR_EXP_GAP_SEC:
+            want = exp_ready[0]                             # замена дорогого дорогим — с маржой и не чаще gap
+    elif exp_ready and (n - st["last_change"]) >= _MIRROR_EXP_GAP_SEC:
+        want = exp_ready[0]
+    storm = False
+    if want is not None and _MIRROR_EXP_SLOTS > 0:
+        if sum_floor + want[0] > _MIRROR_SUM_CAP:
+            # Σ-кап: дорогой пускается только ШТОРМОМ (свежие точные >= ENTRY_N уже проверены)
+            # и пока не выбран суточный шторм-бюджет
+            if st["storm_used"] < _MIRROR_STORM_SEC_PER_DAY:
+                storm = True
+            else:
+                want = None
+    else:
+        want = None
+    if want is not None and (cur != want[0]):
+        st.update({"cls": want[0], "w": want[1], "since": n, "last_change": n})
+    elif want is None and cur is not None:
+        st.update({"cls": None, "w": 0, "last_change": n})
+    st["storm"] = bool(want is not None and storm)
+    exp_val = want[0] if want is not None else None
+    modes = ([exp_val] if exp_val is not None else []) + floor_sel[:(_MIRROR_SLOTS - (1 if exp_val is not None else 0))]
+    if not floor_sel and exp_val is None:
         _MIRROR_APPLIED, _MIRROR_APPLIED_MODES = (), frozenset()
         return ()
-    modes = sorted({g[0] for g in sel}, reverse=True)
-    slots = list(modes)
-    for t in _PROBE_TIP_TIERS:                          # добивка статикой, без дублей
-        if len(slots) >= _MIRROR_SLOTS:
+    # --- добивка статикой без дублей и СТАБИЛЬНЫЕ ИНДЕКСЫ: значение держит свой индекс
+    fill = list(modes)
+    for t in _PROBE_TIP_TIERS:
+        if len(fill) >= _MIRROR_SLOTS:
             break
-        if t not in slots:
-            slots.append(int(t))
-    while len(slots) < _MIRROR_SLOTS:                   # вырожденный список тиров
-        slots.append(slots[-1])
+        if int(t) not in fill:
+            fill.append(int(t))
+    while len(fill) < _MIRROR_SLOTS:
+        fill.append(fill[-1])
+    prev = list(_MIRROR_APPLIED) if len(_MIRROR_APPLIED) == _MIRROR_SLOTS else [None] * _MIRROR_SLOTS
+    slots = [v if v in fill else None for v in prev]
+    pending = [v for v in fill if v not in slots]
+    for i in range(_MIRROR_SLOTS):
+        if slots[i] is None:
+            slots[i] = pending.pop(0) if pending else fill[i]
     _MIRROR_APPLIED, _MIRROR_APPLIED_MODES = tuple(slots), frozenset(modes)
     return _MIRROR_APPLIED
 

@@ -1141,6 +1141,7 @@ def main():
     try:
         from chain.execute import note_transit_tip as _ntt104
         from chain.execute import _mirror_cost_usd as _mcost104
+        from chain.execute import _PROBE_TIP_TIERS as _tiers104
         from chain.execute import mirror_slots_changed as _msc104
         _idx104 = chain_index.get_index()
 
@@ -1159,7 +1160,9 @@ def main():
                 # соврала бы на любом движении рынка) и по замеренному газу пробы.
                 log.info("#104 зеркало v2: слоты %s (было %s), ожидаемая цена tip проб "
                          "~$%.2f/окно", list(slots) or "статика", list(prev) or "статика",
-                         _mcost104(slots, cfg.eth_price_usd) if slots else 0.0)
+                         # 27.08: «статика ~$0» была артефактом (пустой кортеж -> 0); статика
+                         # стоит по той же формуле, что и слоты
+                         _mcost104(slots or tuple(_tiers104), cfg.eth_price_usd))
 
         if _idx104 is not None:
             _idx104.set_on_transit(_on_transit_104)

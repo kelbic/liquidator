@@ -83,6 +83,7 @@ def replay(portfolio_fn, fresh_state=True):
             ex._TRANSIT_TIPS.clear()
         ex._MIRROR_APPLIED, ex._MIRROR_APPLIED_MODES = (), frozenset()
         ex._MIRROR_HOT_UNTIL = 0.0
+        ex._mirror_exp_reset()
     t0, t1 = data[0][0], data[-1][0]
     i, moments, with_floor, changes, jam_at = 0, 0, 0, 0, None
     prev, seen = None, []
