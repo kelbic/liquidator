@@ -583,6 +583,66 @@ check("ВНЕ ПОЛОСЫ" not in w.history_note(_CBLTC, _USDC, log_path=_LOG, 
 print("UNIT_OK: ярлык серии называет свой предел, полоса ряда несёт числа, "
       "приписка не липнет к мерцанию и к состоянию")
 
+print("\n=== 16. Квотер берётся из ЗАПИСИ маршрута, а не по адресу роутера ===")
+# 27.08: коммит d34f6d6 увёл cbXRP на вторую CL-фабрику Aerodrome (AERO_CL3_ROUTER +
+# свой QuoterV2 в поле `quoter`). Прежнее правило сравнивало АДРЕС роутера с одним-
+# единственным AERO_CL_ROUTER, поэтому аэродромный путь ушёл в UniV3-квотер, тот
+# ревертнул — и канарейка объявила ЖИВОЙ маршрут МЁРТВЫМ (ложная тревога 5d198dc0).
+# Прибор обязан спрашивать пул тем же квотером, каким его спрашивает бой (route_depth).
+
+
+def quoters_used(items, module):
+    """(coll, loan) -> множество адресов `to`, которым канарейка слала котировку."""
+    seen = {}
+
+    def fetch(url, body):
+        req = json.loads(body)
+        to = req["params"][0]["to"].lower()
+        data = req["params"][0]["data"]
+        amount = int(data[74:138], 16)
+        plen = int(data[138:202], 16)
+        tin = "0x" + data[202:202 + plen * 2][:40]
+        seen.setdefault(tin, set()).add(to)
+        return {"jsonrpc": "2.0", "id": 1, "result": "0x%064x" % amount}
+
+    rows = rc.scan(items=items, module=module, fetch=fetch, pause=0, tries=1,
+                   block="0x1")
+    return seen, {(r["coll"], r["loan"]): r["router"] for r in rows}
+
+
+_XRP = _MOD._CBXRP
+_items16, _mod16 = routes_subset([((_XRP, _USDC), None),      # свой quoter (CL3)
+                                  ((_CBLTC, _USDC), None),    # style v1, квотера в записи нет
+                                  ((_WETH, _USDC), None)])    # style 02 -> UniV3
+_seen16, _who16 = quoters_used(_items16, _mod16)
+_xrp_q = dict(_items16)[(_XRP, _USDC)]["quoter"].lower()
+
+check(_seen16.get(_XRP.lower()) == {_xrp_q},
+      "маршрут со своим quoter обязан опрашиваться ИМ (пришло %s)" % _seen16.get(_XRP.lower()))
+check(rc.UNIV3_QUOTER.lower() not in _seen16.get(_XRP.lower(), set()),
+      "аэродромный маршрут не должен уезжать в UniV3-квотер (это и был ложный МЁРТВ)")
+check(_seen16.get(_CBLTC.lower()) == {rc.AERO_QUOTER.lower()},
+      "маршрут style=v1 без своего quoter обязан идти в AERO_QUOTER")
+check(_seen16.get(_WETH.lower()) == {rc.UNIV3_QUOTER.lower()},
+      "маршрут style=02 обязан идти в UNIV3_QUOTER")
+# ярлык венью в строке лога не должен врать про фабрику
+check(_who16[(_XRP, _USDC)] == "AERO*",
+      "венью маршрута на не дефолтной CL-фабрике = AERO*, пришло %r" % _who16[(_XRP, _USDC)])
+check(_who16[(_CBLTC, _USDC)] == "AERO" and _who16[(_WETH, _USDC)] == "UNIV3",
+      "ярлыки прежних семейств не поехали: %r / %r" % (_who16[(_CBLTC, _USDC)],
+                                                       _who16[(_WETH, _USDC)]))
+# и то же правило, что в БОЮ: расхождение прибора с route_depth — это и есть дефект
+try:
+    from chain.route_depth import _route_quoter as _combat_quoter
+    check(all(_combat_quoter(r).lower() == rc._route_quoter(r).lower()
+              for _k, r in _items16),
+          "квотер канарейки обязан совпадать с боевым chain.route_depth._route_quoter")
+except ImportError:
+    print("  SKIP: chain.route_depth недоступен — сверка с боевым правилом не сделана")
+
+print("UNIT_OK: квотер и ярлык венью берутся из записи маршрута; вторая CL-фабрика "
+      "больше не читается как мёртвый UniV3")
+
 print("\n=== САМОКОНТРОЛЬ (тест обязан уметь падать) ===")
 ctrl = []
 
@@ -635,6 +695,18 @@ finally:
     w.STEP_OUTLIER_X = _x
 ctrl.append(("сорванный множитель полосы => ступень снова «эпизод»",
              "ВНЕ ПОЛОСЫ" not in _blind3))
+
+# (е) НЕГАТИВНЫЙ КОНТРОЛЬ К ФИКСУ КВОТЕРА: вернуть прежнее правило «по адресу роутера» —
+# и маршрут второй CL-фабрики снова уезжает в UniV3-квотер. Проверка 16 обязана этим падать.
+_realq = rc._route_quoter
+rc._route_quoter = lambda r: (rc.AERO_QUOTER if r["router"] == _MOD.AERO_CL_ROUTER
+                              else rc.UNIV3_QUOTER)
+try:
+    _seen_blind, _ = quoters_used(_items16, _mod16)
+finally:
+    rc._route_quoter = _realq
+ctrl.append(("прежнее правило по адресу роутера => CL3 снова в UniV3-квотере",
+             _seen_blind.get(_XRP.lower()) == {rc.UNIV3_QUOTER.lower()}))
 
 for name, ok_ in ctrl:
     print(("  контроль ok:   " if ok_ else "  КОНТРОЛЬ СЛЕП: ") + name)

@@ -143,6 +143,33 @@ def block_number(*, rpc=None, fetch=None, timeout=45):
         return None
 
 
+def _route_quoter(r):
+    """Квотер маршрута: явный `quoter` записи, иначе квотер семейства по `style`.
+    Ровно то же правило, что в боевом chain/route_depth._route_quoter — прибор обязан
+    спрашивать пул тем же квотером, каким его спрашивает бой.
+
+    Почему НЕ по адресу роутера (так было до 27.08): у Aerodrome не один CL-роутер.
+    Коммит d34f6d6 увёл cbXRP на вторую CL-фабрику (AERO_CL3_ROUTER 0x698Cb2b6 +
+    свой QuoterV2 0x514c8B5f), сравнение `router == AERO_CL_ROUTER` дало False, и
+    аэродромный путь поехал в UniV3-квотер. Тот ревертит по построению — канарейка
+    объявила ЖИВОЙ маршрут МЁРТВЫМ (ложная тревога 27.08 17:06, ключ 5d198dc0).
+    Признак семейства взят из ЗАПИСИ маршрута, а не из адреса: адресов у семейства много,
+    запись одна."""
+    q = r.get("quoter")
+    if isinstance(q, str) and q.startswith("0x"):
+        return q
+    return AERO_QUOTER if r.get("style") == "v1" else UNIV3_QUOTER
+
+
+def _venue_name(quoter):
+    """Ярлык венью в строке лога. Ложный ярлык дороже отсутствующего: 27.08 строка
+    сказала «UNIV3» про аэродромный маршрут, и разбор тревоги начинался бы не с той
+    фабрики. `AERO*` — аэродромное семейство на НЕ дефолтной фабрике (свой квотер)."""
+    if quoter == UNIV3_QUOTER:
+        return "UNIV3"
+    return "AERO" if quoter == AERO_QUOTER else "AERO*"
+
+
 def routes(module=None):
     """Боевая карта маршрутов (chain.execute._SWAP_ROUTES) как список пар."""
     if module is None:
@@ -174,8 +201,8 @@ def scan(items=None, *, module=None, call=None, **kw):
         blk = block_number(rpc=kw.get("rpc"), fetch=kw.get("fetch")) or "latest"
     out = []
     for (coll, loan), r in items:
-        quoter = AERO_QUOTER if r["router"] == module.AERO_CL_ROUTER else UNIV3_QUOTER
-        who = "AERO" if r["router"] == module.AERO_CL_ROUTER else "UNIV3"
+        quoter = _route_quoter(r)
+        who = _venue_name(quoter)
         cap = r.get("max_in")
         work = cap if cap else 10 ** 8            # рабочий объём: кап либо номинал
         ref = max(1, work // 100)                 # референс: 1% от рабочего
