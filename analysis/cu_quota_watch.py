@@ -86,6 +86,19 @@ LEDGER_PATH = os.path.join(WATCH_DIR, "cu-quota.ledger.json")   # остаток
 SOURCE = "cu-quota"
 HOST = os.environ.get("CU_WATCH_SSH", "root@185.173.146.134")
 QUOTA_M = 30.0
+
+def _host_quota(anchor, host):
+    """Месячное ведро ХОСТА: пер-хостовое `hosts[host].quota_cu`, иначе общее `quota_cu`.
+    27.08: ключ A (#3133) переведён на платный тариф — у него своё ведро и свой CUPS, общее
+    число 30M для него ложно (сторож бы звонил/молчал не по тому знаменателю)."""
+    try:
+        h = ((anchor or {}).get("hosts") or {}).get(host) or {}
+        if h.get("quota_cu"):
+            return float(h["quota_cu"])
+    except Exception:
+        pass
+    return float((anchor or {}).get("quota_cu", QUOTA_M * 1e6))
+
 # Сколько книге надо накопить, чтобы ЕЮ судить срок до нуля (см. balance_verdicts).
 MIN_BOOK_SEC = float(os.environ.get("CU_WATCH_MIN_BOOK_H", "6")) * 3600.0
 # СВЕЖЕЕ ОКНО (21.08, ПРЕДЕЛ 4): сколько последних прогонов считать «сейчас» и сколько
@@ -565,13 +578,12 @@ def fleet_deficit(anchor, ledger, recs, *, now=None, horizon="cal", spans=SPANS_
     if not band:
         return None
     now_s = float(now if now is not None else time.time())
-    quota = float((anchor or {}).get("quota_cu", QUOTA_M * 1e6))
     led = (ledger or {}).get("hosts") or {}
     supply, locked = 0.0, []
     parts = []
     for h in sorted(hosts):
         mtd = float((hosts[h] or {}).get("mtd_cu", 0)) + float((led.get(h) or {}).get("cu", 0.0))
-        rem = max(0.0, quota - mtd)
+        rem = max(0.0, _host_quota(anchor, h) - mtd)          # ведро ПО ХОСТУ (A платный с 27.08)
         reason = (hosts[h] or {}).get("locked_reason")
         if reason:
             locked.append((h, rem, str(reason)))
@@ -812,7 +824,6 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fr
     Приговор по ТЕМПУ этой правкой НЕ ТРОНУТ: он защищён замером 22% ложных на норме.
     """
     now = float(now if now is not None else time.time())
-    quota = float(anchor.get("quota_cu", QUOTA_M * 1e6))
     led = (ledger or {}).get("hosts") or {}
     span = burn_span or {}
     since_map = burn_since or {}
@@ -827,7 +838,7 @@ def balance_verdicts(anchor, ledger, burn_cu_per_day, *, burn_span=None, burn_fr
         book_cu = float(book.get("cu", 0.0))
         book_sec = max(0.0, now - float(book.get("since", as_of) or as_of))
         mtd = float(a.get("mtd_cu", 0)) + book_cu
-        remaining = quota - mtd
+        remaining = _host_quota(anchor, host) - mtd      # ведро ПО ХОСТУ (A платный с 27.08)
 
         tail = float(burn_cu_per_day.get(host, 0.0))
         tail_sec = float(span.get(host, 0.0))
@@ -1143,13 +1154,12 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
     #      самый ранний из возможных сбросов. В ЖУРНАЛ, а не в тревогу: звонить по
     #      неподтверждённой дате — это порог, звенящий на норме (замер 22% ложных, 20.08).
     if parked:
-        q_cu = float(anchor.get("quota_cu", QUOTA_M * 1e6))
         pp = []
         for h in sorted(parked):
             ah = (anchor.get("hosts") or {}).get(h) or {}
             mtd_h = float(ah.get("mtd_cu", 0)) + float(
                 ((ledger.get("hosts") or {}).get(h) or {}).get("cu", 0.0))
-            pp.append("%s(ост%.1fM%s)" % (h, (q_cu - mtd_h) / 1e6,
+            pp.append("%s(ост%.1fM%s)" % (h, (_host_quota(anchor, h) - mtd_h) / 1e6,
                                           "" if h in per_host else ", строк в журнале нет"))
         out("cu-quota: ПРИПАРКОВАНЫ и сняты с обоих приговоров — co-наблюдение %d прогонов "
             "(ноль по ключу ПРИ разобранных окнах у других: замер, а не незнание): %s"
@@ -1220,7 +1230,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
         b_m = burst[host][0] if host in burst else None
         _ah = (anchor.get("hosts") or {}).get(host) or {}
         if _ah:
-            _rest = float(anchor.get("quota_cu", QUOTA_M * 1e6)) - (
+            _rest = _host_quota(anchor, host) - (
                 float(_ah.get("mtd_cu", 0))
                 + float(((ledger.get("hosts") or {}).get(host) or {}).get("cu", 0.0)))
             _d0 = _rest / (rate / 30.0 * 1e6) if rate > 0 else 0.0
@@ -1303,7 +1313,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
             ah = (anchor.get("hosts") or {}).get(host) or {}
             mtd_h = float(ah.get("mtd_cu", 0)) + float(
                 ((ledger.get("hosts") or {}).get(host) or {}).get("cu", 0.0))
-            rest_m = (float(anchor.get("quota_cu", QUOTA_M * 1e6)) - mtd_h) / 1e6
+            rest_m = (_host_quota(anchor, host) - mtd_h) / 1e6
             out("cu-quota: ПРИГОВОР СНЯТ, ЭПИЗОД КОНЧИЛСЯ — %s: хвост %.0fM/мес за %.1fч ВЫШЕ "
                 "порога %.0fM, но свежий час идёт %.0fM/мес, то есть и ниже хвоста (<=0.67), и "
                 "САМ ПОД ПОРОГОМ. Хвост описывает режим, которого уже нет; остаток ведра "
@@ -1435,7 +1445,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
                    "перестановка не лечит (22.08: 51.0M суммарно против 65.6M спроса до "
                    "сброса). Звать человека, если нужен новый ключ/оплата или правка боевого "
                    "env (HIL-1)."
-                   % (host, mtd / 1e6, float(anchor.get("quota_cu", QUOTA_M * 1e6)) / 1e6,
+                   % (host, mtd / 1e6, _host_quota(anchor, host) / 1e6,
                       remaining / 1e6, burn / 1000.0, days_zero, days_reset,
                       a.get("as_of_iso", a.get("as_of", "?")),
                       float(a.get("mtd_cu", 0)) / 1e6,
@@ -1462,7 +1472,7 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
                 # неотличима от сломанного сторожа).
                 out("cu-quota: ОСТАТОК %s %.1fM из %.0fM (%.1f сут против %.1f, полоса %d) "
                     "-> водораздел (не хуже полосы %s за окно 6ч), молчим"
-                    % (host, mtd / 1e6, float(anchor.get("quota_cu", QUOTA_M * 1e6)) / 1e6,
+                    % (host, mtd / 1e6, _host_quota(anchor, host) / 1e6,
                        days_zero, days_reset, _band, (_marks.get(host) or {}).get("band")))
                 continue
             _stamp = int(_band)
