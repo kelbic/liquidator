@@ -99,7 +99,7 @@ def lif_bonus_pct(lltv: float) -> float:
 def _lltv_table():
     """(coll, loan) -> [lltv, …] всех НАШИХ рынков пары. Ленивая: адреса живут в execute."""
     from chain.execute import (_CBBTC, _CBLTC, _CBXRP, _CBDOGE, _CBADA, _CBETH, _LBTC,
-                               _WSTETH, _WEETH, _EURC, _UNIV3_USDC, _UNIV3_WETH)
+                               _WSTETH, _WEETH, _EURC, _SOL, _UNIV3_USDC, _UNIV3_WETH)
     return {
         (_CBBTC, _EURC): [0.860],                    # 0x67ebd84b… -> 4.3841%
         (_CBLTC, _UNIV3_USDC): [0.625],              # 0x9125d0fa… -> 12.6761%
@@ -107,6 +107,11 @@ def _lltv_table():
         # (7.41%). Связывает ТЕСНЕЙШИЙ — маршрут один на оба, кап тоже один.
         (_CBXRP, _UNIV3_USDC): [0.625, 0.770],       # -> 7.4114%
         (_CBBTC, _UNIV3_USDC): [0.860],              # 0x9103c3b4… -> 4.3841%
+        # SOL/USDC 27.08 (роут заведён после вскрытия: рынок третий по деньгам, а маршрута не
+        # было вовсе). Рынков пары РОВНО ДВА, оба lltv 0.625 — перебором CreateMarket-логов
+        # Morpho за 9M блоков: 0x7dc02ff6… и 0x4aa5debe…. Без этой строки test_route_cap ловит
+        # незнание бонуса как незакрытый гард — и правильно делает.
+        (_SOL, _UNIV3_USDC): [0.625],                # -> 12.6761%
         # cbBTC/WETH 19.08 (роут заведён после потери 50191667): рынок пары РОВНО ОДИН —
         # 0x5dffffc7… lltv 0.915 (проверено обходом всех 33 рынков конфигов на форке 50191666).
         # Без этой строки канарейка выходов судила бы новый роут дефолтом (класс #76), а
