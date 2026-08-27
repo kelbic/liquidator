@@ -2093,6 +2093,19 @@ def prepare_hot(rpc, preconf_rpc, cfg, market_id, borrower, debt_usd, debt_asset
             except Exception:
                 _diag_blk = 0
             _diag_bucket = _diag_revert_bucket(str(sim.get("error", "")))
+            # 27.08: отказ СВОПНОЙ стороны запоминается для HEALTHY-RACE. Он приходит на ОДНОМ
+            # тике, а HR-ставка рождается на СЛЕДУЮЩЕМ (инцидент 16:15: SwapFailed в 16:15:13,
+            # ставка в 16:15:54) — без памяти знание о сломанном выходе не доживает до решения.
+            # CannotRepay (0x2206a00f) — наш собственный гард «свопа не хватило на погашение»;
+            # он попадает в бакет "other", поэтому ловим селектор явно, а не по бакету.
+            _serr = str(sim.get("error", "")).lower()
+            if _diag_bucket == "swapfailed" or "0x2206a00f" in _serr:
+                try:
+                    from chain import healthy_race as _hr_note
+                    _hr_note.note_swap_fail(market_id, borrower,
+                                            "CannotRepay" if "0x2206a00f" in _serr else "SwapFailed")
+                except Exception:                                    # noqa: BLE001
+                    pass                                             # учёт сбоку: не трогает огонь
             if _diag_bucket == "panic-underflow" and HOT_PANIC_PROBE:
                 _panic_probe(rpc, market_id, borrower, mid, repaid_shares, seized)
             _note_refusal(market_id, borrower, _diag_bucket, debt_usd)   # #123: отказ в регистр

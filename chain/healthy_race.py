@@ -82,6 +82,43 @@ def corpse_by_index(market_id, borrower, lookback=None):
         return None
 
 
+# --- ПАМЯТЬ О СЛОМАННОМ ВЫХОДЕ (27.08) ------------------------------------------------------
+# Инцидент 16:15:54Z: по 0xb3920b96/0xAA80d36B симуляция за 41с ДО ставки ревертнула SwapFailed
+# ("HOT skip: preconf sim revert 0x81ceff30"), а на следующем тике тот же реверт классифицировался
+# как «healthy» -> лаг оракула -> HR выстрелил РЕАЛЬНОЙ tx. Она ревертнула нашим CannotRepay()
+# (0x2206a00f): своп не дал денег на погашение. Замер выхода того же залога: полный сейз 4.12M
+# stkWELL выкупается за $242 при долге $11 554 (импакт -95.5%) — приз $1 465 был фантомом,
+# посчитанным по ЦЕНЕ ОРАКУЛА, а не по достижимому выходу.
+#
+# Гейт «здоров ли заёмщик» и гейт «продаётся ли залог» — РАЗНЫЕ вопросы, и второй у HR
+# отсутствовал. Здесь он и появляется: свежий отказ СВОПНОЙ стороны по этой цели закрывает
+# HEALTHY_RACE, пока не протухнет. Незнание закрывает гард; знание о поломке — тем более.
+_SWAP_FAIL: dict = {}
+HR_SWAPFAIL_TTL_SEC = float(os.environ.get("HR_SWAPFAIL_TTL_SEC", "300"))
+
+
+def note_swap_fail(market_id, borrower, why="", now=None):
+    """Запомнить отказ СВОПНОЙ стороны по цели (SwapFailed / CannotRepay / нет глубины).
+    Зовётся из горячего пути ПОСЛЕ симуляции; учёт сбоку, огня не касается."""
+    now = time.time() if now is None else now
+    with _LOCK:
+        _SWAP_FAIL[(str(market_id).lower(), str(borrower).lower())] = (now, str(why)[:40])
+        for k, (ts, _w) in list(_SWAP_FAIL.items()):
+            if now - ts > HR_SWAPFAIL_TTL_SEC * 4:
+                del _SWAP_FAIL[k]
+
+
+def swap_fail_fresh(market_id, borrower, now=None):
+    """(возраст, причина) свежего отказа свопа по цели либо None. Чистая (под стенд)."""
+    now = time.time() if now is None else now
+    with _LOCK:
+        v = _SWAP_FAIL.get((str(market_id).lower(), str(borrower).lower()))
+    if v is None:
+        return None
+    age = now - v[0]
+    return (age, v[1]) if age <= HR_SWAPFAIL_TTL_SEC else None
+
+
 def classify(market_id, borrower, hf_est, prize_net_usd, data_age_s=0.0,
              borrow_shares=1, episode=None, corpse=None, now=None):
     """Чистая классификация: все аргументы-сигналы можно подать снаружи (стенд), дефолты
@@ -107,6 +144,13 @@ def classify(market_id, borrower, hf_est, prize_net_usd, data_age_s=0.0,
             COUNTERS["hr_gate_skips"] += 1
         return ("SKIP", "hf_est=%s > %.3f (воды не видим)" % (
             "%.4f" % hf_est if hf_est is not None else "?", HR_HF_MAX))
+    _sf = swap_fail_fresh(market_id, borrower, now=now)
+    if _sf is not None:
+        with _LOCK:
+            COUNTERS["hr_gate_skips"] += 1
+            COUNTERS["hr_swapfail_skips"] = COUNTERS.get("hr_swapfail_skips", 0) + 1
+        return ("SKIP", "выход сломан: %s %.0fс назад (залог не продаётся — приз фантом)"
+                % (_sf[1], _sf[0]))
     if data_age_s > HR_FRESH_SEC:
         with _LOCK:
             COUNTERS["hr_gate_skips"] += 1
