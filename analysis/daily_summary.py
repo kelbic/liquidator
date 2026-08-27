@@ -186,14 +186,20 @@ try:
     done = subprocess.run(["git", "-C", "/root/liquidator", "log", "--since=-%dh" % int(HOURS),
                            "--format=%s", "--no-merges"], capture_output=True, text=True,
                           timeout=20).stdout.splitlines()
-    done = [d.split(" — ")[0].split(":")[0][:64] if len(d) > 72 else d[:72] for d in done if d.strip()]
+    # тема коммита без служебного префикса («STATE: …», «Plan+STATE: …»), уникально, до 70 символов
+    _seen = set(); _d2 = []
+    for d in done:
+        d = re.sub(r"^(STATE|Plan(\+STATE)?|docs)\s*:\s*", "", d.strip())[:70]
+        if d and d not in _seen:
+            _seen.add(d); _d2.append(d)
+    done = _d2
     if done:
         lines.append("сделано за окно (%d коммитов): " % len(done) + " | ".join(done[:5])
                      + (" | …" if len(done) > 5 else ""))
     plan = open("/root/liquidator/Plan.md", encoding="utf-8").read()
     sec = plan.split("## Открыто", 1)[1] if "## Открыто" in plan else ""
     nxt = re.findall(r"^\d+\.\s+\**(.+?)\**(?:\s*[—:-]|$)", sec, re.M)
-    nxt = [x.strip("* ").split("(")[0].strip()[:70] for x in nxt if not x.startswith("~~")]
+    nxt = [x.replace("*", "").split("(")[0].strip()[:70] for x in nxt if not x.startswith("~~")]
     if nxt:
         lines.append("следующие шаги (Plan «Открыто»): " + "; ".join(nxt[:4]))
 except Exception as e:
