@@ -68,12 +68,31 @@ def probed_borrowers():
     return out
 
 
-# 1) _top_fat: кромка возвращается отдельно, даже когда она не жирнейшая (k=1)
+# 1) _top_fat: ДВА РЕЖИМА (27.08). Ранг стал «долг x P(флип)», а не чистый долг: цель дальше
+#    замеренного предела толчков фида не флипает вовсе и слот занимать не должна. Фикстура:
+#    ЖИР $1.5M на 0.50%, КРОМКА $600k на 0.10%; замер BTC (журнал PREDICT, 3 суток): max 0.226%.
+import chain.push_scale as _ps
+
+# 1а) МИР, ГДЕ ЖИР ДОСЯГАЕМ (кольцо BTC знает толчки 0.6%): прежний контракт БИТ-В-БИТ —
+#     top-1 по долгу, кромка отдельно. Без этого «кромка победила» неотличимо от «ранг сломан».
+_ps._RINGS.clear()
+for _i in range(_ps.MIN_N + 2):
+    _ps.note_push("BTC", 0.60)
 sf = make(mk_shared())
 tgts, hold, edge = sf._top_fat("BTC", "down", max_dist=0.03, k=1)
 assert [t[1] for t in tgts] == ["0xFATWHALE"], tgts
 assert edge is not None and edge[1] == "0xEDGESMALL", edge
-print("UNIT_OK: _top_fat отдаёт top-1 по долгу И кромку по dist отдельно")
+print("UNIT_OK: досягаемый жир держит top-1 по долгу, кромка отдаётся отдельно (контракт цел)")
+
+# 1б) БОЕВОЙ МИР (замер BTC 0.226%): жир на 0.50% НЕДОСЯГАЕМ -> слот забирает кромка.
+#     Это и есть каскад 26.08: у нас стоял заёмщик на 2.27% при толчках максимум 0.601%.
+_ps._RINGS.clear()
+sf = make(mk_shared())
+tgts, hold, edge = sf._top_fat("BTC", "down", max_dist=0.03, k=1)
+assert [t[1] for t in tgts] == ["0xEDGESMALL"], (
+    "жир на 0.50%% при максимальном толчке BTC 0.226%% не флипает — слот его быть не должен: %s" % (tgts,))
+assert edge is not None and edge[1] == "0xEDGESMALL", edge
+print("UNIT_OK: недосягаемый жир уступает слот кромке (замер BTC max 0.226%%)")
 
 # 1b) hf<=1.0 (уже за флипом) = dist 0 — кромка вне конкуренции
 sf1b = make(mk_shared(hf_edge=0.9990))
@@ -90,6 +109,12 @@ assert edge1c is None and len(tgts1c) == 1, (tgts1c, edge1c)
 print("UNIT_OK: без hf_by edge=None (fail-open, чистый ранг по долгу)")
 
 # 2) живой огонь: обе цели получают пробы, кромка помечена [edge]
+# Ротация «жир + кромка» — контракт, ОРТОГОНАЛЬНЫЙ досягаемости, поэтому мир фикстуры делаем
+# таким, где досягаемы ОБЕ (толчки 0.6% при жире на 0.50%). Иначе проверялась бы не ротация,
+# а гейт досягаемости, у которого есть свой стенд (test_push_scale_reach.py).
+_ps._RINGS.clear()
+for _i in range(_ps.MIN_N + 2):
+    _ps.note_push("BTC", 0.60)
 sent.clear(); LOGS.clear(); RET["v"] = -0.005
 old_iv, old_j = sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC, sfl_mod.SPEC_FIRE_DENSE_JITTER_SEC
 sfl_mod.SPEC_FIRE_DENSE_INTERVAL_SEC = 0.05       # пол max(0.25,...) удержит 0.25

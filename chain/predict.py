@@ -459,6 +459,13 @@ class PredictDriver:
                 self.stats["arms"] += 1
             elif ev["event"] == "confirmed":
                 self.stats["confirmed"] += 1
+                # 27.08: масштаб толчка — СБОКУ (учёт на сигнальном пути не должен его ронять).
+                # Кормит гейт досягаемости доски: цель дальше p99 толчков фида не флипает вовсе.
+                try:
+                    from chain import push_scale as _ps
+                    _ps.note_push(ev.get("feed"), ev.get("ret_pct"))
+                except Exception:                       # noqa: BLE001
+                    pass
             elif ev["event"] == "falsepos":
                 self.stats["falsepos"] += 1
             if self.on_event is not None:

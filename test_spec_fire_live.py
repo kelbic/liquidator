@@ -179,6 +179,19 @@ print("UNIT_OK: арм-гейт — мёртвое окно не стартуе�
 # 7b) FIRE-гейт (predicted-HF): dist 2% армится (< потолка), малый ret -> hold;
 #     ret с досягаемостью |ret|+2×dev >= dist -> огонь
 sent.clear(); LOGS.clear(); RET["v"] = -0.0011    # достягаемость 0.11%+0.20% = 0.31% < 2%
+# 27.08: мир этой фикстуры — толчки ~2% (ниже RET=-0.019). Кольцо масштаба обязано описывать ТОТ
+# ЖЕ мир, иначе новый гейт досягаемости (p99 толчков фида) срежет цель на 2% ДО FIRE-гейта, и
+# тест 7b будет проверять не то, что заявляет. Боевой замер BTC (max 0.226%) здесь неуместен —
+# он описывает боевой рынок, а не эту фикстуру.
+import chain.push_scale as _ps_live
+_ps_live._RINGS.clear()
+# Потолок CAP_PCT=1.5% — БОЕВОЙ предохранитель (максимум замеренного толчка 0.601%), но мир этой
+# фикстуры устроен вокруг движения 2%, поэтому здесь потолок поднимается ЯВНО и локально.
+# Иначе гейт срежет цель на 2.00% раньше FIRE-гейта, и 7b проверит не то, что заявляет.
+_ps_live_cap = _ps_live.CAP_PCT
+_ps_live.CAP_PCT = 5.0
+for _i in range(_ps_live.MIN_N + 2):
+    _ps_live.note_push("BTC", 2.10)
 sf7 = SpecFireLive(rpc=None, cfg=cfg, shared=mk_shared(1.0204), ret_fn=lambda l: RET["v"],
                    dev_by={"BTC": 0.0010}, build_fn=build_fn, send_fn=send_fn,
                    receipt_fn=receipt_fn, log_fn=LOGS.append)   # dist=2.00%

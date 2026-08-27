@@ -26,6 +26,8 @@ import random
 import threading
 import time
 
+
+from chain import push_scale as _push_scale   # 27.08: масштаб толчка -> гейт досягаемости
 from chain.spec_fire import _label_of
 
 log = logging.getLogger("liq.spec_fire_live")
@@ -1240,6 +1242,7 @@ class SpecFireLive:
         (кандидат edge-слота ротации; None = dist ни у кого не вычислим). Пустой
         список = досягаемого жира нет."""
         elig = []
+        dist_by = {}
         hold_dist = None
         edge_d, edge_t = None, None
         with self.shared.lock:
@@ -1279,14 +1282,23 @@ class SpecFireLive:
                     elif 0.0 < hf <= 1.0:         # уже за флипом — ближе кромки не бывает
                         dist = 0.0
                 elig.append((mid, b, d))
+                dist_by[(mid, b)] = dist          # для ранга по ожиданию (27.08)
                 if dist is not None and (edge_d is None or dist < edge_d):
                     edge_d, edge_t = dist, (mid, b, d)
-        # top-1 по ДОЛГУ. Контракт edge-слота (test_spec_fire_edge_slot): кромка-по-dist
-        # отдаётся ОТДЕЛЬНО через edge_t и НЕ ранжирует top-K; незнание HF fail-open — цель
-        # остаётся eligible (1c: без hf_by len(tgts)==1). Владельца ОДНОГО слота доски по EV
-        # (долг × близость) выбирает арбитр в _prearm_board ПОСЛЕ этого ранга (R2 разрешает
-        # post-selection), а ценностной гард #88 — в _arm_board. Здесь ранг чист по долгу.
-        elig.sort(key=lambda t: -t[2])
+        # 27.08 РАНГ ПО ОЖИДАНИЮ, А НЕ ПО ДОЛГУ. Прежний `sort(-долг)` систематически ставил на
+        # доску САМУЮ ЖИРНУЮ цель вместо ДОСЯГАЕМОЙ: в каскаде 26.08 15:05 у нас стоял заёмщик
+        # HF 1.02319 (2.27% от кромки, долг $174k), а все десять победителей были в пределах
+        # 0.51%, взявший $19 408 — на 1.00096. Замер 920 подтверждённых пушей за 3 суток:
+        # максимум толчка 0.601%, p99 0.510%. Цель на 2.27% не флипает НИ ПРИ ОДНОМ из них —
+        # 7 391 проба за 9.8 суток, все «position is healthy», ноль исполнений.
+        # Вес — доля толчков фида, перекрывающих расстояние цели (chain/push_scale). Незнание
+        # HF даёт вес 1.0: прежний fail-open сохранён бит-в-бит, такая цель конкурирует долгом.
+        # Механизм выключается PUSH_SCALE=0 -> вес 1.0 у всех -> ранг снова чист по долгу.
+        def _ev_key(t):
+            _d = dist_by.get((t[0], t[1]))
+            _w = 1.0 if _d is None else _push_scale.p_flip(feed, _d)
+            return -(float(t[2]) * _w)
+        elig.sort(key=_ev_key)
         return elig[:k], hold_dist, edge_t
 
     def _min_flip_dist(self, feed: str, direction: str):
@@ -4532,7 +4544,16 @@ class SpecFireLive:
                 direction = ev.get("dir") or "down"
                 if self._cooldown_active(feed):            # WIN-пауза (#46: по умолчанию пер-фид)
                     return None
-                best, hold_dist, _ = self._top_fat(feed, direction, max_dist=SPEC_FIRE_ARM_MAX_DIST)
+                # 27.08: предел досягаемости — ЗАМЕРЕННЫЙ пер-фид (p99 толчков этого фида),
+                # а не общая константа 3%. Разброс втрое: BTC p99 0.192% против XRP 0.601%;
+                # прежние 3% были в пять раз шире МАКСИМАЛЬНОГО толчка за 3 суток (0.601%),
+                # то есть гейт не отсекал ничего и пропускал заведомо недосягаемые цели.
+                # PUSH_SCALE=0 -> reach()=None -> прежняя константа бит-в-бит.
+                _reach = _push_scale.reach(feed)
+                best, hold_dist, _ = self._top_fat(
+                    feed, direction,
+                    max_dist=SPEC_FIRE_ARM_MAX_DIST if _reach is None
+                    else min(SPEC_FIRE_ARM_MAX_DIST, _reach))
                 if not best:
                     if hold_dist is not None:              # жир есть, но заведомо вне окна — не палим
                         _n = self._now()                   # ни петлю, ни ончейн-паттерн
