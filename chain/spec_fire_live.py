@@ -882,6 +882,8 @@ class SpecFireLive:
         # исключаются из вершины _top_fat: иначе доска переспрашивает ТУ ЖЕ цель каждые 5с
         # (682 раза за 2ч, 5ч без единого выстрела при живой службе — «без доски флот нем»).
         self._unbuildable: dict = {}              # (mid, b) -> until_ts
+        self._unbuildable_mid: dict = {}          # mid -> until_ts (весь рынок после >=3 осечек: нет роута у ЗАЛОГА)
+        self._unbuildable_hits: dict = {}         # mid -> число осечек за TTL
         self._cooldown_until = 0.0                # WIN-пауза (SCOPE=global): окна не армим
         self._cooldown_feed: dict = {}            # feed -> ts (SCOPE=feed, дефолт): гаснет только
                                                   # фид, чья цель взята — ноги 2+ каскада живы
@@ -1262,8 +1264,9 @@ class SpecFireLive:
                 if d < _min_usd:
                     continue
                 _ub = (getattr(self, "_unbuildable", None) or {}).get((mid, b))
-                if _ub is not None and _ub > self._now():      # 27.08: несобираемая — мимо вершины
-                    continue
+                _um = (getattr(self, "_unbuildable_mid", None) or {}).get(mid)
+                if (_ub is not None and _ub > self._now()) or (_um is not None and _um > self._now()):
+                    continue                                    # 27.08: несобираемая цель/рынок — мимо вершины
                 dist = None
                 if max_dist is not None:
                     hf = float(hf_by.get((mid, b), 0.0) or 0.0)
@@ -1309,8 +1312,9 @@ class SpecFireLive:
             _bonus = float(getattr(m, "bonus", 0.0) or 0.0)
             for b in borrowers:
                 _ub = (getattr(self, "_unbuildable", None) or {}).get((mid, b))
-                if _ub is not None and _ub > self._now():      # 27.08: несобираемая цель не судит детонатор
-                    continue
+                _um = (getattr(self, "_unbuildable_mid", None) or {}).get(mid)
+                if (_ub is not None and _ub > self._now()) or (_um is not None and _um > self._now()):
+                    continue                                    # 27.08: несобираемая цель/рынок не судит детонатор
                 _debt = float(debt_by.get((mid, b), 0.0) or 0.0)
                 if _debt < _min_usd:
                     continue
@@ -2477,8 +2481,9 @@ class SpecFireLive:
                 except Exception:                            # noqa: BLE001
                     pass
                 _dub = (getattr(self, "_unbuildable", None) or {}).get((_dmid, _db))
-                if _dub is not None and _dub > self._now():     # 27.08: несобираемую не навязываем
-                    _ddebt = 0.0
+                _dum = (getattr(self, "_unbuildable_mid", None) or {}).get(_dmid)
+                if (_dub is not None and _dub > self._now()) or (_dum is not None and _dum > self._now()):
+                    _ddebt = 0.0                                 # 27.08: несобираемую цель/рынок не навязываем
                 if _ddebt > 0 and not tgts:
                     self._log("SPECFIRE доска: план ПОД ЦЕЛЬ ДЕТОНАТОРА %s/%s (dist %.3f%%, "
                               "жир вне reach %.2f%% — справка, не гейт)"
@@ -2563,6 +2568,15 @@ class SpecFireLive:
                     # помечаем на TTL и даём _top_fat выдать СЛЕДУЮЩУЮ вершину уже на переспросе
                     self._unbuildable[(mid, b)] = self._now() + SPEC_FIRE_UNBUILDABLE_TTL_SEC
                     self.stats["board_unbuildable"] = self.stats.get("board_unbuildable", 0) + 1
+                    # РЫНОК целиком после >=3 осечек: роута нет у ЗАЛОГА (yoETH), а не у заёмщика —
+                    # иначе доска обходит 67 заёмщиков по 5с = ~6 мин слепоты каждые TTL (замер 13:42)
+                    _h = self._unbuildable_hits.get(mid, 0) + 1
+                    self._unbuildable_hits[mid] = _h
+                    if _h >= 3:
+                        self._unbuildable_mid[mid] = self._now() + SPEC_FIRE_UNBUILDABLE_TTL_SEC
+                        self._unbuildable_hits[mid] = 0
+                        self._log("SPECFIRE доска: рынок %s несобираем целиком (3 осечки) — исключён на %.0fс"
+                                  % (mid[:10], SPEC_FIRE_UNBUILDABLE_TTL_SEC))
                     self._log("SPECFIRE доска: цель %s/%s несобираема (нет роута/котировки) — "
                               "исключена из вершины на %.0fс, доска пойдёт к следующей"
                               % (mid[:10], b[:10], SPEC_FIRE_UNBUILDABLE_TTL_SEC))

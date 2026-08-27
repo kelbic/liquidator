@@ -16,7 +16,7 @@ T=[1000.0]
 def mk():
     o=sfl.SpecFireLive.__new__(sfl.SpecFireLive)
     o.stats={}; o._lock=threading.Lock(); o._logs=[]; o._log=o._logs.append; o._now=lambda:T[0]
-    o._armskip_ts={}; o._unbuildable={}
+    o._armskip_ts={}; o._unbuildable={}; o._unbuildable_mid={}; o._unbuildable_hits={}
     m=SimpleNamespace(collateral_token="ETH", loan_token="USDC", bonus=0.043)
     o.shared=SimpleNamespace(lock=threading.Lock(), groups={MID:[BAD,GOOD]}, debt_by={(MID,BAD):59_000.0,(MID,GOOD):28_000.0}, by_id={MID:m}, hf_by={(MID,BAD):1.001,(MID,GOOD):1.002})
     return o
@@ -40,7 +40,7 @@ o4._min_flip_dist("ETH","down")
 _dk=(o4._det_key_by_feed or {}).get("ETH")
 check("детонатор: несобираемая цель пропущена, ключ — собираемая", _dk is not None and _dk[0]==(MID,GOOD), _dk)
 _S=open("chain/spec_fire_live.py").read()
-check("гард: пропуск стоит и в _min_flip_dist, и в ветке «под цель детонатора»", _S.count("несобираемая цель не судит детонатор")==1 and "несобираемую не навязываем" in _S)
+check("гард: пропуск стоит и в _min_flip_dist, и в ветке «под цель детонатора»", _S.count("не судит детонатор")==1 and "не навязываем" in _S)
 check("пометка стоит в ветке «проба не собралась» и печатает причину", "self._unbuildable[(mid, b)] = self._now() + SPEC_FIRE_UNBUILDABLE_TTL_SEC" in _S and "несобираема (нет роута/котировки)" in _S)
 check("причина записана (682 отказа, 5ч без выстрела)", "682 раза" in _S and "5ч без единого выстрела" in _S)
 sfl._label_of=_sv
