@@ -743,12 +743,82 @@ def _price_moved(agg, px, last_price):
     return prev is None or px != prev
 
 
-def _flips(price, lltv_wad, tba, tbs, positions):
+# ---- НАЧИСЛЕНИЕ ПРОЦЕНТА ДО ПРОВЕРКИ ЗДОРОВЬЯ (28.08) --------------------------------------
+# Morpho.liquidate первым делом делает _accrueInterest: totalBorrowAssets растёт на
+# tba * rate * elapsed (Тейлор до 3-го члена; на секундах-минутах линейный член — всё), и только
+# потом сверяет здоровье. Мы считали HF по ХРАНИМЫМ тоталам ⇒ цель на границе для нас здорова
+# ВСЕГДА. Замер 28.08: четыре ликвидации cbXRP (блоки 50542383..50543714) — у нас HF ровно 1.00000
+# при 10-44с без accrual, конкуренты взяли. Тренировочный режим за час: 6 гонок, все «noflip».
+# lastUpdate — бесплатно из уже читаемого market(); ставка — один borrowRateView на рынок раз в
+# ACCRUAL_RATE_TTL_SEC (в горячем цикле RTT не добавляется: читается лениво и кэшируется).
+# НЕЗНАНИЕ (нет ставки/lastUpdate/выключено) — прежнее поведение БИТ-В-БИТ. Откат HF_ACCRUAL=0.
+HF_ACCRUAL = os.environ.get("HF_ACCRUAL", "1").lower() not in ("0", "off", "false", "no")
+ACCRUAL_RATE_TTL_SEC = float(os.environ.get("HF_ACCRUAL_RATE_TTL_SEC", "300"))
+_MARKET_ACCRUAL: dict = {}      # mid -> {"last_update": int, "rate_ps": int|None, "rate_ts": float}
+_ACCRUAL_LOCK = threading.Lock()
+
+
+def note_market_accrual(mid, last_update, rate_ps=None, now=None):
+    """Запомнить lastUpdate (и ставку, если дали) рынка. Чистая, без сети."""
+    n = time.time() if now is None else now
+    with _ACCRUAL_LOCK:
+        d = _MARKET_ACCRUAL.setdefault(mid, {"last_update": None, "rate_ps": None, "rate_ts": 0.0})
+        d["last_update"] = int(last_update)
+        if rate_ps is not None:
+            d["rate_ps"], d["rate_ts"] = int(rate_ps), n
+
+
+def accrued_tba(mid, tba, now=None):
+    """totalBorrowAssets ПОСЛЕ начисления, как его увидит Morpho.liquidate. Незнание -> tba как есть."""
+    if not HF_ACCRUAL:
+        return int(tba)
+    n = time.time() if now is None else now
+    with _ACCRUAL_LOCK:
+        d = _MARKET_ACCRUAL.get(mid)
+        if not d or d["last_update"] is None or d["rate_ps"] is None:
+            return int(tba)
+        elapsed = max(0, int(n) - int(d["last_update"]))
+        rate = int(d["rate_ps"])
+    if elapsed <= 0 or rate <= 0:
+        return int(tba)
+    # Morpho: interest = wMulDown(tba, wTaylorCompounded(rate, elapsed)); линейный член = rate*elapsed/1e18,
+    # второй = x^2/2, третий = x^3/6 — берём все три, как в MathLib, целочисленно.
+    x = rate * elapsed
+    W = 10 ** 18
+    t1 = x
+    t2 = (x * x) // (2 * W)
+    t3 = (t2 * x) // (3 * W)
+    return int(tba) + (int(tba) * (t1 + t2 + t3)) // W
+
+
+def _maybe_refresh_rate(rpc, mid, mk):
+    """Ставка IRM для начисления: один borrowRateView на рынок раз в ACCRUAL_RATE_TTL_SEC.
+    Ошибка чтения -> ставка остаётся None -> accrued_tba отдаёт tba как есть (незнание не открывает)."""
+    if not HF_ACCRUAL:
+        return
+    n = time.time()
+    with _ACCRUAL_LOCK:
+        d = _MARKET_ACCRUAL.get(mid)
+        if d and d.get("rate_ps") is not None and n - d.get("rate_ts", 0.0) < ACCRUAL_RATE_TTL_SEC:
+            return
+    from chain.multicall import (aggregate3, encode_id_to_market_params_call, decode_id_to_market_params,
+                                 encode_borrow_rate_view_call, decode_borrow_rate_view)
+    from chain.execute import _MORPHO_BLUE
+    m32 = rpc.to_bytes32(mid)
+    r1 = aggregate3(rpc, [(_MORPHO_BLUE, encode_id_to_market_params_call(m32))])
+    loan, coll, oracle, irm, lltv_wad = decode_id_to_market_params(r1[0][1])
+    r2 = aggregate3(rpc, [(irm, encode_borrow_rate_view_call((loan, coll, oracle, irm, int(lltv_wad)), mk))])
+    if r2 and r2[0][0]:
+        note_market_accrual(mid, mk[4], rate_ps=decode_borrow_rate_view(r2[0][1]), now=n)
+
+
+def _flips(price, lltv_wad, tba, tbs, positions, mid=None, now=None):
     """PURE flip recompute on the preconf price — identical to the armed assess (chain.simulate.health_from).
     positions: [(borrower, borrow_shares, collateral, debt_usd)] -> [(borrower, HealthReport, debt_usd)]."""
     from chain.simulate import MarketContext, health_from
+    _tba = accrued_tba(mid, tba, now=now) if mid is not None else int(tba)
     ctx = MarketContext(oracle="", price=int(price), lltv_wad=int(lltv_wad),
-                        total_borrow_assets=int(tba), total_borrow_shares=int(tbs))
+                        total_borrow_assets=int(_tba), total_borrow_shares=int(tbs))
     out = []
     for (b, bs, col, du) in positions:
         hr = health_from(ctx, int(bs), int(col))
@@ -1233,6 +1303,11 @@ def read_positions(rpc, mid, borrowers, preconf_rpc=None, src_out=None):
     if not res or not res[0][0] or not res[0][1]:
         return None
     m = decode_market(res[0][1]); tba, tbs = m[2], m[3]
+    try:
+        note_market_accrual(mid, m[4])                      # lastUpdate бесплатно, из того же чтения
+        _maybe_refresh_rate(rpc, mid, m)                     # ставка — лениво, раз в TTL, один вызов
+    except Exception:                                        # noqa: BLE001 — прибор сбоку от денег
+        pass
     pos = []; _dropped = []
     for b, (ok, data) in zip(borrowers, res[1:]):
         if ok and data:
@@ -1296,6 +1371,11 @@ def refresh_position_cache(cache_rpc, mid, borrowers):
         log.info("DIAG position-cache refresh-fail market=%s reason=market-call-failed", mid[:10])
         return
     m = decode_market(res[0][1]); tba, tbs = m[2], m[3]
+    try:
+        note_market_accrual(mid, m[4])                      # lastUpdate бесплатно, из того же чтения
+        _maybe_refresh_rate(rpc, mid, m)                     # ставка — лениво, раз в TTL, один вызов
+    except Exception:                                        # noqa: BLE001 — прибор сбоку от денег
+        pass
     now = time.time()
     with _POSITION_CACHE_LOCK:
         prev = _POSITION_CACHE.get(mid)
@@ -2625,7 +2705,10 @@ def _process_transmit(agg, block, subidx, t, *, rpc, preconf_rpc, cfg, feeds, me
         positions = [(b, bs, col, debt_by.get((mid, b), 0.0)) for (b, bs, col) in pos]
         pos_by = {b: (bs, col) for (b, bs, col) in pos}      # P0-4: state для prepare_hot без повторного RTT
         _fls = time.perf_counter()                           # 07-17 п.1: CPU _flips по непруненному набору — мерить
-        flipped = _flips(price, lltv_wad, tba, tbs, positions)
+        try:
+            flipped = _flips(price, lltv_wad, tba, tbs, positions, mid=mid)
+        except TypeError:                                   # стенды подменяют _flips лямбдой старой формы
+            flipped = _flips(price, lltv_wad, tba, tbs, positions)
         _t_flips_last = (time.perf_counter() - _fls) * 1000.0; _t_flips_total += _t_flips_last
         stage_note("flips", _t_flips_last)
         if not flipped:
