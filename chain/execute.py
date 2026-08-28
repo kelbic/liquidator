@@ -1810,7 +1810,12 @@ def send_owner_tx_v6(rpc, cfg, calldata: str, gas: int, log=None, tag="v6",
                     continue
                 _LOCAL_NONCE.pop(bot, None)   # неизвестно, съелся ли nonce -> ресинк с цепи
                 if log:
-                    log.info("V6 %s send fail: %s", tag, type(e).__name__)
+                    try:
+                        from chain.rpc import redact_clip as _rc
+                        _body = _rc(str(e), 200)
+                    except Exception:                       # noqa: BLE001 — прибор сбоку от денег
+                        _body = "?"
+                    log.info("V6 %s send fail: %s: %s", tag, type(e).__name__, _body)   # 28.08: инцидент 19:49 — час без доски, а в журнале только имя класса
                 return None
             h = res.get("hash")
             _LOCAL_NONCE[bot] = n + 1
@@ -2054,7 +2059,7 @@ def volley_bal_read_rpc(rpc):
             _VOLLEY_BAL_RPC = False
         else:
             try:
-                from chain.rpc import BaseRpc, guard_chain_id
+                from chain.rpc import redact_clip, BaseRpc, guard_chain_id
                 h = guard_chain_id(BaseRpc(url, rpc.chain_id, request_timeout=10),
                                    rpc.chain_id, "ключ фоновых чтений патрона", fallback=rpc)
                 _VOLLEY_BAL_RPC = False if h is rpc else h
