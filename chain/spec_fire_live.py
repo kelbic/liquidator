@@ -1333,10 +1333,14 @@ class SpecFireLive:
         """
         if SPEC_FIRE_DET_REACH_PUSHES <= 0 or dist is None:
             return True
-        p99 = _push_scale.reach(feed)
+        p99 = _push_scale.reach(feed, seed_floor=False)     # ЖИВОЙ квантиль одного пуша — под x PUSHES
         if p99 is None:
             return True
-        budget = p99 * SPEC_FIRE_DET_REACH_PUSHES
+        # ЛИНЗА Fable 28.08: множитель PUSHES калиброван под ЖИВОЙ p99 одного пуша («1-2 пуша за TTL
+        # доски»). Семя же (p99 7-суточного поля, XRP 2.772%) — величина ОКНА: ≈ p95 хода за 14 мин
+        # (2.93% по 933 окнам). Умножать семя на 2 значит открыть альтам 4.99-6.07% — ту самую полосу,
+        # где стояли перехваченные цели 27.08 (5.16-6.48%, 7 391 реверт). Поэтому пол входит x1.
+        budget = max(p99 * SPEC_FIRE_DET_REACH_PUSHES, _push_scale.reach(feed) or 0.0)
         if dist <= budget:
             return True
         self._log("SPECFIRE доска: перехват детонатора ОТКЛОНЁН %s/%s (dist %.3f%% > бюджет "

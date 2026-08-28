@@ -89,7 +89,7 @@ def samples(feed, now=None):
     return len(_fresh(feed, time.time() if now is None else now))
 
 
-def reach(feed, now=None):
+def reach(feed, now=None, seed_floor=None):
     """Предел досягаемости фида в ДОЛЕ (не процентах): дальше цель не флипает.
     None = механизм выключен (вызывающий возвращается к прежней константе)."""
     if not PUSH_SCALE_ON:
@@ -106,7 +106,7 @@ def reach(feed, now=None):
         # 2.11%, p99 11.4%. Штиль не должен ОПУСКАТЬ досягаемость ниже посевной: семя снято
         # с 7-суточного поля, где были и каскады. Вверх живой замер по-прежнему двигает.
         # Откат: PUSH_SCALE_SEED_FLOOR=0.
-        if SEED_IS_FLOOR:
+        if (SEED_IS_FLOOR if seed_floor is None else seed_floor):
             pct = max(pct, seed)
     else:
         pct = seed

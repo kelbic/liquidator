@@ -38,7 +38,8 @@ def test_negative_control_rollback_restores_old_behaviour():
     assert abs(r - 0.616) < 1e-9, "откат не вернул прежнее поведение: %.3f" % r
 
 def test_gate_accepts_target_within_seed_budget():
-    """Боевой _det_reach_ok с бюджетом seed x 2: цель в 5.0% для XRP (семя 2.772%) проходит."""
+    """Боевой _det_reach_ok: бюджет = max(живой p99 x2, семя x1). На штиле это семя 2.772%:
+    цель в 2.5% проходит, цель в 5.0% ОТКЛОНЯЕТСЯ (линза Fable: семя ≈ p95 окна, множить нельзя)."""
     ps = _fresh_module({"PUSH_SCALE_MIN_N": "20", "PUSH_SCALE_SEED_FLOOR": "1"})
     now = 1_800_000_000.0
     _feed_calm(ps, "XRP", 60, 0.616, now)
@@ -48,8 +49,10 @@ def test_gate_accepts_target_within_seed_budget():
     logs = []
     obj = sfl.SpecFireLive.__new__(sfl.SpecFireLive)
     obj._log = logs.append; obj.stats = {}
-    ok = sfl.SpecFireLive._det_reach_ok(obj, "XRP", 0.050, mid="0xm", borrower="0xb")
-    assert ok, "цель в 5.0%% отклонена при бюджете %.3f%%" % (ps.reach("XRP", now=now)*200)
+    ok = sfl.SpecFireLive._det_reach_ok(obj, "XRP", 0.025, mid="0xm", borrower="0xb")
+    assert ok, "цель в 2.5%% отклонена при поле %.3f%%" % (ps.reach("XRP", now=now)*100)
+    bad = sfl.SpecFireLive._det_reach_ok(obj, "XRP", 0.050, mid="0xm", borrower="0xb")
+    assert not bad, "цель в 5.0%% ПРОШЛА — семя умножено, а не взято полом x1"
 
 if __name__ == "__main__":
     import pytest
