@@ -3274,8 +3274,12 @@ async def hot_loop(rpc, preconf_rpc, cfg, shared, store, guard, alerter, log, st
                             if (_dec and MIRROR_LIVE_FEED and _dec[0] in agg_set
                                     and ("m", _dec[0], bn) not in feed_handled):
                                 feed_handled.add(("m", _dec[0], bn))
+                                # 28.08 (B): bn едет ВМЕСТЕ с сэмплом — кросс-дедуп с индексной
+                                # подачей общий для обоих путей (свой feed_handled ловил только
+                                # повтор внутри живой ветки; второй приход того же транзита из
+                                # индекса удваивал вес класса в кольце).
                                 _ntt_live(tip_from_raw(_raw, basefee=_fresh_basefee()),
-                                          agg=_dec[0])
+                                          agg=_dec[0], bn=bn)
                             if _dec and _dec[0] in shadow_map:
                                 _sym, _scale, _oracle = shadow_map[_dec[0]]
                                 if cfg.price_from_feed and _feed_spawn_gate(_oracle, bn, feed_handled):

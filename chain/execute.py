@@ -707,8 +707,11 @@ _MIRROR_MIN_ENTRY_COUNT = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MIN_ENT
 #  * антифлап (520 смен состава/сутки 26-27.08): дорогой класс держится >= DWELL, замена
 #    дорогого дорогим — при весе нового >= старого + REPLACE_MARGIN и не чаще GAP; индексы
 #    слотов СТАБИЛЬНЫ (сдвиг [15.86,1.0,1.1,1.15]->[15.86,5.0,1.0,1.1] переодевал 165 ног
-#    вместо 55). Статика по умолчанию = пол-4 бит-в-бит с составом «только пол» — переходы
-#    статика<->слоты (174/сутки) перестают менять tip хоть одной ноги.
+#    вместо 55). Статика по умолчанию = пол-4 бит-в-бит с составом «только пол».
+#    ПОПРАВКА 28.08: обещание «переходы статика<->слоты (174/сутки) не меняют tip ни одной
+#    ноги» было ЛОЖНЫМ на плотном потоке — уход в статику обнулял память выравнивания, и тот
+#    же набор возвращался в другом порядке (замер: 27 из 253 смен — чистая перестановка).
+#    Держит это обещание не комментарий, а _align_slots/_MIRROR_SLOT_PREV ниже.
 _MIRROR_EXP_MIN = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_WEI", "2500000"))
 _MIRROR_EXP_SLOTS = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_SLOTS", "1"))
 _MIRROR_SUM_CAP = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_SUM_CAP_WEI", "12000000"))
@@ -747,13 +750,148 @@ _MIRROR_LAST_SLOTS: tuple = ()           # прошлый состав порт�
 _MIRROR_APPLIED: tuple = ()              # состав, ДЕЙСТВУЮЩИЙ сейчас (пустой = статика)
 _MIRROR_APPLIED_MODES: frozenset = frozenset()   # какие классы в нём заняли слоты (гистерезис)
 _MIRROR_HOT_UNTIL = 0.0                  # до этого момента состав ЗАМОРОЖЕН (горячая фаза)
+# (C) 28.08 — ВЫРАВНИВАНИЕ СЛОТОВ. Индекс слота — это ЧЕТВЕРТЬ ФЛОТА (probe_tip_for: h%len),
+# и цену платит не пересчёт состава, а смена ЗНАЧЕНИЯ индекса: 55 лестниц по 28-32с. Прежний
+# код выравнивал состав по _MIRROR_APPLIED — но _MIRROR_APPLIED ОБНУЛЯЕТСЯ при уходе в статику,
+# и на возврате prev=[None]*4 раскладывал ТОТ ЖЕ набор в новом порядке. Замер плотного потока
+# (analysis/mirror_slot_align_replay.py, 4 027 транзитов): 27 из 253 смен — ЧИСТАЯ ПЕРЕСТАНОВКА,
+# 64% смен трогают все 4 слота = 220 ног. Обещание комментария «переходы статика<->слоты не
+# меняют tip ни одной ноги» на плотном потоке было ЛОЖНЫМ.
+# ЧИНИТСЯ ОДНИМ ПРАВИЛОМ: память состава живёт ОТДЕЛЬНО от _MIRROR_APPLIED и переживает уход в
+# статику, а СТАТИКА раскладывается по индексам ТЕМ ЖЕ выравнивателем (mirror_effective_slots).
+# Откат: SPEC_FIRE_MIRROR_SLOT_ALIGN=0 (возвращает прежнее поведение бит-в-бит).
+_MIRROR_SLOT_ALIGN = os.environ.get("SPEC_FIRE_MIRROR_SLOT_ALIGN", "1").lower() not in ("0", "false", "no", "off")
+_MIRROR_SLOT_PREV: tuple = ()            # ЧТО НОГИ НОСЯТ СЕЙЧАС (включая статику); переживает ()
 
 
-def note_transit_tip(tip_wei, agg=None, now=None) -> bool:
+def _align_slots(fill, prev):
+    """Разложить значения `fill` по индексам, СОХРАНЯЯ места прежнего состава `prev`.
+
+    ИНВАРИАНТ (первой строкой, и он же смысл всей функции): если мультимножество `fill`
+    совпадает с `prev`, результат РАВЕН prev побайтно — ни одна нога не переодевается на
+    перестановке того же набора. Значение, стоявшее в индексе i и уцелевшее в наборе, остаётся
+    в индексе i; новые значения занимают освободившиеся индексы в порядке `fill`.
+
+    Мультимножество, а не множество: добивка статикой умеет продублировать значение
+    (`fill.append(fill[-1])`), и проверка членством `v in fill` теряла бы вторую копию.
+    Функция ЧИСТАЯ (глобалов не пишет) и не бросает — она стоит на денежном пути presign.
+    """
+    from collections import Counter
+    fill = [int(v) for v in fill]
+    n = len(fill)
+    prev = list(prev) if prev is not None and len(prev) == n else [None] * n
+    if Counter(fill) == Counter(prev):
+        return list(prev)                      # ИНВАРИАНТ: тот же набор -> тот же порядок
+    rem = Counter(fill)
+    slots = [None] * n
+    for i, v in enumerate(prev):
+        if v is not None and rem.get(v, 0) > 0:
+            slots[i] = v
+            rem[v] -= 1
+    pending = []
+    for v in fill:
+        if rem.get(v, 0) > 0:
+            pending.append(v)
+            rem[v] -= 1
+    for i in range(n):
+        if slots[i] is None:
+            slots[i] = pending.pop(0) if pending else fill[i]
+    return slots
+
+
+def mirror_effective_slots(now=None) -> tuple:
+    """СОСТАВ, КОТОРЫЙ НОСЯТ НОГИ СЕЙЧАС: живой портфель либо ВЫРОВНЕННАЯ СТАТИКА.
+
+    Денежный путь (probe_tip_for) ходит СЮДА, а не мимо: иначе выравнивание жило бы только на
+    половине переходов, и уход в статику по-прежнему переодевал бы флот перестановкой.
+    Пустой возврат = «носим сырые тиры» (холодный старт либо откат ручкой)."""
+    slots = transit_tip_portfolio(now=now) if PROBE_TIP_MIRROR else ()
+    if slots:
+        return slots
+    return _MIRROR_SLOT_PREV if _MIRROR_SLOT_ALIGN else ()
+
+
+# --- 28.08 (A)+(B): У КОЛЬЦА ДВЕ ДВЕРИ, А ГАРД СТОЯЛ НА ОДНОЙ ------------------------------------
+#
+# (A) ЧУЖИЕ ТРАНЗИТЫ. Живая подача (hotpath, ветка FORWARD_SEL) фильтрует по карте НАШИХ
+#     агрегаторов (`_dec[0] in agg_set`). Индексная (main -> chain_index.set_on_transit) не
+#     фильтровала НИКАК: `parse_logs` берёт AnswerUpdated БЕЗ фильтра адреса эмитента (в отличие
+#     от Liquidate, где адрес Morpho проверяется явно) — по построению, ибо запрос идёт
+#     topics-OR без address. Замер live 300 блоков: наших 6 логов от 4 эмитентов, чужих 33 от 21.
+#     То есть ~85% сырья кольца — тарифы операторов, к нашим фидам отношения не имеющих, а
+#     портфель tip строится по МОДЕ кольца. Гейт берёт множество из ТОГО ЖЕ источника, что и
+#     живой agg_set: `feeds.legs_map()` — карта последнего resolve_feeds, из которого hotpath и
+#     делает `agg_set = set(feeds)`. Отдельного списка НЕТ и быть не должно: две копии карты
+#     владения разъезжаются молча.
+#
+# (B) ДВОЙНАЯ ПОДАЧА. Наш транзит приходит в кольцо ДВАЖДЫ — живьём (~200мс) и вторым заходом
+#     из индекса, дедуп у каждого пути СВОЙ (live: `feed_handled` по (agg,bn); индекс: никакого).
+#     Кольцо K=12 и пороги веса (ENTRY_N=8, EXP_N=6, MIN_ENTRY=3) считались по ЧИСЛУ УЛИК, значит
+#     достигались вдвое раньше расчётного, а «улика» вдвое переоценивала частоту класса.
+#     Кросс-дедуп — ОДИН на оба пути, по (agg, blockNumber) с TTL: ключ ставится ТОЛЬКО на
+#     принятом сэмпле (у путей разный расчёт tip — отвергнутый не вправе съедать ключ) и
+#     атомарно под тем же локом, что и запись в кольцо (иначе гонка recv-треда и треда индекса
+#     возвращает ровно тот дубль, ради которого всё и делается).
+#
+# ОТКАТ ОДНОЙ РУЧКОЙ: SPEC_FIRE_MIRROR_INDEX_GATE=0 -> прежнее поведение БИТ-В-БИТ (индексная
+# подача без гейта, ни один путь не трогает дедуп-словарь — «бит-в-бит» включает и отсутствие
+# побочного состояния).
+_MIRROR_INDEX_GATE = os.environ.get("SPEC_FIRE_MIRROR_INDEX_GATE", "1").lower() not in ("0", "false", "no")
+_MIRROR_SEEN_TTL = float(os.environ.get("SPEC_FIRE_MIRROR_SEEN_TTL_SEC", str(_MIRROR_TTL_SEC)))   # ЛИНЗА Fable 28.08: 60с мало — индекс отстаёт под 429 ровно в каскаде, второй приход (agg,bn) ложился в кольцо со свежим ts; ключ уникален по построению, TTL = жизнь кольца (900с)
+_MIRROR_SEEN_MAX = 4096                  # выше — чистка по TTL (кольцо блоков ~2с * 30 транзитов)
+_MIRROR_SEEN: dict = {}                  # (agg_lower, bn) -> ts принятого сэмпла; ТОЛЬКО под _TRANSIT_TIPS_LOCK
+_MIRROR_IDX_STATS = {"ours": 0, "foreign": 0, "cross_dup": 0, "blind": 0}
+_MIRROR_BLIND_WARN = [0.0]               # monotonic последней жалобы на пустую карту владения
+
+
+def mirror_our_aggs() -> frozenset:
+    """НАШИ watch-ключи — ИЗ ТОГО ЖЕ ИСТОЧНИКА, что у живой подачи.
+
+    hotpath держит `agg_set = set(feeds)`, где feeds — возврат resolve_feeds; тот же резолв
+    заполняет модульную карту владения feeds._LEGS_AGG, читаемую через legs_map(). Здесь
+    берётся объединение её ног, потому что владение транзитом — свойство РЫНКА, а не одной
+    BF1-ноги (см. docstring legs_map). Карта переживает шторм (пустой резолв её не затирает),
+    то есть множество — надмножество по времени: наш транзит оно не потеряет, чужой не пустит.
+
+    ПУСТО = карта не строилась (до первого резолва / процесс без hot_loop). Это НЕЗНАНИЕ, а не
+    «наших нет», и оно закрывает гард (кольцо не кормится -> портфель = статика — штатный режим
+    отказа зеркала), но закрывает ГРОМКО: см. счётчик blind и предупреждение в note_..._indexed.
+    """
+    try:
+        from chain.feeds import legs_map
+        return frozenset(str(a).lower() for legs in legs_map().values() for a in (legs or []))
+    except Exception:                                   # noqa: BLE001
+        return frozenset()
+
+
+def _mirror_seen_mark(key, bn, n) -> bool:
+    """True = этот (agg, bn) в кольцо СЕГОДНЯ ещё не клали. ЗОВЁТСЯ ПОД _TRANSIT_TIPS_LOCK."""
+    k = (key, int(bn))
+    prev = _MIRROR_SEEN.get(k)
+    if prev is not None and abs(n - prev) <= _MIRROR_SEEN_TTL:
+        _MIRROR_IDX_STATS["cross_dup"] += 1
+        return False
+    if len(_MIRROR_SEEN) > _MIRROR_SEEN_MAX:
+        for _k in [_k for _k, _ts in _MIRROR_SEEN.items() if abs(n - _ts) > _MIRROR_SEEN_TTL]:
+            del _MIRROR_SEEN[_k]
+    _MIRROR_SEEN[k] = n
+    return True
+
+
+def mirror_index_stats() -> dict:
+    """Счётчики гейта индексной подачи (наши/чужие/кросс-дубли/слепые проходы). Прибор СБОКУ."""
+    return dict(_MIRROR_IDX_STATS)
+
+
+def note_transit_tip(tip_wei, agg=None, now=None, bn=None) -> bool:
     """#104/Ш24b v2: записать tip живого транзита В КОЛЬЦО ЕГО АГРЕГАТОРА.
 
     agg=None не смешивается с именованными: неизвестное происхождение — это отдельное
     распределение, а не «чьё-то». Вне границ [_MIRROR_TIP_MIN, _MIRROR_TIP_MAX] — отброс.
+
+    bn (28.08): номер блока транзита. Задан -> сэмпл проходит КРОСС-ДЕДУП обоих путей подачи
+    по (agg, bn); повтор возвращает False и в кольцо не идёт. bn=None -> дедупа нет (прежнее
+    поведение; так зовут офлайн-приборы и стенды).
     """
     try:
         w = int(tip_wei)
@@ -764,10 +902,44 @@ def note_transit_tip(tip_wei, agg=None, now=None) -> bool:
     key = str(agg).lower() if agg else _MIRROR_UNKNOWN
     n = float(now if now is not None else time.time())
     with _TRANSIT_TIPS_LOCK:
+        # Метка ставится под тем же локом и ТОЛЬКО когда сэмпл уже прошёл границы входа:
+        # отвергнутый по границам (напр. tip=-1, дефолт индекса) не вправе съесть ключ у
+        # второго пути, который тот же транзит посчитал иначе и посчитал верно.
+        if bn is not None and _MIRROR_INDEX_GATE and not _mirror_seen_mark(key, bn, n):
+            return False
         ring = _TRANSIT_TIPS.setdefault(key, [])
         ring.append((n, w))
         del ring[:-_MIRROR_K]
     return True
+
+
+def note_transit_tip_indexed(tip_wei, agg=None, bn=None, now=None) -> bool:
+    """ИНДЕКСНАЯ дверь кольца: тот же гейт наших агрегаторов, что у живой, + кросс-дедуп.
+
+    Вызывается из боевого колбэка индекса (main: _on_transit_104). Отдельная функция, а не
+    условие в колбэке, ровно затем, чтобы стенд звал ТУ ЖЕ функцию, что и бой: гейт, спрятанный
+    в замыкании внутри main(), проверяется только грепом по исходнику.
+
+    Возврат True = сэмпл лёг в кольцо. False = чужой агрегатор / дубль живой подачи / вне границ.
+    """
+    if not _MIRROR_INDEX_GATE:                          # ОТКАТ: прежняя подача, без гейта и дедупа
+        return note_transit_tip(tip_wei, agg, now=now)
+    ours = mirror_our_aggs()
+    if not ours:
+        _MIRROR_IDX_STATS["blind"] += 1
+        _t = time.monotonic()
+        if _t - _MIRROR_BLIND_WARN[0] > 300.0:
+            _MIRROR_BLIND_WARN[0] = _t
+            log.warning("#104 гейт зеркала: КАРТА ВЛАДЕНИЯ ПУСТА (resolve_feeds ещё не отработал "
+                        "или в этом процессе нет hot_loop) — индексная подача закрыта, кольцо не "
+                        "кормится, портфель tip = СТАТИКА. Это незнание, а не «наших транзитов нет»")
+        return False
+    a = str(agg or "").lower()
+    if a not in ours:
+        _MIRROR_IDX_STATS["foreign"] += 1
+        return False
+    _MIRROR_IDX_STATS["ours"] += 1
+    return note_transit_tip(tip_wei, a, now=now, bn=bn)
 
 
 def _agg_mode(fresh):
@@ -866,7 +1038,7 @@ def transit_tip_portfolio(now=None) -> tuple:
     состав, каким бы ни был свежий расчёт — пересигнация 110 лестниц в горячей фазе стоит
     дороже любого выигрыша от смены тарифа, а успеть к призу (transit+1, ~2с) она не может.
     """
-    global _MIRROR_APPLIED, _MIRROR_APPLIED_MODES
+    global _MIRROR_APPLIED, _MIRROR_APPLIED_MODES, _MIRROR_SLOT_PREV
     n = float(now if now is not None else time.time())
     if n < _MIRROR_HOT_UNTIL:
         return _MIRROR_APPLIED
@@ -969,6 +1141,11 @@ def transit_tip_portfolio(now=None) -> tuple:
         modes[-1] = max(_floors, key=lambda g: g[1])[0]
     if not floor_sel and exp_val is None:
         _MIRROR_APPLIED, _MIRROR_APPLIED_MODES = (), frozenset()
+        # (C): статика — ТОТ ЖЕ выравниватель. _MIRROR_APPLIED обнуляется (он про ЖИВОЙ состав
+        # и про гистерезис), а память слотов ПЕРЕЖИВАЕТ уход: ноги носят выровненную статику, и
+        # возврат зеркала с тем же набором обязан вернуть их состав побайтно.
+        if _MIRROR_SLOT_ALIGN and _PROBE_TIP_TIERS:
+            _MIRROR_SLOT_PREV = tuple(_align_slots(list(_PROBE_TIP_TIERS), _MIRROR_SLOT_PREV))
         return ()
     # --- добивка статикой без дублей и СТАБИЛЬНЫЕ ИНДЕКСЫ: значение держит свой индекс
     fill = list(modes)
@@ -979,13 +1156,9 @@ def transit_tip_portfolio(now=None) -> tuple:
             fill.append(int(t))
     while len(fill) < _MIRROR_SLOTS:
         fill.append(fill[-1])
-    prev = list(_MIRROR_APPLIED) if len(_MIRROR_APPLIED) == _MIRROR_SLOTS else [None] * _MIRROR_SLOTS
-    slots = [v if v in fill else None for v in prev]
-    pending = [v for v in fill if v not in slots]
-    for i in range(_MIRROR_SLOTS):
-        if slots[i] is None:
-            slots[i] = pending.pop(0) if pending else fill[i]
+    slots = _align_slots(fill, _MIRROR_SLOT_PREV if _MIRROR_SLOT_ALIGN else _MIRROR_APPLIED)
     _MIRROR_APPLIED, _MIRROR_APPLIED_MODES = tuple(slots), frozenset(modes)
+    _MIRROR_SLOT_PREV = tuple(slots)
     return _MIRROR_APPLIED
 
 
@@ -1100,7 +1273,7 @@ def probe_tip_for(addr) -> int:
     except Exception:                                   # noqa: BLE001
         return _PROBE_TIP_TIERS[0]
     if PROBE_TIP_MIRROR:
-        slots = transit_tip_portfolio()
+        slots = mirror_effective_slots()        # (C): портфель ЛИБО ВЫРОВНЕННАЯ статика
         if slots:
             return slots[h % len(slots)]
     return _PROBE_TIP_TIERS[h % len(_PROBE_TIP_TIERS)]
