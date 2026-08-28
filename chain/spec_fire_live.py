@@ -719,6 +719,7 @@ SPEC_FIRE_DIST_MARGIN_DEVS = float(os.environ.get("SPEC_FIRE_DIST_MARGIN_DEVS", 
 SPEC_FIRE_FLIP_SET = os.environ.get("SPEC_FIRE_FLIP_SET", "1").lower() not in ("0", "off", "false", "no")
 SPEC_FIRE_FLIP_SET_K = int(os.environ.get("SPEC_FIRE_FLIP_SET_K", "8"))   # доска держит до 8 целей
 SPEC_FIRE_ARM_MAX_DIST = float(os.environ.get("SPEC_FIRE_ARM_MAX_DIST", "0.03"))
+SPEC_FIRE_EDGE_SLOT = os.environ.get("SPEC_FIRE_EDGE_SLOT", "1").lower() not in ("0", "off", "false", "no")   # 28.08: ближайшая цель гарантирована в группе
 # 27.08: пол досягаемости у перехвата доски детонатором — во сколько p99-толчков фида
 # укладывается срок жизни доски. 0 = откат к прежнему поведению (перехват без пола).
 SPEC_FIRE_DET_REACH_PUSHES = float(os.environ.get("SPEC_FIRE_DET_REACH_PUSHES", "2"))
@@ -1323,7 +1324,16 @@ class SpecFireLive:
             # то есть произвольную цель — и это нормальный случай, а не угол (линза 27.08).
             return (-(float(t[2]) * _w), -float(t[2]))
         elig.sort(key=_ev_key)
-        return elig[:k], hold_dist, edge_t
+        top = elig[:k]
+        # ГАРАНТИЯ БЛИЖАЙШЕЙ (28.08, гонка 50571836): группа из 7 целей стояла с запасом >= 1%, а
+        # взятая конкурентом цель с запасом 0.34% ($20) в набор не попала — ранг «долг x вес» честно
+        # предпочёл жир, но ход дал -0.61% и не дотянул ни до одной. Свип существует ровно для того,
+        # чтобы держать И близкую мелочь: самая близкая досягаемая цель занимает последний слот
+        # группы, если ранг её не взял. Откат: SPEC_FIRE_EDGE_SLOT=0.
+        if SPEC_FIRE_EDGE_SLOT and edge_t is not None and k > 1 and len(top) >= 1 \
+                and not any(t[0] == edge_t[0] and t[1] == edge_t[1] for t in top):
+            top = (top[:k - 1] if len(top) >= k else top) + [edge_t]
+        return top, hold_dist, edge_t
 
     def _det_reach_ok(self, feed, dist, mid=None, borrower=None) -> bool:
         """Пол досягаемости перехвата: дотянется ли цель до кромки за срок жизни доски.

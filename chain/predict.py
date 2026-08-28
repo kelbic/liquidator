@@ -394,6 +394,11 @@ class PredictDriver:
                       "stale_episodes": 0}
 
     def start(self):
+        try:
+            from chain import push_scale as _ps0
+            _ps0.load()                        # 28.08: восстановить кольцо толчков после рестарта
+        except Exception:
+            pass
         if self._thread is not None:
             return
         self._thread = threading.Thread(target=self._run, name="predict-driver", daemon=True)
@@ -466,6 +471,8 @@ class PredictDriver:
                 try:
                     from chain import push_scale as _ps
                     if _ps.note_push(ev.get("feed"), ev.get("ret_pct")):
+                        try: _ps.save()            # 28.08: кольцо ПЕРЕЖИВАЕТ рестарт (5 рестартов/день обнуляли ранг)
+                        except Exception: pass
                         # Сохраняем РЕДКО (раз в _PS_SAVE_EVERY пушей): при 3150 пушах за 7 суток
                         # это ~1 запись в 20 минут, а кольцо переживает рестарт (63 старта юнита
                         # за 10 суток, аптайм 3.8ч — иначе MIN_N не набирается никогда).
