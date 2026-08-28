@@ -1719,10 +1719,16 @@ class SpecFireLive:
     def _collect_core(self, res, h, mid, borrower, debt_usd, feed=""):
         """ДЕНЬГИ исхода пробы главного кошелька: res = кортеж _receipt/_res_from_receipt
         либо None (NO-RECEIPT/таймаут). Ровно один вызов на отправку — инвариант П.3."""
-        from chain.execute import specfire_gas_add, mark_recent_send, canary_invalidate_nonce
+        from chain.execute import specfire_gas_add, mark_recent_send, canary_invalidate_nonce, \
+            probe_sender, volley_invalidate_nonce
         if res is None:
-            canary_invalidate_nonce(self.rpc, self.cfg)   # дроп? nonce вперёд чейна -> инвалидация
-            self._log("SPECFIRE probe NO-RECEIPT tx=%s (nonce инвалидирован)" % h)
+            _snd = probe_sender(h)
+            if _snd:                                        # проба с НОГИ — снимаем nonce НОГИ, не главного
+                volley_invalidate_nonce(_snd)
+                self._log("SPECFIRE probe NO-RECEIPT tx=%s (nonce ноги %s инвалидирован)" % (h, _snd[:10]))
+            else:
+                canary_invalidate_nonce(self.rpc, self.cfg)   # дроп? nonce вперёд чейна -> инвалидация
+                self._log("SPECFIRE probe NO-RECEIPT tx=%s (nonce инвалидирован)" % h)
             return
         status, gas_usd = res[0], res[1]
         pos = (" blk=%s idx=%s" % (res[2], res[3])) if len(res) >= 4 and res[2] is not None else ""

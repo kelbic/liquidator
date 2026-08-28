@@ -9,9 +9,12 @@ def _ex(env):
     ex._VOLLEY_ACCTS = [(Account.from_key(K_L1).address, K_L1), (Account.from_key(K_L2).address, K_L2)]
     ex._VOLLEY_LOCKS.update({a: __import__("threading").Lock() for a, _ in ex._VOLLEY_ACCTS})
     sent = []
-    def fake_send(rpc, key, tx, **kw):
+    def fake_send(rpc, key, tx, **kw):                       # путь ГЛАВНОГО (откат / нет ног)
         sent.append(Account.from_key(key).address); return {"hash": "0x" + "ab" * 32}
     ex.send_tx = fake_send
+    def fake_volley(rpc, cfg, addr, key, calldata, gas, **kw):  # путь НОГИ (линза: тот же, что лестницы)
+        sent.append(addr); return "0x" + "cd" * 32
+    ex.send_volley_probe = fake_volley
     ex._pending_nonce = lambda w3, a: 0
     ex.account_for = lambda w3, key: Account.from_key(key)
     # гейты пробы (резерв/баланс/интервал/кап) — не предмет стенда: открываем

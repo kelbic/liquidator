@@ -1594,6 +1594,12 @@ def mark_recent_send(market_id: str, borrower: str):
 PROBE_FROM_LEGS = os.environ.get("SPEC_FIRE_PROBE_FROM_LEGS", "1").lower() not in ("0", "off", "false", "no")
 _PROBE_LEG_RR = [0]
 _PROBE_LEG_LOCK = threading.Lock()
+_PROBE_SENDER: dict = {}          # hash -> адрес ноги-отправителя (для NO-RECEIPT)
+
+
+def probe_sender(h):
+    """Адрес ноги, отправившей пробу с хэшем h; None = главный кошелёк."""
+    return _PROBE_SENDER.pop(h, None)
 
 
 def _next_probe_leg():
@@ -1626,10 +1632,20 @@ def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
                 or _INFLIGHT > 0):
             return None
     w3 = rpc._web3()
-    _key = cfg.wallet_key
+    # ЛИНЗА Fable (a702380 → БЛОКЕР): ветка ноги обязана идти ТЕМ ЖЕ путём, что лестницы залпа —
+    # send_volley_probe: _VOLLEY_NONCE + пер-EOA лок (иначе два счётчика nonce на адрес → replacement
+    # underpriced, нога немая), БЕЗ гейта резерва главного (0.12 ETH глушит ногу с 0.008 навсегда, а
+    # глобальный слот _BAL_CACHE отравляется чужим балансом) и вне глобального _SEND_LOCK.
     _leg = _next_probe_leg() if PROBE_FROM_LEGS else None
     if _leg is not None:
-        _key = _leg[1]
+        _res = send_volley_probe(rpc, cfg, _leg[0], _leg[1], calldata, int(gas), log=log,
+                                 max_fee=max_fee, tip=tip, broadcast_raw_urls=broadcast_raw_urls)
+        _h = _res.get("hash") if isinstance(_res, dict) else _res     # send_volley_probe отдаёт хэш-строку
+        if _h:
+            _PROBE_SENDER[_h] = _leg[0]                    # чей nonce снимать при NO-RECEIPT
+            return _res
+        return None                                        # нога не смогла — пробу НЕ дублируем главным
+    _key = cfg.wallet_key
     bot = account_for(w3, _key).address
     # патронный резерв: расходники не грызут выстрел (см. BULLET_RESERVE_WEI)
     _cost = int(gas) * int(max_fee if max_fee else int(cfg.tip_gwei * 1e9) * 3)
