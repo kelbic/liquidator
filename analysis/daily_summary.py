@@ -25,7 +25,8 @@ except Exception as e:
 
 rest = [re.match(r"\s*(\w{3} +\d+ \d\d:\d\d:\d\d)", l).group(1)
         for l in out.splitlines() if "EXECUTE mode" in l and re.match(r"\s*(\w{3} +\d+ \d\d:\d\d:\d\d)", l)]
-lines.append(f"рестартов: {len(rest)}" + (f" ({'; '.join(t[7:] for t in rest[:6])}{'…' if len(rest) > 6 else ''})" if rest else ""))
+if len(rest) > 1:                       # 28.08 kelbic: один рестарт = плановый деплой, не событие
+    lines.append(f"⚠ рестартов: {len(rest)} ({'; '.join(t[7:] for t in rest[:4])}{'…' if len(rest) > 4 else ''})")
 
 shots = len(re.findall(r"HOT ACTIONABLE|ACTIONABLE \S+/\S+ HF", out))
 lines.append(f"выстрелов (ACTIONABLE): {shots}")
@@ -37,7 +38,7 @@ if rest and not warm:
     lines.append("⚠ рестарты БЕЗ warm-start в логе — снапшот не грузился, проверь candidates_snapshot.json")
 hs = re.findall(r"hot stats .*", out)
 if hs:
-    lines.append("детекция: " + hs[-1].split("hot stats ", 1)[-1][:180])
+    pass                                 # 28.08 kelbic: «детекция» — самоотчёт механизма, из сводки убрана
 else:
     lines.append("⚠ hot stats в журнале НЕТ — hot path не жив?")
 
@@ -72,62 +73,33 @@ try:
         if stop:
             break
         skip += 100
-    lines.append(f"рынок (covered): {n_liq} ликв. на ${vol:,.0f}; наших {n_us}; "
-                 f"чужих хот-класса (repaid>=${cfg.hot_min_repaid_usd:.0f}): {n_hot}")
+    # 28.08 kelbic: ИСХОД первым, одной строкой — «где мы» отвечает счёт побед с цепи, не механизм
+    lines.append(f"🏁 ИСХОД: наших побед {n_us} | чужих {n_liq - n_us} на ${vol:,.0f} "
+                 f"(из них хот-класса ≥${cfg.hot_min_repaid_usd:.0f}: {n_hot})")
 except Exception as e:
     lines.append(f"рыночный блок упал: {type(e).__name__}: {str(e)[:80]}")
 
-# ---- ОСЬ НАБЛЮДЕНИЯ rate-класса (ревью 25.07): не «HF близко», а РАЗНИЦА СКОРОСТЕЙ ----
-# margin = дрейф оракула − APR долга. margin>0 => цель уходит вверх (пег-ножи «в 0.4%» бессмертны);
-# смена знака => класс ожил. APR адаптивен (Morpho IRM), за изломом утилизации растёт кратно —
-# поэтому «уходит вверх» это УСЛОВИЕ под наблюдением, а не приговор.
+# ---- rate-класс: 28.08 kelbic — таблица убрана, остаётся ТОЛЬКО событие (ETA < 30 дн) ----
 try:
-    from analysis.flip_eta import compute_rows, margin_changes
+    from analysis.flip_eta import compute_rows
     _rows = compute_rows(cfg, hf_max=1.05, n=12)
-    _rate = [r for r in _rows if not r["market_oracle"] and r["margin"] is not None]
-    if _rate:
-        _rate.sort(key=lambda r: r["margin"])
-        lines.append("— ось rate-класса (дрейф−APR, + = уходит вверх):")
-        for r in _rate[:5]:
-            lines.append("   %-15s $%-9.0f HF=%.4f  APR %.2f%%  фид %+.2f%%  запас %+.2f%%/год"
-                         % (r["pair"], r["debt_usd"], r["hf"], r["apr"] * 100,
-                            (r["drift"] or 0) * 100, r["margin"] * 100))
-    _ch = margin_changes(_rows)
-    if _ch:
-        lines.append("⚠️ RATE-КЛАСС: " + "; ".join(
-            "%s %s (%s -> %+.2f%%)" % (p_, why, ("базлайн" if was is None else "%+.2f%%" % (was * 100)), now * 100)
-            for _k, p_, was, now, why in _ch))
-    _mkt = [r for r in _rows if r["market_oracle"]]
-    if _mkt:
-        lines.append("— рыночно-оракульные цели (там и живёт SPEC-FIRE): " +
-                     ", ".join("%s $%.0fk HF=%.3f" % (r["pair"], r["debt_usd"] / 1e3, r["hf"])
-                               for r in _mkt[:4]))
-except Exception as e:
-    lines.append(f"ось rate-класса упала: {type(e).__name__}: {str(e)[:70]}")
+    # ETA до кромки = (hf-1) / |margin| лет, margin<0 = цель идёт ВНИЗ (ключи строки: pair, debt_usd,
+    # hf, margin — как в прежней таблице; eta_days у compute_rows НЕТ, считаем здесь)
+    _soon = []
+    for r in _rows:
+        if r["market_oracle"] or r["margin"] is None or r["margin"] >= 0:
+            continue
+        eta = (r["hf"] - 1.0) / abs(r["margin"]) * 365.0
+        if 0 <= eta < 30:
+            _soon.append((eta, r))
+    if _soon:
+        _soon.sort()
+        lines.append("⚠️ RATE-КЛАСС близко: " + "; ".join(
+            f"{r['pair']} ${r['debt_usd']:,.0f} ETA {eta:.0f} дн" for eta, r in _soon[:3]))
+except Exception:
+    pass                                 # молчание блока — не событие для человека
 
-# ---- пульсы сторожей (урок 28.07: мёртвый сторож хуже отсутствующего) ----
-# Независимый суточный канал надзора за самим heartbeat-check: если таймер надзора умрёт,
-# его протухший пульс всплывёт здесь — в сводке, которую человек читает каждый день.
-try:
-    from heartbeat import age_sec
-    from analysis.heartbeat_check import _host_registry, REGISTRY, SELF_THRESHOLD_SEC
-
-    def _fmt_age(a):
-        if a is None:
-            return "нет"
-        return "%.0fс" % a if a < 120 else "%.0fм" % (a / 60) if a < 7200 else "%.1fч" % (a / 3600)
-
-    parts = []
-    # пер-хостовый реестр (03.08): сырой REGISTRY показывал usde-watch 84.7ч⚠️ по мёртвому
-    # локальному файлу — вотчер с 30.07 живёт на Вене (HB_WATCH_SKIP), надзор там свой
-    for name in list(_host_registry()) + ["heartbeat-check"]:
-        a = age_sec(name)
-        thr = REGISTRY[name][1] if name in REGISTRY else SELF_THRESHOLD_SEC
-        parts.append(name + " " + _fmt_age(a) + (" ⚠️" if a is None or a > thr else ""))
-    lines.append("пульсы: " + "; ".join(parts))
-except Exception as e:
-    lines.append(f"пульсы сторожей: блок упал: {type(e).__name__}")
-
+# ---- пульсы сторожей: 28.08 kelbic — убраны (живость — не событие; мёртвость ловит heartbeat-check) ----
 
 # ---- KPI «транзит+N» (kelbic 27.08): вход в призовую полосу по прибору ПОЗИЦИИ, было -> стало ----
 # Читаем ТОЛЬКО нужные строки через grep в пайпе: полный журнал штормового дня (330k строк)
@@ -181,29 +153,7 @@ try:
 except Exception as e:
     lines.append(f"KPI транзит+N: блок упал: {type(e).__name__}")
 
-# ---- прогресс по плану: сделано (коммиты за окно) и следующее (Plan.md «Открыто») ----
-try:
-    done = subprocess.run(["git", "-C", "/root/liquidator", "log", "--since=-%dh" % int(HOURS),
-                           "--format=%s", "--no-merges"], capture_output=True, text=True,
-                          timeout=20).stdout.splitlines()
-    # тема коммита без служебного префикса («STATE: …», «Plan+STATE: …»), уникально, до 70 символов
-    _seen = set(); _d2 = []
-    for d in done:
-        d = re.sub(r"^(STATE|Plan(\+STATE)?|docs)\s*:\s*", "", d.strip())[:70]
-        if d and d not in _seen:
-            _seen.add(d); _d2.append(d)
-    done = _d2
-    if done:
-        lines.append("сделано за окно (%d коммитов): " % len(done) + " | ".join(done[:5])
-                     + (" | …" if len(done) > 5 else ""))
-    plan = open("/root/liquidator/Plan.md", encoding="utf-8").read()
-    sec = plan.split("## Открыто", 1)[1] if "## Открыто" in plan else ""
-    nxt = re.findall(r"^\d+\.\s+\**(.+?)\**(?:\s*[—:-]|$)", sec, re.M)
-    nxt = [x.replace("*", "").split("(")[0].strip()[:70] for x in nxt if not x.startswith("~~")]
-    if nxt:
-        lines.append("следующие шаги (Plan «Открыто»): " + "; ".join(nxt[:4]))
-except Exception as e:
-    lines.append(f"прогресс по плану: блок упал: {type(e).__name__}")
+# ---- прогресс по плану: 28.08 kelbic — список коммитов и шаги плана убраны (стена текста) ----
 
 msg = "\n".join(lines)[:3900]
 print(msg)
