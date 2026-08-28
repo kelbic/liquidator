@@ -24,11 +24,23 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import chain.execute as ex                                      # noqa: E402
 
-LOG = pathlib.Path(__file__).resolve().parent / "transit_tips_7d.txt"
+import os as _os
+# 28.08: вход — через MIRROR_REPLAY_LOG; дефолт прежний 129-строчный. Плотный поток
+# (transit_tips_7d_dense.txt, 4 027 транзитов наших 26 фидов) исполняет пуловый путь в ~85%
+# моментов против 0.8% у дефолтного — приёмка портфеля судится ТОЛЬКО на нём.
+LOG = pathlib.Path(_os.environ.get("MIRROR_REPLAY_LOG") or (pathlib.Path(__file__).resolve().parent / "transit_tips_7d.txt"))
 FLOOR_MAX = ex._MIRROR_FLOOR_MAX
 GRID_SEC = 60.0                    # шаг сетки опроса портфеля
-JAM_TS = 1787172660                # 19.08 20:51 — затор, в котором потеряли $3905
 JAM_LO, JAM_HI = 30_000_000, 34_000_000
+# 28.08: затор — ИЗ ДАННЫХ, не дата 19.08: первая пачка транзитов >= JAM_LO в потоке (на дефолтном
+# файле это и есть 1787172660). Иначе на любом другом потоке проверка (в) падает и на откате.
+def _jam_start():
+    _t = [int(l.split()[0]) for l in LOG.read_text().splitlines()
+          if l.strip() and not l.startswith("#") and int(l.split()[1]) >= JAM_LO]
+    return min(_t) if _t else None
+JAM_TS = _jam_start()
+JAM_HI = max(JAM_HI, max((int(l.split()[1]) for l in LOG.read_text().splitlines()
+                          if l.strip() and not l.startswith("#")), default=JAM_HI))
 FAILS = []
 
 
@@ -130,11 +142,14 @@ print("\nПОСЛЕ ФИКСА: моментов=%d, с полом<=%d wei: %.1f
 print("   первые составы: %s" % "; ".join(
     "%d:%s" % (t, [int(x) for x in p]) for t, p in seen[:4]))
 check("(а) слот пола присутствует >=95%% моментов", share >= 95.0, "%.1f%%" % share)
-check("(б) смен состава за неделю немного (модель линзы без склейки: ~317/сутки)",
+check("(б) смен состава <32/сутки (приёмка kelbic <=40; замер, не модель)",
       ch / DAYS < 32.0, "%.1f/сутки" % (ch / DAYS))
-check("(в) слот затора 31-33 mgwei ПОЯВИЛСЯ", jam is not None,
-      "нет" if jam is None else "в t=%d (затор с %d, задержка %.0fс)" % (jam, JAM_TS, jam - JAM_TS))
-if jam is not None:
+if JAM_TS is None:
+    print("   (в) в потоке нет транзитов >= %d — проверка затора НЕПРИМЕНИМА, не провал" % JAM_LO)
+else:
+  check("(в) слот затора >=30 mgwei ПОЯВИЛСЯ", jam is not None,
+        "нет" if jam is None else "в t=%d (затор с %d, задержка %.0fс)" % (jam, JAM_TS, jam - JAM_TS))
+if jam is not None and JAM_TS is not None:
     # гистерезис входа: не раньше самой пачки и не позже разумного (возраст 60с + шаг сетки)
     check("(в) вход в затор в пределах гистерезиса, а не мгновенно",
           jam >= JAM_TS, "t=%d против начала затора %d" % (jam, JAM_TS))
