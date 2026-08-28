@@ -41,7 +41,12 @@ _dk=(o4._det_key_by_feed or {}).get("ETH")
 check("детонатор: несобираемая цель пропущена, ключ — собираемая", _dk is not None and _dk[0]==(MID,GOOD), _dk)
 _S=open("chain/spec_fire_live.py").read()
 check("гард: пропуск стоит и в _min_flip_dist, и в ветке «под цель детонатора»", _S.count("не судит детонатор")==1 and "не навязываем" in _S)
-check("пометка стоит в ветке «проба не собралась» и печатает причину", "self._unbuildable[(mid, b)] = self._now() + SPEC_FIRE_UNBUILDABLE_TTL_SEC" in _S and "несобираема (нет роута/котировки)" in _S)
+# 28.08: строка несёт ПРИЧИНУ из _build (_last_nobuild) и полный адрес — grep по старому литералу
+# охранял только текст (урок «негативный контроль, охраняющий grep»), теперь проверяем поведение:
+# пометка стоит, причина и полный borrower попадают в формат строки.
+check("пометка стоит в ветке «проба не собралась» и печатает причину + полный адрес",
+      "self._unbuildable[(mid, b)] = self._now() + SPEC_FIRE_UNBUILDABLE_TTL_SEC" in _S
+      and "несобираема (%s; borrower=%s)" in _S and "_last_nobuild" in _S)
 check("причина записана (682 отказа, 5ч без выстрела)", "682 раза" in _S and "5ч без единого выстрела" in _S)
 sfl._label_of=_sv
 print("\n%s"%("FAIL: %d"%len(FAILS) if FAILS else "OK: несобираемая цель не держит доску"))
