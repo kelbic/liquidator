@@ -1081,6 +1081,7 @@ class SpecFireLive:
         repaid_shares = _cap_repaid_shares(_shave_ask(int(bs)), int(coll_amt), int(price), _lif_wad,
                                            tba, tbs, drift_fn=_drift)
         if repaid_shares <= 0:
+            self._last_nobuild = "repaid_shares<=0 (кап-ветка отказала)"
             return None
         if repaid_shares < int(bs):
             # КАП-ВЕТКА (тот же учёт, что в горячем пути): запоминаем ПРЕДВЫСТРЕЛЬНЫЙ залог,
@@ -1090,6 +1091,7 @@ class SpecFireLive:
         repaid_assets = to_assets_up(repaid_shares, tba, tbs)   # репэй-сторона: вверх, как и было
         seized = _seized_exact(repaid_shares, _lif_wad, int(price), tba, tbs)
         if seized == 0:
+            self._last_nobuild = "seized==0"
             return None
         liq = self.cfg.liquidator_address
         mp = {"loanToken": loan, "collateralToken": coll, "oracle": oracle,
@@ -1127,6 +1129,7 @@ class SpecFireLive:
                     repaid_shares, repaid_assets, seized, swap = sp, ap, zp, sw
                     swap_meta = (coll, loan, int(zp))
         if swap is None:
+            self._last_nobuild = "нет роута и нет прогретой квоты"
             return None                           # ни роута, ни прогретой квоты — пробу НЕ строим
         min_profit = int(repaid_assets) * SPEC_FIRE_MIN_PROFIT_BPS // 10000
         calldata = encode_liquidate(mp, borrower, repaid_shares, swap["router"],
@@ -2707,9 +2710,9 @@ class SpecFireLive:
                         self._unbuildable_hits[mid] = 0
                         self._log("SPECFIRE доска: рынок %s несобираем целиком (3 осечки) — исключён на %.0fс"
                                   % (mid[:10], SPEC_FIRE_UNBUILDABLE_TTL_SEC))
-                    self._log("SPECFIRE доска: цель %s/%s несобираема (нет роута/котировки) — "
+                    self._log("SPECFIRE доска: цель %s/%s несобираема (%s; borrower=%s) — "
                               "исключена из вершины на %.0fс, доска пойдёт к следующей"
-                              % (mid[:10], b[:10], SPEC_FIRE_UNBUILDABLE_TTL_SEC))
+                              % (mid[:10], b[:10], getattr(self, "_last_nobuild", "?"), b, SPEC_FIRE_UNBUILDABLE_TTL_SEC))
                     self._arm_retry(feed, "проба не собралась")
                 # #78: склад и прогрев патрона НЕ зависят от того, собралась ли эта цель.
                 # Раньше _engine() жил только внутри ветки dict, и одна несобираемая цель на
