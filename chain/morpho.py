@@ -32,7 +32,7 @@ MORPHO_API_URL = "https://api.morpho.org/graphql"
 # Floor: позиции с долгом в USD ниже этого — пыль: невыгодны всем (бонус < газ+флор) и
 # Morpho ревертит 0x81ceff30 на ~нулевом долге. Режем на стадии кандидата, чтобы они не
 # засоряли hot set / simulations. (Бэклог STATE; в Config не тянем — хватает дефолта модуля.)
-MIN_DEBT_USD = 1.0
+MIN_DEBT_USD = float(os.environ.get("MIN_DEBT_USD", "1.0"))   # 28.08: порог в ИСТОЧНИКЕ кандидатов; тренировка снимает через env
 
 # Мега-рынки (CBBTC_PLAN 07-09): >10000 заёмщиков -> merged-пагинация упирается в API-лимит
 # skip<=10000 и РОНЯЕТ весь candidate refresh; orderBy:HealthFactor у API нет (400). Такие рынки
