@@ -1811,8 +1811,11 @@ def send_owner_tx_v6(rpc, cfg, calldata: str, gas: int, log=None, tag="v6",
                 _LOCAL_NONCE.pop(bot, None)   # неизвестно, съелся ли nonce -> ресинк с цепи
                 if log:
                     try:
+                        import re as _re
                         from chain.rpc import redact_clip as _rc
-                        _body = _rc(str(e), 200)
+                        # raw tx / длинные hex не печатаем: ключ из подписи не восстановить, но и
+                        # мусор в журнале не нужен; redact() маскирует только ЛИТЕРАЛЫ известных ключей
+                        _body = _rc(_re.sub(r"0x[0-9a-fA-F]{100,}", "0x<raw>", str(e)), 200)
                     except Exception:                       # noqa: BLE001 — прибор сбоку от денег
                         _body = "?"
                     log.info("V6 %s send fail: %s: %s", tag, type(e).__name__, _body)   # 28.08: инцидент 19:49 — час без доски, а в журнале только имя класса
