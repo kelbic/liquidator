@@ -2294,6 +2294,17 @@ class SpecFireLive:
             return False
         plans = [plan] + list(extra_plans or [])
         targets = [self._v6_target(p) for p in plans]
+        # Потолок газа одной tx (2^24, EIP-7825): группу, чей ОЖИДАЕМЫЙ расход арма выше потолка,
+        # узел не примет (28.08: модель лимита на 8 целях = 17.2M, «gas limit too high» на каждый
+        # арм, доска мертва 6ч). Урезаем с хвоста ДО §9 и до записи: владелец — plans[0], экстры
+        # стоят по рангу. Сегодняшние роуты (~450 Б) влезают все восемь; урезание — для жирных.
+        _fit = _v6mod.arm_fit_count(targets)
+        if _fit < len(targets):
+            _rb = max(len(t[4]) for t in targets)
+            self._log("SPECFIRE v6: группа урезана %d->%d под потолок tx %d (роут до %d Б, ожидаемый "
+                      "расход %d)" % (len(targets), _fit, _v6mod.TX_GAS_CAP, _rb,
+                                      _v6mod.arm_gas_expected(len(targets), _rb)))
+            targets, plans = targets[:_fit], plans[:_fit]
         # §9: цели одной группы делят пул -> minOut второй посчитан ДО свопа первой. Проверку
         # ведёт board_v6 (два режима, #133); для группы из ОДНОЙ цели вопрос не стоит.
         if len(targets) > 1:

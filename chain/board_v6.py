@@ -409,8 +409,16 @@ def verify_hot(call_fn, addr, g0, count, until, our_receipt=None, head_fn=None):
     return True, "указатель сел: hotInfo == (%d,%d,%d)" % (g0, count, until)
 
 
-def arm_gas_limit(n_targets, route_bytes) -> int:
-    """§3: лимит газа арма от ЗАМЕРЕННОГО (12 757 108 на 8 целей/2КБ) с запасом, НЕ от лимита v5.
+# Потолок газа ОДНОЙ tx на узле (EIP-7825, 2^24). Замерено 28.08 на боевом RPC одноразовым ключом:
+# 16 777 216 проходит до проверки баланса, 16 777 217 — «gas limit too high» (-32003), от 30M —
+# «exceeds max transaction gas limit». Лимит выше потолка = tx НЕ УХОДИТ вовсе: отказ бесплатный,
+# но доска мертва (28.08 14:08→20:xx: все группы из 8 целей, 43 отказа, 0 армов после 19:49).
+TX_GAS_CAP = int(os.environ.get("V6_TX_GAS_CAP", str(1 << 24)))
+
+
+def _arm_gas_raw(n_targets, route_bytes) -> int:
+    """Щедрая модель лимита БЕЗ потолка узла: от ЗАМЕРЕННОГО (12 757 108 на 8 целей/2КБ) с
+    запасом, НЕ от лимита v5.
 
     Формула масштабируется входом (число целей × размер роута — байт роута ложится в холодный
     SSTORE ~625/байт) и снизу подпёрта эталоном×запас: недооценка = мёртвый арм (#84), а щедрый
@@ -421,6 +429,36 @@ def arm_gas_limit(n_targets, route_bytes) -> int:
     formula = 500_000 + n * per_target
     ref_scaled = int(ARM_GAS_REF * ARM_GAS_SAFETY * max(1, n) / 8)
     return max(formula, ref_scaled, _ARM_GAS_FLOOR if (n >= 8 and rb >= 2048) else 0)
+
+
+def arm_gas_limit(n_targets, route_bytes) -> int:
+    """§3: лимит газа арма = щедрая модель (`_arm_gas_raw`), срезанная потолком узла TX_GAS_CAP.
+
+    Щедрость ничего не стоит, но выше 2^24 tx не уходит ВООБЩЕ: 28.08 модель на 8 целях давала
+    17 222 095, и узел отвергал КАЖДЫЙ арм. Для (8, 2048) теперь отдаёт потолок (16 777 216 при
+    ожидаемом расходе 12.76M), не ARM_GAS_REF×запас. Влезает ли группа по РАСХОДУ — судит
+    `arm_gas_expected`/`arm_fit_count`, а не лимит: кап лимита без этой проверки превратил бы
+    бесплатный отказ узла в СГОРЕВШИЙ арм (gasUsed == gasLimit, #84).
+    """
+    return min(_arm_gas_raw(n_targets, route_bytes), TX_GAS_CAP)
+
+
+def arm_gas_expected(n_targets, route_bytes) -> int:
+    """Ожидаемый РАСХОД арма: та же модель без запаса ARM_GAS_SAFETY (эталон 12 757 108 на
+    8 целей/2КБ — измерение, из которого модель выросла). Реальный расход 28.08 на роутах ~450 Б:
+    1 цель 97–173k, 7 целей 1.62M — модель выше в разы, то есть урезает раньше, чем жжёт."""
+    return int(_arm_gas_raw(n_targets, route_bytes) / ARM_GAS_SAFETY)
+
+
+def arm_fit_count(targets, route_len=None) -> int:
+    """Сколько ПЕРВЫХ целей группы влезает в потолок tx по ожидаемому расходу. Владелец группы —
+    первый (`[owner_plan] + extras`), урезаем с хвоста. Одна цель остаётся всегда: одиночную
+    группу судит сам узел, а пустая доска = немой флот."""
+    rl = route_len or (lambda t: len(t[4]))
+    n = len(targets)
+    while n > 1 and arm_gas_expected(n, max((rl(t) for t in targets[:n]), default=0)) > TX_GAS_CAP:
+        n -= 1
+    return n
 
 
 # ==================================================================================================
@@ -712,7 +750,20 @@ def arm_group(send_fn, call_fn, addr, g, mp, deadline, gate_trigger, targets, *,
     if gas is None:
         rb = route_bytes if route_bytes is not None else max((len(t[4]) for t in targets), default=0)
         gas = arm_gas_limit(len(targets), rb)
+        exp = arm_gas_expected(len(targets), rb)
+        if exp > TX_GAS_CAP:
+            # Лимит срезан потолком, а расход в него не влезает: отправка = сгоревший арм на всю
+            # tx. Не шлём; сборщик обязан урезать группу заранее (arm_fit_count в _v6_arm).
+            return False, None, ("группа %d целей/роут %d Б не влезает в потолок tx %d (ожидаемый "
+                                 "расход %d) — НЕ ОТПРАВЛЕНО, сборщик обязан урезать группу"
+                                 % (len(targets), rb, TX_GAS_CAP, exp))
     rec = send_fn(cd, gas)
+    if rec is None:
+        # 28.08: send_fn упал ДО отправки (Web3RPCError «gas limit too high»), а status_of(None)=0
+        # читался как «квитанция status!=1 (арм сгорел)» — ×20 ложных «сгорел» при нуле сгоревших
+        # в цепи. Нет квитанции = tx НЕ УШЛА; это другой отказ, и называть его надо своим именем.
+        return False, None, ("отправка не удалась (send_fn вернул None) — tx НЕ ушла в цепь, это НЕ "
+                             "сгоревший арм; причина — в строке «send fail» отправителя")
     borrowers = [t[0] for t in targets]
     ok, reason = verify_arm(call_fn, addr, g, rec, deadline, borrowers, head_fn=head_fn)
     return ok, rec, reason

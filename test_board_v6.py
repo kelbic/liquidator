@@ -200,9 +200,15 @@ def test_verify_hot():
 
 def test_arm_gas_limit_floor_and_monotone():
     ref = b.ARM_GAS_REF
-    assert b.arm_gas_limit(8, 2048) >= int(ref * b.ARM_GAS_SAFETY) >= ref
-    assert b.arm_gas_limit(8, 2048) > b.arm_gas_limit(8, 1024)     # растёт с роутом
-    assert b.arm_gas_limit(8, 2048) > b.arm_gas_limit(4, 2048)     # растёт с числом целей
+    # 28.08: пол «эталон×запас» живёт у МОДЕЛИ (_arm_gas_raw); ЛИМИТ срезан потолком узла 2^24
+    # (EIP-7825): 17 222 095 на 8 целях отвергался узлом («gas limit too high»), доска была мертва 6ч.
+    assert b._arm_gas_raw(8, 2048) >= int(ref * b.ARM_GAS_SAFETY) >= ref
+    assert b.arm_gas_limit(8, 2048) == min(b._arm_gas_raw(8, 2048), b.TX_GAS_CAP) <= b.TX_GAS_CAP
+    assert b.arm_gas_expected(8, 2048) <= b.TX_GAS_CAP            # эталонная восьмёрка ВЛЕЗАЕТ
+    assert b._arm_gas_raw(8, 2048) > b._arm_gas_raw(8, 1024)      # модель растёт с роутом
+    assert b._arm_gas_raw(8, 2048) > b._arm_gas_raw(4, 2048)      # и с числом целей
+    assert b.arm_gas_limit(8, 2048) >= b.arm_gas_limit(8, 1024) >= b.arm_gas_limit(4, 1024)  # лимит не убывает
+    assert b.arm_gas_limit(2, 450) == 4_305_523                    # малые группы — бит-в-бит (цепь 28.08)
 
 
 def test_choose_eviction_hysteresis_and_live_span():
