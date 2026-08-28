@@ -1586,6 +1586,27 @@ def mark_recent_send(market_id: str, borrower: str):
         _RECENT_SENDS[(market_id, borrower)] = time.monotonic()
 
 
+# ПРОБЫ SPEC-FIRE — С НОГ, НЕ С ГЛАВНОГО (28.08, гонка 50572467, приз $2 375). Шесть проб горячей цели
+# ушли с главного кошелька на 0.001 gwei (nonce 27985-27990), а боевой выстрел (nonce 27991, 3.3 gwei)
+# встал в nonce-очередь ЗА НИМИ и вошёл в блок 468 — на один позже приза. Секвенсер включает nonce
+# по порядку; дешёвая проба главного = пробка перед его же выстрелом. 220 ног существуют ровно для
+# проб: каждая — свой nonce-поток. Главный остаётся ТОЛЬКО выстрелам. Откат SPEC_FIRE_PROBE_FROM_LEGS=0.
+PROBE_FROM_LEGS = os.environ.get("SPEC_FIRE_PROBE_FROM_LEGS", "1").lower() not in ("0", "off", "false", "no")
+_PROBE_LEG_RR = [0]
+_PROBE_LEG_LOCK = threading.Lock()
+
+
+def _next_probe_leg():
+    """(адрес, ключ) следующей ноги по кругу; None = ног нет (фолбэк на главный, как прежде)."""
+    accs = volley_accounts() or []
+    if not accs:
+        return None
+    with _PROBE_LEG_LOCK:
+        i = _PROBE_LEG_RR[0] % len(accs)
+        _PROBE_LEG_RR[0] = i + 1
+    return accs[i]
+
+
 def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
                          max_fee=None, tip=None, broadcast_raw_urls=None):
     """Боевая спек-проба: НАСТОЯЩИЙ liquidate-calldata ДО транзита (реверт 'healthy' ~$0.01-0.02,
@@ -1605,7 +1626,11 @@ def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
                 or _INFLIGHT > 0):
             return None
     w3 = rpc._web3()
-    bot = account_for(w3, cfg.wallet_key).address
+    _key = cfg.wallet_key
+    _leg = _next_probe_leg() if PROBE_FROM_LEGS else None
+    if _leg is not None:
+        _key = _leg[1]
+    bot = account_for(w3, _key).address
     # патронный резерв: расходники не грызут выстрел (см. BULLET_RESERVE_WEI)
     _cost = int(gas) * int(max_fee if max_fee else int(cfg.tip_gwei * 1e9) * 3)
     if not probe_allowed_by_reserve(cached_balance_wei(rpc, bot), _cost):
@@ -1636,7 +1661,7 @@ def send_spec_fire_probe(rpc, cfg, calldata: str, gas: int, log=None,
             _tx["maxFeePerGas"] = int(max_fee)
             _tx["maxPriorityFeePerGas"] = tip_wei
         try:
-            res = send_tx(rpc, cfg.wallet_key, _tx,
+            res = send_tx(rpc, _key, _tx,
                           wait=False, min_tip_wei=tip_wei, broadcast_raw_urls=broadcast_raw_urls)
         except Exception as e:
             _LOCAL_NONCE.pop(bot, None)
