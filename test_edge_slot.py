@@ -7,7 +7,7 @@ def _sfl(env):
     import test_top_fat_tiebreak as tt; importlib.reload(tt)
     return sfl, tt
 MID = "0xm"   # тот же рынок, что в фикстуре _mk из test_top_fat_tiebreak
-FAT = {("%s" % MID, "0xF%d" % i): 1.0 / (1.0 - 0.011 - 0.003 * i) for i in range(7)}   # запас 1.1%..2.9% (все внутри max_dist 3%)
+FAT = {("%s" % MID, "0xF%d" % i): 1.0 / (1.0 - 0.0036 - 0.0002 * i) for i in range(7)}   # запас 0.36%..0.48%: ВСЕ внутри семени BTC 0.53% => вес 1 у всех, решает долг, и NEAR ($51) без edge-слота ВЫЛЕТАЕТ
 NEAR = {(MID, "0xNEAR"): 1.0 / (1.0 - 0.0034)}                                          # запас 0.34%
 DEBT = {k: 18_000.0 for k in FAT}
 # NEAR — мелочь, но ВЫШЕ рыночного порога _market_min_repaid_usd (иначе тест проверяет порог, а не слот):
