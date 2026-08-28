@@ -255,17 +255,17 @@ if __name__ == "__main__":
 
 def test_index_late_120s_still_deduped():
     """ЛИНЗА Fable 28.08: индекс отстаёт от live на десятки секунд под нагрузкой. Второй приход того же
-    (agg, bn) через 120с ОБЯЗАН остаться дедупнутым (кольцо = 1); через > TTL кольца — новый сэмпл."""
-    import importlib, os, chain.execute as ex
-    os.environ["SPEC_FIRE_MIRROR_INDEX_GATE"] = "1"; importlib.reload(ex)
-    ex._TRANSIT_TIPS.clear(); ex._MIRROR_SEEN.clear()
-    agg = sorted(ex._mirror_agg_set() if hasattr(ex, "_mirror_agg_set") else {OUR})[0] if False else OUR
-    now = 1_800_000_000.0
-    ex.note_transit_tip(1_800_000, agg, now=now, bn=500)
-    ex.note_transit_tip_indexed(1_800_000, agg, bn=500, now=now + 120)
-    n1 = sum(len(v) for v in ex._TRANSIT_TIPS.values())
-    assert n1 == 1, "через 120с индекс снова лёг в кольцо: %d сэмплов" % n1
-    # ПОЗИТИВНЫЙ КОНТРОЛЬ: за TTL дедуп ОТПУСКАЕТ — второй приход ПРИНЯТ (кольцо к тому моменту
-    # само выкинуло первый сэмпл по своему TTL, поэтому судим по факту приёма, а не по сумме).
-    ok = ex.note_transit_tip_indexed(1_800_000, agg, bn=500, now=now + ex._MIRROR_TTL_SEC + 5)
-    assert ok is True, "за TTL кольца дедуп обязан отпустить, а вернул %r" % (ok,)
+    (agg, bn) через 120с ОБЯЗАН остаться дедупнутым (кольцо = 1); за TTL кольца дедуп отпускает."""
+    import chain.execute as ex
+    saved = _seed_map(OUR)
+    try:
+        ex._TRANSIT_TIPS.clear(); ex._MIRROR_SEEN.clear()
+        now = 1_800_000_000.0
+        assert ex.note_transit_tip(1_800_000, OUR, now=now, bn=500) is True, "позитивный контроль: live принят"
+        assert ex.note_transit_tip_indexed(1_800_000, OUR, bn=500, now=now + 120) is False, \
+            "через 120с индекс снова лёг в кольцо"
+        assert sum(len(v) for v in ex._TRANSIT_TIPS.values()) == 1
+        assert ex.note_transit_tip_indexed(1_800_000, OUR, bn=500, now=now + ex._MIRROR_TTL_SEC + 5) is True, \
+            "за TTL кольца дедуп обязан отпустить"
+    finally:
+        _restore_map(saved)
