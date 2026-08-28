@@ -1815,7 +1815,9 @@ def send_owner_tx_v6(rpc, cfg, calldata: str, gas: int, log=None, tag="v6",
                         from chain.rpc import redact_clip as _rc
                         # raw tx / длинные hex не печатаем: ключ из подписи не восстановить, но и
                         # мусор в журнале не нужен; redact() маскирует только ЛИТЕРАЛЫ известных ключей
-                        _body = _rc(_re.sub(r"0x[0-9a-fA-F]{100,}", "0x<raw>", str(e)), 200)
+                        _m = _re.sub(r"0x[0-9a-fA-F]{100,}", "0x<raw>", str(e))
+                        _m = _re.sub(r"(?<![0-9a-fA-F])(0x)?[0-9a-fA-F]{64}(?![0-9a-fA-F])", "<hex64>", _m)   # redact() знает только URL-ключи; 64-hex (ключ/хэш) режем сами
+                        _body = _rc(_m, 200)
                     except Exception:                       # noqa: BLE001 — прибор сбоку от денег
                         _body = "?"
                     log.info("V6 %s send fail: %s: %s", tag, type(e).__name__, _body)   # 28.08: инцидент 19:49 — час без доски, а в журнале только имя класса
