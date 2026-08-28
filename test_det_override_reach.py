@@ -46,21 +46,23 @@ def _override_taken(det_dist, feed="ETH"):
     return sf._det_reach_ok(feed, det_dist, "0xm", "0xDET")
 
 
-# кольцо ETH: 40 толчков по 0.20% -> p99 = 0.20%, бюджет = 0.40%
+# кольцо ETH: 40 толчков по 0.20%. 28.08: семя стало НИЖНЕЙ границей, поэтому reach = семя
+# ETH 0.808% (не 0.20%), бюджет = 1.616%. Пороги целей ниже пересчитаны от бюджета, не от константы.
 ps._RINGS.clear()
 now = time.time()
 for i in range(40):
     ps.note_push("ETH", 0.20, now=now - i)
-assert ps.samples("ETH") >= ps.MIN_N and abs(ps.reach("ETH") - 0.0020) < 1e-9, ps.reach("ETH")
+assert ps.samples("ETH") >= ps.MIN_N and abs(ps.reach("ETH") - ps._SEED["ETH"] / 100.0) < 1e-9, ps.reach("ETH")
 
 # (2) ПОЗИТИВНЫЙ КОНТРОЛЬ ПЕРВЫМ: досягаемая цель перехват получает
 assert _override_taken(0.0015) is True, "пол не должен выключать перехват целиком"
 print("UNIT_OK 1: позитивный контроль — цель на 0.150%% (бюджет 0.400%%) перехват ПОЛУЧАЕТ")
 
 # (1) ГЛАВНОЕ: боевая цель 6.27% отклоняется
-assert _override_taken(0.0627) is False, "цель на 6.27%% при бюджете 0.40%% обязана быть отклонена"
-assert _override_taken(0.0041) is False, "чуть за бюджетом — тоже отклонение (граница работает)"
-assert _override_taken(0.0039) is True, "чуть внутри бюджета — проходит"
+_budget = ps.reach("ETH") * sfl.SPEC_FIRE_DET_REACH_PUSHES          # граница — ОТ бюджета, не константой
+assert _override_taken(0.0627) is False, "цель на 6.27%% при бюджете %.3f%% обязана быть отклонена" % (_budget * 100)
+assert _override_taken(_budget + 0.0002) is False, "чуть за бюджетом — тоже отклонение (граница работает)"
+assert _override_taken(_budget - 0.0002) is True, "чуть внутри бюджета — проходит"
 print("UNIT_OK 2: боевая цель 6.270%% отклонена; граница бюджета режет по 0.400%%")
 
 # (3) БЕЗ ЗАМЕРА пол не применяется — прежнее поведение

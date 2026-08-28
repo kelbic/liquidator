@@ -692,6 +692,7 @@ _MIRROR_FLOOR_MAX = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_FLOOR_MAX", "
 # То есть на ПЕРВОЙ пачке зеркало физически не успевает, и платить за неё пересборкой нечем.
 _MIRROR_ENTRY_N = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_ENTRY_N", "8"))
 _MIRROR_ENTRY_AGE_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_ENTRY_AGE_SEC", "60"))
+_MIRROR_MIN_ENTRY_COUNT = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MIN_ENTRY_COUNT", "3"))   # демпфер 28.08; откат =1
 # 27.08 — СЛЕПОЙ ДИЗАЙН ПОРТФЕЛЯ (STATE 79bd9dd; замер: коэффициент цены $0.344 за 1M wei
 # Σtip слотов/окно, состав [15.86,10,5,1] = $10.94/окно при 2/10 точных попаданий против
 # 3/10 у пола-4 за $1.56). ДВЕ ЗОНЫ с разными правилами:
@@ -786,6 +787,46 @@ def _agg_mode(fresh):
     return m, cnt, min(ts for ts, w in fresh if w == m)
 
 
+_MIRROR_POOLED = os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_POOLED", "0").lower() not in ("0", "false", "no")
+
+
+def _pooled_modes(rings):
+    """Кандидаты из ПУЛА ПО ВСЕМ КОЛЬЦАМ, а не из моды каждого фида по отдельности.
+
+    ЗАЧЕМ (замер 28.08 на 4 027 транзитах наших 26 фидов за 7 суток): у ОТДЕЛЬНОГО фида
+    доминирующего класса tip НЕТ — доля моды внутри фида 11.8% (медиана окна 25%), а
+    `_agg_mode` требует >= MIN_SHARE (50%). Прогон по реальной истории: порог проходит лишь
+    **14.8% окон** ⇒ в 85% времени кандидатов нет вовсе и портфель падает на СТАТИКУ. Именно
+    поэтому в бою стояли 1.0/1.01/1.1/1.15, а самый частый класс транзита 2.2M (10.2% пула)
+    не держался НИКОГДА, и наши ноги садились на ~750 000 wei ниже транзита.
+
+    ПУЛ структуру имеет: 2.2M 10.2%, 1.0M 8.9%, 1.15M 6.5%, 1.01M 5.6%, 5.0M 3.3%.
+    Порог доли здесь НЕ применяется по построению: пул — это не «класс оператора», а частоты
+    поля, и отбор в слоты идёт по УЛИКЕ (числу сэмплов), как и раньше.
+
+    Возврат — формат `_agg_mode`: [(значение, вес, ранний ts)]. Откат:
+    SPEC_FIRE_PROBE_TIP_MIRROR_POOLED=0 (вернёт пер-агг моды бит-в-бит).
+    """
+    from collections import Counter
+    flat = [(ts, w) for ring in rings.values() for ts, w in ring]
+    if len(flat) < _MIRROR_MIN_N:
+        return []
+    cnt = Counter(w for _ts, w in flat)
+    # ЛИНЗА (Opus, 28.08): трункация most_common(K) по ЧАСТОТЕ выбрасывала класс затора — он редок
+    # и распылён по значениям, в плотном каскаде 12 частых полов вытесняли его из cands, и
+    # шторм-гейт оставался БЕЗ ВХОДА при достаточной улике (репро: транзит 31.2M, _fresh_exact=8
+    # при пороге 6, слот не выставлен). Дорогая полоса (>= EXP_MIN) в cands ВСЕГДА — гейты ниже
+    # (_fresh_exact/EXP_N/Σ-кап/шторм-бюджет) не трогаются и по-прежнему решают вход.
+    # ЛИНЗА (Fable): порядок детерминирован ключом (-счёт, значение) — иначе на границе K
+    # членство плавало от порядка вставки колец и пересобирало лестницы на пустом месте.
+    ranked = sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))
+    keep = [v for v, _c in ranked[:_MIRROR_K]]
+    keep += [v for v, _c in ranked if v >= _MIRROR_EXP_MIN and v not in keep]
+    out = [(val, cnt[val], min(ts for ts, w in flat if w == val)) for val in keep]
+    out.sort(key=lambda c: (-c[1], c[0]))
+    return out
+
+
 def _glue_modes(cands):
     """Склейка кандидатов в КЛАССЫ: цепная, по возрастанию, шаг <= _MIRROR_GLUE_STEP.
 
@@ -837,7 +878,8 @@ def transit_tip_portfolio(now=None) -> tuple:
             del _TRANSIT_TIPS[k]
         rings = {k: [(ts, w) for ts, w in v if n - ts <= _MIRROR_TTL_SEC]
                  for k, v in _TRANSIT_TIPS.items()}
-    cands = [c for c in (_agg_mode(f) for f in rings.values()) if c is not None]
+    cands = (_pooled_modes(rings) if _MIRROR_POOLED
+             else [c for c in (_agg_mode(f) for f in rings.values()) if c is not None])
     # --- полоса пола: ТОЧНЫЕ значения (склейки нет), дубли значений из разных колец суммируются
     fl = {}
     for m, w, ts in cands:
@@ -846,9 +888,14 @@ def transit_tip_portfolio(now=None) -> tuple:
             g[0] += w
             g[1] = min(g[1], ts)
     floor_c = [(m, g[0], g[1]) for m, g in fl.items()]
+    # ДЕМПФЕР (ЛИНЗА Fable 28.08): путь возраста пропускал ОДИНОЧКУ (count=1) через 60с — при пуле
+    # это сделало гистерезис входа мёртвым: плотный реплей (4 027 транзитов) дал ~317 смен состава
+    # в сутки против приёмки <=40, а флот сходится к новому составу за ~44 мин — ноги вечно
+    # несли бы протухший tip. Инкумбентам (_MIRROR_APPLIED_MODES) вход не нужен; новичок входит
+    # либо уликой >= ENTRY_N, либо возрастом — но с улики >= MIN_ENTRY_COUNT, не с одного сэмпла.
     floor_ready = [g for g in floor_c
                    if g[0] in _MIRROR_APPLIED_MODES or g[1] >= _MIRROR_ENTRY_N
-                   or (n - g[2]) >= _MIRROR_ENTRY_AGE_SEC]
+                   or (g[1] >= _MIRROR_MIN_ENTRY_COUNT and (n - g[2]) >= _MIRROR_ENTRY_AGE_SEC)]
     # --- дорогая зона: склейка, вход ТОЛЬКО по свежим точным сэмплам одного агрегатора
     exp_glued = _glue_modes([c for c in cands if c[0] >= _MIRROR_EXP_MIN])
 
@@ -872,7 +919,7 @@ def transit_tip_portfolio(now=None) -> tuple:
     st["tick"] = n
     # --- пол: сколько слотов ему положено и какие значения
     n_floor = _MIRROR_SLOTS - _MIRROR_EXP_SLOTS
-    floor_sel = [g[0] for g in sorted(floor_ready, key=lambda g: (-g[1], -g[0]))[:_MIRROR_SLOTS]]
+    floor_sel = [g[0] for g in sorted(floor_ready, key=lambda g: (-g[1], g[0]))[:_MIRROR_SLOTS]]   # ЛИНЗА (Fable): при равной улике — ДЕШЕВЛЕ, не дороже
     # --- дорогой слот: удержание/замена/вход с гистерезисом, Σ-кап и шторм
     cur = st["cls"]
     # ВЫХОД мягче ВХОДА (слепой дизайн: вход 6 свежих за 300с, удержание пока >= 4 за 600с):
@@ -912,6 +959,14 @@ def transit_tip_portfolio(now=None) -> tuple:
     st["storm"] = bool(want is not None and storm)
     exp_val = want[0] if want is not None else None
     modes = ([exp_val] if exp_val is not None else []) + floor_sel[:(_MIRROR_SLOTS - (1 if exp_val is not None else 0))]
+    # ПОЛ ГАРАНТИРОВАН ЯВНО (ЛИНЗА Fable 28.08: строки гарантии из 2faeeab были ПОТЕРЯНЫ в bad9f68,
+    # докстринг обещал то, чего в коде не было; пул сделал вытеснение нормой — красный стенд
+    # [2.2M, 2.4M, 1.5M, 1.3M] при 1.0M в пуле). Живой класс <= FLOOR_MAX занимает слабейший по
+    # улике из эмитируемых слотов. Цена промаха — не деньги, а ГЛУШЕНИЕ: 20/20 призовых tx
+    # вскрытия 49834406 стояли на tip ровно 1.0M, нога выше пола сортируется ПЕРЕД транзитом.
+    _floors = [g for g in floor_ready if g[0] <= _MIRROR_FLOOR_MAX]
+    if _floors and modes and not any(v <= _MIRROR_FLOOR_MAX for v in modes):
+        modes[-1] = max(_floors, key=lambda g: g[1])[0]
     if not floor_sel and exp_val is None:
         _MIRROR_APPLIED, _MIRROR_APPLIED_MODES = (), frozenset()
         return ()

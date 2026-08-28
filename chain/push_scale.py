@@ -53,6 +53,7 @@ CAP_PCT = float(os.environ.get("PUSH_SCALE_CAP_PCT", "7.00"))       # выше �
 _SEED = {"BTC": 0.530, "ETH": 0.808, "XRP": 2.772, "ADA": 3.034,
          "SOL": 2.768, "DOGE": 2.495, "LTC": 1.602}
 SEED_DEFAULT_PCT = float(os.environ.get("PUSH_SCALE_SEED_PCT", "1.820"))   # p99 всего поля
+SEED_IS_FLOOR = os.environ.get("PUSH_SCALE_SEED_FLOOR", "1").lower() not in ("0", "off", "false", "no")
 
 _LOCK = threading.Lock()
 _RINGS: dict = {}
@@ -95,10 +96,20 @@ def reach(feed, now=None):
         return None
     now = time.time() if now is None else now
     v = sorted(_fresh(feed, now))
+    seed = _SEED.get(str(feed or "?").upper(), SEED_DEFAULT_PCT)
     if len(v) >= MIN_N:
         pct = v[min(len(v) - 1, int(len(v) * Q))]
+        # СЕМЯ — НИЖНЯЯ ГРАНИЦА, А НЕ ТОЛЬКО ЗАМЕНА ДО MIN_N (28.08). Живое кольцо с TTL 3 суток
+        # переучилось на тихой неделе: XRP p99 одного пуша уехал с посевных 2.772% до 0.616%, гейт
+        # `_det_reach_ok` встал на 1.232% и отклонял цель в 5.98% — в то время как замер по цепи
+        # (30 суток, 933 окна) даёт ход XRP за 14-минутный TTL доски >= 1.232% в 25.7% окон, p90
+        # 2.11%, p99 11.4%. Штиль не должен ОПУСКАТЬ досягаемость ниже посевной: семя снято
+        # с 7-суточного поля, где были и каскады. Вверх живой замер по-прежнему двигает.
+        # Откат: PUSH_SCALE_SEED_FLOOR=0.
+        if SEED_IS_FLOOR:
+            pct = max(pct, seed)
     else:
-        pct = _SEED.get(str(feed or "?").upper(), SEED_DEFAULT_PCT)
+        pct = seed
     pct = max(FLOOR_PCT, min(CAP_PCT, float(pct)))
     return pct / 100.0
 
