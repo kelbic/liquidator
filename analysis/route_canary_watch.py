@@ -206,13 +206,28 @@ def evaluate(rows, thresholds, symbols=None):
                           "text": "%s %s МЁРТВ: %s%s" % (name, r["router"], r["err"],
                                                               at_block(r))})
         elif r["status"] == rc.ALIVE and r["impact"] >= th:
+            # ПРОБА ПОТОЛКА ДОГОВАРИВАЕТ ГЛУБОКУЮ ТРЕВОГУ (29.08 23:xx, тревога
+            # route-canary:09df3967). Ветки ниже — elif, поэтому упёршийся В ОСТАТОК роут,
+            # у которого impact уже выше порога, уходил в "deep", и посчитанный headroom в
+            # текст НЕ ПОПАДАЛ — ровно там, где он решает. Цена этой немоты: 17:05 impact
+            # 34.42% при резерве 122 WETH, 23:05 — 16.03% при резерве 156 WETH; ОДНО И ТО ЖЕ
+            # состояние потолка читалось как «полегчало, эпизод», потому что impact на
+            # ОДНОМ размере тут функция чужого остатка, а не нашей глубины. Отдельной
+            # тревоги не заводим (дубль), но ЧИСЛО едет в том же пункте.
+            text = ("%s %s impact %.2f%% ≥ порога %.2f%% [%s], "
+                    "max_in=%s (ед. token_in)%s" % (
+                        name, r["router"], r["impact"], th, src,
+                        r["cap"] if r["cap"] is not None else "нет", at_block(r)))
+            if r.get("headroom") is not None and r["headroom"] < CEILING_MIN:
+                text += ("\n    ПОТОЛОК ПУЛА (та же строка, не вторая тревога): удвоение "
+                         "входа даёт выход x%.4f (нужно ~x2) — %s против %s ед. token_out. "
+                         "Упёрлись в ОСТАТОК выходного токена, а не в цену ⇒ impact на этом "
+                         "капе мерит ЧУЖОЙ резерв: он падает при доливе пула БЕЗ возврата "
+                         "роута. Снижение impact между проходами тут НЕ улучшение и не "
+                         "эпизод — сравнивать надо headroom" % (
+                             r["headroom"], r["out"], r["out2x"]))
             probs.append({"kind": "deep", "name": name, "row": r,
-                          "th": th, "src": src,
-                          "text": "%s %s impact %.2f%% ≥ порога %.2f%% [%s], "
-                                  "max_in=%s (ед. token_in)%s" % (
-                              name, r["router"], r["impact"], th, src,
-                              r["cap"] if r["cap"] is not None else "нет",
-                              at_block(r))})
+                          "th": th, "src": src, "text": text})
         elif (r["status"] == rc.ALIVE and r.get("headroom") is not None
               and r["headroom"] < CEILING_MIN):
             probs.append({"kind": "ceiling", "name": name, "row": r,
