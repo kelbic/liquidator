@@ -78,10 +78,30 @@ check("запись: 1e6 принят", ex.note_transit_tip(1_000_000) is True)
 check("прежняя граница 2e7 была НИЖЕ наблюдённого режима", MAX_SEEN > 20_000_000)
 for w in (21_200_000, 31_200_000, 33_400_000, MAX_SEEN):
     check("запись: режим затора %d принят" % w, ex.note_transit_tip(w) is True)
-check("запись: 51 mgwei (вне экономического кэпа) отброшен",
-      ex.note_transit_tip(51_000_000) is False)
-check("запись: 35.1 mgwei (выше наблюдённого класса) отброшен",
-      ex.note_transit_tip(35_100_000) is False)
+# 29.08: кап 35M был подогнан под максимум 129-строчного файла; плотный поток дал штормовой класс 42.8M x11
+# и max 100M за 7 суток — всё это резалось на входе, зеркало слепло ровно в каскаде. Кап поднят до 120M.
+for w in (42_800_000, 51_000_000, 100_000_000):
+    check("запись: штормовой класс %d ПРИНЯТ (кап 120M)" % w, ex.note_transit_tip(w) is True)
+check("запись: 130 mgwei (выше капа 120M) отброшен", ex.note_transit_tip(130_000_000) is False)
+check("кап — константа модуля 120M", ex._MIRROR_TIP_MAX == 120_000_000 and ex._MIRROR_STORM_MAX == 120_000_000)
+# строка журнала на принятый штормовой сэмпл: печатается, дедупится 60 с, ниже 35M молчит
+import logging as _lg
+class _Cap(_lg.Handler):
+    def __init__(self): super().__init__(); self.msgs = []
+    def emit(self, r): self.msgs.append(r.getMessage())
+_h = _Cap(); ex.log.addHandler(_h); ex.log.setLevel(_lg.INFO)
+ex._STORM_LOG_TS[0] = 0.0
+_t = 1_800_000_000.0
+check("штормовой сэмпл 42.8M печатается", ex.note_transit_tip(42_800_000, "0xaa", now=_t) is True
+      and any("штормовой сэмпл 42800000" in m for m in _h.msgs))
+_n0 = len(_h.msgs)
+ex.note_transit_tip(51_000_000, "0xaa", now=_t + 10)
+check("дедуп 60 с: второй сэмпл через 10 с НЕ печатается", len(_h.msgs) == _n0)
+ex.note_transit_tip(51_000_000, "0xaa", now=_t + 61)
+check("через 61 с печатается снова", len(_h.msgs) == _n0 + 1)
+_n1 = len(_h.msgs); ex.note_transit_tip(2_200_000, "0xaa", now=_t + 200)
+check("сэмпл 2.2M (ниже 35M) не печатается", len(_h.msgs) == _n1)
+ex.log.removeHandler(_h)
 
 # --- 2. ПЕР-АГГ КОЛЬЦА: мода одного не разбавляется полами другого ------------------------------
 reset()
@@ -286,8 +306,8 @@ check("проводка: main передаёт agg (это и чинилось)"
 src_ex = open(ex.__file__.replace(".pyc", ".py")).read()
 check("проводка: presign_ladder через probe_tip_for", "probe_tip_for" in src_ex)
 check("боевой дефолт: зеркало включено", ex.PROBE_TIP_MIRROR is True)
-check("боевой дефолт: верх границы = экономический кэп 3.5e7 (чуть выше наблюдённого максимума)",
-      ex._MIRROR_TIP_MAX == 35_000_000 and ex._MIRROR_TIP_MAX > MAX_SEEN)
+check("боевой дефолт: верх границы = экономический кэп 1.2e8 (29.08: штормовой класс 42.8M и max 100M за 7 суток — выше прежних 35M)",
+      ex._MIRROR_TIP_MAX == 120_000_000 and ex._MIRROR_TIP_MAX > MAX_SEEN)
 check("боевой дефолт: TTL 15 минут (хвост цены режется)", ex._MIRROR_TTL_SEC == 900.0)
 check("проводка: движок сообщает о горячей фазе",
       "note_hot_phase" in open(os.path.join(os.path.dirname(ex.__file__),

@@ -674,7 +674,11 @@ _MIRROR_TTL_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_TTL_SEC", "90
 _MIRROR_MIN_SHARE = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MIN_SHARE", "0.5"))
 _MIRROR_MIN_N = 4
 _MIRROR_TIP_MIN = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MIN", "500000"))
-_MIRROR_TIP_MAX = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MAX", "35000000"))
+# 29.08: кап входа 35M был подогнан под максимум 129-строчного файла (34.6M); плотный поток показал модальный
+# затор каскада 42.8M x11 за 6 мин с трёх аггов и max 100M за 7 суток (4 027 транзитов). Всё выше капа резалось
+# НА ВХОДЕ note_transit_tip — зеркало было слепо ровно в каскаде, где живут призы. Расход ограничен не капом,
+# а конструкцией слота: дорогой слот 1 из 4, вход только по свежей улике, Σ-кап 12M, шторм-бюджет 3 600 с/сутки.
+_MIRROR_TIP_MAX = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_MAX", "120000000"))
 _MIRROR_SLOTS = 4                        # слотов портфеля = длине статического портфеля
 # СКЛЕЙКА: два tip в пределах ±10% — ОДИН класс, а не два кандидата в слоты. 10.0 и 10.1 mgwei
 # у одного оператора это дрейф, а не два режима; 1.0/1.1/1.15/1.2 — один пол (склейка цепная,
@@ -716,7 +720,7 @@ _MIRROR_EXP_MIN = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_WEI",
 _MIRROR_EXP_SLOTS = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_SLOTS", "1"))
 _MIRROR_SUM_CAP = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_SUM_CAP_WEI", "12000000"))
 _MIRROR_EXP_FRESH_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_FRESH_SEC", "300"))
-_MIRROR_STORM_MAX = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_STORM_MAX_WEI", "35000000"))
+_MIRROR_STORM_MAX = int(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_STORM_MAX_WEI", "120000000"))   # 29.08: 35M резал штормовой класс 42.8M (см. _MIRROR_TIP_MAX)
 _MIRROR_STORM_SEC_PER_DAY = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_STORM_SEC_PER_DAY", "3600"))
 _MIRROR_EXP_DWELL_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_DWELL_SEC", "600"))
 _MIRROR_EXP_GAP_SEC = float(os.environ.get("SPEC_FIRE_PROBE_TIP_MIRROR_EXPENSIVE_GAP_SEC", "300"))
@@ -883,6 +887,26 @@ def mirror_index_stats() -> dict:
     return dict(_MIRROR_IDX_STATS)
 
 
+# 29.08: приёмка капа 120M — событийная. Каскад редок, и если дорогой слот в следующий каскад НЕ войдёт,
+# надо различать «кап не сработал» и «улики не хватило». Прежний кап 35M резал сэмплы МОЛЧА (0 строк
+# в журнале) — теперь каждый принятый сэмпл выше прежнего капа печатается (дедуп 60 с). Строка журнала,
+# не прибор.
+_MIRROR_STORM_LOG_ABOVE = 35_000_000
+_MIRROR_STORM_LOG_EVERY_SEC = 60.0
+_STORM_LOG_TS = [0.0]
+
+
+def _storm_sample_log(w, key, n):
+    if w <= _MIRROR_STORM_LOG_ABOVE:
+        return False
+    if n - _STORM_LOG_TS[0] < _MIRROR_STORM_LOG_EVERY_SEC:
+        return False
+    _STORM_LOG_TS[0] = n
+    log.info("зеркало: штормовой сэмпл %d wei от %s ПРИНЯТ (прежний кап 35M его резал; кап %d)",
+             w, str(key)[:10], _MIRROR_TIP_MAX)
+    return True
+
+
 def note_transit_tip(tip_wei, agg=None, now=None, bn=None) -> bool:
     """#104/Ш24b v2: записать tip живого транзита В КОЛЬЦО ЕГО АГРЕГАТОРА.
 
@@ -901,6 +925,7 @@ def note_transit_tip(tip_wei, agg=None, now=None, bn=None) -> bool:
         return False
     key = str(agg).lower() if agg else _MIRROR_UNKNOWN
     n = float(now if now is not None else time.time())
+    _storm_sample_log(w, key, n)
     with _TRANSIT_TIPS_LOCK:
         # Метка ставится под тем же локом и ТОЛЬКО когда сэмпл уже прошёл границы входа:
         # отвергнутый по границам (напр. tip=-1, дефолт индекса) не вправе съесть ключ у
