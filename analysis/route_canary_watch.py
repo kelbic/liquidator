@@ -45,6 +45,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from analysis import route_canary as rc  # noqa: E402
 
 DEFAULT_PCT = 10.0                 # пар нет в covered_markets.json -> прежний общий порог
+# Дискриминатор пробы потолка: во сколько раз обязан вырасти выход при удвоении входа, чтобы
+# считать, что запас есть. 2.0 — идеал глубокого пула, 1.1 отделяет «упёрлись в резерв»
+# (wstETH до обвала: x1.037) от просто искривлённого пула (impact 1-4%, x1.9+). Порог низкий
+# НАРОЧНО: тревога-справка не должна конкурировать с impact-порогом за внимание.
+CEILING_MIN = 1.1
 WATCH_DIR = os.path.expanduser("~/.fleet-watch")
 SOURCE = "route-canary"
 
@@ -208,6 +213,18 @@ def evaluate(rows, thresholds, symbols=None):
                               name, r["router"], r["impact"], th, src,
                               r["cap"] if r["cap"] is not None else "нет",
                               at_block(r))})
+        elif (r["status"] == rc.ALIVE and r.get("headroom") is not None
+              and r["headroom"] < CEILING_MIN):
+            probs.append({"kind": "ceiling", "name": name, "row": r,
+                          "th": th, "src": src,
+                          "text": "%s %s ПОТОЛОК ПУЛА: удвоение входа даёт выход x%.3f "
+                                  "(нужно ~x2) — %s из %s ед. token_out при impact %.2f%% "
+                                  "(< порога %.2f%%). Маршрут упёрся в ОСТАТОК выходного "
+                                  "токена, а не в цену: у peg-пула impact на одном размере "
+                                  "слеп к этому (разбор wstETH 29.08). max_in=%s%s" % (
+                              name, r["router"], r["headroom"], r["out"], r["out2x"],
+                              r["impact"], th,
+                              r["cap"] if r["cap"] is not None else "нет", at_block(r))})
     return probs
 
 

@@ -214,7 +214,8 @@ def scan(items=None, *, module=None, call=None, **kw):
             q_ref, e1, k1 = quote(quoter, r["path"], ref, call=call, block="latest", **kw)
             q_work, e2, k2 = quote(quoter, r["path"], work, call=call, block="latest", **kw)
         row = {"coll": coll, "loan": loan, "router": who, "cap": cap, "block": blk,
-               "work": work, "ref": ref, "out": None, "impact": None, "err": None}
+               "work": work, "ref": ref, "out": None, "impact": None, "err": None,
+               "out2x": None, "headroom": None}
         if DEAD in (k1, k2):
             row["status"], row["err"] = DEAD, (e1 if k1 == DEAD else e2)
         elif UNPOLLED in (k1, k2):
@@ -225,6 +226,19 @@ def scan(items=None, *, module=None, call=None, **kw):
             row["status"] = ALIVE
             row["out"] = q_work
             row["impact"] = (1 - px_work / px_ref) * 100 if px_ref else 0.0
+            # ПРОБА ПОТОЛКА (29.08, разбор wstETH/WETH — тревога 4cbc66e0). impact НА ОДНОМ
+            # размере не мера глубины у peg-пула с ts=1: цена там стоит колом, пока не кончится
+            # ВЫХОДНОЙ ТОКЕН, и кап может съедать почти весь резерв при impact 0.00%. Ретро тем
+            # же прибором: 22.08/26.08/28.08 q300 == 2*q150 (запас), 29.08 за час до обвала
+            # q150=186.18 (impact 0.00%, канарейка молчала) при q300=193.07 — это ВЕСЬ резерв
+            # пула. Отношение выходов на 2x капа отличает «плоско, потому что глубоко» от
+            # «плоско, потому что упёрлись». Справка НЕ МЕНЯЕТ статус: реверт квотера на
+            # двойном размере — свойство пробы, а не приговор маршруту (канон
+            # unknown-must-close-the-gate: незнание оставляет headroom=None).
+            if cap and q_work:
+                q_2x, _e3, k3 = quote(quoter, r["path"], work * 2, call=call, block=blk, **kw)
+                if k3 == ALIVE and q_2x:
+                    row["out2x"], row["headroom"] = q_2x, q_2x / q_work
         out.append(row)
     return out
 

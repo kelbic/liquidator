@@ -179,10 +179,11 @@ check(ok["problems"] == 0 and ok["alert"] == "нет",
       "здоровые роуты: проблем=%d alert=%s" % (ok["problems"], ok["alert"]))
 check(len(ok["spy"].calls) == 0, "здоровые роуты: канал молчит")
 check(ok["node"].bad_sel == 0, "калдата собрана настоящим селектором quoteExactInput")
-# 5 = 2 маршрута x 2 объёма + ОДИН eth_blockNumber на проход (пин блока, 19.08). Заглушка
-# узла номер блока не отдаёт (её __call__ разбирает только eth_call) — канарейка обязана
-# продолжить на «latest», а не ослепнуть: неумение узла назвать блок не факт о маршруте.
-check(ok["node"].calls == 5, "два маршрута опрошены на двух объёмах + пин: %d" % ok["node"].calls)
+# 7 = 2 маршрута x 3 объёма (референс, кап и УДВОЕННЫЙ кап — проба потолка, 29.08) + ОДИН
+# eth_blockNumber на проход (пин блока, 19.08). Заглушка узла номер блока не отдаёт (её
+# __call__ разбирает только eth_call) — канарейка обязана продолжить на «latest», а не
+# ослепнуть: неумение узла назвать блок не факт о маршруте.
+check(ok["node"].calls == 7, "два маршрута опрошены на трёх объёмах + пин: %d" % ok["node"].calls)
 check(all(r["block"] == "latest" for r in ok["rows"]),
       "узел без eth_blockNumber -> замер на latest, а не отказ")
 
@@ -329,7 +330,7 @@ items, module = routes_subset([DOGE, BTC])
 pinned = run_case(items, module, BlockNode({_CBDOGE: 0.0094, _CBBTC: 0.0168}))
 check(all(b == "0x2fdef60" for b in pinned["node"].seen_blocks),
       "все котировки ушли на пине: %s" % sorted(set(pinned["node"].seen_blocks)))
-check(len(pinned["node"].seen_blocks) == 4 and pinned["problems"] == 0,
+check(len(pinned["node"].seen_blocks) == 6 and pinned["problems"] == 0,
       "пин не добавил лишних квот и не создал проблем: %d квот, проблем %d"
       % (len(pinned["node"].seen_blocks), pinned["problems"]))
 check(all(r["block"] == "0x2fdef60" for r in pinned["rows"]), "блок замера записан в строку")
