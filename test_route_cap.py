@@ -33,9 +33,9 @@ print("UNIT_OK: weETH под капом -> direct; над капом -> None")
 # 295 -> 0.003%, 305 -> 0.023%, 315 -> 0.29%, 326 -> 3.45%, 340 -> 7.44% (три блока подряд).
 # Бонус пары 1.0611% — самый тесный во флоте (lltv 0.965) — достигается на 317.7 wstETH,
 # то есть кап стоял в 6% от размера, съедающего ВЕСЬ бонус. S_обрыв/2 = 158.9 -> кап 150.
-assert _SWAP_ROUTES[(_WSTETH, _UNIV3_WETH)]["max_in"] == 150 * 10**18
-assert direct_swap(_WSTETH, _UNIV3_WETH, 150 * 10**18, LIQ, LIQ, repaid_assets=1) is not None, "ровно кап — ок"
-assert direct_swap(_WSTETH, _UNIV3_WETH, 150 * 10**18 + 1, LIQ, LIQ, repaid_assets=1) is None, "кап+1 — None"
+assert _SWAP_ROUTES[(_WSTETH, _UNIV3_WETH)]["max_in"] == 60 * 10**18   # 30.08: пул ts=1 держит 157.76 WETH, S_обрыв ≈ 127 wstETH, кап = S_обрыв/2
+assert direct_swap(_WSTETH, _UNIV3_WETH, 60 * 10**18, LIQ, LIQ, repaid_assets=1) is not None, "ровно кап — ок"
+assert direct_swap(_WSTETH, _UNIV3_WETH, 60 * 10**18 + 1, LIQ, LIQ, repaid_assets=1) is None, "кап+1 — None"
 print("UNIT_OK: wstETH кап 150 включительно, кап+1 -> None")
 
 # 4) cbBTC/USDC кап 13 cbBTC (рекалибровка 22.08: ликвидность ушла, impact на старом капе
@@ -123,7 +123,7 @@ print("UNIT_OK: капы cbDOGE/cbADA — под обрывом директ, с
 # импакта на $50k, а LBTC/cbBTC обрывается на 54.7 LBTC при бонусе всего 1.68%.
 from chain.execute import _CBLTC, _LBTC
 assert all(r.get("max_in") for r in _SWAP_ROUTES.values()), "бескапный роут = слепая зона"
-assert _SWAP_ROUTES[(_CBLTC, _UNIV3_USDC)]["max_in"] == 280 * 10**8      # S_обрыв 565 / 2
+assert _SWAP_ROUTES[(_CBLTC, _UNIV3_USDC)]["max_in"] == 150 * 10**8   # 30.08: плечо cbLTC/WETH ts=200 = 6.02 WETH, S_обрыв ≈ 301 cbLTC, кап = S_обрыв/2      # S_обрыв 565 / 2
 assert _SWAP_ROUTES[(_LBTC, _CBBTC)]["max_in"] == 27 * 10**8             # S_обрыв 54.7 / 2
 assert direct_swap(_CBLTC, _UNIV3_USDC, 1_000 * 10**8, LIQ, LIQ, repaid_assets=1) is None
 assert direct_swap(_LBTC, _CBBTC, 60 * 10**8, LIQ, LIQ, repaid_assets=1) is None

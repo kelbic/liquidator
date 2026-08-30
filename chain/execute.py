@@ -3617,7 +3617,10 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     # (~$12.9k). Без капа сейз на $50k шёл бы прямым свопом при impact 55%.
     (_CBLTC, _UNIV3_USDC): {"router": AERO_CL_ROUTER, "style": "v1",
                             "path": _pack_path(_CBLTC, 200, _UNIV3_WETH, 100, _UNIV3_USDC),
-                            "max_in": 280 * 10**8},
+                            # 30.08: связывающее плечо — пул cbLTC/WETH ts=200 (0x200681…): остаток 6.02 WETH ≈ $15k
+                            # (пин 50639145), S_обрыв ≈ 301 cbLTC; кап 280 = 0.93x обрыва — чужой своп на ~$1.2k уводил
+                            # кап за обрыв ТИХО (impact этого не показывает). Конвенция S_обрыв/2 -> 150 (route-canary).
+                            "max_in": 150 * 10**8},
     # cbXRP/USDC 09.08 (замер на форке 49666337, #69): прямого роута НЕ БЫЛО — путь собирался
     # по фи-карте в UniV3 fee=10000, и это ПРОТУХЛО ровно как предупреждал урок 24.07: на
     # seized кита 18 333 cbXRP UniV3 отдаёт 0.0176 WETH против 4.7342 у Slipstream ts=2000
@@ -3728,7 +3731,10 @@ _SWAP_ROUTES = {  # (collateral_lower, loan_lower) -> {router, style, path}
     # от размера, на котором выход съедает ВЕСЬ бонус. Кап 150 (~$356k) = S_обрыв/2.
     (_WSTETH, _UNIV3_WETH): {"router": AERO_CL_ROUTER, "style": "v1",
                              "path": _pack_path(_WSTETH, 1, _UNIV3_WETH),
-                             "max_in": 150 * 10**18},
+                             # 30.08: пул wstETH/WETH ts=1 (0x861a2922…) держит 157.76 WETH (пин 50639145): 150 wstETH
+                             # требуют ~186 WETH -> упор в остаток, S_обрыв ≈ 127 wstETH; кап 150 стоял x1.18 выше обрыва
+                             # (своп ревертил на min_out на любом сейзе 127-150, промах по жиру). S_обрыв/2 -> 60.
+                             "max_in": 60 * 10**18},
     # weETH/WETH 24.07 (кандидат $452k @ HF 1.0113 — direction по ETH? нет: weETH↔WETH оба ETH-нога,
     # но ликвидатору всё равно нужен ВЫХОД weETH->WETH при взятии). Раньше роута НЕ было -> Kyber
     # block-loop 0.4-0.9с. Slipstream ts=1 живой (pool 0xbd3cd0, liq 2.23e24): плоско до 180 weETH
