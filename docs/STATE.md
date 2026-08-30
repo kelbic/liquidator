@@ -53,7 +53,7 @@ $141 818 доезжает $138 026 = **97.3%**. Это противополож�
 цену. Статистика ДО 26.08 (0 из 544, 55% «блоков релиза») описывает старый режим и к новому не относится.
 Вход в аукцион пермишенлесс (бонд 0.1 ETH на Base, солвер-контракт с `atlasSolverCall`, WS-гейтвей, аукцион ~2 с
 после отчёта), но по единственной выборке ставка съедает ~99% OEV (солвер оставил ~$12 из $2 249). Разворот — решение
-владельца (29.08). Проверено сессией по цепи: раунд 1 DualAggregator cbADA 26.08 15:11:25Z / cbXRP 15:12:55Z;
+владельца (29.08). **Публичный первоисточник (30.08, проверка по просьбе kelbic): changelog Chainlink (dev.chain.link/changelog), запись от 25.08.2026: «Starting Aug 26, 2026, Chainlink Smart Value Recapture (SVR) will be enabled by default for BTC, ETH, LTC, DOGE, XRP, SOL and ADA Data Feeds on Base»; «Protocols can opt out at any time by reading from the 'Standard' proxy address». Документация docs.chain.link/data-feeds/svr-feeds: SVR на Base/Arbitrum/BNB через аукцион Atlas, «activated by default … currently Base and Ink», фолбэк на стандартную цену «after a configurable delay». Онбординг солвера (searcher-onboarding-atlas): бонд 0.1 ETH, `atlasSolverCall`, WS svr-bid-endpoint.chain.link, gasPrice = оракула, tx шлёт сеть Chainlink; доля выручки в доках не раскрыта. Покупка Atlas by FastLane — пресс-релиз 22.01.2026.** Проверено сессией по цепи: раунд 1 DualAggregator cbADA 26.08 15:11:25Z / cbXRP 15:12:55Z;
 tx 0x94616f6f… (приз $2 375) несёт лог отпирания; правило релиза — blockOverrides.time на состоянии B+5.
 
 **ЦЕПЬ ПРИЗА — ПЯТЬ ЗВЕНЬЕВ, СРЫВ ЛЮБОГО = НОЛЬ. Состояние на 28.08 12:30Z:**
