@@ -1188,12 +1188,44 @@ def run(*, fetch=None, notify_fn=None, out=print, now=None, history_path=None,
     st = _load_state(state_path)
     now_s = float(now if now is not None else time.time())
 
+    # ВЫВОД ИЗ ЭКСПЛУАТАЦИИ — НЕ АВАРИЯ (31.08, крон-триаж тревоги cu-quota:blind). Бот на
+    # Шарлотте остановлен и disabled НАМЕРЕННО (капитал возвращён владельцу), поэтому строк
+    # `INFO CU ` в журнале нет и не будет: «0 CU-окон распарсено» стало ИСТИННЫМ и ПОСТОЯННЫМ
+    # состоянием, а тревога о слепоте звонила бы каждые 6ч вечно. Гасим НЕ порог и НЕ текст,
+    # а СУБЪЕКТ — ровно тем же маркером, что threads-watch.sh (fleet-watch 7b7b1f3): один
+    # файл возвращает в строй всех сторожей этого юнита разом.
+    # Маркер выводится из history_path по общему правилу файлов прогона (см. _load_state):
+    # стенд с временным каталогом не должен читать боевой маркер и наоборот.
+    # Ранний выход НЕ НЕМОЙ (мёртвый сторож хуже отсутствующего: молчание неотличимо от
+    # «крон меня не зовёт»), но строка пишется ОДИН РАЗ НА ПЕРЕХОД — cu-quota.log служит
+    # разбирающему лентой событий, 24 строки/сутки её бы вымыли.
+    retired_path = _beside_history(history_path, "RETIRED-liquidator-bot.md")
+    if os.path.exists(retired_path):
+        st["fails"] = 0   # серия слепых прогонов не должна пережить вывод из эксплуатации
+        first = not st.get("retired")
+        st["retired"] = True
+        _save_state(st, state_path)
+        if first:
+            out("cu-quota: retired=1 маркер=%s — юнит выведен из эксплуатации, CU-строк в "
+                "журнале нет по построению: наблюдать нечего (возврат — удаление маркера)"
+                % retired_path)
+        return 0
+    if st.pop("retired", None):
+        out("cu-quota: retired=0 — маркер снят, наблюдение за квотой возобновлено")
+        _save_state(st, state_path)
+
     try:
         text = (fetch or _fetch_journal)()
         # Отсечка перекрытия: считаем только окна новее уже учтённых прошлым прогоном.
         prev = load_history(history_path, keep_sec=keep_sec, now=now_s)
         per_host = parse_cu_windows(text, since_epoch=history_cutoff(prev))
-        total_windows = sum(len(d["projs"]) for d in per_host.values())
+        # СЧИТАЕМ РАЗОБРАННЫЕ ОКНА, А НЕ НЕ-БУТОВЫЕ (31.08). Было `len(d["projs"])`, куда
+        # бут-окна НЕ кладутся: час, целиком состоящий из бутовых окон (многорестартная
+        # деплой-кампания — наблюдалась 26.08), давал total_windows==0 при полностью
+        # прочитанном журнале, и сторож объявлял бы «журнал не читается / формат уехал» о
+        # самом себе. Слепота — это «строк не разобрано вовсе», а не «нечем судить темп»;
+        # темпом судит burst ниже, у него свой порог min_windows.
+        total_windows = sum(d["n_all"] for d in per_host.values())
         if total_windows == 0:
             raise RuntimeError("0 CU-окон распарсено (бот молчит? формат уехал?)")
     except Exception as e:  # noqa: BLE001
