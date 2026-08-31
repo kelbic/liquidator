@@ -14354,3 +14354,46 @@ $1 216 погашения (~$155 бонуса)** — крупнейший пуб
 ~2.5 месяца работы (пик — $271/сутки, замер 27.08), при нуле побед. Доход равен нулю, весь расход — комиссии.
 Непокрытый хвост: 4 старые канарейки (0x64d751c0, 0x6d902fde, 0xf5bdb5da, 0x944857d0) держат по 0.000002 ETH
 (итого ~$0.02) — их ключей на машине НЕТ (скан всех .env/.fleet_keys дал ровно 221 адрес: главный + 220 ног).
+
+## 31.08 АНАЛИЗ Б, ЭТАП «ГЕЙТ»: КАРТА ЗАПИСИ ЦЕНЫ ПО СЕТЯМ (агент Opus, замер по цепи 17 сетей / ~1500 фидов)
+
+**Отпечаток SVR найден и годится как инструмент:** `typeAndVersion()` (`0x181f5a77`) у агрегатора = `"DualAggregator 1.0.0"`.
+Плюс: у SVR-пары в reference-data-directory поле `secondaryProxyAddress` — это и есть ЗАДЕРЖАННЫЙ прокси, который читает
+протокол (подтверждено трижды: Aave Base, Compound Base с `description()="ETH / USD SVR Price Feed"`, и прямым замером
+расхождения). Окно перемерено на живом ETH/USD Base 31.08: **12 с = 6 блоков** (round 775 на Standard в 50684279,
+на каноническом — только в 50684285).
+
+**Периметр SVR (замер, не доки):** «по умолчанию на КАНОНИЧЕСКИХ адресах» — **только Base** (7 фидов с 26.08; Ink заявлен
+в доках, но на цепи не подтверждается). Везде ещё SVR существует лишь на отдельных прокси, по подписке протокола:
+Ethereum 22/258, Base 30/177, Arbitrum 20/250, BNB 22/173, Monad 14/101, **HyperEVM 15/36**, Ink 5/23, Unichain 4/12.
+**SVR ОТСУТСТВУЕТ ПОЛНОСТЬЮ: Optimism, Polygon, Avalanche, Sonic, Scroll, Linea, Gnosis, Plasma, Soneium.**
+
+**Поправка к премисе 8 (важно):** вход в аукцион Atlas **permissionless, включая high-reputation set** («Onboarding and
+access to the high-reputation set is permissionless and does not require communication with Chainlink Labs»), порядок
+победителей — по величине бида, не по репутации; 2 бида на tx, бонд 0.1 ETH (Base/Arbitrum), итоговую tx шлёт оракул.
+Значит вариант А закрыт не дверью, а ЭКОНОМИКОЙ (ставка съедает ~99% OEV — наш замер 0.922 ETH за приз $2 375).
+
+**Аукционы OEV — актуальная карта:**
+* **Pyth Express Relay МЁРТВ** — свёрнут по governance OP-PIP-124 (22.07.2026). ⇒ над pull-путём Pyth аукциона больше нет НИГДЕ.
+* **API3 / OEV Network** — жив, аукцион с залогом, 80% выручки dApp'у; только там, где протокол сам подписался
+  (Orbit, INIT, Lendle, Moonwell ETH/USD на Optimism).
+* **RedStone Atom (НОВАЯ УГРОЗА, нам была неизвестна)** — sealed-bid до выхода цены на цепь, исполнение через тот же Atlas;
+  live на Unichain (Compound, Morpho, Venus, Upshift), «активируется мгновенно на ЛЮБОМ фиде RedStone, без изменений кода».
+  ⇒ замер открытости у RedStone-рынка протухает быстрее, чем у Chainlink.
+* **Moonwell**: его обёртка читает КАНОНИЧЕСКИЙ Base ETH/USD, то есть уже SVR-сторону ⇒ двойной гейт (12 с SVR + 10 с обёртки);
+  `liquidatorFeeBps=3000` подтверждён на цепи (доки Moonwell врут про 4000), дверь `updatePriceEarlyAndLiquidate` `0x16bb3b3a` —
+  платная, но permissionless. Наш замер «0 из 1 217 через отпирание» согласуется с тем, что Atlas обслуживает AAVE/Compound/Venus,
+  а не Moonwell.
+
+**ГДЕ ЗАПИСЬ ЦЕНЫ СЕЙЧАС ОТКРЫТА (вход для этапа «добыча»):**
+1. Aave v3 на **Optimism, Polygon, Avalanche, BNB, Gnosis, Scroll, Sonic, Linea** — обычный Chainlink push, SVR нет (проверено
+   по фидам WETH/WBTC каждой сети);
+2. Compound v3 на **Optimism** — то же;
+3. **любой рынок на Pyth-pull в любой сети** — `updatePriceFeeds` без белого списка (проверено eth_call с чужого from на Base,
+   Arbitrum, Optimism, HyperEVM), плата 0, окно годности 60 с; аукциона над этим путём нет с 22.07.2026. Конкретная пара
+   «сеть + лендинг на Pyth-pull» пока НЕ НАЗВАНА — это следующий шаг (кандидат №1 — HyperLend на HyperEVM).
+
+**Чек-лист «закрыта ли дверь» (за час, по цепи):** typeAndVersion агрегатора; два прокси на один агрегатор (задержанный —
+тот, что зашит immutable в байткоде); тест расхождения latestRoundData на 500 блоках; поле secondaryProxyAddress в RDD;
+`description()` фида у протокола; наличие обёртки (`priceFeed()`/`liquidatorFeeBps()`/селектор 0x16bb3b3a);
+кто отправитель settlement-tx (DON = аукцион уже отработал); для Pyth — eth_call `updatePriceFeeds` с чужого адреса.
