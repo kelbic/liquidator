@@ -14397,3 +14397,42 @@ access to the high-reputation set is permissionless and does not require communi
 тот, что зашит immutable в байткоде); тест расхождения latestRoundData на 500 блоках; поле secondaryProxyAddress в RDD;
 `description()` фида у протокола; наличие обёртки (`priceFeed()`/`liquidatorFeeBps()`/селектор 0x16bb3b3a);
 кто отправитель settlement-tx (DON = аукцион уже отработал); для Pyth — eth_call `updatePriceFeeds` с чужого адреса.
+
+## 31.08 АНАЛИЗ Б, ЭТАП «ДОБЫЧА-1»: ИЗОЛИРОВАННЫЕ ЛЕНДИНГИ НА 24 СЕТЯХ (агент Opus, 30.00 суток, окна сверены по ts блоков)
+
+**Контроль метода на нашем же поле:** Base/Morpho за 3 последних суток — **95.8% объёма через SVR-отпирание** (по дням:
+0% до 27.08 → 81.8% 28.08 → 43.8% 30.08). Наш вердикт воспроизведён независимо; 30-дневное среднее 4.4% — артефакт того,
+что режим включился 4 дня назад. Ловушка, которую агент поймал сам: `0xa56fc0ad…` — это `Withdraw`, а не `Liquidate`
+(иначе замер был бы завышен на порядок); topic0 всех событий пересчитаны через keccak и сверены с openchain.
+
+**ИТОГО ПО ВСЕМ ИЗОЛИРОВАННЫМ ЛЕНДИНГАМ (Morpho/Euler/Fluid/Silo/Dolomite) НА 24 СЕТЯХ: $38.98M за 30 суток,
+из них 90% — ОДИН рынок на Ethereum.** Вне Base/Morpho весь месячный поток = **$2.23M**, и $1.4M из них — тот же Base.
+
+| сеть/протокол | объём/30д | гейт %$ | ликвидаторов | top5 %$ | оракул топ-рынков |
+|---|---|---|---|---|---|
+| ethereum/morpho | **$36.75M** | 0.0 | 55 | 99.1 | **Ojo push + RedStone push** |
+| base/morpho | $1.32M | 4.4 (за 3 сут — 95.8) | 260 | 26.6 | Chainlink SVR |
+| hyperevm/morpho | $0.64M | 2.2 | 23 | 97.3 | RedStone pull (WHYPE) |
+| ethereum/fluid | $104k | 0.0 | 28 | 94.7 | Fluid custom |
+| ethereum/dolomite | $41k | 0.0 | 3 | 100 | Chainlink push |
+| worldchain/morpho | $32k | **99.5** | 20 | 99.5 | **Chainlink Data Streams** |
+| ethereum/silo $20k, ethereum/euler $18k, lisk/morpho $5.5k (гейт 54% RedStone pull), sonic/silo $2k (Pyth pull), остальные 15 сетей — сотни долларов или ноль |
+
+**Интенсивность к долгу (сколько ликвидируется от размера рынка):** ethereum/morpho 1.71% (без PT-рынка — 0.07%),
+hyperevm 0.55%, base 0.071%, ethereum/fluid 0.016%, **ethereum/euler 0.007% при $242M долга**, arbitrum/fluid 0.000% при $120M.
+Ноль ликвидаций за месяц: bob, fraxtal, hemi, mantle, mode, scroll, soneium. Plasma при $105M долга Euler — НОЛЬ (это замер, не пропуск).
+
+**ЕДИНСТВЕННЫЙ КРУПНЫЙ НЕЗАПЕРТЫЙ РЫНОК: PT-Pendle на Ethereum/Morpho** (PT-reUSD-10DEC2026/USDC, оракул — push-фид
+**Ojo Network** `0x77ee1473…`, аукциона нет): **$35.2M за 30 суток**, но всё в 16 событиях 25.08, и **97% берёт один адрес**
+`0xbcea1aac…`. Его схема: флешлон → Liquidate → **SupplyCollateral + Borrow** — PT неликвиден, победитель не продаёт залог,
+а кладёт его обратно в Morpho и перекредитовывается. **Барьер там не латентность, а БАЛАНС** — способность держать
+неликвидный PT. Это другая игра, чем наша.
+
+**ТРЕНД, который виден по срезу:** поля закрываются одно за другим — Base под SVR/Atlas (95.8% за 3 суток),
+Worldchain под Chainlink Data Streams (99.5%), Lisk и HyperEVM/WHYPE под RedStone pull, Sonic/Silo под Pyth pull.
+Свободными остаются рынки на PUSH-оракулах (Ojo, RedStone push, Chainlink push) — и именно там сидит вся добыча.
+
+**СЛЕПЫЕ ЗОНЫ (связывающий предел — платный архивный RPC, назван первым):** Monad (Morpho $120M + Euler $138M долга),
+Robinhood Chain (Morpho $415M), Avalanche (Euler $38.9M), BSC (Euler $12.5M) — публичные RPC режут `eth_getLogs`
+до 100 блоков (Monad: понадобилось бы ≥65 000 запросов) либо отсутствуют. Это дешёвая покупка, закрывающая три
+крупнейшие неизмеренные площадки; решение о трате — за владельцем.
