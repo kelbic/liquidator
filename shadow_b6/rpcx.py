@@ -148,10 +148,16 @@ def dec_aggregate3(ret_hex: str):
     return rows
 
 
-def multicall(calls, urls, block="latest", chunk: int = 250, timeout: float = 60.0):
-    """-> [(ok, bytes)] в том же порядке. Один eth_call на chunk вызовов."""
+def multicall(calls, urls, block="latest", chunk: int = 250, timeout: float = 60.0,
+              gap: float = 0.03):
+    """-> [(ok, bytes)] в том же порядке. Один eth_call на chunk вызовов.
+
+    gap — пауза между чанками: полный проход по вселенной это 250 мультиколлов подряд, и
+    без паузы бесплатные эндпоинты отвечают 429 (замер 18.09: base.org 74 отказа из 94)."""
     out = []
     for i in range(0, len(calls), chunk):
+        if i and gap:
+            time.sleep(gap)
         part = calls[i:i + chunk]
         data = enc_aggregate3(part)
         blk = block if isinstance(block, str) else hex(block)

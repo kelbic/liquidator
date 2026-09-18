@@ -31,6 +31,10 @@ SEL_TRANSMIT = ("6fadcf72", "b1dc65a4", "c9807539")   # transmit / transmitSecon
 
 # --- политики, объявленные протоколом (§3.4). Менять по ходу прогона нельзя. ---
 DELTA_MS = float(os.environ.get("SHADOW_DELTA_MS", "50"))
+# Упреждение предсказательной политики: на сколько РАНЬШЕ ожидаемого локального прихода
+# fb#0 блока B_rel надо отдать tx, чтобы она успела к сборке этого флешблока.
+# День 1 — 150 мс; с 19.09 фиксируется как p10 замеренного зазора (§3.4 протокола).
+PRED_LEAD_MS = float(os.environ.get("SHADOW_PRED_LEAD_MS", "150"))
 TIP_SHARE = float(os.environ.get("SHADOW_TIP_SHARE", "0.35"))
 TIP_CAP_GWEI = float(os.environ.get("SHADOW_TIP_CAP_GWEI", "400"))
 TIP_FLOOR_GWEI = float(os.environ.get("SHADOW_TIP_FLOOR_GWEI", "0.05"))
@@ -39,7 +43,7 @@ ETH_USD = float(os.environ.get("SHADOW_ETH_USD", "4500"))
 MIN_GROSS_USD = float(os.environ.get("SHADOW_MIN_GROSS_USD", "20"))
 REL_OFFSET = int(os.environ.get("SHADOW_REL_OFFSET", "6"))    # B+6, проверяется §3.2
 FULL_REFRESH_SEC = float(os.environ.get("SHADOW_FULL_REFRESH_SEC", "120"))
-FULL_ALL_SEC = float(os.environ.get("SHADOW_FULL_ALL_SEC", "1800"))
+FULL_ALL_SEC = float(os.environ.get("SHADOW_FULL_ALL_SEC", "3600"))   # 92k позиций = 461 мультиколл на проход
 UNIVERSE_RESCAN_SEC = float(os.environ.get("SHADOW_UNI_RESCAN_SEC", "21600"))
 
 LOG = open(f"{DATA}/shadow.log", "a", buffering=1)
@@ -209,19 +213,39 @@ def on_transit(agg: str, block: int, t_mono: float, t_wall: float, txh: str):
     threading.Thread(target=_decide, args=(agg, block, t_mono, t_wall, txh), daemon=True).start()
 
 
-def _decide(agg, block, t_mono, t_wall, txh):
-    try:
-        ST.cnt["transit"] += 1
-        s = rpcx.selectors()
-        # 1) новый answer раунда — с АГРЕГАТОРА (не с прокси: там ещё задержанная цена)
+def _read_round(agg, block, prev):
+    """Новый answer раунда с АГРЕГАТОРА. ГОНКА, пойманная контролем 18.09: `latest` у RPC —
+    это последний ЗАПЕЧАТАННЫЙ блок, а транзит мы видим во ФЛЕШБЛОКЕ, за ~2 с до запечатывания.
+    Чтение сразу после детекта давало ПРЕДЫДУЩИЙ раунд — 10 из 10 проверенных раундов
+    (check_round_race.py). Молчаливое занижение M1: цена B+6 считалась бы по старому answer.
+    Ждём, пока поток флешблоков не покажет следующий блок (значит `block` запечатан), и только
+    потом читаем; ожидание бесплатно — до B+6 у нас 12 с."""
+    s = rpcx.selectors()
+    deadline = time.monotonic() + 5.0
+    while ST.head <= block and time.monotonic() < deadline:
+        time.sleep(0.05)
+    for attempt in range(6):
         ret = rpcx.rpc("eth_call", [{"to": agg, "data": "0x" + s["latestRoundData"].hex()}, "latest"],
                        FREE + PAID, timeout=8)
         b = bytes.fromhex(ret[2:])
         round_id = rpcx.u256(b, 0)
         a_new = rpcx.i256(b, 1)
         updated_at = rpcx.u256(b, 3)
+        if prev is None or round_id > prev:
+            return round_id, a_new, updated_at, attempt
+        if time.monotonic() > deadline + 3.0:
+            break
+        time.sleep(0.25)
+    return None, None, None, -1
+
+
+def _decide(agg, block, t_mono, t_wall, txh):
+    try:
+        ST.cnt["transit"] += 1
         prev = _last_round.get("ans:" + agg)
-        if prev is not None and prev == round_id:
+        round_id, a_new, updated_at, tries = _read_round(agg, block, prev)
+        t_answer = time.monotonic()
+        if round_id is None:
             ST.cnt["transit_noround"] += 1
             return
         _last_round["ans:" + agg] = round_id
@@ -249,7 +273,9 @@ def _decide(agg, block, t_mono, t_wall, txh):
         if not decided:
             jsonl("rounds.jsonl", {"t": t_wall, "agg": agg, "b": block, "b_rel": b_rel,
                                    "round": round_id, "a_new": a_new, "named": 0,
-                                   "lat_ms": round((time.monotonic() - t_mono) * 1000, 1)})
+                                   "lat_ms": round((time.monotonic() - t_mono) * 1000, 1),
+                                   "answer_wait_ms": round((t_answer - t_mono) * 1000, 1),
+                                   "tries": tries})
             return
         # 2) сборка и ПОДПИСЬ (одноразовый ключ, нулевой баланс) — чтобы t_ready был честным
         shots = []
@@ -266,6 +292,8 @@ def _decide(agg, block, t_mono, t_wall, txh):
         row = {"t": t_wall, "agg": agg, "b": block, "b_rel": b_rel, "round": round_id,
                "a_new": a_new, "named": len(shots), "shots": shots,
                "lat_ms": round((t_ready - t_mono) * 1000, 1),
+               "answer_wait_ms": round((t_answer - t_mono) * 1000, 1),
+               "compute_ms": round((t_ready - t_answer) * 1000, 1), "tries": tries,
                "t_ready_mono": t_ready, "rtt": round(ST.rtt, 4),
                "c_offset": ST.c_offset, "txh_transit": txh}
         jsonl("rounds.jsonl", row)
@@ -319,6 +347,23 @@ def outcome_loop():
 
 
 def _outcome(b_rel, rows):
+    # Отпирание Atlas между раундом и B+6: цена выходит раньше, ликвидация идёт в блоке
+    # победителя аукциона, и наш выстрел реальный бот отменил бы. Без этой проверки раунд
+    # читается как «назвали N, событий 0» — то есть как ПРОИГРАННАЯ гонка.
+    b_round = min((r["b"] for r in rows), default=b_rel - REL_OFFSET)
+    unlocked = []
+    try:
+        ul = rpcx.getlogs(b_round, b_rel - 1, [T_SVR], None, FREE + PAID, timeout=20)
+        aggs_round = {r["agg"] for r in rows}
+        unlocked = sorted({l["address"].lower() for l in ul if l["address"].lower() in aggs_round})
+    except Exception as ex:
+        log("outcome: отпирания не прочитаны", str(ex)[:80])
+    if unlocked:
+        ST.cnt["rounds_atlas_unlocked"] += 1
+        for r in rows:
+            jsonl("atlas_unlocked.jsonl", {"b_rel": b_rel, "b": r["b"], "agg": r["agg"],
+                                           "named": r.get("named"), "unlocked": unlocked})
+        log(f"ОТПИРАНИЕ ATLAS до B+6 на {b_rel}: {unlocked} — выстрелы отменяются (не проигрыш)")
     logs = rpcx.getlogs(b_rel, b_rel, [T_LIQ], rpcx.MORPHO, FREE + PAID, timeout=20)
     hdr = rpcx.rpc("eth_getBlockByNumber", [hex(b_rel), False], FREE + PAID, timeout=20)
     base_fee = int(hdr["baseFeePerGas"], 16)
@@ -354,7 +399,8 @@ def _outcome(b_rel, rows):
             t_fb0 = fbe.get("first")
             t_prev_last = prev.get("last")
             t_last = fbe.get("last")
-        row = {"b_rel": b_rel, "mid": mid, "pair": (ST.markets.get(mid) or {}).get("pair"),
+        row = {"b_rel": b_rel, "atlas_unlocked": unlocked, "mid": mid,
+               "pair": (ST.markets.get(mid) or {}).get("pair"),
                "user": user, "repaid": repaid, "tx": txh, "txi": txi, "cls": cls,
                "tip_gwei": round((egp - base_fee) / 1e9, 6), "base_gwei": round(base_fee / 1e9, 6),
                "gas": int(rc.get("gasUsed", "0x0"), 16),
@@ -368,7 +414,7 @@ def _outcome(b_rel, rows):
             t_send = None
             ts_rel = ST.blk_ts.get(b_rel)
             if ts_rel is not None and ST.c_offset is not None:
-                t_send = ts_rel + ST.c_offset + DELTA_MS / 1000.0     # предсказательная политика
+                t_send = (ts_rel + ST.c_offset) - ST.wm - PRED_LEAD_MS / 1000.0   # предсказательная
             elif t_prev_last is not None:
                 t_send = t_prev_last + DELTA_MS / 1000.0              # хиндсайт-запас     # политика §3.4
             arrive = (t_send + ST.rtt / 2) if t_send is not None else None
@@ -386,6 +432,25 @@ def _outcome(b_rel, rows):
                 row["ours"]["m5_tip_ok"] = bool(tip_wins)
         ev.append(row)
         jsonl("outcomes.jsonl", row)
+    # §3.2 протокола: блок отпирания ПРОВЕРЯТЬ, а не предполагать. Выборка 1 раунд из 10:
+    # читаем price() оракула на B_rel-1 и B_rel и записываем ФАКТИЧЕСКОЕ смещение.
+    try:
+        if rows and (b_rel % 10 == 0):
+            s_ = rpcx.selectors()
+            mids = sorted({m for r in rows for m, _l in ST.agg_of.get(r["agg"], [])})[:2]
+            for mid in mids:
+                orc = ST.markets[mid]["oracle"]
+                p_prev = rpcx.multicall([(orc, "0x" + s_["price"].hex())], FREE, block=b_rel - 1)[0]
+                p_now = rpcx.multicall([(orc, "0x" + s_["price"].hex())], FREE, block=b_rel)[0]
+                if p_prev[0] and p_now[0]:
+                    v0, v1 = rpcx.u256(p_prev[1]), rpcx.u256(p_now[1])
+                    jsonl("release_check.jsonl", {"b_rel": b_rel, "mid": mid, "price_B5": v0,
+                                                  "price_B6": v1, "changed": v0 != v1,
+                                                  "b_round": b_round, "offset": b_rel - b_round})
+                    ST.cnt["rel_check"] += 1
+                    ST.cnt["rel_changed"] += 1 if v0 != v1 else 0
+    except Exception as ex:
+        log("release-check: ошибка", str(ex)[:90])
     ST.cnt["events"] += len(ev)
     ST.cnt["events_outside"] += sum(1 for r in ev if r["cls"] == "C_OUTSIDE")
     ST.cnt["events_named"] += sum(1 for r in ev if r.get("ours"))
@@ -426,17 +491,24 @@ def boundary_loop():
             #     границу блока берём из ЧАСОВ ЦЕПИ ts(bn) + калибровка c_offset.
             ok_p = None
             t_pred = None
+            lo_rel = hi_rel = None
             if ts is not None and c is not None:
-                # ts+c — ожидаемое ВРЕМЯ СТЕНЫ прихода fb0 блока bn; переводим в монотонное,
-                # иначе сравниваем секунды эпохи с секундами аптайма (ошибка первого прогона)
-                t_pred = (ts + c) - ST.wm + DELTA_MS / 1000.0
+                # ts+c — ожидаемое ВРЕМЯ СТЕНЫ прихода fb0 блока bn; переводим в монотонное
+                # (иначе сравниваются секунды эпохи с секундами аптайма — дефект первого прогона).
+                exp_fb0 = (ts + c) - ST.wm
+                t_pred = exp_fb0 - PRED_LEAD_MS / 1000.0
                 ok_p = lo < t_pred <= hi
+                # ГЕОМЕТРИЯ ОКНА относительно ожидаемого прихода fb0 — чтобы ЛЮБОЕ упреждение
+                # можно было оценить офлайн по этим же данным, не переигрывая прогон.
+                lo_rel = round((lo - exp_fb0) * 1000, 1)
+                hi_rel = round((hi - exp_fb0) * 1000, 1)
             jsonl("boundaries.jsonl", {"b": bn, "gap_ms": round((e["first"] - p["last"]) * 1000, 1),
                                        "fb_span_ms": round((e["last"] - e["first"]) * 1000, 1),
                                        "idx_last_prev": p.get("idx"), "ntx": e.get("n"),
                                        "in_fb0": bool(ok_h), "in_fb0_pred": ok_p,
                                        "win_ms": round((hi - lo) * 1000, 1),
-                                       "pred_off_ms": (round((t_pred - lo) * 1000, 1) if t_pred else None),
+                                       "lo_rel_ms": lo_rel, "hi_rel_ms": hi_rel,
+                                       "lead_ms": PRED_LEAD_MS,
                                        "rtt_ms": round(rtt * 1000, 1)})
             ST.cnt["bnd"] += 1
             ST.cnt["bnd_ok"] += 1 if ok_h else 0
@@ -487,18 +559,26 @@ def rotate(urls):
     return head[k:] + head[:k] + tail
 
 
-def hot_users(mid, hf_max=1.30):
+HOT_HF = float(os.environ.get("SHADOW_HOT_HF", "1.10"))
+HOT_CAP = int(os.environ.get("SHADOW_HOT_CAP", "2000"))
+
+
+def hot_users(mid, hf_max=None):
     """Позиции у кромки — считаются ЛОКАЛЬНО из кэша на текущей цене, бесплатно."""
+    hf_max = HOT_HF if hf_max is None else hf_max
     ctx = ST.ctx.get(mid); pos = ST.pos.get(mid) or {}
     m = ST.markets.get(mid)
     if not ctx or not m or "price" not in ctx:
-        return sorted(pos)
-    out = []
+        # без контекста «горячим» становится ВЕСЬ рынок — это и раздувало расход (замер 18.09:
+        # 0.64 запроса/с). Ограничиваем капом, а не молча читаем всё.
+        return sorted(pos)[:HOT_CAP]
+    scored = []
     for u, (co, sh) in pos.items():
         _b, _mb, _liq, hf = core.health(co, sh, ctx["price"], m["lltv"], ctx["tba"], ctx["tbs"])
         if hf <= hf_max:
-            out.append(u)
-    return out
+            scored.append((hf, u))
+    scored.sort()
+    return [u for _hf, u in scored[:HOT_CAP]]
 
 
 def refresh_positions(full=False):
@@ -595,6 +675,19 @@ def state_loop():
                 added = 0
                 log("uni: ошибка", str(ex)[:90])
             full = (time.time() - last_full) > FULL_ALL_SEC or added > 0
+            if full:
+                # вселенную перечитываем с диска: догон истории (merge_universe.py) должен
+                # подхватываться без рестарта, иначе «расширили вселенную» останется на бумаге
+                try:
+                    fresh = json.load(open(f"{HERE}/data/universe_live.json"))
+                    add = sum(len(set(v) - set(ST.universe.get(k) or [])) for k, v in fresh.items())
+                    if add:
+                        for k, v in fresh.items():
+                            ST.universe[k] = sorted(set(ST.universe.get(k) or []) | set(v))
+                        log(f"вселенная перечитана с диска: +{add} заёмщиков, всего "
+                            f"{sum(len(v) for v in ST.universe.values())}")
+                except Exception as ex:
+                    log("uni-reload: ошибка", str(ex)[:80])
             refresh_positions(full=full)
             if full:
                 last_full = time.time()

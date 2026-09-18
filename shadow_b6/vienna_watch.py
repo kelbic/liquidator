@@ -52,6 +52,8 @@ def main():
     age = time.time() - float(hb.get("wall") or 0)
     cnt = hb.get("cnt") or {}
     cur = {k: int(cnt.get(k) or 0) for k in ("fb_msg", "blocks", "rounds", "decisions", "events")}
+    cur["pid"] = int(hb.get("pid") or 0)
+    cur["up"] = float(hb.get("up_sec") or 0)
     prev = {}
     if os.path.exists(STATE):
         try:
@@ -63,8 +65,11 @@ def main():
         alarm(f"heartbeat стар {age:.0f} с (fb_msg={cur['fb_msg']}, blocks={cur['blocks']})", "shadow-b6:stale")
         return
     elapsed = time.time() - float(prev.get("t") or 0) if prev else 0.0
-    if prev and elapsed >= MIN_ELAPSED and (cur["fb_msg"] <= prev.get("fb_msg", -1)
-                                            or cur["blocks"] <= prev.get("blocks", -1)):
+    restarted = prev and (prev.get("pid") not in (None, cur["pid"]) or cur["up"] < float(prev.get("up") or 0))
+    if restarted:
+        print(f"OK перезапуск (pid {prev.get('pid')}->{cur['pid']}, up {cur['up']:.0f}с) — рост счётчиков не судим")
+    elif prev and elapsed >= MIN_ELAPSED and (cur["fb_msg"] <= prev.get("fb_msg", -1)
+                                              or cur["blocks"] <= prev.get("blocks", -1)):
         alarm(f"цикл замер при свежем heartbeat: fb {prev.get('fb_msg')}->{cur['fb_msg']}, "
               f"blocks {prev.get('blocks')}->{cur['blocks']}", "shadow-b6:frozen")
         return

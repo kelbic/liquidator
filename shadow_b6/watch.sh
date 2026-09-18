@@ -33,6 +33,8 @@ except Exception as e:
 age = time.time() - float(hb.get("wall") or 0)
 cnt = hb.get("cnt") or {}
 cur = {k: int(cnt.get(k) or 0) for k in ("fb_msg", "blocks", "rounds", "decisions")}
+cur["pid"] = int(hb.get("pid") or 0)
+cur["up"] = float(hb.get("up_sec") or 0)
 prev = {}
 if os.path.exists(st_path):
     try: prev = json.load(open(st_path))
@@ -41,6 +43,10 @@ elapsed = (time.time() - float(prev.get("t") or 0)) if prev else 0.0
 json.dump({"t": time.time(), **cur}, open(st_path, "w"))
 if age > 120:
     print("BAD heartbeat стар %.0f с (счётчики fb=%d blk=%d)" % (age, cur["fb_msg"], cur["blocks"]))
+elif prev and prev.get("pid") not in (None, cur["pid"]):
+    print("OK перезапуск (pid %s->%s), счётчики начаты заново — рост не судим" % (prev.get("pid"), cur["pid"]))
+elif prev and cur["up"] < float(prev.get("up") or 0):
+    print("OK процесс моложе прошлой проверки (up %.0f<%.0f) — рост не судим" % (cur["up"], float(prev.get("up") or 0)))
 elif prev and elapsed >= 120 and (cur["fb_msg"] <= prev.get("fb_msg", -1) or cur["blocks"] <= prev.get("blocks", -1)):
     print("BAD цикл замер: fb %d->%d, blocks %d->%d (heartbeat свежий — это и есть мёртвый сторож)"
           % (prev.get("fb_msg", -1), cur["fb_msg"], prev.get("blocks", -1), cur["blocks"]))
