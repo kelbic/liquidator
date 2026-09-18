@@ -1,0 +1,502 @@
+{
+ "0x0b3bdf8627442f43607716b9e20475500fd62cb91bbb2c16c711e7c31038beb8": {
+  "pair": "wstETH/MAI",
+  "premise8": false,
+  "lltv": 860000000000000000,
+  "oracle": "0x040ba460ed355833a0693348421c7f1fd831d0c7",
+  "loan": "0xbf1aea8670d2528e08334083616dd9c5f3b087ae",
+  "coll": "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452",
+  "loan_sym": "MAI",
+  "loan_dec": 18,
+  "coll_sym": "wstETH",
+  "coll_dec": 18,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0xa669e5272e60f78299f4824495ce01a3923f4380",
+    "agg": "0x54f6b1e6642c882cb9f214bdc896f1e22a5409f2",
+    "tv": null
+   },
+   "BASE_FEED_2()": {
+    "feed": "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70",
+    "agg": "0x05c84a58fe042275b37db038baacd15f410c7bb0",
+    "tv": null
+   }
+  },
+  "n_liq_window": 1
+ },
+ "0x0ca10126f6c94cbd9cf0a48cc9516ae5e3dec5aa68303e6d988ee37c5149bf0d": {
+  "pair": "cbETH/USDC",
+  "premise8": false,
+  "lltv": 770000000000000000,
+  "oracle": "0x97ff9cbd7e77348b2b8ffbb883bf29452ad18295",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbETH",
+  "coll_dec": 18,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0xd7818272b9e248357d13057aab0b417af31e817d",
+    "agg": "0x71e021bc2e8a709b72ac7b6036e5b2bf30f263d0",
+    "tv": null
+   }
+  },
+  "n_liq_window": 3
+ },
+ "0x1c21c59df9db44bf6f645d854ee710a8ca17b479451447e9f56758aee10a2fad": {
+  "pair": "cbETH/USDC",
+  "premise8": false,
+  "lltv": 860000000000000000,
+  "oracle": "0xb40d93f44411d8c09ad17d7f88195ef9b05ccd96",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbETH",
+  "coll_dec": 18,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x806b4ac04501c29769051e42783cf04dce41440b",
+    "agg": "0x53fdcab0650570d07e2770004979ef10a86df559",
+    "tv": null
+   },
+   "BASE_FEED_2()": {
+    "feed": "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70",
+    "agg": "0x05c84a58fe042275b37db038baacd15f410c7bb0",
+    "tv": null
+   },
+   "QUOTE_FEED_1()": {
+    "feed": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+    "agg": "0x68be4c50235205ede361ac8244b1ee221cdda5e2",
+    "tv": null
+   }
+  },
+  "n_liq_window": 2
+ },
+ "0x3b3769cfca57be2eaed03fcc5299c25691b77781a1e124e7a8d520eb9a7eabb5": {
+  "pair": "USDC/WETH",
+  "premise8": false,
+  "lltv": 860000000000000000,
+  "oracle": "0xd09048c8b568dbf5f189302bea26c9edabfc4858",
+  "loan": "0x4200000000000000000000000000000000000006",
+  "coll": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "loan_sym": "WETH",
+  "loan_dec": 18,
+  "coll_sym": "USDC",
+  "coll_dec": 6,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+    "agg": "0x68be4c50235205ede361ac8244b1ee221cdda5e2",
+    "tv": null
+   },
+   "QUOTE_FEED_1()": {
+    "feed": "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70",
+    "agg": "0x05c84a58fe042275b37db038baacd15f410c7bb0",
+    "tv": null
+   }
+  },
+  "n_liq_window": 6
+ },
+ "0x5c4b3fceb3705d3afccd3e0f41b76a9ec8b0e56a50c39cb7f8ed7bec4b7fdf34": {
+  "pair": "WETH/USDC",
+  "premise8": true,
+  "lltv": 770000000000000000,
+  "oracle": "0xdd6af1478db5806279da77490d0252e308a7bbea",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0x4200000000000000000000000000000000000006",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "WETH",
+  "coll_dec": 18,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70",
+    "agg": "0x05c84a58fe042275b37db038baacd15f410c7bb0",
+    "tv": null
+   },
+   "QUOTE_FEED_1()": {
+    "feed": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+    "agg": "0x68be4c50235205ede361ac8244b1ee221cdda5e2",
+    "tv": null
+   }
+  },
+  "n_liq_window": 1
+ },
+ "0x669b68ae003954dde5b2be025fa373bfc6b6134fc3180ea746c31e892243ae81": {
+  "pair": "PT-USR-25SEP2025/USDC",
+  "premise8": false,
+  "lltv": 915000000000000000,
+  "oracle": "0x6aded60f115bd6244ff4be46f84149ba758d9085",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xa6f0a4d18b6f6ddd408936e81b7b3a8befa18e77",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "PT-USR-25SEP2025",
+  "coll_dec": 18,
+  "legs": {
+   "QUOTE_FEED_1()": {
+    "feed": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+    "agg": "0x68be4c50235205ede361ac8244b1ee221cdda5e2",
+    "tv": null
+   }
+  },
+  "n_liq_window": 2
+ },
+ "0x67ebd84b2fb39e3bc5a13d97e4c07abe1ea617e40654826e9abce252e95f049e": {
+  "pair": "cbBTC/EURC",
+  "premise8": false,
+  "lltv": 860000000000000000,
+  "oracle": "0xa857411cb2231a6a87a3bef987a4ced8a067d799",
+  "loan": "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",
+  "coll": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+  "loan_sym": "EURC",
+  "loan_dec": 6,
+  "coll_sym": "cbBTC",
+  "coll_dec": 8,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x64c911996d3c6ac71f9b455b1e8e7266bcbd848f",
+    "agg": "0xe5ec87a39445b8d5b751b116802a53c5ae7e9df1",
+    "tv": null
+   },
+   "QUOTE_FEED_1()": {
+    "feed": "0xc91d87e81fab8f93699ecf7ee9b44d11e1d53f0f",
+    "agg": "0x46ba9365c7ce12224504cf8581f061a6942f8516",
+    "tv": null
+   }
+  },
+  "n_liq_window": 1
+ },
+ "0x73527ddd796e6d4f48387adaae36f6f3d49d606d7f2a15eb0c931416a58875d8": {
+  "pair": "cbDOGE/USDC",
+  "premise8": true,
+  "lltv": 625000000000000000,
+  "oracle": "0xa9d36600fb9eba7548857e61f836ec951e3091b2",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xcbd06e5a2b0c65597161de254aa074e489deb510",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbDOGE",
+  "coll_dec": 8,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x8422f3d3caff15ca682939310d6a5e619ae08e57",
+    "agg": "0x243d5582c12c905c939f97e66f8ee0cdec80ce02",
+    "tv": null
+   }
+  },
+  "n_liq_window": 52
+ },
+ "0x76629002c9fdb20fb2092053a4f22c5c65e04a81887218b9546f2a2d82b4c0a8": {
+  "pair": "cbHYPE/USDC",
+  "premise8": false,
+  "lltv": 625000000000000000,
+  "oracle": "0x7fad8b8de2ddb7b4b415e1aa3613e45eef9e4bff",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xb200000000000000000000451d033a5000cb479e",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbHYPE",
+  "coll_dec": 18,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0xadb55ef366459c94a318af2b05a44eee463f8e63",
+    "agg": "0xaa768940e12b59b37ec6a334d343bd0dc43aabd1",
+    "tv": null
+   }
+  },
+  "n_liq_window": 1
+ },
+ "0x7dc02ff6c536b1d49d7fba770438d79f5bd1f1c78884629b7d1aaee19675782b": {
+  "pair": "SOL/USDC",
+  "premise8": false,
+  "lltv": 625000000000000000,
+  "oracle": "0xe9725430f3a72611ac72eddc650625bce4f45dc7",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0x311935cd80b76769bf2ecc9d8ab7635b2139cf82",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "SOL",
+  "coll_dec": 9,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x975043adbb80fc32276cbf9bbcfd4a601a12462d",
+    "agg": "0x57b823541ab83ecdcd0b25a23d8fd572764d4ad9",
+    "tv": null
+   }
+  },
+  "n_liq_window": 17
+ },
+ "0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda": {
+  "pair": "WETH/USDC",
+  "premise8": true,
+  "lltv": 860000000000000000,
+  "oracle": "0xfea2d58cefcb9fcb597723c6bae66ffe4193afe4",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0x4200000000000000000000000000000000000006",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "WETH",
+  "coll_dec": 18,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70",
+    "agg": "0x05c84a58fe042275b37db038baacd15f410c7bb0",
+    "tv": null
+   },
+   "QUOTE_FEED_1()": {
+    "feed": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+    "agg": "0x68be4c50235205ede361ac8244b1ee221cdda5e2",
+    "tv": null
+   }
+  },
+  "n_liq_window": 11
+ },
+ "0x9103c3b4e834476c9a62ea009ba2c884ee42e94e6e314a26f04d312434191836": {
+  "pair": "cbBTC/USDC",
+  "premise8": true,
+  "lltv": 860000000000000000,
+  "oracle": "0x663becd10dae6c4a3dcd89f1d76c1174199639b9",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbBTC",
+  "coll_dec": 8,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x64c911996d3c6ac71f9b455b1e8e7266bcbd848f",
+    "agg": "0xe5ec87a39445b8d5b751b116802a53c5ae7e9df1",
+    "tv": null
+   }
+  },
+  "n_liq_window": 6
+ },
+ "0x9125d0fa03c3137166df68bcc72283477830de2a4a5536512374c573ad4583c3": {
+  "pair": "cbLTC/USDC",
+  "premise8": true,
+  "lltv": 625000000000000000,
+  "oracle": "0x47f961e6653423a77b1ef8fb680ee53bf7d8a00d",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xcb17c9db87b595717c857a08468793f5bab6445f",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbLTC",
+  "coll_dec": 8,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x206a34e47093125fbf4c75b7c7e88b84c6a77a69",
+    "agg": "0xd175aa4ed3aeccd03266c2bbbb16b0b419d005aa",
+    "tv": null
+   }
+  },
+  "n_liq_window": 4
+ },
+ "0x995caf6283977748ac3aebad52440a5561c8ade20cc63487c9fb38f0e053c9fe": {
+  "pair": "stUSD/jEUR",
+  "premise8": false,
+  "lltv": 860000000000000000,
+  "oracle": "0x32b898e98033ca12859921618896764299661c10",
+  "loan": "0x4154550f4db74dc38d1fe98e1f3f28ed6dad627d",
+  "coll": "0x0022228a2cc5e7ef0274a7baa600d44da5ab5776",
+  "loan_sym": "jEUR",
+  "loan_dec": 18,
+  "coll_sym": "stUSD",
+  "coll_dec": 18,
+  "legs": {
+   "QUOTE_FEED_1()": {
+    "feed": "0xc91d87e81fab8f93699ecf7ee9b44d11e1d53f0f",
+    "agg": "0x46ba9365c7ce12224504cf8581f061a6942f8516",
+    "tv": null
+   }
+  },
+  "n_liq_window": 1
+ },
+ "0xace0ea2ff0a6c4b7edc51fbce422be4cdbba45471e395d974c46d619aa2a393d": {
+  "pair": "MAMO/USDC",
+  "premise8": false,
+  "lltv": 385000000000000000,
+  "oracle": "0x18d1325e8528e3ceafbf9a77f3be3f76fec42d5c",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0x7300b37dfdfab110d83290a29dfb31b1740219fe",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "MAMO",
+  "coll_dec": 18,
+  "legs": {
+   "QUOTE_FEED_1()": {
+    "feed": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+    "agg": "0x68be4c50235205ede361ac8244b1ee221cdda5e2",
+    "tv": null
+   }
+  },
+  "n_liq_window": 1
+ },
+ "0xb3920b96dec75b6a1144b71f963f30236fb200f3e33e93c2e9c0d222c1fa53c2": {
+  "pair": "stkWELL/USDC",
+  "premise8": false,
+  "lltv": 625000000000000000,
+  "oracle": "0xc842d95b9c35bf97842110408a8c501645fb1722",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xe66e3a37c3274ac24fe8590f7d84a2427194dc17",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "stkWELL",
+  "coll_dec": 18,
+  "legs": {
+   "QUOTE_FEED_1()": {
+    "feed": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+    "agg": "0x68be4c50235205ede361ac8244b1ee221cdda5e2",
+    "tv": null
+   }
+  },
+  "n_liq_window": 34
+ },
+ "0xd4a903dc6d949519060c7707f9604fdc9772c046e05c2e3a8fce0bd7196e4109": {
+  "pair": "cbXRP/USDC",
+  "premise8": true,
+  "lltv": 625000000000000000,
+  "oracle": "0x031b2efc8d70042ac8d9f5c793c4149ec4b60fde",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xcb585250f852c6c6bf90434ab21a00f02833a4af",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbXRP",
+  "coll_dec": 6,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x9f0c1dd78c4cbdf5b9cf923a549a201edc676d34",
+    "agg": "0xfa9ebd1fc381c5babb495bb53664ae9b6665e4e4",
+    "tv": null
+   }
+  },
+  "n_liq_window": 457
+ },
+ "0xd7520ad198b497b6eb75bc690268f4597630dbc12e305e9d4105843bab36e41d": {
+  "pair": "cbADA/USDC",
+  "premise8": true,
+  "lltv": 625000000000000000,
+  "oracle": "0x35d87a743d1f2f7cafb42d855dc1c5df857ce45f",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xcbada732173e39521cdbe8bf59a6dc85a9fc7b8c",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbADA",
+  "coll_dec": 6,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x34cd971a092d5411bd69c10a5f0a7eef72c69041",
+    "agg": "0x540e67a10128a32bd7dee10067fd6e9c528201d3",
+    "tv": null
+   }
+  },
+  "n_liq_window": 29
+ },
+ "0xdaa04f6819210b11fe4e3b65300c725c32e55755e3598671559b9ae3bac453d7": {
+  "pair": "AERO/USDC",
+  "premise8": false,
+  "lltv": 625000000000000000,
+  "oracle": "0x96f1485daf396c2ab7e53dc76d7b330143cb2269",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "AERO",
+  "coll_dec": 18,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x4ec5970fc728c5f65ba413992cd5ff6fd70fcff0",
+    "agg": "0xfcddfb2294beba43987516371febb2e677eb403e",
+    "tv": null
+   },
+   "QUOTE_FEED_1()": {
+    "feed": "0x7e860098f58bbfc8648a4311b374b1d669a2bc6b",
+    "agg": "0x68be4c50235205ede361ac8244b1ee221cdda5e2",
+    "tv": null
+   }
+  },
+  "n_liq_window": 1
+ },
+ "0xde70aae6f81a39f4144149ba97e48f547cc6a9f36163f856acbf29e0e02ed8fd": {
+  "pair": "AFAKE/WETH",
+  "premise8": false,
+  "lltv": 860000000000000000,
+  "oracle": "0x01794708d88feaf1b2afe88cc1952b0ce9ca0c9e",
+  "loan": "0x4200000000000000000000000000000000000006",
+  "coll": "0xf4bbe24eb210bf39f10fcfe07a997224e58576fe",
+  "loan_sym": "WETH",
+  "loan_dec": 18,
+  "coll_sym": "AFAKE",
+  "coll_dec": 18,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x8d0e3d1b443a631c25282022f4e3bb57e57c4db6",
+    "agg": "0x8d0e3d1b443a631c25282022f4e3bb57e57c4db6",
+    "tv": null
+   }
+  },
+  "n_liq_window": 29
+ },
+ "0xe458a501c1103ca3b256f2bcb45d223263fb34b6349d82675494ce3a94ce1327": {
+  "pair": "cbZEC/USDC",
+  "premise8": false,
+  "lltv": 625000000000000000,
+  "oracle": "0xa3cb2d7204f47a468b82c6fab1ca9675e9f7a272",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xb2000000000000000000008501b13360000cb2ec",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbZEC",
+  "coll_dec": 8,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0xc4a161651546983083aedddec5878a2eaf604890",
+    "agg": "0xb00e68fb3754ee8cc7b5f61348a2f09d53fb2e0e",
+    "tv": null
+   }
+  },
+  "n_liq_window": 1
+ },
+ "0xf2a59ad1aec67664c564cb33c33538ab41372363204ce2bdcf00900b7d28c6ab": {
+  "pair": "cbADA/USDC",
+  "premise8": true,
+  "lltv": 770000000000000000,
+  "oracle": "0x35d87a743d1f2f7cafb42d855dc1c5df857ce45f",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xcbada732173e39521cdbe8bf59a6dc85a9fc7b8c",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbADA",
+  "coll_dec": 6,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x34cd971a092d5411bd69c10a5f0a7eef72c69041",
+    "agg": "0x540e67a10128a32bd7dee10067fd6e9c528201d3",
+    "tv": null
+   }
+  },
+  "n_liq_window": 1
+ },
+ "0xfdfecf85a4dd90a7637ae2aaf28b35061166f0e62bfc714c565eed9f7e959783": {
+  "pair": "cbXRP/USDC",
+  "premise8": true,
+  "lltv": 770000000000000000,
+  "oracle": "0x031b2efc8d70042ac8d9f5c793c4149ec4b60fde",
+  "loan": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  "coll": "0xcb585250f852c6c6bf90434ab21a00f02833a4af",
+  "loan_sym": "USDC",
+  "loan_dec": 6,
+  "coll_sym": "cbXRP",
+  "coll_dec": 6,
+  "legs": {
+   "BASE_FEED_1()": {
+    "feed": "0x9f0c1dd78c4cbdf5b9cf923a549a201edc676d34",
+    "agg": "0xfa9ebd1fc381c5babb495bb53664ae9b6665e4e4",
+    "tv": null
+   }
+  },
+  "n_liq_window": 1
+ }
+}
