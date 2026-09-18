@@ -220,18 +220,24 @@ def _read_round(agg, block, prev):
     (check_round_race.py). Молчаливое занижение M1: цена B+6 считалась бы по старому answer.
     Ждём, пока поток флешблоков не покажет следующий блок (значит `block` запечатан), и только
     потом читаем; ожидание бесплатно — до B+6 у нас 12 с."""
-    s = rpcx.selectors()
     deadline = time.monotonic() + 5.0
     while ST.head <= block and time.monotonic() < deadline:
         time.sleep(0.05)
+    # Читаем ЛОГ AnswerUpdated ИМЕННО ЭТОГО БЛОКА, а не latestRoundData: условие
+    # «roundId больше прошлого» пропускало БОЛЕЕ НОВЫЙ раунд (следующего блока) и привязывало
+    # его к нашему B — 2 расхождения из 13 после первого фикса. Лог однозначно связывает
+    # answer с блоком, и цена B+6 считается по тому раунду, который в этом блоке и вышел.
     for attempt in range(6):
-        ret = rpcx.rpc("eth_call", [{"to": agg, "data": "0x" + s["latestRoundData"].hex()}, "latest"],
-                       FREE + PAID, timeout=8)
-        b = bytes.fromhex(ret[2:])
-        round_id = rpcx.u256(b, 0)
-        a_new = rpcx.i256(b, 1)
-        updated_at = rpcx.u256(b, 3)
-        if prev is None or round_id > prev:
+        try:
+            lg = rpcx.getlogs(block, block, [T_AU], agg, FREE + PAID, timeout=10)
+        except Exception:
+            lg = []
+        if lg:
+            t = lg[-1]["topics"]
+            v = int(t[1], 16)
+            a_new = v - (1 << 256) if v >= (1 << 255) else v
+            round_id = int(t[2], 16)
+            updated_at = int((lg[-1]["data"] or "0x0")[2:66] or "0", 16)
             return round_id, a_new, updated_at, attempt
         if time.monotonic() > deadline + 3.0:
             break
