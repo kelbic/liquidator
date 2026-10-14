@@ -3575,3 +3575,76 @@ ssh: connect to host 185.173.146.134 port 22: Connection timed out
 
 ```
 </details>
+
+> ⚠️ 2026-10-14T06:40:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T06:50:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T07:00:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T07:10:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: inbox)
+
+> ⚠️ 2026-10-14T07:20:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T07:30:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T07:40:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T07:50:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T08:00:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T08:10:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: inbox)
+
+> ⚠️ 2026-10-14T08:20:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T08:30:17Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T08:40:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T08:50:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T09:00:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T09:10:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T09:20:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: inbox)
+
+> ⚠️ 2026-10-14T09:30:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T09:40:17Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T09:50:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T10:00:17Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T10:10:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T10:20:17Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: inbox)
+
+> ⚠️ 2026-10-14T10:30:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T10:40:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T10:50:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T11:00:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T11:10:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T11:20:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T11:30:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: inbox)
+
+> ⚠️ 2026-10-14T11:40:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T11:50:17Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T12:00:17Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T12:10:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+> ⚠️ 2026-10-14T12:20:16Z сторож тени: Charlotte недоступна или heartbeat отсутствует (rc=255, ssh: connect to host 185.173.146.134 port 22: Connection timed out) (адресат: dedup)
+
+---
+**14.10.2026 — тень B+6 СНЯТА (агент-триаж).** Charlotte (185.173.146.134) не отвечает с 06.10 ~19:00Z (ping 100% потерь, TCP 22 таймаут) — истечение аренды, о котором владелец распорядился 31.08 (STATE.md, «CHARLOTTE НЕ ПРОДЛЕВАЕТСЯ»). Последняя настоящая строка лога — до 06.10. **Строки «за 2026-10-06…2026-10-13» — НЕ данные:** это текст ошибки ssh, принятый `vienna_daily.sh` за отчёт (дефект починен: теперь проверяется код возврата). Строки ⚠️ после 06.10 — сторож, будивший по уже отпущенному хосту. Кроны закомментированы в crontab Вены (бэкап `~/.fleet-watch/cron.bak-20261014-shadowb6`).

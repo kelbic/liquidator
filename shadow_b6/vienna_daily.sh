@@ -6,7 +6,9 @@ DOC=/home/claude-agent/work/liquidator/docs/research/SHADOW-B6-LOG.md
 DAY=${1:-$(date -u -d yesterday +%F)}
 OUT=$(timeout 900 ssh -o ConnectTimeout=20 -o BatchMode=yes root@185.173.146.134 \
       "cd /root/shadow-b6 && nice -n 19 /root/liquidator/venv/bin/python daily.py $DAY" 2>&1)
-if [ -z "$OUT" ]; then
+RC=$?
+# 07-13.10: при мёртвом хосте 2>&1 давал непустой OUT (текст ошибки ssh), и он коммитился как суточная строка
+if [ $RC -ne 0 ] || [ -z "$OUT" ]; then
   echo "$(date -u +%FT%TZ) суточный отчёт за $DAY НЕ ПОЛУЧЕН" >> /home/claude-agent/.fleet-watch/shadow-b6.log
   nice -n 19 python3 -c "
 import sys; sys.path.insert(0,'/home/claude-agent/.fleet-watch'); import notify
